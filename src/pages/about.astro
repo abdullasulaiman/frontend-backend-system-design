@@ -1,0 +1,56 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+
+<BaseLayout title="About · Grokking Frontend System Design">
+  <main class="mx-auto max-w-[72ch] px-4 py-12 sm:px-6 sm:py-16">
+    <article class="prose">
+      <p class="not-prose mb-2 text-sm font-semibold uppercase tracking-wide text-[var(--muted)]">About</p>
+      <h1>About Grokking Frontend System Design</h1>
+
+      <p>
+        <strong>Grokking Frontend System Design</strong> is a free, self-contained study guide for
+        the kind of open-ended architecture, performance, and API-design questions that show up in
+        senior and staff frontend interviews. It's built as a small interactive app rather than a
+        static document: lessons render with diagrams, quizzes, and mock-interview drills, and your
+        progress through them is tracked right in your browser.
+      </p>
+
+      <h2>Original content, no affiliation</h2>
+      <p>
+        This project is an <strong>independent, original recreation</strong> written from scratch
+        for this codebase. It is <strong>not affiliated with, endorsed by, sponsored by, or
+        copied from</strong> "Grokking the System Design Interview," "Grokking the Frontend
+        Interview," Design Gurus, Educative, or any other commercial course or platform. Any
+        resemblance in high-level topic names (e.g. "rendering strategies" or "state management")
+        reflects standard, widely-taught frontend engineering terminology, not shared content. All
+        explanations, examples, diagrams, and quiz questions on this site were authored for this
+        project.
+      </p>
+
+      <h2>How to use the site</h2>
+      <p>The site is organized into two tracks, each broken into modules of short lessons:</p>
+      <ul>
+        <li><strong>Concepts</strong> — the core mental models: rendering, state, data fetching, performance, architecture.</li>
+        <li><strong>Interview Prep</strong> — timed drills and mock walkthroughs that exercise those concepts under interview-like conditions.</li>
+      </ul>
+      <p>
+        Work through modules top to bottom — later lessons often build on earlier ones. Use the
+        sidebar to jump between lessons in a track, and the in-page table of contents to navigate
+        within a long lesson. Mark a lesson complete when you finish it; the progress rings on the
+        home page and sidebar fill in automatically. Nothing is sent to a server — progress lives
+        in your browser's local storage, so it's private and specific to this device.
+      </p>
+
+      <h2>Built with</h2>
+      <p>This project is open about the tools behind it:</p>
+      <ul>
+        <li><strong>Astro</strong> — static-first site framework powering routing, content collections, and the overall page shell.</li>
+        <li><strong>React</strong> — powers the small interactive "islands" (theme toggle, progress rings, quizzes, mock interviews) embedded in otherwise static pages.</li>
+        <li><strong>Tailwind CSS</strong> — utility-first styling layered on top of a custom design-token system for consistent light/dark theming.</li>
+        <li><strong>Mermaid</strong> — renders the architecture and sequence diagrams found throughout the lessons.</li>
+        <li><strong>Pagefind</strong> — powers static, client-side search across all lessons.</li>
+      </ul>
+    </article>
+  </main>
+</BaseLayout>

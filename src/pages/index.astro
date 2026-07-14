@@ -1,63 +1,251 @@
 ---
-import '../styles/global.css';
+import BaseLayout from '../layouts/BaseLayout.astro';
+import ProgressRing from '../components/ProgressRing';
+import { getCollection } from 'astro:content';
+import { buildNav } from '../lib/navigation';
+
+const [conceptEntries, interviewEntries] = await Promise.all([
+  getCollection('concepts'),
+  getCollection('interview'),
+]);
+
+const conceptNav = buildNav(conceptEntries);
+const interviewNav = buildNav(interviewEntries);
+
+const tracks = [
+  {
+    key: 'concepts',
+    label: 'Concepts',
+    description: 'Core frontend system design building blocks — rendering, state, performance, architecture.',
+    base: '/concepts',
+    nav: conceptNav,
+  },
+  {
+    key: 'interview',
+    label: 'Interview Prep',
+    description: 'Timed drills and mock walkthroughs that put the concepts to work under interview conditions.',
+    base: '/interview',
+    nav: interviewNav,
+  },
+] as const;
+
+// Build each module's lesson-id list once (stable reference) so <ProgressRing>
+// doesn't tear down + re-subscribe its progress listener on every render.
+// Same approach as Sidebar.astro.
+const moduleLessonIds = new Map<string, string[]>();
+for (const track of tracks) {
+  for (const mod of track.nav) {
+    moduleLessonIds.set(`${track.key}:${mod.module}`, mod.lessons.map(l => l.id));
+  }
+}
+
+// Primary CTA: first lesson of the Concepts track, in nav order. Falls back
+// to the first Interview Prep lesson, and finally to the roadmap section
+// itself, so the hero never links to a 404 while content is still sparse.
+const firstConceptLesson = conceptNav[0]?.lessons[0];
+const firstInterviewLesson = interviewNav[0]?.lessons[0];
+const heroHref = firstConceptLesson
+  ? `/concepts/${firstConceptLesson.id}`
+  : firstInterviewLesson
+    ? `/interview/${firstInterviewLesson.id}`
+    : '#roadmap';
+const heroCtaLabel = firstConceptLesson || firstInterviewLesson ? 'Start learning' : 'View the roadmap';
+
+const totalLessons = conceptEntries.length + interviewEntries.length;
 ---
 
-<html lang="en">
-	<head>
-		<meta charset="utf-8" />
-		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-		<link rel="icon" href="/favicon.ico" />
-		<meta name="viewport" content="width=device-width" />
-		<meta name="generator" content={Astro.generator} />
-		<title>Grokking Frontend System Design</title>
-	</head>
-	<body>
-		<main class="prose" style="padding: 2rem; max-width: 72ch; margin-inline: auto;">
-			<h1>Grokking Frontend System Design</h1>
-			<p>
-				This page is a temporary token/theme smoke test for
-				<strong>Task 2</strong>. Toggle <code>data-theme</code> on
-				<code>&lt;html&gt;</code> between <code>"light"</code> and
-				<code>"dark"</code> in devtools to confirm colors flip.
-			</p>
-			<h2>Typography scale</h2>
-			<p>
-				Body copy should be readable with a comfortable line length, and
-				<a href="#">links</a> should stand out from body text in both themes.
-			</p>
-			<ul>
-				<li>List item one</li>
-				<li>List item two with <code>inline code</code></li>
-			</ul>
-			<blockquote>
-				<p>A blockquote to check the accent-colored left border and muted italic text.</p>
-			</blockquote>
-			<pre><code>const theme = document.documentElement.dataset.theme;</code></pre>
-			<table>
-				<thead>
-					<tr><th>Token</th><th>Light</th><th>Dark</th></tr>
-				</thead>
-				<tbody>
-					<tr><td>--bg</td><td>#ffffff</td><td>#0c0d12</td></tr>
-					<tr><td>--text</td><td>#12131a</td><td>#eceef5</td></tr>
-				</tbody>
-			</table>
-			<div class="callout callout-note">
-				<span class="callout-title">Note</span>
-				<p>Informational callout.</p>
-			</div>
-			<div class="callout callout-tip">
-				<span class="callout-title">Tip</span>
-				<p>Helpful tip callout.</p>
-			</div>
-			<div class="callout callout-warn">
-				<span class="callout-title">Warning</span>
-				<p>Cautionary callout.</p>
-			</div>
-			<div class="callout callout-interview">
-				<span class="callout-title">Interview tip</span>
-				<p>Interview-specific callout.</p>
-			</div>
-		</main>
-	</body>
-</html>
+<BaseLayout title="Grokking Frontend System Design">
+  <main>
+    <!-- Hero -->
+    <section
+      class="relative overflow-hidden border-b border-[var(--border)] bg-gradient-to-br from-brand-700 via-brand-600 to-accent-600 px-4 py-20 text-white sm:px-6 sm:py-28"
+    >
+      <div
+        aria-hidden="true"
+        class="pointer-events-none absolute inset-0 opacity-40"
+        style="background: radial-gradient(60rem 30rem at 15% -10%, rgba(255,255,255,0.25), transparent 60%), radial-gradient(50rem 26rem at 110% 110%, rgba(255,255,255,0.18), transparent 60%);"
+      ></div>
+
+      <div class="reveal relative mx-auto max-w-4xl text-center">
+        <p
+          class="mb-5 inline-flex items-center gap-2 rounded-pill border border-white/30 bg-white/10 px-4 py-1 text-xs font-semibold uppercase tracking-wide backdrop-blur"
+        >
+          Free &amp; independent
+        </p>
+        <h1 class="text-4xl font-extrabold tracking-tight sm:text-5xl lg:text-6xl">
+          Grokking Frontend System Design
+        </h1>
+        <p class="mx-auto mt-5 max-w-2xl text-lg text-white/85 sm:text-xl">
+          Master the architecture, performance, and API-design tradeoffs that separate senior
+          frontend engineers — through interactive lessons and interview-style drills.
+        </p>
+
+        <div class="mt-9 flex flex-wrap items-center justify-center gap-4">
+          <a
+            href={heroHref}
+            class="rounded-pill bg-white px-6 py-3 text-base font-semibold text-brand-700 shadow-[var(--shadow-elevated)] transition-transform duration-[var(--transition-fast)] hover:-translate-y-0.5"
+          >
+            {heroCtaLabel}
+          </a>
+          <a
+            href="#roadmap"
+            class="rounded-pill border border-white/40 px-6 py-3 text-base font-semibold text-white transition-colors duration-[var(--transition-fast)] hover:bg-white/10"
+          >
+            See the roadmap
+          </a>
+        </div>
+
+        <p class="mt-7 text-sm text-white/70">
+          {totalLessons} lesson{totalLessons === 1 ? '' : 's'} across two tracks · No signup · No paywall
+        </p>
+      </div>
+    </section>
+
+    <!-- Roadmap -->
+    <section id="roadmap" class="mx-auto max-w-6xl px-4 py-16 sm:px-6 sm:py-20">
+      <div class="reveal mx-auto mb-12 max-w-2xl text-center">
+        <h2 class="text-3xl font-bold tracking-tight text-[var(--text)] sm:text-4xl">
+          Two tracks, one system
+        </h2>
+        <p class="mt-3 text-[var(--muted)]">
+          Work through Concepts to build a mental model, then drill Interview Prep to rehearse
+          explaining it under pressure. Progress is tracked locally in your browser.
+        </p>
+      </div>
+
+      <div class="grid grid-cols-1 gap-8 lg:grid-cols-2">
+        {tracks.map((track, ti) => {
+          const lessonCount = track.nav.reduce((n, m) => n + m.lessons.length, 0);
+          return (
+            <div
+              class={`reveal reveal-delay-${ti + 1} flex h-full flex-col rounded-lg border border-[var(--border)] bg-[var(--surface)] p-6 shadow-[var(--shadow-card)] sm:p-8`}
+            >
+              <div class="mb-6 flex items-start justify-between gap-3">
+                <div>
+                  <h3 class="text-xl font-bold text-[var(--text)]">{track.label}</h3>
+                  <p class="mt-1 text-sm text-[var(--muted)]">{track.description}</p>
+                </div>
+                <span class="shrink-0 rounded-pill bg-[var(--surface-2)] px-3 py-1 text-xs font-semibold text-[var(--muted)]">
+                  {lessonCount} lesson{lessonCount === 1 ? '' : 's'}
+                </span>
+              </div>
+
+              {track.nav.length === 0 ? (
+                <div class="flex flex-1 items-center justify-center rounded-card border border-dashed border-[var(--border)] p-8 text-center text-sm text-[var(--muted)]">
+                  Modules for this track are coming soon.
+                </div>
+              ) : (
+                <ul class="flex flex-col gap-3">
+                  {track.nav.map(mod => {
+                    const lessonIds = moduleLessonIds.get(`${track.key}:${mod.module}`) ?? [];
+                    const firstLesson = mod.lessons[0];
+                    return (
+                      <li>
+                        <a
+                          href={`${track.base}/${firstLesson.id}`}
+                          class="flex items-center justify-between gap-4 rounded-card border border-[var(--border)] bg-[var(--bg)] px-4 py-3 no-underline transition-colors duration-[var(--transition-fast)] hover:border-[var(--brand)] hover:bg-[var(--surface-2)]"
+                        >
+                          <span class="min-w-0">
+                            <span class="block truncate font-semibold text-[var(--text)]">{mod.module}</span>
+                            <span class="block text-sm text-[var(--muted)]">
+                              {mod.lessons.length} lesson{mod.lessons.length === 1 ? '' : 's'}
+                            </span>
+                          </span>
+                          <ProgressRing client:visible lessonIds={lessonIds} size={44} label={`${mod.module} progress`} />
+                        </a>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </section>
+
+    <!-- How to use -->
+    <section class="reveal border-y border-[var(--border)] bg-[var(--surface)] px-4 py-14 sm:px-6">
+      <div class="mx-auto max-w-5xl">
+        <h2 class="text-center text-sm font-bold uppercase tracking-wide text-[var(--muted)]">
+          How to use this site
+        </h2>
+        <div class="mt-8 grid grid-cols-1 gap-8 sm:grid-cols-3">
+          <div class="text-center sm:text-left">
+            <div class="mx-auto mb-3 flex h-9 w-9 items-center justify-center rounded-card bg-[var(--brand)] text-sm font-bold text-white sm:mx-0">
+              1
+            </div>
+            <h3 class="font-semibold text-[var(--text)]">Pick a track</h3>
+            <p class="mt-1 text-sm text-[var(--muted)]">
+              Start with Concepts for foundations, or jump into Interview Prep if you already know
+              the material and want timed practice.
+            </p>
+          </div>
+          <div class="text-center sm:text-left">
+            <div class="mx-auto mb-3 flex h-9 w-9 items-center justify-center rounded-card bg-[var(--brand)] text-sm font-bold text-white sm:mx-0">
+              2
+            </div>
+            <h3 class="font-semibold text-[var(--text)]">Work through modules in order</h3>
+            <p class="mt-1 text-sm text-[var(--muted)]">
+              Each module builds on the last. Use the sidebar to jump between lessons, and the
+              table of contents to navigate within one.
+            </p>
+          </div>
+          <div class="text-center sm:text-left">
+            <div class="mx-auto mb-3 flex h-9 w-9 items-center justify-center rounded-card bg-[var(--brand)] text-sm font-bold text-white sm:mx-0">
+              3
+            </div>
+            <h3 class="font-semibold text-[var(--text)]">Track your progress</h3>
+            <p class="mt-1 text-sm text-[var(--muted)]">
+              Mark lessons complete as you go — the rings above fill in automatically. Progress is
+              saved locally in your browser, no account needed.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="px-4 py-10 text-center text-sm text-[var(--muted)] sm:px-6">
+      <p>
+        Grokking Frontend System Design is an independent, original project — not affiliated with,
+        endorsed by, or sourced from any commercial course.
+      </p>
+      <p class="mt-2">
+        <a href="/about" class="font-medium text-[var(--brand)] underline underline-offset-2 hover:text-[var(--brand-strong)]">
+          About this project
+        </a>
+      </p>
+    </footer>
+  </main>
+
+  <style>
+    /*
+     * Subtle entrance animation, gated behind prefers-reduced-motion so the
+     * "no preference" case is the ONLY one that opts in. Content is fully
+     * visible-by-default outside the media query, so reduced-motion users
+     * (and anyone whose browser doesn't run the animation) never see it
+     * start hidden.
+     */
+    @media (prefers-reduced-motion: no-preference) {
+      .reveal {
+        opacity: 0;
+        transform: translateY(14px);
+        animation: reveal-in 0.7s var(--ease-out) both;
+      }
+      .reveal-delay-1 {
+        animation-delay: 0.05s;
+      }
+      .reveal-delay-2 {
+        animation-delay: 0.15s;
+      }
+    }
+
+    @keyframes reveal-in {
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+  </style>
+</BaseLayout>
