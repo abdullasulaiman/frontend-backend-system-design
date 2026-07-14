@@ -1,5 +1,5 @@
 ---
-
+import '../styles/global.css';
 ---
 
 <html lang="en">
@@ -9,9 +9,55 @@
 		<link rel="icon" href="/favicon.ico" />
 		<meta name="viewport" content="width=device-width" />
 		<meta name="generator" content={Astro.generator} />
-		<title>Astro</title>
+		<title>Grokking Frontend System Design</title>
 	</head>
 	<body>
-		<h1>Astro</h1>
+		<main class="prose" style="padding: 2rem; max-width: 72ch; margin-inline: auto;">
+			<h1>Grokking Frontend System Design</h1>
+			<p>
+				This page is a temporary token/theme smoke test for
+				<strong>Task 2</strong>. Toggle <code>data-theme</code> on
+				<code>&lt;html&gt;</code> between <code>"light"</code> and
+				<code>"dark"</code> in devtools to confirm colors flip.
+			</p>
+			<h2>Typography scale</h2>
+			<p>
+				Body copy should be readable with a comfortable line length, and
+				<a href="#">links</a> should stand out from body text in both themes.
+			</p>
+			<ul>
+				<li>List item one</li>
+				<li>List item two with <code>inline code</code></li>
+			</ul>
+			<blockquote>
+				<p>A blockquote to check the accent-colored left border and muted italic text.</p>
+			</blockquote>
+			<pre><code>const theme = document.documentElement.dataset.theme;</code></pre>
+			<table>
+				<thead>
+					<tr><th>Token</th><th>Light</th><th>Dark</th></tr>
+				</thead>
+				<tbody>
+					<tr><td>--bg</td><td>#ffffff</td><td>#0c0d12</td></tr>
+					<tr><td>--text</td><td>#12131a</td><td>#eceef5</td></tr>
+				</tbody>
+			</table>
+			<div class="callout callout-note">
+				<span class="callout-title">Note</span>
+				<p>Informational callout.</p>
+			</div>
+			<div class="callout callout-tip">
+				<span class="callout-title">Tip</span>
+				<p>Helpful tip callout.</p>
+			</div>
+			<div class="callout callout-warn">
+				<span class="callout-title">Warning</span>
+				<p>Cautionary callout.</p>
+			</div>
+			<div class="callout callout-interview">
+				<span class="callout-title">Interview tip</span>
+				<p>Interview-specific callout.</p>
+			</div>
+		</main>
 	</body>
 </html>

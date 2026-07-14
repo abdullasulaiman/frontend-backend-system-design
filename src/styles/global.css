@@ -1,0 +1,308 @@
+@import './tokens.css';
+
+/* ---------------------------------------------------------------------
+ * Base
+ * ------------------------------------------------------------------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light dark;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  transition: background-color var(--transition-base) var(--ease-out),
+    color var(--transition-base) var(--ease-out);
+}
+
+img,
+svg,
+video {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 2rem 0;
+}
+
+/* Respect reduced-motion preference: neutralize animation/transition timing
+ * everywhere, including the theme-swap transition above. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Keyboard-focus ring, visible in both themes, hidden for pointer interaction. */
+:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--color-ink-950);
+}
+
+/* ---------------------------------------------------------------------
+ * .prose — lesson typography scope
+ * Applied to MDX-rendered lesson bodies. Self-contained: headings scale,
+ * spacing rhythm, links, lists, code, tables, blockquotes, callouts.
+ * ------------------------------------------------------------------- */
+
+.prose {
+  max-width: 72ch;
+  color: var(--text);
+  line-height: 1.75;
+}
+
+.prose > :first-child {
+  margin-top: 0;
+}
+.prose > :last-child {
+  margin-bottom: 0;
+}
+
+.prose h1,
+.prose h2,
+.prose h3,
+.prose h4 {
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  scroll-margin-top: 5rem;
+}
+
+.prose h1 {
+  font-size: clamp(1.875rem, 1.6rem + 1.2vw, 2.5rem);
+  margin: 0 0 1rem;
+}
+
+.prose h2 {
+  font-size: clamp(1.5rem, 1.35rem + 0.7vw, 1.875rem);
+  margin: 2.5rem 0 1rem;
+  padding-top: 0.25rem;
+  border-top: 1px solid var(--border);
+}
+
+.prose h2:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.prose h3 {
+  font-size: clamp(1.25rem, 1.15rem + 0.4vw, 1.5rem);
+  margin: 2rem 0 0.75rem;
+}
+
+.prose h4 {
+  font-size: 1.125rem;
+  margin: 1.5rem 0 0.5rem;
+}
+
+.prose p {
+  margin: 1rem 0;
+}
+
+.prose strong {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.prose a {
+  color: var(--brand);
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+  text-decoration-thickness: from-font;
+  font-weight: 500;
+}
+
+.prose a:hover {
+  color: var(--brand-strong);
+}
+
+.prose ul,
+.prose ol {
+  margin: 1rem 0;
+  padding-left: 1.5rem;
+}
+
+.prose li {
+  margin: 0.375rem 0;
+}
+
+.prose li::marker {
+  color: var(--muted);
+}
+
+.prose li > ul,
+.prose li > ol {
+  margin: 0.375rem 0;
+}
+
+.prose code {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  background: var(--code-inline-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.125em 0.375em;
+}
+
+.prose pre {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  line-height: 1.6;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  padding: 1rem 1.25rem;
+  margin: 1.25rem 0;
+  overflow-x: auto;
+  box-shadow: var(--shadow-card);
+}
+
+.prose pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: inherit;
+  color: var(--text);
+}
+
+.prose blockquote {
+  margin: 1.25rem 0;
+  padding: 0.25rem 0 0.25rem 1rem;
+  border-left: 3px solid var(--accent);
+  color: var(--muted);
+  font-style: italic;
+}
+
+.prose blockquote p {
+  margin: 0.5rem 0;
+}
+
+.prose table {
+  width: 100%;
+  margin: 1.25rem 0;
+  border-collapse: collapse;
+  font-size: 0.9375rem;
+}
+
+.prose th,
+.prose td {
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.prose th {
+  background: var(--surface);
+  font-weight: 600;
+}
+
+.prose tbody tr:nth-child(even) {
+  background: var(--surface);
+}
+
+.prose figure {
+  margin: 1.25rem 0;
+}
+
+.prose figcaption {
+  margin-top: 0.5rem;
+  font-size: 0.875rem;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* Semantic callouts (note / tip / warn / interview-tip) — later tasks can
+ * render <div class="prose callout callout-note"> etc. from MDX. */
+
+.prose .callout {
+  margin: 1.25rem 0;
+  padding: 1rem 1.25rem;
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: var(--radius-card);
+  background: var(--surface);
+}
+
+.prose .callout > :first-child {
+  margin-top: 0;
+}
+.prose .callout > :last-child {
+  margin-bottom: 0;
+}
+
+.prose .callout-note {
+  background: var(--note-bg);
+  border-color: var(--note-border);
+  border-left-color: var(--note-ink);
+}
+.prose .callout-note .callout-title {
+  color: var(--note-ink);
+}
+
+.prose .callout-tip {
+  background: var(--tip-bg);
+  border-color: var(--tip-border);
+  border-left-color: var(--tip-ink);
+}
+.prose .callout-tip .callout-title {
+  color: var(--tip-ink);
+}
+
+.prose .callout-warn {
+  background: var(--warn-bg);
+  border-color: var(--warn-border);
+  border-left-color: var(--warn-ink);
+}
+.prose .callout-warn .callout-title {
+  color: var(--warn-ink);
+}
+
+.prose .callout-interview {
+  background: var(--interview-bg);
+  border-color: var(--interview-border);
+  border-left-color: var(--interview-ink);
+}
+.prose .callout-interview .callout-title {
+  color: var(--interview-ink);
+}
+
+.prose .callout-title {
+  display: block;
+  font-weight: 700;
+  font-size: 0.8125rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.375rem;
+}

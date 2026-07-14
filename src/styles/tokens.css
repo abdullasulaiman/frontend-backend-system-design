@@ -1,0 +1,163 @@
+@import 'tailwindcss';
+
+/*
+ * Design tokens for "Grokking Frontend System Design".
+ *
+ * Two layers:
+ * 1. `@theme` — static values Tailwind compiles into utility classes
+ *    (`bg-brand-500`, `font-mono`, `rounded-card`, …). These do NOT change
+ *    with the theme attribute; they are the fixed brand palette.
+ * 2. `:root`/`[data-theme="…"]` — plain CSS custom properties that DO flip
+ *    at runtime when `data-theme` changes on `<html>`. Global/base/prose
+ *    styles consume these (`var(--bg)`, `var(--text)`, …), never the raw
+ *    Tailwind-only tokens above, so the whole UI re-themes instantly.
+ */
+
+@theme {
+  /* Type */
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+
+  /* Brand ramp (indigo) */
+  --color-brand-50: #eef2ff;
+  --color-brand-100: #e0e7ff;
+  --color-brand-200: #c7d2fe;
+  --color-brand-300: #a5b4fc;
+  --color-brand-400: #818cf8;
+  --color-brand-500: #6366f1;
+  --color-brand-600: #4338ca;
+  --color-brand-700: #3730a3;
+  --color-brand-800: #312e81;
+  --color-brand-900: #23215a;
+
+  /* Accent ramp (cyan) */
+  --color-accent-50: #ecfeff;
+  --color-accent-100: #cffafe;
+  --color-accent-200: #a5f3fc;
+  --color-accent-300: #67e8f9;
+  --color-accent-400: #22d3ee;
+  --color-accent-500: #06b6d4;
+  --color-accent-600: #0891b2;
+  --color-accent-700: #0e7490;
+  --color-accent-800: #155e75;
+  --color-accent-900: #164e63;
+
+  /* Semantic callout accents (note / tip / warn / interview-tip) */
+  --color-note-500: #3b82f6;
+  --color-tip-500: #22c55e;
+  --color-warn-500: #f59e0b;
+  --color-interview-500: #8b5cf6;
+
+  /* Neutral ramp used for surfaces/borders in both themes */
+  --color-ink-950: #0c0d12;
+  --color-ink-50: #f7f8fa;
+
+  /* Shape */
+  --radius-sm: 0.375rem;
+  --radius-card: 0.875rem;
+  --radius-lg: 1.25rem;
+  --radius-pill: 999px;
+
+  /* Motion (paired with the prefers-reduced-motion guard in global.css) */
+  --transition-fast: 120ms;
+  --transition-base: 200ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ---------------------------------------------------------------------
+ * Runtime theme tokens — read by global.css and components via var(--x).
+ * Swapping `data-theme` on <html> between "light" and "dark" re-themes
+ * the whole page without a rebuild. All pairs below are verified WCAG AA
+ * (>= 4.5:1 for text) against the background/surface they're used on.
+ * ------------------------------------------------------------------- */
+
+:root,
+[data-theme='light'] {
+  color-scheme: light;
+
+  /* Surfaces */
+  --bg: #ffffff;
+  --surface: #f7f8fa;
+  --surface-2: #eef0f4;
+  --border: #e4e6ec;
+
+  /* Text */
+  --text: #12131a;
+  --muted: #5b6070;
+
+  /* Brand / accent (usable as text — verified >= 4.5:1 on --bg/--surface) */
+  --brand: var(--color-brand-600);
+  --brand-strong: var(--color-brand-700);
+  --accent: var(--color-accent-500); /* decorative use: icons, borders, tints */
+  --accent-ink: var(--color-accent-700); /* text-safe cyan (5.0–5.4:1 on white/surface) */
+
+  /* Semantic callouts: bg (tint), border, ink (text-safe label/icon color) */
+  --note-bg: #eff6ff;
+  --note-border: #bfdbfe;
+  --note-ink: #1d4ed8;
+
+  --tip-bg: #f0fdf4;
+  --tip-border: #bbf7d0;
+  --tip-ink: #15803d;
+
+  --warn-bg: #fffbeb;
+  --warn-border: #fde68a;
+  --warn-ink: #92400e;
+
+  --interview-bg: #f5f3ff;
+  --interview-border: #ddd6fe;
+  --interview-ink: #6d28d9;
+
+  /* Elevation */
+  --shadow-card: 0 1px 2px rgba(18, 19, 26, 0.04), 0 8px 24px rgba(18, 19, 26, 0.06);
+  --shadow-elevated: 0 4px 12px rgba(18, 19, 26, 0.08), 0 16px 40px rgba(18, 19, 26, 0.1);
+
+  /* Code frames */
+  --code-bg: var(--surface-2);
+  --code-inline-bg: #edeef2;
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+
+  /* Surfaces */
+  --bg: #0c0d12;
+  --surface: #14161d;
+  --surface-2: #1b1e27;
+  --border: #262a36;
+
+  /* Text */
+  --text: #eceef5;
+  --muted: #9aa0b4;
+
+  /* Brand / accent */
+  --brand: #8b8cf0;
+  --brand-strong: #a5b4fc;
+  --accent: #22d3ee;
+  --accent-ink: #22d3ee; /* 10:1 on dark surfaces, safe as text directly */
+
+  /* Semantic callouts */
+  --note-bg: #12203a;
+  --note-border: #1e3a5f;
+  --note-ink: #93c5fd;
+
+  --tip-bg: #102819;
+  --tip-border: #14532d;
+  --tip-ink: #86efac;
+
+  --warn-bg: #2a1f0a;
+  --warn-border: #78350f;
+  --warn-ink: #fcd34d;
+
+  --interview-bg: #1f1730;
+  --interview-border: #4c1d95;
+  --interview-ink: #c4b5fd;
+
+  /* Elevation (darker page needs stronger, cooler shadows to read) */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-elevated: 0 4px 16px rgba(0, 0, 0, 0.4), 0 20px 48px rgba(0, 0, 0, 0.45);
+
+  /* Code frames */
+  --code-bg: var(--surface-2);
+  --code-inline-bg: #20242f;
+}
