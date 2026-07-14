@@ -1,0 +1,153 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../layouts/BaseLayout.astro';
+import { buildNav } from '../lib/navigation';
+
+interface TrackConfig {
+  key: 'concept' | 'interview';
+  label: string;
+  basePath: string;
+}
+
+const tracks: TrackConfig[] = [
+  { key: 'concept', label: 'Concepts', basePath: '/concepts' },
+  { key: 'interview', label: 'Interview Prep', basePath: '/interview' },
+];
+
+const [conceptEntries, interviewEntries] = await Promise.all([
+  getCollection('concepts'),
+  getCollection('interview'),
+]);
+
+const entriesByTrack = {
+  concept: conceptEntries,
+  interview: interviewEntries,
+};
+
+// Per track, build nav order (module -> lessons) and keep a lookup back to
+// the full entry (for its cheatsheet bullets) by id.
+const trackData = tracks.map(track => {
+  const entries = entriesByTrack[track.key];
+  const byId = new Map(entries.map(e => [e.id, e]));
+  const nav = buildNav(entries);
+  return { ...track, nav, byId };
+});
+---
+
+<BaseLayout title="Cheatsheets · Grokking Frontend System Design">
+  <main class="mx-auto max-w-[80ch] px-4 py-12 sm:px-6 sm:py-16">
+    <header class="not-prose mb-8 flex flex-col gap-4 border-b border-[var(--border)] pb-6 print:border-black">
+      <div>
+        <p class="m-0 text-sm font-semibold uppercase tracking-wide text-[var(--muted)]">Revision</p>
+        <h1 class="m-0 text-3xl font-bold text-[var(--text)]">Cheatsheets</h1>
+        <p class="mt-2 max-w-[60ch] text-[var(--muted)]">
+          Every lesson's key takeaways in one place, grouped by track and module — for quick
+          revision before an interview, or to print out.
+        </p>
+      </div>
+
+      <div
+        id="cheatsheet-filters"
+        class="flex flex-wrap gap-2 print:hidden"
+        role="group"
+        aria-label="Filter cheatsheets by track"
+      >
+        <button
+          type="button"
+          data-filter="all"
+          aria-pressed="true"
+          class="cheatsheet-filter-btn rounded-pill border border-[var(--border)] px-4 py-1.5 text-sm font-medium text-[var(--text)] transition-colors duration-[var(--transition-fast)] hover:bg-[var(--surface)] aria-pressed:border-[var(--brand)] aria-pressed:bg-[var(--brand)] aria-pressed:text-white"
+        >
+          All
+        </button>
+        {tracks.map(track => (
+          <button
+            type="button"
+            data-filter={track.key}
+            aria-pressed="false"
+            class="cheatsheet-filter-btn rounded-pill border border-[var(--border)] px-4 py-1.5 text-sm font-medium text-[var(--text)] transition-colors duration-[var(--transition-fast)] hover:bg-[var(--surface)] aria-pressed:border-[var(--brand)] aria-pressed:bg-[var(--brand)] aria-pressed:text-white"
+          >
+            {track.label}
+          </button>
+        ))}
+      </div>
+    </header>
+
+    <div class="flex flex-col gap-12">
+      {trackData.map(track => (
+        <section data-track={track.key} class="flex flex-col gap-8 break-after-page">
+          <h2 class="m-0 text-2xl font-bold text-[var(--text)]">{track.label}</h2>
+
+          {track.nav.length === 0 ? (
+            <p class="text-[var(--muted)]">No lessons yet in this track — check back soon.</p>
+          ) : (
+            track.nav.map(mod => (
+              <div class="flex flex-col gap-6">
+                <h3 class="m-0 text-lg font-semibold uppercase tracking-wide text-[var(--muted)]">
+                  {mod.module}
+                </h3>
+                <div class="flex flex-col gap-6">
+                  {mod.lessons.map(lesson => {
+                    const entry = track.byId.get(lesson.id);
+                    const cheatsheet = entry?.data.cheatsheet ?? [];
+                    return (
+                      <article class="rounded-card border border-[var(--border)] bg-[var(--surface)] p-5 shadow-card print:border-black print:bg-transparent print:shadow-none">
+                        <h4 class="m-0 mb-3 text-base font-semibold">
+                          <a
+                            href={`${track.basePath}/${lesson.id}`}
+                            class="text-[var(--text)] no-underline hover:text-[var(--brand)] hover:underline"
+                          >
+                            {lesson.title}
+                          </a>
+                        </h4>
+                        {cheatsheet.length > 0 ? (
+                          <ul class="m-0 flex list-disc flex-col gap-1.5 pl-5 text-[var(--text)]">
+                            {cheatsheet.map(bullet => <li>{bullet}</li>)}
+                          </ul>
+                        ) : (
+                          <p class="m-0 text-sm text-[var(--muted)]">No cheatsheet bullets yet.</p>
+                        )}
+                      </article>
+                    );
+                  })}
+                </div>
+              </div>
+            ))
+          )}
+        </section>
+      ))}
+    </div>
+  </main>
+</BaseLayout>
+
+<style>
+  @media print {
+    #cheatsheet-filters {
+      display: none;
+    }
+    section[data-track] {
+      display: block !important;
+    }
+  }
+</style>
+
+<script>
+  const buttons = document.querySelectorAll<HTMLButtonElement>('.cheatsheet-filter-btn');
+  const sections = document.querySelectorAll<HTMLElement>('section[data-track]');
+
+  function applyFilter(filter: string) {
+    for (const section of sections) {
+      const matches = filter === 'all' || section.dataset.track === filter;
+      section.hidden = !matches;
+    }
+    for (const btn of buttons) {
+      btn.setAttribute('aria-pressed', String(btn.dataset.filter === filter));
+    }
+  }
+
+  for (const btn of buttons) {
+    btn.addEventListener('click', () => {
+      applyFilter(btn.dataset.filter ?? 'all');
+    });
+  }
+</script>
