@@ -1,0 +1,43 @@
+---
+import ThemeToggle from './ThemeToggle';
+---
+
+<header class="sticky top-0 z-40 border-b border-[var(--border)] bg-[var(--bg)]/95 backdrop-blur supports-[backdrop-filter]:bg-[var(--bg)]/80">
+  <div class="mx-auto flex max-w-[1600px] items-center gap-4 px-4 py-3 sm:px-6">
+    <a
+      href="/"
+      class="flex shrink-0 items-center gap-2 text-base font-bold text-[var(--text)] no-underline"
+    >
+      <span
+        aria-hidden="true"
+        class="inline-flex h-8 w-8 items-center justify-center rounded-card bg-[var(--brand)] text-sm font-bold text-white"
+      >
+        GF
+      </span>
+      <span class="hidden sm:inline">Grokking Frontend System Design</span>
+    </a>
+
+    <nav class="hidden items-center gap-4 text-sm font-medium md:flex" aria-label="Tracks">
+      <a href="/concepts" class="text-[var(--muted)] transition-colors duration-[var(--transition-fast)] hover:text-[var(--text)]">
+        Concepts
+      </a>
+      <a href="/interview" class="text-[var(--muted)] transition-colors duration-[var(--transition-fast)] hover:text-[var(--text)]">
+        Interview Prep
+      </a>
+    </nav>
+
+    <div class="ml-auto flex items-center gap-3">
+      <label class="hidden sm:block">
+        <span class="sr-only">Search lessons</span>
+        <input
+          type="search"
+          placeholder="Search (coming soon)"
+          disabled
+          aria-label="Search lessons (coming soon)"
+          class="w-48 rounded-pill border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm text-[var(--muted)] placeholder:text-[var(--muted)] disabled:cursor-not-allowed"
+        />
+      </label>
+      <ThemeToggle client:load />
+    </div>
+  </div>
+</header>

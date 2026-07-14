@@ -1,0 +1,88 @@
+---
+import { getCollection } from 'astro:content';
+import { buildNav } from '../lib/navigation';
+import ProgressRing from './ProgressRing';
+
+export interface Props {
+  /** id (slug) of the lesson currently being viewed, if any, for highlighting. */
+  activeId?: string;
+}
+
+const { activeId } = Astro.props;
+
+const [conceptEntries, interviewEntries] = await Promise.all([
+  getCollection('concepts'),
+  getCollection('interview'),
+]);
+
+// `buildNav` groups by module, and modules are scoped per-track, so each
+// track's entries are grouped independently rather than merged together.
+const conceptNav = buildNav(conceptEntries);
+const interviewNav = buildNav(interviewEntries);
+
+// Build each module's lesson-id list once here (stable reference) and pass
+// that same array down to <ProgressRing>. ProgressRing's effect depends on
+// `lessonIds`, so a freshly-allocated array literal on every render would
+// make it tear down + re-subscribe its `gfsd:progress` listener needlessly.
+const tracks = [
+  { key: 'concepts', label: 'Concepts', base: '/concepts', nav: conceptNav },
+  { key: 'interview', label: 'Interview Prep', base: '/interview', nav: interviewNav },
+] as const;
+
+const moduleLessonIds = new Map<string, string[]>();
+for (const track of tracks) {
+  for (const mod of track.nav) {
+    moduleLessonIds.set(`${track.key}:${mod.module}`, mod.lessons.map(l => l.id));
+  }
+}
+---
+
+<aside
+  class="w-full shrink-0 border-[var(--border)] p-4 lg:sticky lg:top-16 lg:h-[calc(100vh-4rem)] lg:w-72 lg:overflow-y-auto lg:border-r"
+  aria-label="Lesson navigation"
+>
+  {tracks.map(track => (
+    <div class="mb-6 last:mb-0">
+      <h2 class="mb-2 px-2 text-xs font-bold uppercase tracking-wide text-[var(--muted)]">
+        {track.label}
+      </h2>
+
+      {track.nav.length === 0 && (
+        <p class="px-2 text-sm text-[var(--muted)]">Lessons coming soon.</p>
+      )}
+
+      {track.nav.map(mod => {
+        const lessonIds = moduleLessonIds.get(`${track.key}:${mod.module}`) ?? [];
+        return (
+          <div class="mb-4 last:mb-0">
+            <div class="flex items-center justify-between gap-2 px-2 py-1">
+              <span class="text-sm font-semibold text-[var(--text)]">{mod.module}</span>
+              <ProgressRing client:visible lessonIds={lessonIds} size={28} />
+            </div>
+            <ul class="flex flex-col gap-0.5">
+              {mod.lessons.map(lesson => {
+                const isActive = lesson.id === activeId;
+                return (
+                  <li>
+                    <a
+                      href={`${track.base}/${lesson.id}`}
+                      aria-current={isActive ? 'page' : undefined}
+                      class={
+                        'block rounded-sm px-2 py-1.5 text-sm transition-colors duration-[var(--transition-fast)] ' +
+                        (isActive
+                          ? 'bg-[var(--brand)] font-semibold text-white'
+                          : 'text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]')
+                      }
+                    >
+                      {lesson.title}
+                    </a>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        );
+      })}
+    </div>
+  ))}
+</aside>

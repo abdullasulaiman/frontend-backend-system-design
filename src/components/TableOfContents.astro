@@ -1,0 +1,37 @@
+---
+import type { MarkdownHeading } from 'astro';
+
+export interface Props {
+  headings: MarkdownHeading[];
+}
+
+const { headings = [] } = Astro.props;
+
+// Only h2/h3 make a useful in-page outline; h1 duplicates the lesson title
+// already rendered above, and deeper levels get noisy fast.
+const items = headings.filter(h => h.depth >= 2 && h.depth <= 3);
+---
+
+{items.length > 0 && (
+  <nav
+    class="hidden lg:sticky lg:top-16 lg:block lg:max-h-[calc(100vh-4rem)] lg:w-64 lg:shrink-0 lg:overflow-y-auto lg:pl-4"
+    aria-label="Table of contents"
+  >
+    <h2 class="mb-2 text-xs font-bold uppercase tracking-wide text-[var(--muted)]">On this page</h2>
+    <ul class="flex flex-col gap-1 border-l border-[var(--border)] text-sm">
+      {items.map(h => (
+        <li>
+          <a
+            href={`#${h.slug}`}
+            class={
+              'block py-1 text-[var(--muted)] transition-colors duration-[var(--transition-fast)] hover:text-[var(--text)] ' +
+              (h.depth === 3 ? 'pl-6' : 'pl-3')
+            }
+          >
+            {h.text}
+          </a>
+        </li>
+      ))}
+    </ul>
+  </nav>
+)}

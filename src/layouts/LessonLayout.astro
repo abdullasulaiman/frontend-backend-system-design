@@ -1,0 +1,73 @@
+---
+import { getCollection, type CollectionEntry } from 'astro:content';
+import type { MarkdownHeading } from 'astro';
+import BaseLayout from './BaseLayout.astro';
+import Sidebar from '../components/Sidebar.astro';
+import TableOfContents from '../components/TableOfContents.astro';
+import MarkComplete from '../components/MarkComplete';
+import { buildNav, flattenNav, getPrevNext } from '../lib/navigation';
+import type { Track } from '../lib/types';
+
+export interface Props {
+  entry: CollectionEntry<'concepts'> | CollectionEntry<'interview'>;
+  headings: MarkdownHeading[];
+  track: Track;
+}
+
+const { entry, headings, track } = Astro.props;
+const { data } = entry;
+
+const collectionName: 'concepts' | 'interview' = track === 'concept' ? 'concepts' : 'interview';
+const basePath = track === 'concept' ? '/concepts' : '/interview';
+
+// Prev/next is computed across the lesson's own track only (concepts and
+// interview lessons are separate flows with their own module ordering).
+const siblingEntries = await getCollection(collectionName);
+const flat = flattenNav(buildNav(siblingEntries));
+const { prev, next } = getPrevNext(flat, entry.id);
+---
+
+<BaseLayout title={`${data.title} · Grokking Frontend System Design`}>
+  <div class="mx-auto grid max-w-[1600px] grid-cols-1 gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[18rem_minmax(0,1fr)] lg:items-start xl:grid-cols-[18rem_minmax(0,1fr)_16rem]">
+    <Sidebar activeId={entry.id} />
+
+    <article class="prose min-w-0">
+      <header class="not-prose mb-8 flex flex-col gap-2 border-b border-[var(--border)] pb-6">
+        <p class="m-0 text-sm font-semibold uppercase tracking-wide text-[var(--muted)]">
+          {data.module}
+        </p>
+        <h1 class="m-0 text-3xl font-bold text-[var(--text)]">{data.title}</h1>
+        <div class="flex flex-wrap items-center gap-4 pt-1">
+          <span class="text-sm text-[var(--muted)]">{data.estMinutes} min read</span>
+          <MarkComplete client:visible lessonId={entry.id} />
+        </div>
+      </header>
+
+      <slot />
+
+      <footer class="not-prose mt-12 grid grid-cols-1 gap-3 border-t border-[var(--border)] pt-6 sm:grid-cols-2">
+        {prev ? (
+          <a
+            href={`${basePath}/${prev.id}`}
+            class="flex flex-col gap-1 rounded-card border border-[var(--border)] px-4 py-3 no-underline transition-colors duration-[var(--transition-fast)] hover:bg-[var(--surface)]"
+          >
+            <span class="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">← Previous</span>
+            <span class="font-medium text-[var(--text)]">{prev.title}</span>
+          </a>
+        ) : <span />}
+
+        {next ? (
+          <a
+            href={`${basePath}/${next.id}`}
+            class="flex flex-col items-end gap-1 rounded-card border border-[var(--border)] px-4 py-3 text-right no-underline transition-colors duration-[var(--transition-fast)] hover:bg-[var(--surface)] sm:col-start-2"
+          >
+            <span class="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">Next →</span>
+            <span class="font-medium text-[var(--text)]">{next.title}</span>
+          </a>
+        ) : <span />}
+      </footer>
+    </article>
+
+    <TableOfContents headings={headings} />
+  </div>
+</BaseLayout>
