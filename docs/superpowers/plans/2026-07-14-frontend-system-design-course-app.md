@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Node ≥ 20.3 (dev uses 20.19.2). Package manager: npm.
+- Node ≥ 22.12 (Astro 7 requires it). Pinned via `.nvmrc` to 22.15.1. This machine's default shell node is 20.19.2, so **every** npm/astro/node command must first load nvm and select the pinned version: `export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm use`. Package manager: npm.
 - All prose is **original**. Never copy Educative's text verbatim. Same curriculum, our own words/diagrams.
 - No backend, no accounts, no payment, no video. All state is client-side `localStorage`.
 - Both tracks must be fully populated: all Concepts modules + all 5 case studies (Newsfeed, Video Streaming, Chat, Uber, Calendar) each with a mock interview.
