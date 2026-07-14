@@ -1,0 +1,51 @@
+---
+/**
+ * Semantic callout box for MDX lessons.
+ *
+ * Wraps `.callout` / `.callout-*` classes already defined in
+ * `src/styles/global.css` — no new color values are introduced here.
+ *
+ * The MDX-facing `type` prop accepts "warning" (the natural English word),
+ * which is reconciled to the CSS class name `callout-warn`.
+ */
+export type CalloutType = 'note' | 'tip' | 'warning' | 'interview';
+
+export interface Props {
+  type?: CalloutType;
+}
+
+const { type = 'note' } = Astro.props;
+
+// Map the MDX-facing prop value to the CSS class suffix defined in global.css
+// (which uses "warn", not "warning").
+const classSuffix: Record<CalloutType, string> = {
+  note: 'note',
+  tip: 'tip',
+  warning: 'warn',
+  interview: 'interview',
+};
+
+const label: Record<CalloutType, string> = {
+  note: 'Note',
+  tip: 'Tip',
+  warning: 'Warning',
+  interview: 'Interview tip',
+};
+
+const icon: Record<CalloutType, string> = {
+  note: 'ℹ️',
+  tip: '💡',
+  warning: '⚠️',
+  interview: '🎯',
+};
+
+const calloutClass = `callout callout-${classSuffix[type]}`;
+---
+
+<div class={calloutClass} role="note">
+  <span class="callout-title">
+    <span aria-hidden="true">{icon[type]}</span>
+    {' '}{label[type]}
+  </span>
+  <slot />
+</div>
