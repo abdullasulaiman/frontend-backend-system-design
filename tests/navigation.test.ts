@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { buildNav, flattenNav, getPrevNext } from '../src/lib/navigation';
 
-const e = (id, module, moduleOrder, order, title) => ({ id, data: { module, moduleOrder, order, title } });
+const e = (id: string, module: string, moduleOrder: number, order: number, title: string) => ({ id, data: { module, moduleOrder, order, title } });
 const entries = [
   e('b', 'Perf', 2, 1, 'B'),
   e('a2', 'Intro', 1, 2, 'A2'),
