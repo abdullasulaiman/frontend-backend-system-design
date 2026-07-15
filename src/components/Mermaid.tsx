@@ -1,8 +1,15 @@
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useState } from 'react';
 
 export interface MermaidProps {
   chart: string;
 }
+
+// Module-scoped counter for unique diagram ids. `useId()` is NOT reliable here:
+// each <Mermaid> is its own React island root with no shared identifierPrefix,
+// so two islands can produce the same id and collide in `mermaid.render(id, …)`.
+// A module counter is shared across every island of this one bundled module,
+// guaranteeing uniqueness within a page.
+let mermaidCounter = 0;
 
 /** Reads the app's current theme off `<html data-theme="...">`. */
 function currentMermaidTheme(): 'dark' | 'default' {
@@ -24,8 +31,9 @@ function currentMermaidTheme(): 'dark' | 'default' {
  * in a `<pre>` instead, so the page never breaks.
  */
 export default function Mermaid({ chart }: MermaidProps) {
-  const reactId = useId();
-  const id = `mermaid-${reactId.replace(/[^a-zA-Z0-9-]/g, '')}`;
+  // Assigned once per instance (useState initializer runs only on mount), so it
+  // stays stable across theme-driven re-renders while staying unique per island.
+  const [id] = useState(() => `mermaid-${mermaidCounter++}`);
 
   const [svg, setSvg] = useState<string | null>(null);
   const [error, setError] = useState(false);

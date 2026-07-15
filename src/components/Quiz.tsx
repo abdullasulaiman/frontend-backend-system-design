@@ -115,11 +115,10 @@ export default function Quiz({ lessonId, questions }: { lessonId: string; questi
         >
           Check
         </button>
-        {revealed && (
-          <span className="text-sm font-semibold text-[var(--text)]">
-            Score: {score} / {total}
-          </span>
-        )}
+        {/* Always present so screen readers announce the result when it appears. */}
+        <span aria-live="polite" className="text-sm font-semibold text-[var(--text)]">
+          {revealed ? `Score: ${score} / ${total}` : ''}
+        </span>
       </div>
     </div>
   );
