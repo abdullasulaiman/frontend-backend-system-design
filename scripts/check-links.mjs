@@ -75,8 +75,9 @@ async function resolves(href, sourceFile) {
   }
   target = path.normalize(target);
 
-  // Must stay within dist/ — anything else is not our concern here.
-  if (!target.startsWith(distRoot)) return true;
+  // A link that resolves outside dist/ (e.g. too many `../` segments) can never
+  // point at an emitted page — report it as broken rather than silently passing.
+  if (target !== distRoot && !target.startsWith(distRoot + path.sep)) return false;
 
   const candidates = [];
   if (target === distRoot || pathname === '/' ) {
