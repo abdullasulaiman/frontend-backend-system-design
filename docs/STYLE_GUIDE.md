@@ -303,6 +303,8 @@ quiz.
 
 Save as: `src/content/concepts/debouncing-and-throttling.mdx`
 
+> **Note:** The `title`, `module`, `moduleOrder`, `order`, `slug` (filename), `summary`, `tags`, and `estMinutes` values below are **illustrative only**. When writing a real lesson, copy these fields verbatim from your assigned `LessonBrief` entry in `docs/content-manifest.ts` — do not reuse the example's values (this example's `order: 5` is not a real slot in the Fundamentals module).
+
 ````mdx
 ---
 title: Debouncing and Throttling
