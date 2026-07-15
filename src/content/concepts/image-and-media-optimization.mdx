@@ -120,8 +120,8 @@ wiring required for the common case. Two rules make it safe:
 1. **Always set `width`/`height` (or CSS `aspect-ratio`)** so the browser
    reserves layout space before the image loads — otherwise content below
    an unloaded image jumps around as images pop in, hurting Cumulative
-   Layout Shift. (This overlaps with the [Lazy Loading](lazy-loading) and
-   [Core Web Vitals](core-web-vitals) lessons — the CLS mechanics are the
+   Layout Shift. (This overlaps with the [Lazy Loading](/concepts/lazy-loading) and
+   [Core Web Vitals](/concepts/core-web-vitals) lessons — the CLS mechanics are the
    same regardless of *why* something loads late.)
 2. **Never lazy-load the image likely to be the LCP element** — typically
    a hero image or above-the-fold banner. Lazy-loading it *adds* a

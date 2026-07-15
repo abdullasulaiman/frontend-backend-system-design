@@ -1,6 +1,22 @@
 ---
 import Search from './Search.astro';
 import ThemeToggle from './ThemeToggle';
+import { getCollection } from 'astro:content';
+import { buildNav, flattenNav } from '../lib/navigation';
+
+// Resolve the first lesson of each track so the nav never points at a
+// bare `/concepts` or `/interview` route, neither of which exists (only
+// the dynamic `/concepts/[...slug]` and `/interview/[...slug]` pages do).
+// Falls back to `/cheatsheets` if a track has no lessons yet, so the link
+// is never dead even while content is sparse.
+const [conceptEntries, interviewEntries] = await Promise.all([
+  getCollection('concepts'),
+  getCollection('interview'),
+]);
+const firstConceptLesson = flattenNav(buildNav(conceptEntries))[0];
+const firstInterviewLesson = flattenNav(buildNav(interviewEntries))[0];
+const conceptsHref = firstConceptLesson ? `/concepts/${firstConceptLesson.id}` : '/cheatsheets';
+const interviewHref = firstInterviewLesson ? `/interview/${firstInterviewLesson.id}` : '/cheatsheets';
 ---
 
 <header class="sticky top-0 z-40 border-b border-[var(--border)] bg-[var(--bg)]/95 backdrop-blur supports-[backdrop-filter]:bg-[var(--bg)]/80">
@@ -19,10 +35,10 @@ import ThemeToggle from './ThemeToggle';
     </a>
 
     <nav class="hidden items-center gap-4 text-sm font-medium md:flex" aria-label="Tracks">
-      <a href="/concepts" class="text-[var(--muted)] transition-colors duration-[var(--transition-fast)] hover:text-[var(--text)]">
+      <a href={conceptsHref} class="text-[var(--muted)] transition-colors duration-[var(--transition-fast)] hover:text-[var(--text)]">
         Concepts
       </a>
-      <a href="/interview" class="text-[var(--muted)] transition-colors duration-[var(--transition-fast)] hover:text-[var(--text)]">
+      <a href={interviewHref} class="text-[var(--muted)] transition-colors duration-[var(--transition-fast)] hover:text-[var(--text)]">
         Interview Prep
       </a>
     </nav>

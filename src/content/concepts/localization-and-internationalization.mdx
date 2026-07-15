@@ -23,7 +23,7 @@ import Mermaid from '../../components/Mermaid';
 
 Imagine you've just finished a component library for a checkout flow. It ships to the US, then someone asks for a German version, and the "Add to cart" button's text now runs long enough to wrap onto two lines and break the layout. Then someone asks for Arabic, and the whole page needs to read right-to-left, including the icons showing "next" and "back." Then someone asks for Japan, and your date formatter prints `12/25/2026` when it should print `2026年12月25日`. None of these are bugs in the traditional sense — they're the cost of not treating internationalization as a requirement from the start.
 
-This is why "does this need to support multiple locales?" belongs in the same requirements-gathering pass as performance targets (see [Performance as a Requirement](/lesson/performance-as-a-requirement)) and accessibility scope (see [Accessibility & Compatibility](/lesson/accessibility-and-compatibility)). It's cheap to design for up front and expensive to retrofit, because it touches component APIs, data models, and layout assumptions all at once.
+This is why "does this need to support multiple locales?" belongs in the same requirements-gathering pass as performance targets (see [Performance as a Requirement](/concepts/performance-as-a-requirement)) and accessibility scope (see [Accessibility & Compatibility](/concepts/accessibility-and-compatibility)). It's cheap to design for up front and expensive to retrofit, because it touches component APIs, data models, and layout assumptions all at once.
 
 ## Internationalization vs. localization
 
@@ -97,7 +97,7 @@ Design the component this way once, and adding a fourth locale later is a conten
 
 ## How this shapes later design decisions
 
-The component and data-model choices you make because of i18n requirements echo through the rest of a frontend system design: data models need a locale-agnostic representation of dates/numbers (store as UTC timestamps or ISO strings, format at render time, not the reverse), component APIs need to accept translated strings or keys as props rather than hardcoded text, and layout primitives need flexible, direction-aware CSS from day one. Skip this early and you retrofit all three later, usually under deadline pressure from a real customer request. This is also why maintainability matters here — see [Maintainability as a Requirement](/lesson/maintainability-as-a-requirement) — a string-key contract that's easy for translators to work against without breaking your components is a long-term design investment, not a one-time task.
+The component and data-model choices you make because of i18n requirements echo through the rest of a frontend system design: data models need a locale-agnostic representation of dates/numbers (store as UTC timestamps or ISO strings, format at render time, not the reverse), component APIs need to accept translated strings or keys as props rather than hardcoded text, and layout primitives need flexible, direction-aware CSS from day one. Skip this early and you retrofit all three later, usually under deadline pressure from a real customer request. This is also why maintainability matters here — see [Maintainability as a Requirement](/concepts/maintainability-as-a-requirement) — a string-key contract that's easy for translators to work against without breaking your components is a long-term design investment, not a one-time task.
 
 <Quiz
   lessonId="localization-and-internationalization"
