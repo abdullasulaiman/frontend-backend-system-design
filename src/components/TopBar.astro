@@ -1,4 +1,5 @@
 ---
+import Search from './Search.astro';
 import ThemeToggle from './ThemeToggle';
 ---
 
@@ -27,16 +28,7 @@ import ThemeToggle from './ThemeToggle';
     </nav>
 
     <div class="ml-auto flex items-center gap-3">
-      <label class="hidden sm:block">
-        <span class="sr-only">Search lessons</span>
-        <input
-          type="search"
-          placeholder="Search (coming soon)"
-          disabled
-          aria-label="Search lessons (coming soon)"
-          class="w-48 rounded-pill border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm text-[var(--muted)] placeholder:text-[var(--muted)] disabled:cursor-not-allowed"
-        />
-      </label>
+      <Search />
       <ThemeToggle client:load />
     </div>
   </div>

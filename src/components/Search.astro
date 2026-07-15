@@ -1,0 +1,92 @@
+---
+// Static search powered by Pagefind (https://pagefind.app/).
+//
+// Pagefind indexes the *built* `dist/` output via the `postbuild` npm script
+// (`pagefind --site dist`), which emits `/pagefind/pagefind-ui.js` +
+// `/pagefind/pagefind-ui.css` into `dist/pagefind/`. That directory does not
+// exist during `astro dev` or in the source tree, so this component must
+// degrade gracefully when it's missing:
+//   - Render a disabled placeholder input by default (no layout shift, no
+//     broken UI in dev).
+//   - Probe for `/pagefind/pagefind-ui.js` at runtime; only if it responds
+//     OK do we inject the script/stylesheet and mount PagefindUI, then swap
+//     the placeholder out.
+//   - Any failure (404 in dev, network error, etc.) is swallowed silently —
+//     never thrown, never left as an unhandled console error.
+---
+
+<div class="hidden sm:block" data-search-root>
+  <div id="search" class="gfsd-search hidden w-64"></div>
+  <label data-search-fallback>
+    <span class="sr-only">Search lessons</span>
+    <input
+      type="search"
+      placeholder="Search (available after build)"
+      disabled
+      aria-label="Search lessons (available after build)"
+      class="w-48 rounded-pill border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm text-[var(--muted)] placeholder:text-[var(--muted)] disabled:cursor-not-allowed"
+    />
+  </label>
+</div>
+
+<style>
+  /* Light token-mapping for Pagefind's themeable CSS custom properties.
+     These cascade to the dynamically-inserted Pagefind UI markup even
+     though it isn't known at compile time. */
+  .gfsd-search {
+    --pagefind-ui-primary: var(--brand);
+    --pagefind-ui-text: var(--text);
+    --pagefind-ui-background: var(--surface);
+    --pagefind-ui-border: var(--border);
+    --pagefind-ui-tag: var(--surface-2);
+    --pagefind-ui-border-width: 1px;
+    --pagefind-ui-border-radius: 999px;
+    --pagefind-ui-font: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+    --pagefind-ui-scale: 0.85;
+  }
+</style>
+
+<script is:inline>
+  (function () {
+    var root = document.querySelector('[data-search-root]');
+    if (!root) return;
+
+    var mount = root.querySelector('#search');
+    var fallback = root.querySelector('[data-search-fallback]');
+    if (!mount || !fallback) return;
+
+    // Guarded probe: only wire up the real UI if the built index exists.
+    // A missing /pagefind/pagefind-ui.js (e.g. during `astro dev`, where
+    // Pagefind hasn't run yet) must never throw or log a fetch/script error.
+    fetch('/pagefind/pagefind-ui.js', { method: 'HEAD' })
+      .then(function (res) {
+        if (!res || !res.ok) return;
+
+        var link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = '/pagefind/pagefind-ui.css';
+        document.head.appendChild(link);
+
+        var script = document.createElement('script');
+        script.src = '/pagefind/pagefind-ui.js';
+        script.onload = function () {
+          try {
+            if (window.PagefindUI) {
+              new window.PagefindUI({ element: '#search', showSubResults: true, showImages: false });
+              mount.classList.remove('hidden');
+              fallback.remove();
+            }
+          } catch (e) {
+            /* keep the disabled fallback visible */
+          }
+        };
+        script.onerror = function () {
+          /* keep the disabled fallback visible */
+        };
+        document.body.appendChild(script);
+      })
+      .catch(function () {
+        /* dev server / no built index yet — keep the disabled fallback */
+      });
+  })();
+</script>
