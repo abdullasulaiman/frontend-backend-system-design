@@ -1,0 +1,144 @@
+---
+title: "Micro-Frontends"
+module: "Design Patterns & Architectures"
+moduleOrder: 6
+order: 2
+track: "concept"
+summary: "Explains the micro-frontend architecture, composition approaches, and its trade-offs."
+cheatsheet:
+  - "Micro-frontends split a large web app into independently built, tested, and deployed pieces, usually owned by different teams — the frontend analogue of microservices."
+  - "Build-time integration (publishing an app as a package another app installs) is the simplest to reason about but couples every consumer to a shared release train — it's really just a modular monolith with extra ceremony."
+  - "Runtime integration (iframes, client-side composition, edge-side includes) lets teams deploy independently, at the cost of harder cross-app communication and styling consistency."
+  - "Iframes give you the strongest isolation (separate JS realm, CSS, history) but the weakest integration — expect friction with routing, deep linking, shared auth, and responsive layout."
+  - "Client-side composition (a shell app mounting remotes at runtime) is the most common modern approach — see the module-federation lesson for a concrete mechanism."
+  - "Bundle duplication is the default cost of independent deployability: two teams shipping React independently means React ships twice unless you deliberately share it."
+  - "Pick micro-frontends for org/team-boundary reasons (independent release cadence, different tech choices, large teams stepping on each other), not for technical elegance — a well-modularized single app is simpler and should be the default until team scale forces the split."
+tags: ["patterns", "architecture", "micro-frontends"]
+estMinutes: 12
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Picture a retailer's web app: a product catalog team, a checkout team, and an account-management team, each with their own backlog, release schedule, and on-call rotation. If all three ship into one repo and one deploy pipeline, every team's release is gated on every other team's code review, test suite, and deploy window. A checkout bug fix waits behind an unrelated catalog redesign. That coordination tax is the problem micro-frontends exist to solve: split the frontend along team boundaries so each piece can be built, tested, and shipped on its own schedule, then composed back into one experience for the user.
+
+This is an architectural trade, not a free upgrade. You're trading a single, consistent codebase for independent deployability — and that trade only pays off once team size and release-cadence friction are real problems, not hypothetical ones.
+
+## What a micro-frontend actually is
+
+A micro-frontend is a piece of UI — anything from a full page to a widget — that is:
+
+- **Owned by one team**, who choose its internal implementation, framework version, and release schedule.
+- **Independently deployable**, meaning shipping a change to it doesn't require rebuilding or redeploying the rest of the app.
+- **Composed at some point** — build time, runtime, or somewhere in between — into a single page the user perceives as one app.
+
+That last point matters: the user should never know the page is stitched together from three teams' code. Composition is the whole engineering challenge. If it were fine for users to see three visually inconsistent, independently-loading fragments, this would be a solved problem — the hard part is making independently-shipped pieces look and behave like one product.
+
+## Composition approaches
+
+### Build-time integration
+
+The simplest option: each team publishes their piece as a versioned package (an npm package, for instance), and a "shell" app installs specific versions and bundles everything together at build time.
+
+This gives you a single bundle with no runtime integration risk — no version-mismatch surprises in production, no cross-origin overhead. But it defeats much of the point: the shell still has to bump a dependency version and redeploy to pick up any team's change, so you've reintroduced the release-train coupling you were trying to escape. It's best thought of as "a modular monolith with package boundaries," useful when teams want code ownership boundaries but don't actually need independent production deploys.
+
+### Runtime integration via iframes
+
+Each team's piece runs inside an `iframe`, pointed at a URL that team owns and deploys independently. This is the oldest and most isolated option: separate JavaScript realm, separate CSS scope, separate history stack. A memory leak or a crashed script in one iframe can't reach into another.
+
+That isolation is also the weakness. Iframes don't share layout naturally (you're fighting fixed-size boxes and scroll containers), routing and deep-linking across iframe boundaries is awkward, passing data between frames means `postMessage` plumbing instead of normal function calls, and shared concerns like auth session, theming, and analytics have to be re-implemented or explicitly re-synced per frame. Iframes are the right call when isolation is the priority — embedding a third-party widget you don't trust, or a legacy app you can't touch — less often the right call for pieces of your own product that need to feel unified.
+
+### Runtime integration via client-side composition
+
+A "shell" (or "container") app loads at runtime and mounts each team's app into a DOM region, usually keyed off the current route. Each remote app is a normal JS bundle fetched over the network and instantiated in the same page context — no iframe boundary. Frameworks like single-spa popularized this pattern; Module Federation (covered in its own lesson) is a newer mechanism for sharing dependencies across these runtime-loaded bundles.
+
+This is the most common approach in production today because it hits a good balance: independent deploys (each remote ships on its own schedule, the shell just fetches whatever is at that URL right now), real DOM-level layout (no iframe box constraints), and same-realm JavaScript, so cross-app communication can use a shared event bus or shared store instead of `postMessage`. The cost is that you lose the strong isolation iframes gave you — one remote's runtime error can, if unhandled, affect the rest of the page.
+
+### Edge-side includes
+
+Composition happens at the CDN/edge layer instead of the client: the edge server fetches HTML fragments from each team's origin and stitches them into one HTML response before it reaches the browser. This is a server-side analogue to client-side composition — good for content-heavy, mostly-server-rendered pages (a homepage assembled from a "featured products" fragment, a "personalized recommendations" fragment, and a "navigation" fragment, each owned by a different team and cached with its own TTL). It's less suited to highly interactive, client-heavy pages, since the composition happens before any client JS runs.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  U[Browser] --> S[Shell App]
+  S -->|mounts at /catalog| A[Catalog remote<br/>owned by Team A]
+  S -->|mounts at /checkout| B[Checkout remote<br/>owned by Team B]
+  S -->|mounts at /account| C[Account remote<br/>owned by Team C]
+  A -.shared event bus.-> B
+  B -.shared event bus.-> C
+  A --> DA[(Team A deploy pipeline)]
+  B --> DB[(Team B deploy pipeline)]
+  C --> DC[(Team C deploy pipeline)]
+`} />
+
+## The trade-offs
+
+### Team autonomy versus consistency
+
+The whole point of micro-frontends is letting teams move independently — different release cadences, sometimes different frameworks or framework versions, different testing strategies. That autonomy directly fights visual and behavioral consistency. Without deliberate investment (a shared design-system package, a shared linting/a11y baseline, agreed-upon shared UX conventions for things like loading states and error boundaries), independently-built pieces drift: different button styles, different focus-trap behavior in modals, different date formatting. Consistency in a micro-frontend org is an ongoing governance cost, not something the architecture gives you for free.
+
+### Bundle duplication
+
+If Team A ships React 18 and Team B independently ships React 18.2 in their own bundle, the user's browser downloads two copies of React. Multiply that across every shared dependency — a UI library, a state management library, date utilities — and the aggregate payload for the composed page can be substantially larger than an equivalent monolith would produce. This is the single most-cited technical cost of runtime-composed micro-frontends, and it's exactly the problem Module Federation's dependency-sharing mechanism targets (with its own versioning pitfalls, covered in that lesson).
+
+### Cross-app communication
+
+In a monolith, two features share data by importing a shared module or reading from a shared store — a normal function call. Across independently-deployed micro-frontends, that link has to be more deliberate: a shared event bus, custom DOM events, a small shared state package, or (weakest but simplest) URL/query-string state. Whatever you choose, it becomes a de facto contract between teams — change the event's shape and every consumer breaks, so it needs the same versioning discipline as an API, not ad hoc coordination in a shared Slack channel.
+
+## Worked example: splitting a dashboard product
+
+Say a B2B analytics product has three logical areas: a **data-explorer** (query building and charts), a **reports** section (scheduled PDF/email reports), and **admin settings** (users, billing, permissions). Today it's one React app, one team, one deploy — fine at 8 engineers.
+
+The company grows to 40 engineers across three squads, one per area, and releases start colliding: the admin squad's Tuesday deploy keeps getting blocked on a flaky data-explorer test they don't own. This is the point where micro-frontends earn their cost. The team introduces a thin shell app that owns global nav, auth, and the design-system provider, then mounts each squad's app as a runtime-loaded remote keyed by route (`/explore`, `/reports`, `/admin`). Each squad gets their own repo, their own CI/CD pipeline, and can deploy Tuesday's admin fix without touching the data-explorer's code at all. The shared design-system package and a small shared "current user" store (read-only, published by the shell) keep the three remotes visually and behaviorally consistent without coupling their release schedules.
+
+<Callout type="warning">
+  A common mistake is reaching for micro-frontends to solve a code-organization problem that a well-structured monolith already solves — folder boundaries, module ownership via CODEOWNERS, and a shared component library get you most of the "clean team ownership" benefit without any of the runtime composition cost. Micro-frontends earn their complexity specifically when independent *deployment* is the blocker (teams genuinely need to ship on different days, on different schedules, sometimes with different frameworks) — not merely because the codebase feels big. Splitting too early buys you bundle duplication, cross-app communication overhead, and consistency drift for a problem you didn't actually have yet.
+</Callout>
+
+<Quiz
+  lessonId="micro-frontends"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A checkout team and a catalog team each want to deploy independently, several times a day, without waiting on each other\'s CI pipeline. Which composition approach most directly enables that?',
+      options: [
+        { id: 'a', text: 'Build-time integration via a shared npm package', correct: false, explanation: 'Build-time integration still requires the shell to bump a version and redeploy to pick up either team\'s change, so their deploys stay coupled to the shell\'s release.' },
+        { id: 'b', text: 'Runtime integration, where the shell fetches each team\'s bundle fresh at page load', correct: true, explanation: 'Runtime integration (iframes or client-side composition) lets each team ship to their own URL/origin on their own schedule — the shell simply loads whatever is live there at request time, with no shared release train.' },
+        { id: 'c', text: 'Merging both teams into a single repo and shared release branch', correct: false, explanation: 'That reintroduces exactly the coordination problem the teams are trying to avoid — one shared release train for both teams.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine costs commonly introduced by adopting micro-frontends? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Duplicate copies of shared dependencies (e.g. two versions of React) shipped to the browser', correct: true, explanation: 'Independently-built remotes each bundling their own copy of shared libraries is the most commonly cited technical cost of runtime-composed micro-frontends.' },
+        { id: 'b', text: 'Visual and behavioral inconsistency across independently-built pieces without deliberate governance', correct: true, explanation: 'Team autonomy over implementation directly trades off against consistency unless teams share a design system and UX conventions.' },
+        { id: 'c', text: 'Cross-team data sharing becoming a de facto contract that needs versioning discipline', correct: true, explanation: 'Once features live in separately-deployed apps, sharing data (via events, a shared store, etc.) has to be treated like an API contract, not an internal function call.' },
+        { id: 'd', text: 'A hard requirement that every team use the exact same frontend framework', correct: false, explanation: 'Micro-frontends specifically allow teams to choose different frameworks or versions if they want to — that flexibility is a benefit of the architecture, not a requirement it imposes.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Iframes provide stronger runtime isolation between micro-frontends than client-side composition (a shell mounting remotes directly into the DOM), at the cost of more friction integrating layout, routing, and cross-app communication.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Iframes run in a separate JS realm and CSS scope, so isolation is strongest — but that same separation makes shared layout, deep linking, and passing data across the boundary harder than same-realm client-side composition.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This is backwards — iframe isolation is the whole reason they trade away integration ease; client-side composition gives up some isolation specifically to gain easier layout and communication.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A marketing homepage assembles a "hero banner," "featured products," and "footer" fragment, each owned by a different team, cached independently at the CDN with different TTLs, and stitched together before the HTML reaches the browser. Which composition approach is this?',
+      options: [
+        { id: 'a', text: 'Edge-side includes', correct: true, explanation: 'Composing HTML fragments from different origins at the CDN/edge layer, before the response reaches the browser, is the defining trait of edge-side include composition — well suited to content-heavy, cacheable pages like this.' },
+        { id: 'b', text: 'Iframes', correct: false, explanation: 'Iframes compose in the browser at render time inside frame boundaries, not as HTML fragments merged server-side at the edge before delivery.' },
+        { id: 'c', text: 'Build-time integration', correct: false, explanation: 'Build-time integration bundles code together during a build/publish step, not at request time via CDN-level fragment assembly with independent per-fragment caching.' },
+      ],
+    },
+  ]}
+/>

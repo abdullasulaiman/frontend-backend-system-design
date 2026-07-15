@@ -1,0 +1,283 @@
+---
+title: "Newsfeed: Requirements & Scope"
+module: "Case Study: Newsfeed"
+moduleOrder: 1
+order: 1
+track: "interview"
+summary: "Scopes a social newsfeed feature end to end: functional requirements, NFRs, and clarifying questions."
+cheatsheet:
+  - "Open with clarifying questions before sketching anything — chronological vs. ranked feed, real-time requirement, and media mix each change the architecture."
+  - "Functional scope for a newsfeed interview: infinite-scroll pagination, mixed text/image/video posts, likes and comments, and some notion of 'new posts available.'"
+  - "Nonfunctional scope: perceived performance on slow networks, huge post volume (fan-out), and an explicit freshness-vs-consistency trade-off for likes/comment counts."
+  - "A ranked feed implies a ranking service and a 'why am I seeing this' concern; a chronological feed implies simpler pagination but a harder 'catch up on everything' problem."
+  - "Real-time updates only matter for the count/badge, not the full feed re-render — say this explicitly, it signals architectural maturity."
+  - "State scope out loud: no DMs, no stories, no ads pipeline, no admin moderation tooling — unless the interviewer says otherwise."
+tags: ["case-study","newsfeed","requirements"]
+estMinutes: 12
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design a social media newsfeed" is one of the most common frontend system
+design prompts, and also one of the easiest to botch in the first five
+minutes. Candidates who jump straight to "I'll use a virtualized list and
+cursor pagination" skip the part that actually separates a senior answer
+from a junior one: deciding what you're building before deciding how. The
+same prompt can mean an Instagram-style ranked feed, a Twitter-style
+chronological timeline, or a LinkedIn-style hybrid — and each of those
+implies a different component tree, a different data-fetching strategy,
+and a different set of edge cases to defend later in the interview.
+
+This lesson is the scoping pass. We'll define the functional requirements
+(what the feed does), the nonfunctional requirements (what "good" looks
+like under load and on bad networks), and — most importantly — the
+clarifying questions that let you pin down the version of the problem
+you're actually solving before you commit to an architecture.
+
+## Why scoping first matters here specifically
+
+A newsfeed touches almost every hard problem in frontend system design at
+once: pagination, list virtualization, optimistic updates, media loading,
+and real-time-ish freshness. That breadth is exactly why interviewers use
+it — it's a forcing function to see whether you can triage. If you spend
+your first ten minutes deciding whether comments support nested replies,
+you'll run out of time before touching performance. If you spend zero
+minutes on scope, you'll design something that doesn't match what the
+interviewer had in mind, and you'll have to backtrack mid-interview.
+
+Two to four minutes of scoping, spoken out loud, buys you the rest of the
+interview.
+
+## Functional requirements
+
+For the core "design a newsfeed" prompt, a strong functional scope usually
+looks like this:
+
+- **An infinite-scrolling feed of posts.** The user opens the app, sees a
+  page of posts, and scrolling down loads more — with no "page 2" button.
+- **Mixed post content.** Posts can contain text, a single image, an image
+  gallery, or a video, sometimes combined with text. The feed has to
+  render all of these in one scrollable list.
+- **Engagement actions.** Users can like and comment on a post directly
+  from the feed, and see aggregate counts (like count, comment count)
+  update.
+- **Some notion of new content arriving.** Either new posts silently
+  appear at the top on next refresh, or the client is notified that new
+  posts exist ("12 new posts") without forcing a jarring re-render of
+  what the user is currently looking at.
+
+What's usually **out of scope** unless the interviewer says otherwise:
+direct messages, stories/ephemeral content, an ads insertion pipeline,
+content moderation tooling, and the post-composition/upload flow itself.
+Say this out loud — "I'm going to assume post creation and DMs are out of
+scope, focusing on the read/render/engage path" — so the interviewer can
+correct you if they disagree.
+
+## Nonfunctional requirements
+
+The functional list above is nearly identical across every version of this
+question. The nonfunctionals are where the interesting engineering
+trade-offs live, and where interviewers expect a frontend-specific answer
+rather than a backend one.
+
+### Performance on constrained networks and devices
+
+A newsfeed is a mobile-first, high-frequency-use surface. That means:
+
+- Time to first meaningful content matters more than total load time — the
+  first screenful of posts should render fast even if the rest of the feed
+  is still arriving.
+- Images and video are usually the dominant payload weight, so a
+  bandwidth-aware media strategy (lazy loading below the fold, responsive
+  image sizes, deferring video until it's actually in view) is a
+  first-class nonfunctional requirement, not an afterthought.
+- The feed has to stay smooth while scrolling through potentially thousands
+  of items in a session — a naive unbounded DOM list will degrade badly on
+  a mid-range phone.
+
+### Scale: huge post and event volume
+
+Feeds are read far more often than they're written, and each post can
+generate a large fan-out of likes and comments. From the frontend's
+perspective, this shows up as:
+
+- Pagination has to work correctly even as the underlying dataset is
+  being written to concurrently (someone posts while you're scrolling).
+- Engagement counts (likes, comments) update at high frequency for popular
+  posts — the UI can't literally re-render on every single event at
+  scale, so some batching or "close enough" number is expected.
+
+### Freshness vs. consistency
+
+This is the trade-off worth naming explicitly, because it's the one
+interviewers listen for: a newsfeed does **not** need strong consistency.
+A like count that's a few seconds stale, or a comment that takes a moment
+to appear for other users, is an acceptable and expected trade-off in
+exchange for a feed that feels fast and responsive. Contrast that with,
+say, a bank balance — where staleness is unacceptable. Saying "I'm
+optimizing for perceived freshness and low latency over strict
+consistency, because a slightly stale like count is a fine trade for a
+snappy UI" is a strong, senior-level framing to state up front.
+
+## The clarifying questions to ask
+
+Before touching architecture, a strong candidate asks questions that
+materially change the design — not questions for the sake of looking
+thorough. Here are the ones that matter most for a newsfeed, and what
+changes depending on the answer.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  Q1["Chronological or ranked feed?"] -->|chronological| A1["Simple pagination by timestamp/cursor"]
+  Q1 -->|ranked/algorithmic| A2["Ranking service + 'why this post' concerns"]
+  Q2["Real-time updates required?"] -->|yes| B1["Live connection for new-post signal + count updates"]
+  Q2 -->|no, refresh-based| B2["Poll or refresh-to-fetch is enough"]
+  Q3["Media-heavy or text-first?"] -->|media-heavy| C1["Image/video pipeline is a core concern"]
+  Q3 -->|text-first| C2["Media strategy is secondary, text rendering dominates"]
+`} />
+
+### "Is this a single chronological feed, or algorithmically ranked?"
+
+This is the single highest-leverage question. A **chronological** feed
+(think a simple following-only timeline) means pagination is
+straightforward — you're always fetching "everything older/newer than
+cursor X" in a stable order. A **ranked** feed (think a relevance-scored
+"For You" feed) means the server is reordering content per-request based
+on a scoring model, which breaks naive cursor pagination (item at position
+20 on your next fetch might not be the item that was at position 20 a
+minute ago), and introduces a design concern around explaining or at
+least tolerating "why is this post here" inconsistency. If the
+interviewer wants ranking, you should flag that pagination needs to be
+designed around stable page tokens rather than raw offsets, and move on —
+the ranking algorithm itself is a backend/ML concern, not yours to design.
+
+### "Do updates need to be real-time, or is refresh-on-demand acceptable?"
+
+If real-time is required, that usually means a live connection (WebSocket
+or long-poll) delivering a lightweight signal — "there are new posts" or
+an updated like/comment count — not the interviewer asking you to stream
+full post payloads continuously. This is an important distinction to make
+out loud: you want a cheap, low-frequency signal driving a "New posts"
+button, not the entire feed re-rendering on every event. If real-time
+isn't required, a simple refresh-to-fetch (pull-to-refresh, or refetch on
+app foreground) is sufficient, and you can skip live-connection design
+entirely, saving real time in the interview.
+
+### "Is this feed mostly text, or heavily media (images/video)?"
+
+A text-first feed (think a professional network's post feed) has a
+render-performance profile dominated by DOM size and virtualization. A
+media-heavy feed (think a photo/video-sharing app) has a profile
+dominated by network payload, image/video decode cost, and layout shift
+from late-loading media — meaning your nonfunctional performance story
+needs to lead with the media pipeline, not the list virtualization. Ask
+this early, because it changes which deep dive you should spend the most
+time on later in the interview.
+
+### A few second-tier questions worth asking if time allows
+
+- "Do comments need to support nested replies, or is a flat list fine?"
+  (Changes data shape and UI complexity, but not the core architecture.)
+- "Is this single-device only, or does state need to sync across a user's
+  devices?" (Affects whether client-side cache can be the source of
+  truth or needs to defer to server state more aggressively.)
+- "What's the expected post volume per user session — tens of posts, or
+  could a user realistically scroll through thousands?" (Confirms whether
+  list virtualization is a "nice to have" or a hard requirement.)
+
+## Worked example: how the answers reshape the design
+
+Say the interviewer answers: "single chronological feed of people you
+follow, no ranking; real-time isn't required, refresh is fine; and yes,
+it's media-heavy — think photos and short videos."
+
+That single set of answers already tells you:
+
+- Pagination can be simple, cursor-based on post timestamp/ID — no need
+  to design around a reordering ranking service.
+- You can skip designing a live-update connection entirely; a
+  pull-to-refresh or "check for new posts on app foreground" flow covers
+  the freshness requirement, which simplifies your data-flow story a lot.
+- Your performance deep dive should center on the media pipeline:
+  responsive image sizing, lazy-loading media below the fold, and
+  deferring video decode until a post scrolls into view — because that's
+  where most of the user-perceived latency and jank will come from, not
+  list virtualization by itself (though you'll still want that too, at
+  scale).
+
+Now contrast with a second interviewer who instead says: "it's a ranked,
+'For You'-style feed; real-time like/comment counts matter; text-first,
+minimal media." That's a meaningfully different problem — you'd spend
+more time on pagination-token stability across re-ranked requests, a
+lightweight live-count-update channel, and comparatively less on media
+optimization. Same prompt, two different fifteen-minute deep dives,
+entirely because of three clarifying questions.
+
+<Callout type="warning">
+  The most common mistake candidates make here is skipping straight to
+  "I'll virtualize the list and use cursor pagination" without ever
+  asking whether the feed is ranked. If it turns out to be ranked, cursor
+  pagination as you originally described it (`offset`/simple next-cursor
+  by ID) silently breaks — a re-ranked feed can shuffle items between
+  requests, causing duplicates or skipped posts. Ask the ranking question
+  first; it changes the pagination design you'll present a few minutes
+  later.
+</Callout>
+
+## Where this goes next
+
+Once scope is settled, the next lesson (`newsfeed-high-level-architecture`)
+turns these requirements into a concrete component tree and data-flow
+diagram, including the SSR-vs-CSR rendering decision for the first page
+versus subsequent pagination. The deep-dive lesson after that
+(`newsfeed-deep-dives`) is where the pagination, virtualization, and
+optimistic-update decisions implied by your answers here get worked out
+in detail.
+
+<Quiz
+  lessonId="newsfeed-requirements-and-scope"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Which single clarifying question has the biggest impact on the pagination strategy you should propose for a newsfeed?',
+      options: [
+        { id: 'a', text: 'Whether the feed is chronological or algorithmically ranked', correct: true, explanation: 'Ranking reorders content per-request, which breaks naive offset/cursor pagination and requires a stable page-token design — chronological order does not have this problem.' },
+        { id: 'b', text: 'Whether comments support nested replies', correct: false, explanation: 'This affects comment data shape and UI complexity, but has no bearing on how the post list itself is paginated.' },
+        { id: 'c', text: 'Whether users can edit their own posts after posting', correct: false, explanation: 'Post editing is a minor feature concern; it does not change the fundamental pagination approach for the feed.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'A candidate learns the feed is media-heavy (photos and video) rather than text-first. Which of these should now get more attention in the design? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A responsive image/video loading strategy (lazy loading, deferred decode)', correct: true, explanation: 'Media payload and decode cost become the dominant performance factor once the feed is media-heavy, so this deserves a deep dive.' },
+        { id: 'b', text: 'Layout-shift prevention as media loads in', correct: true, explanation: 'Late-arriving images/video without reserved space cause visible layout shift, which is a bigger concern the more media-heavy the feed is.' },
+        { id: 'c', text: 'The exact ranking algorithm used to score posts', correct: false, explanation: 'Ranking algorithm internals are a backend/ML concern independent of whether the feed is text-first or media-heavy — the interviewer is not asking you to design a scoring model either way.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'For a newsfeed system design interview, strong consistency of like and comment counts across all users at all times should be treated as a hard requirement.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A newsfeed typically favors perceived freshness and responsiveness over strict consistency — a like count that is a few seconds stale is an acceptable, expected trade-off, unlike, say, a financial balance.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Naming this trade-off explicitly (freshness over strict consistency) is exactly the kind of nonfunctional framing that signals seniority in this interview.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'The interviewer says real-time updates are required for the newsfeed. What is the most appropriate interpretation of that requirement?',
+      options: [
+        { id: 'a', text: 'A lightweight signal (new-post notice or updated counts) should arrive live, without necessarily streaming full post content continuously', correct: true, explanation: 'Real-time in a feed context usually means a cheap live signal driving a UI affordance like a "New posts" button or an updated counter, not a continuous full re-render of feed content.' },
+        { id: 'b', text: 'Every post in the feed should be replaced with a fresh server response on every new event', correct: false, explanation: 'Re-rendering the whole feed on every event would be wasteful and would disrupt the user\'s scroll position; a targeted, low-frequency signal is the right scope.' },
+        { id: 'c', text: 'The client should poll the full feed endpoint every second regardless of activity', correct: false, explanation: 'Constant aggressive polling is neither necessary nor efficient — a live connection delivering a small signal, or a sensibly-paced poll, is the appropriate design.' },
+      ],
+    },
+  ]}
+/>

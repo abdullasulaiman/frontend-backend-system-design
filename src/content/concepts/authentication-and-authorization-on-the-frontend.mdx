@@ -1,0 +1,263 @@
+---
+title: "Authentication & Authorization on the Frontend"
+module: "Security"
+moduleOrder: 7
+order: 1
+track: "concept"
+summary: "Covers the frontend's role in auth flows and why frontend authorization is UX-only, never a security boundary."
+cheatsheet:
+  - "Auth (who are you) and authorization (what can you do) are different problems — the frontend participates in both, but only enforces neither."
+  - "Session cookies with `HttpOnly`, `Secure`, and `SameSite=Lax`/`Strict` are the safest default for browser apps — JavaScript never touches the credential, so a garden-variety XSS bug can't steal it directly."
+  - "If you must hold a token in JS (SPA calling a separate API), keep it in memory only and re-fetch it on reload via silent refresh — never in `localStorage` or `sessionStorage`."
+  - "OAuth/OIDC on the frontend means redirecting to the identity provider and using Authorization Code + PKCE — never embed a client secret in frontend code."
+  - "Silent refresh (a hidden iframe or a refresh-token call) renews short-lived access tokens without forcing a re-login, but needs a plan for the refresh-fails case (expired session, revoked consent)."
+  - "Hiding a button for a role is a UX nicety, not a permission check — the API must reject the request independently, because DevTools, a replayed request, or a hand-crafted `fetch` call bypasses every client-side check trivially."
+  - "Decode a JWT's payload client-side to read claims for UI purposes only; never trust it as proof of anything without server-side signature verification."
+tags: ["security", "auth"]
+estMinutes: 11
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every app with a login screen asks the frontend to answer two different
+questions: "who is this person?" (authentication) and "what are they allowed
+to do?" (authorization). It's tempting to treat both as frontend concerns
+because the frontend is where you see the login form and where you decide
+whether to render an "Admin" tab. But the frontend is a hostile-adjacent
+environment — anyone can open DevTools, edit local storage, or replay a
+request with different headers — so the frontend can *participate* in auth,
+but it can never be the thing that *enforces* it. Getting that distinction
+wrong is one of the most common and most dangerous frontend security
+mistakes, and it comes up constantly in system design interviews for exactly
+that reason.
+
+## Two credential models: sessions vs. tokens
+
+Frontends usually authenticate against a backend using one of two patterns.
+
+### Session cookies
+
+The server generates an opaque session ID on login, stores the real session
+data (user ID, roles, expiry) server-side, and sends the ID back as a cookie
+with `HttpOnly` set. The browser attaches that cookie automatically on every
+request to the same origin — your frontend code never sees or handles the
+credential at all. This is the simplest model for a classic server-rendered
+or same-origin SPA setup, and it has a huge security advantage: JavaScript
+running on the page (including injected XSS payloads) cannot read an
+`HttpOnly` cookie, so a script-injection bug doesn't automatically hand over
+the session.
+
+The trade-off is that cookies are inherently tied to same-origin (or
+carefully configured cross-origin) requests, and they open the door to CSRF
+if you're not also setting `SameSite` correctly — covered in the companion
+lesson on secure data practices (`secure-data-practices`).
+
+### Bearer tokens
+
+When the frontend talks to a separate API (different origin, mobile client
+sharing the same backend, third-party API), the server instead issues a
+token — usually a JWT — that the frontend must attach itself, typically as
+an `Authorization: Bearer <token>` header. This model doesn't rely on
+cookies at all, which makes it natural for multi-origin and multi-client
+setups, but it means the frontend now has to *hold* that token somewhere in
+JavaScript-reachable memory, which is where most of the storage mistakes
+described later in this lesson come from.
+
+Most real systems don't force you to pick one exclusively: a common pattern
+is an `HttpOnly` refresh-token cookie plus a short-lived access token held in
+memory, discussed under silent refresh below.
+
+## OAuth and OIDC: the frontend's role in the redirect dance
+
+When login means "sign in with Google" or an enterprise SSO provider, the
+frontend doesn't handle passwords at all — it orchestrates a redirect flow
+defined by OAuth 2.0 (authorization) and OpenID Connect (identity on top of
+OAuth).
+
+The flow a modern SPA should use is **Authorization Code with PKCE**:
+
+1. The frontend redirects the browser to the identity provider's
+   authorization endpoint, including a randomly generated `code_verifier`
+   (hashed into a `code_challenge` sent in this step).
+2. The user authenticates directly with the identity provider — the
+   frontend never sees their password.
+3. The provider redirects back to your app with a short-lived
+   authorization `code`.
+4. Your frontend (or, better, a backend-for-frontend) exchanges that code
+   plus the original `code_verifier` for tokens.
+5. The provider validates that the verifier matches the challenge from step
+   1, proving the code exchange is happening from the same client that
+   started the flow, and returns access/ID/refresh tokens.
+
+PKCE exists specifically because SPAs are "public clients" — they can't keep
+a client secret confidential, since anything shipped to the browser can be
+read by the user. The old implicit flow (tokens returned directly in the
+redirect URL fragment) is deprecated for this reason: tokens ended up in
+browser history and referrer headers. Never embed a client secret in
+frontend code; if your provider requires one, that exchange belongs on a
+backend, not in the browser.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant U as User/Browser
+    participant App as Your Frontend
+    participant IdP as Identity Provider
+    App->>IdP: Redirect with code_challenge
+    U->>IdP: Logs in, approves access
+    IdP-->>App: Redirect back with auth code
+    App->>IdP: Exchange code + code_verifier
+    IdP-->>App: Access token + refresh token
+    App->>App: Store access token in memory
+`} />
+
+### Silent refresh
+
+Access tokens are deliberately short-lived (minutes, not days) so that a
+leaked one does limited damage. To avoid forcing a full re-login every few
+minutes, the frontend performs a **silent refresh**: it calls a refresh
+endpoint (using an `HttpOnly` refresh-token cookie, or a hidden iframe
+redirect back to the identity provider that reuses the existing SSO
+session) to get a new access token without any visible UI interruption.
+
+This works well but needs explicit handling for the failure path: the
+refresh token can expire, get revoked, or simply fail because the user
+cleared cookies on another tab. Your frontend needs a plan for "silent
+refresh failed" — typically, fall back to a real, visible re-login rather
+than silently failing requests or looping retries forever.
+
+## Authorization on the frontend: UX, not enforcement
+
+Once a user is authenticated, the frontend usually needs to know what they
+can do — show the "Delete project" button only to owners, hide a billing
+tab from non-admins, redirect away from a settings page a viewer role
+shouldn't see. This is legitimate and expected frontend work. The critical
+rule is what it's *for*.
+
+Frontend role/permission checks exist to make the UI make sense — don't
+show controls a user can't use, don't make them click into a page just to
+see a 403. They are not, and can never be, the actual security boundary.
+Anyone can:
+
+- Open DevTools and re-enable a disabled button.
+- Read your bundled JS, find the API route the hidden button would have
+  called, and call it directly with `fetch`.
+- Intercept and replay a request with a different `role` claim if the
+  backend trusts a client-supplied value instead of verifying it.
+
+The real authorization decision — "is this specific request from this
+specific authenticated user allowed to touch this specific resource" — has
+to be made and enforced on the server, on every request, independent of
+whatever the UI decided to render. If your backend's authorization logic is
+"trust the role sent in the request," you don't have authorization, you
+have a suggestion.
+
+## Worked example: a "Delete project" button
+
+Say a project-management app shows a "Delete project" button only to users
+with an `owner` role, stored as a claim in their access token.
+
+**Frontend (correct usage):**
+
+```js
+const role = getClaimsFromToken(accessToken).role;
+return role === 'owner' ? <DeleteButton onClick={deleteProject} /> : null;
+```
+
+This is fine — it's a UX decision, keeping non-owners from seeing a control
+that would just error out for them. But notice the token's claims were
+decoded client-side purely to decide what to *render*. Nothing here proves
+the token is valid or hasn't been tampered with; the frontend has no way to
+verify a JWT signature meaningfully (the verification key is meant to stay
+server-side), so this check is informational, not a guarantee.
+
+**Backend (the actual enforcement), on `DELETE /api/projects/:id`:**
+
+```js
+const session = await verifySessionOrToken(req);
+const project = await db.projects.findById(req.params.id);
+if (project.ownerId !== session.userId) {
+  return res.status(403).json({ error: 'Forbidden' });
+}
+await db.projects.delete(req.params.id);
+```
+
+If a non-owner opens DevTools, deletes the `disabled` attribute, or just
+calls `DELETE /api/projects/42` directly with their own valid session
+cookie, this server check is what actually stops the deletion. Remove the
+frontend button entirely and the app is still secure. Remove this backend
+check and the app is not secure no matter how carefully the button was
+hidden.
+
+<Callout type="warning">
+  The most common version of this mistake: teams build a `role` field into
+  the JWT, decode it client-side to gate UI, and then the backend team
+  assumes "the frontend already checked the role" and skips re-verifying
+  authorization server-side on the sensitive endpoint. A user who edits
+  their own token's claims (trivial if the token isn't properly signed and
+  verified) or simply calls the API directly bypasses every client-side
+  check instantly. Treat every frontend role/permission check as a UX
+  convenience and enforce the real decision again on the server for every
+  request that mutates or reveals sensitive data — never assume the caller
+  is who the UI thought it was.
+</Callout>
+
+## Common storage pitfall
+
+A related mistake worth calling out on its own: storing access tokens in
+`localStorage` for convenience (it persists across reloads, unlike an
+in-memory variable). `localStorage` is readable by any JavaScript running on
+the page, so a single XSS bug anywhere in your app — a third-party script,
+a dependency, an unescaped user-generated string — can read every token in
+storage and exfiltrate it. An `HttpOnly` cookie or an in-memory token that
+gets re-established via silent refresh on reload avoids handing a stolen
+script direct read access to the credential. This overlaps with, and is
+covered in more depth in, the storage trade-offs section of
+`secure-data-practices`.
+
+<Quiz
+  lessonId="authentication-and-authorization-on-the-frontend"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A frontend hides the "Approve refund" button from users without an `admin` role. What is the correct characterization of this check?',
+      options: [
+        { id: 'a', text: 'It is the authorization enforcement mechanism for the refund action.', correct: false, explanation: 'Hiding a button is a UI decision that can be bypassed by calling the API directly or editing the DOM — it enforces nothing.' },
+        { id: 'b', text: 'It is a UX nicety; the server must independently verify the caller is an admin on the refund endpoint.', correct: true, explanation: 'Correct. The frontend check improves the experience for non-admins, but the server has to make and enforce the real decision on every request.' },
+        { id: 'c', text: 'It is unnecessary and should be removed since the server checks anyway.', correct: false, explanation: 'It is still worth keeping for UX — showing users only the actions they can actually perform avoids confusing dead-end clicks and error toasts. It just cannot be the only check.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine risks of storing a bearer access token in `localStorage`? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Any JavaScript running on the page, including an XSS payload, can read it.', correct: true, explanation: 'localStorage has no HttpOnly-style protection — any script context on the page can read and exfiltrate it.' },
+        { id: 'b', text: 'It is automatically sent on every cross-origin request, enabling CSRF.', correct: false, explanation: 'This describes a cookie-based risk, not localStorage. localStorage is never sent automatically with requests at all — the app must attach it manually.' },
+        { id: 'c', text: 'It persists across tabs and reloads, extending the window an exfiltrated value stays valid.', correct: true, explanation: 'Persistence itself is not the vulnerability, but it does mean a stolen token remains usable for longer than a value that only lived in memory for one page session.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Using the Authorization Code flow with PKCE is preferred over the OAuth implicit flow for single-page apps.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'PKCE avoids returning tokens directly in a redirect URL fragment and lets a public client (no confidential secret) prove it originated the flow, which is why it replaced the implicit flow for SPAs.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'The implicit flow is now considered legacy/deprecated for browser apps precisely because of the risks Authorization Code + PKCE was designed to close.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A silent refresh call fails because the refresh token was revoked server-side. What should the frontend do?',
+      options: [
+        { id: 'a', text: 'Retry the silent refresh indefinitely in the background.', correct: false, explanation: 'An indefinitely retrying failed refresh wastes resources and never resolves the underlying problem — the user still ends up unauthenticated with no path forward.' },
+        { id: 'b', text: 'Fall back to a visible re-login flow.', correct: true, explanation: 'Correct. When silent refresh cannot succeed, the frontend needs an explicit path back to a real login rather than silently failing subsequent API calls.' },
+        { id: 'c', text: 'Keep using the last valid access token until it is rejected by every endpoint.', correct: false, explanation: 'This just defers the failure to whichever request happens to run next, producing confusing partial failures instead of a clear re-authentication prompt.' },
+      ],
+    },
+  ]}
+/>

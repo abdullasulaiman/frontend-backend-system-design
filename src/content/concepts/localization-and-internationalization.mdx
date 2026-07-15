@@ -1,0 +1,146 @@
+---
+title: "Localization & Internationalization (i18n)"
+module: "Nonfunctional Requirements"
+moduleOrder: 2
+order: 3
+track: "concept"
+summary: "Distinguishes internationalization from localization and covers the frontend concerns each raises."
+cheatsheet:
+  - "i18n is the engineering work that makes an app localizable (extracted strings, formatting APIs, no hardcoded layout assumptions); l10n is the content work of actually translating and supplying locale data. Do i18n once, do l10n per market."
+  - "Never build sentences by concatenating translated fragments (`translate('Hello') + name`) — word order and grammar vary by language. Use a message-format function with named placeholders instead."
+  - "Translated strings can run 30-100% longer than English (German, Finnish) or need vertical stacking (CJK) — design fixed-width buttons/labels to fail visibly in dev, not just in production for one locale."
+  - "RTL is a layout direction, not a mirror-the-text problem: flip flexbox/grid direction, icon-with-directional-meaning, and padding/margin with logical properties (`margin-inline-start`), and use `dir=\"rtl\"` on the root, not per-component hacks."
+  - "Never format dates, numbers, or currency by hand — use `Intl.DateTimeFormat`, `Intl.NumberFormat`, and locale-aware libraries; hand-rolled formatting breaks on locales with different separators, calendars, or digit systems."
+  - "Load locale bundles on demand, keyed off the active locale, not bundled into the main chunk — an app with 20 locales shouldn't ship 19 unused translation files to every user."
+  - "Clarify i18n scope in requirements gathering before designing components: which locales, RTL or not, and whether translations exist at launch or arrive later change how you structure text nodes and data models."
+tags: ["nonfunctional", "i18n"]
+estMinutes: 9
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Imagine you've just finished a component library for a checkout flow. It ships to the US, then someone asks for a German version, and the "Add to cart" button's text now runs long enough to wrap onto two lines and break the layout. Then someone asks for Arabic, and the whole page needs to read right-to-left, including the icons showing "next" and "back." Then someone asks for Japan, and your date formatter prints `12/25/2026` when it should print `2026年12月25日`. None of these are bugs in the traditional sense — they're the cost of not treating internationalization as a requirement from the start.
+
+This is why "does this need to support multiple locales?" belongs in the same requirements-gathering pass as performance targets (see [Performance as a Requirement](/lesson/performance-as-a-requirement)) and accessibility scope (see [Accessibility & Compatibility](/lesson/accessibility-and-compatibility)). It's cheap to design for up front and expensive to retrofit, because it touches component APIs, data models, and layout assumptions all at once.
+
+## Internationalization vs. localization
+
+These two terms get used interchangeably in casual conversation, but they describe different work done by different people at different times.
+
+**Internationalization (i18n)** is engineering work: structuring your app so it *can* be adapted to any locale without code changes. That means extracting every user-facing string instead of hardcoding it, using formatting APIs instead of string concatenation for dates/numbers/currency, building layouts that tolerate variable text length and both text directions, and setting up a pipeline to load locale-specific data. You do i18n once, as part of the architecture.
+
+**Localization (l10n)** is content work: producing the actual translated strings, locale-specific formats, and cultural adaptations (currency symbols, date conventions, even imagery or color choices) for a specific target locale. You do l10n once *per locale* — and it can happen long after the initial build, often by a translation team that never touches your codebase.
+
+The numbers in each term's abbreviation ("i18n" = i + 18 letters + n, "l10n" = l + 10 letters + n) are just a convention for shortening long words — worth knowing so it doesn't look like a typo the first time you see it.
+
+The practical implication: if you skip i18n, l10n becomes a fight against your own architecture. A translator handing you a Spanish string file can't fix a component that concatenates `"Showing " + count + " results"` — that pattern breaks in languages with different word order or pluralization rules, and no amount of translation effort fixes a code-level assumption.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    A["App with hardcoded strings\n& formatting"] -->|i18n: engineering work| B["i18n-ready app\nstrings extracted,\nformatting via Intl APIs,\nflexible layout"]
+    B -->|l10n: content work, per locale| C["fr-FR bundle"]
+    B -->|l10n: content work, per locale| D["ar-SA bundle\n(RTL)"]
+    B -->|l10n: content work, per locale| E["ja-JP bundle"]
+`} />
+
+## Why clarify this as a nonfunctional requirement
+
+Like performance or accessibility, i18n scope changes what "correct" means for the same feature, without changing what the feature does. A product card built for English-only, LTR-only usage isn't "the same component plus translations later" — it's a different component if it needs text expansion and RTL support, because those constraints shape the CSS, the markup structure, and the props the component accepts.
+
+In an interview or a real design doc, get answers to a few questions early: **Which locales, and how many?** A right-to-left language or one with unusual pluralization rules (Russian has three plural forms; Arabic has six) is a bigger lift than adding a second similar European language. **Is RTL in scope?** Worth calling out separately from "which languages," since it's a layout concern, not just a string concern. **Are translations ready at launch, or does the UI need placeholder text with real translations arriving later?** This affects whether you can hardcode any fallback assumptions. **Who owns the translations?** An external vendor delivering files on their own schedule needs a stable key/value contract you don't casually rename.
+
+## Text expansion and layout
+
+Translated UI strings are rarely the same length as the source language. English strings often *grow* by 20-35% in French or German, and can grow more for short UI labels ("Save" → "Enregistrer"). CJK languages (Chinese, Japanese, Korean) usually *shrink* character count but need more vertical space per character and different line-breaking rules, since spaces don't separate words.
+
+The fix is architectural, not cosmetic: avoid fixed-width buttons and labels, prefer `min-width` over `width`, let flex/grid containers absorb extra length, and test with a deliberately verbose fake locale (a "pseudo-locale" that wraps every string in extra characters, like `[!!! Ѕäνé ¡¡¡]`, catches overflow bugs before real translations even exist).
+
+### Right-to-left (RTL) layouts
+
+Arabic, Hebrew, and a handful of other languages read right-to-left, and that's a document-direction concern, not a per-string concern. Setting `dir="rtl"` on the `<html>` root flips how the browser lays out inline and block content, but it doesn't automatically fix everything:
+
+- Directional icons (arrows, chevrons "next/back") need to be mirrored — an arrow pointing "forward" in LTR should point the other way in RTL.
+- Spacing and alignment written as `margin-left`/`text-align: left` don't flip automatically. CSS logical properties (`margin-inline-start`, `text-align: start`) flip correctly under `dir="rtl"` without extra work; the old physical properties do not.
+- Some things should *not* mirror — a phone number, a code snippet, or a left-to-right logo stays LTR embedded inside an RTL page (using `dir="ltr"` on that specific element).
+
+## Formatting dates, numbers, and currency
+
+This is the category most likely to bite silently — a hand-rolled formatter can look correct in every locale you tested and wrong in every locale you didn't. Locale-aware formatting differs in decimal separators (1,234.56 vs 1.234,56), digit grouping, calendar systems, 12h vs 24h time, and currency symbol placement (`$10` vs `10 €`).
+
+The browser-native `Intl` API handles this with no library dependency: `Intl.NumberFormat` for numbers and currency, `Intl.DateTimeFormat` for dates and times, and `Intl.PluralRules` for pluralization logic that varies far more across languages than English's simple singular/plural split. These take a locale string (`'de-DE'`, `'ar-EG'`) and produce correct output without you needing to know each locale's rules yourself.
+
+<Callout type="warning">
+  A common pitfall: building sentences by concatenating translated pieces, like `translate('welcome_prefix') + userName + translate('welcome_suffix')`. This assumes every language shares English's word order and grammar, which is false — some languages put the name before the greeting, some inflect the surrounding words based on gender or number. Use a message-format approach instead, where the whole sentence is one translatable template with a named placeholder (`"{name} 님, 환영합니다"` in Korean vs `"Welcome, {name}"` in English), so translators control full sentence structure rather than being handed disconnected fragments.
+</Callout>
+
+## Loading locale bundles without hurting performance
+
+Translation data adds up — a large app can have hundreds of kilobytes of strings per locale, multiplied by the number of supported locales. Two mistakes are easy to make here: bundling every locale into the main JavaScript chunk (so a Japanese user downloads French and German strings they'll never use), and blocking first paint on a network fetch for locale data before rendering anything.
+
+The pattern that avoids both: detect or read the active locale early (from a URL segment, a cookie, or `Accept-Language`), then dynamically import only that locale's bundle as a separate chunk, in parallel with your app's critical rendering work rather than blocking it. This keeps the technique in the same family as the code-splitting and lazy-loading strategies covered later in the Performance & Optimization module — locale data is just another kind of "not-needed-immediately" payload.
+
+## Worked example: a pricing card component
+
+Say you're designing a `<PricingCard>` component that shows a plan name, a price, and a "Subscribe" button, and the requirement says "must support English, German, and Arabic at launch, with more locales added later."
+
+That single sentence should change several decisions before you write any CSS:
+
+1. **String storage**: every visible string (`planName`, button label, a "billed monthly" caption) is a translation key resolved through a formatting function, never a literal in the JSX.
+2. **Price formatting**: `Intl.NumberFormat(locale, { style: 'currency', currency })` produces `"$19.99"`, `"19,99 €"`, or `"١٩٫٩٩ د.إ."` correctly, instead of a hand-built string that assumes a `$` prefix.
+3. **Layout**: the card's width isn't hardcoded to fit the English button label ("Subscribe") — German's "Jetzt abonnieren" is nearly twice as long, so the button needs `min-width` and wrapping tolerance, not a fixed box.
+4. **Direction**: for Arabic, the card's internal flex layout (price on one side, badge on the other) needs to flip via `dir="rtl"` and logical CSS properties, not a hardcoded left/right arrangement.
+5. **Loading**: the German and Arabic string bundles load only for users in those locales, as separate chunks fetched alongside the initial render — not bundled for everyone.
+
+Design the component this way once, and adding a fourth locale later is a content task (translate the strings, supply the currency code) rather than an engineering task (rewrite the layout).
+
+## How this shapes later design decisions
+
+The component and data-model choices you make because of i18n requirements echo through the rest of a frontend system design: data models need a locale-agnostic representation of dates/numbers (store as UTC timestamps or ISO strings, format at render time, not the reverse), component APIs need to accept translated strings or keys as props rather than hardcoded text, and layout primitives need flexible, direction-aware CSS from day one. Skip this early and you retrofit all three later, usually under deadline pressure from a real customer request. This is also why maintainability matters here — see [Maintainability as a Requirement](/lesson/maintainability-as-a-requirement) — a string-key contract that's easy for translators to work against without breaking your components is a long-term design investment, not a one-time task.
+
+<Quiz
+  lessonId="localization-and-internationalization"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the clearest way to distinguish internationalization (i18n) from localization (l10n)?',
+      options: [
+        { id: 'a', text: 'i18n is the engineering work of making an app locale-adaptable; l10n is the content work of supplying translations and locale data for a specific market', correct: true, explanation: 'i18n is architecture done once; l10n is content produced per locale, often by a separate team.' },
+        { id: 'b', text: 'i18n means supporting many languages; l10n means supporting only one language', correct: false, explanation: 'l10n is not about supporting fewer languages — it is the act of adapting content for one particular locale, and you typically do it once per locale you support.' },
+        { id: 'c', text: 'They are two names for the same process and can be used interchangeably', correct: false, explanation: 'They describe different kinds of work (engineering vs. content) done at different times by often-different people; conflating them leads to skipping the engineering prep work.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine frontend concerns raised by supporting a right-to-left (RTL) locale like Arabic? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Directional icons like "next/back" arrows need to be mirrored to still make sense', correct: true, explanation: 'An arrow meaning "forward" in LTR reading order needs to point the opposite way once the reading direction flips.' },
+        { id: 'b', text: 'CSS written with physical properties like margin-left does not automatically flip under dir="rtl", unlike logical properties like margin-inline-start', correct: true, explanation: 'Logical properties are direction-aware and flip correctly; physical left/right properties keep pointing the same physical direction regardless of text direction.' },
+        { id: 'c', text: 'Embedded content like phone numbers or code snippets should also be mirrored to read right-to-left', correct: false, explanation: 'Content that is inherently LTR (phone numbers, code, some logos) should stay LTR even inside an RTL page, typically via an explicit dir="ltr" on that element.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'It is safe to load every supported locale\'s translation bundle into the main JavaScript chunk, since translation strings are usually small.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Across many locales this adds up to real payload weight for every user, most of which they never need — it should be split per locale and loaded on demand.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — locale bundles should be dynamically imported based on the active locale, similar to other lazy-loading strategies, so users only download the language they actually use.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A component builds a sentence as `translate("Hello, ") + userName + translate("! You have new messages.")`. What is the main problem with this approach across locales?',
+      options: [
+        { id: 'a', text: 'It hardcodes English word order and grammar, which other languages may not share', correct: true, explanation: 'Concatenating translated fragments assumes every language places words in the same order and needs no grammatical agreement with the inserted value — both assumptions break in many languages.' },
+        { id: 'b', text: 'It uses too many function calls, which hurts runtime performance', correct: false, explanation: 'The performance cost of a couple of translate() calls is negligible; the real problem is a correctness one, not a speed one.' },
+        { id: 'c', text: 'It fails to use Intl.NumberFormat for the username', correct: false, explanation: 'Intl.NumberFormat formats numbers/currency, not arbitrary strings like a username — that is not the issue here.' },
+      ],
+    },
+  ]}
+/>

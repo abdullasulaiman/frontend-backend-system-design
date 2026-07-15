@@ -1,0 +1,142 @@
+---
+title: "Calendar Application: High-Level Architecture"
+module: "Case Study: Calendar Application"
+moduleOrder: 5
+order: 2
+track: "interview"
+summary: "Presents an architecture centered on date-range queries and recurring-event expansion."
+cheatsheet:
+  - "Split the architecture into two layers: a grid/rendering layer that only knows about rows, columns, and cells for the visible range, and an event data layer that only knows about fetching and expanding events — neither should know how the other works internally."
+  - "The data layer's job is to turn a visible date range into a flat list of concrete event instances: every recurring event gets expanded into its individual occurrences before it ever reaches a rendering component."
+  - "Cache fetched data by range, not by 'the whole calendar' — store results keyed by a normalized (start, end) window so switching views or paging forward can reuse already-fetched data instead of re-fetching everything."
+  - "The component tree is CalendarGrid (layout) to DayCell/WeekRow (a slot for one date) to EventChip (one instance, no knowledge of recurrence) to EventEditorModal (create/edit, decides single-instance vs whole-series on save) — each layer only needs the data shape one level below it."
+  - "EventChip renders an already-expanded instance, not a raw event; it should never need to know whether the event it's rendering is a recurring one or a one-off."
+  - "Widen the actual fetch range slightly beyond the visible one (a buffer of a few days or a week) so scrolling or paging by one step feels instant, at the cost of a bit of extra data transferred."
+  - "Cache invalidation on write is range-aware too: creating or editing an event should only invalidate the cached ranges that event actually falls into, not the entire cache."
+tags: ["case-study", "calendar-app", "architecture"]
+estMinutes: 13
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Once you've scoped the calendar interview question (see `calendar-app-requirements-and-scope`), the interviewer wants to see a concrete architecture, not just a list of features. The trap in this case study is treating "events" as one flat list you fetch and render directly. That falls apart the moment recurring events enter the picture — a single "Team standup, every weekday" record isn't something you can hand straight to a grid; something has to turn it into a specific instance on Monday, another on Tuesday, and so on, only for the dates currently on screen.
+
+This lesson lays out the architecture that makes that tractable: a rendering layer that only cares about laying out a grid of cells for a date range, a data layer that turns "give me events between date A and date B" into a flat list of concrete instances, a component tree built around that split, and a caching strategy keyed by date range so switching views or paging forward doesn't mean re-fetching the world.
+
+## Two layers, one clean boundary
+
+The core architectural idea is separating **what to draw** from **what data exists**:
+
+- **The date/grid rendering layer** knows about calendar structure: how many rows and columns a month view needs, which date each cell represents, how a week view lays out 24 hourly rows, how a day view stacks overlapping events into columns. It has no idea what a "recurrence rule" is — it just receives, for each date or time slot, a list of events to draw.
+- **The event data layer** knows about fetching and recurrence, and nothing about pixels or grid cells. Given a visible date range, it returns a flat, already-expanded list of event instances, each with a concrete start and end time. It has no idea whether that instance is being drawn in a day, week, or month view.
+
+This boundary matters because the two layers change for different reasons and at different rates. Swapping month view for a two-week view is a pure rendering change; the data layer's contract ("give me instances for this range") doesn't move. Changing how recurrence is stored (a rule vs. pre-materialized rows — covered in `calendar-app-deep-dives`) is a pure data-layer change; the grid never notices, because it only ever sees flat instances.
+
+## The event data layer: range in, instances out
+
+The data layer's single responsibility is answering one question: **"which concrete event instances fall between this start date and this end date?"** Internally it does three things:
+
+1. **Fetch raw events** that overlap the range — both one-off events and any recurring event whose series could produce an occurrence in that window (a daily standup created a year ago still needs to be considered for next week).
+2. **Expand recurrence rules into instances.** A single stored record like "every Monday and Wednesday at 10am, starting January 1st" gets turned into one instance object per actual occurrence inside the requested range — each with its own concrete date, start time, and end time, plus a reference back to the parent recurring event (needed later for "edit this occurrence vs. the whole series").
+3. **Merge and sort** those instances with one-off events into a single flat, time-ordered list scoped to the range — this is the only data shape the rendering layer ever consumes.
+
+Nothing downstream — the grid, a day cell, an event chip — ever sees a "recurrence rule." By the time data reaches them, recurrence has already been resolved into plain, dated instances. That's the whole point of the layer: it absorbs the one genuinely gnarly piece of this domain (recurrence math) behind a boring, flat output shape.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    VIEW["View (e.g. month grid)<br/>needs Jun 1 - Jun 30"] --> RANGE["Date-range query<br/>getEvents(start, end)"]
+    RANGE --> CACHE{In cache?}
+    CACHE -->|hit| FLAT["Flat, expanded<br/>instance list"]
+    CACHE -->|miss| FETCH["Fetch raw events<br/>overlapping range"]
+    FETCH --> EXPAND["Expand recurrence rules<br/>into concrete instances"]
+    EXPAND --> STORE["Store in range cache"]
+    STORE --> FLAT
+    FLAT --> GRID["CalendarGrid buckets<br/>instances by date/cell"]
+    GRID --> CHIP["EventChip renders<br/>each instance"]
+`} />
+
+## The component tree
+
+With that data contract in place, the UI splits along the same lines:
+
+- **`CalendarGrid`** — the top-level view component. It knows the current mode (day/week/month) and the resulting visible range, requests instances for that range from the data layer, and lays out the structural grid (rows/columns, hour lines for day/week, week rows for month). It doesn't know or care what an event actually is beyond "something with a start and end time to place."
+- **`DayCell`** / **`WeekRow`** — a slot representing one date (month view) or one date-and-hour-range (week/day view). Each receives just the instances that land in its slot — already bucketed by the grid — and decides only about overflow (e.g. "show 3 chips and a `+2 more` link" when a day is packed).
+- **`EventChip`** — renders one event instance: title, color, time label if relevant. It takes a plain instance object as a prop and has no awareness of recurrence, timezone conversion, or fetching — all of that already happened upstream. This is what keeps it trivially reusable and testable: pass it any instance-shaped object and it renders correctly.
+- **`EventEditorModal`** — opens on creating or clicking an event. It's the one component that does need to know about recurrence, because saving a change to a recurring instance requires asking "just this occurrence, or the whole series?" It writes back through the data layer, which is responsible for translating that save into the right update (a per-instance override vs. a change to the underlying rule).
+
+Each layer only needs the shape of data one level below it — `CalendarGrid` needs a flat instance list, `EventChip` needs one instance, `EventEditorModal` needs one instance plus enough context to know its parent series. None of them needs to reach past that boundary.
+
+## Client-side caching by date range
+
+Calendars are heavily range-driven: a user pages forward a week, switches from month to week view, jumps back to today. Re-fetching and re-expanding every event from scratch on every one of those interactions is both slow and wasteful, since large chunks of the range usually overlap what's already been fetched.
+
+The fix is a cache keyed by **date range**, not by view mode or by a single global "all events" blob:
+
+- Normalize each fetch to a canonical `(start, end)` window (e.g. always UTC day boundaries) and store the resulting expanded instance list under that key.
+- Before fetching, check whether the requested range is already covered by cached ranges. A month view showing June and a week view showing the last week of June and first few days of July can share the June portion instead of duplicating it.
+- Fetch a slightly wider buffer than what's strictly visible — a few extra days on each side of a month view, for instance — so paging forward by one step (or switching from month to the adjacent week) usually hits cache instead of triggering a new network round trip.
+- On writes (create, edit, delete), invalidate only the cached ranges the affected event actually falls into. Deleting one Tuesday meeting shouldn't force a re-fetch of the entire year; it should just drop or patch the cache entries for the range(s) containing that instance.
+
+A simple mental model: think of the cache as a set of non-overlapping "known-good" intervals, each mapped to its expanded instance list. A new range request either falls entirely inside a known interval (serve from cache, no fetch), partially overlaps one (fetch only the uncovered portion, then merge), or falls entirely outside any known interval (fetch fresh, then record the new interval).
+
+## Worked example: paging from June to July
+
+A user has the month view open on June, which triggered a fetch for roughly May 28 to July 2 (May and June's grid, plus the buffer) and populated the cache under that range. They click "next month."
+
+The new visible range is July 1–31. The cache check finds July 1–2 already covered by the June fetch, so only July 3 onward through the buffer (say, through August 3) needs a fresh fetch. That request goes out, gets expanded (any recurring "every Monday" event produces its July occurrences here), and the result merges with the already-cached July 1–2 data to produce the full flat instance list `CalendarGrid` needs for July. The user perceives this as a fast page-forward, not a full reload, and the two days of overlap were never fetched twice.
+
+If they then create a new recurring event starting in July, the data layer only needs to invalidate the cached ranges from July onward — May and June's cached instance lists are untouched, since the new series can't produce any occurrence before its start date.
+
+<Callout type="warning">
+  A common mistake: caching the *raw* recurring-event records instead of the *expanded* instances per range. If you cache "the recurrence rule" and re-run expansion on every render, you've moved the expensive work from the network to the render path and it now reruns on every scroll or re-render. If you cache expanded instances but key the cache by "all events" instead of by range, you lose the ability to invalidate or refresh part of the calendar without throwing away everything. Cache the *expanded, flat instance list, keyed by the specific date range it was computed for* — that's what makes both incremental fetching and targeted invalidation possible.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="calendar-app-high-level-architecture"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'In this architecture, what does the event data layer hand off to the rendering layer (CalendarGrid, EventChip, etc.)?',
+      options: [
+        { id: 'a', text: 'A flat, time-ordered list of already-expanded event instances for the requested range', correct: true, explanation: 'Correct — recurrence expansion happens inside the data layer, so the rendering layer only ever deals with concrete instances that already have a start and end time.' },
+        { id: 'b', text: 'The raw recurrence rules, so the grid can decide which occurrences to draw', correct: false, explanation: 'Pushing recurrence rules into the rendering layer would force every grid component to understand recurrence math, defeating the point of the boundary.' },
+        { id: 'c', text: 'A single object containing every event the user has ever created', correct: false, explanation: 'The data layer scopes its output to the requested date range, not the entire event history, which is what keeps fetch and render costs bounded.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasons to cache fetched data keyed by date range rather than as one global cache of all events? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It lets overlapping requests (e.g. adjacent month and week views) reuse already-fetched portions instead of re-fetching everything', correct: true, explanation: 'Correct — a range-keyed cache can detect that part of a new request is already covered and only fetch the uncovered portion.' },
+        { id: 'b', text: 'It allows invalidating just the ranges an edited or deleted event actually falls into, instead of clearing the whole cache', correct: true, explanation: 'Correct — targeted invalidation is only possible if the cache tracks which range each cached result covers.' },
+        { id: 'c', text: 'It removes the need to ever expand recurring events, since the cache stores the raw recurrence rule instead', correct: false, explanation: 'The cache should store already-expanded instances for a range, not raw rules — caching raw rules would mean re-running expansion on every read.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'EventChip needs to know whether the instance it is rendering came from a recurring event or a one-off event.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'EventChip renders a plain instance (title, time, color) and does not need recurrence awareness — that distinction only matters when the user opens the editor to save a change.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — by the time an instance reaches EventChip, recurrence has already been resolved into a concrete occurrence; only EventEditorModal needs to know about the parent series, for the "this occurrence vs. whole series" save decision.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A month view for June is cached, and the user pages forward to July, whose range partially overlaps the buffer already fetched. What should the data layer do?',
+      options: [
+        { id: 'a', text: 'Fetch only the uncovered portion of the July range, then merge it with the already-cached overlapping portion', correct: true, explanation: 'Correct — this is the point of range-based caching: only fetch what is not already known, then merge the results into the full instance list the view needs.' },
+        { id: 'b', text: 'Re-fetch and re-expand the entire July range from scratch, ignoring the June cache', correct: false, explanation: 'This wastes a network round trip and expansion work on the portion of July that was already fetched as part of June\'s buffer.' },
+        { id: 'c', text: 'Serve July entirely from the June cache without fetching anything', correct: false, explanation: 'The June cache only covers the small overlapping buffer, not the rest of July, so the uncovered portion still needs a fresh fetch.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,143 @@
+---
+title: "Performance as a Requirement"
+module: "Nonfunctional Requirements"
+moduleOrder: 2
+order: 1
+track: "concept"
+summary: "Frames performance as a measurable nonfunctional requirement with concrete targets, not a vague goal."
+cheatsheet:
+  - "Never leave performance as 'make it fast' — write it as a number with a condition: a metric, a target value, and the device/network it's measured under."
+  - "Split performance NFRs into three buckets: load (time to first usable paint), runtime/interaction (responsiveness during use), and perceived (how fast it feels, independent of the raw numbers)."
+  - "Phrase load targets as a metric plus percentile plus condition, e.g. 'LCP under 2.5s at p75 on a mid-tier phone over 4G' — a single average number hides your worst users."
+  - "Interaction budgets are usually tighter than load budgets — under 100ms for input response is the line where a UI stops feeling 'stuck.'"
+  - "Perceived performance requirements (skeletons, optimistic UI, progress indicators) are legitimate NFRs even when they don't move the underlying timing numbers."
+  - "State performance targets before picking architecture — they constrain later decisions like SSR vs. CSR, code-splitting boundaries, and caching strategy, covered in the Performance & Optimization module."
+  - "In an interview, always ask what the target device and network are before committing to a performance number — 'fast' on a fiber-connected laptop and 'fast' on a mid-range phone over 3G are different budgets."
+tags: ["nonfunctional", "performance"]
+estMinutes: 10
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Ask "does this need to be fast?" in a design interview and everyone says yes. That answer is useless — it doesn't tell you whether to reach for server-side rendering, whether a 200KB dependency is a problem, or whether you can afford a loading spinner. Performance only becomes a design input once it's a number: a metric, a target, and the conditions it's measured under. This lesson is about turning "fast" into requirements you can actually design against, and setting up the vocabulary the rest of the Performance & Optimization module builds on.
+
+## Why "make it fast" fails as a requirement
+
+A functional requirement tells you what the system does ("users can filter the product list by price"). A nonfunctional requirement (NFR) tells you the quality bar the system must hit while doing it. Performance is one of the most common NFRs raised in a frontend design interview, and also one of the most commonly left vague.
+
+The problem with "make it fast" is that it can't be checked and it can't drive a decision. If someone asks "should this page render on the server or the client?", the answer depends entirely on what target you're hitting and under what conditions — a page that only needs to feel responsive on a fast corporate laptop has very different constraints than one that needs to load in a few seconds on a mid-range phone over a spotty mobile network. Without a number, every architecture choice becomes a guess.
+
+Treat performance the way you'd treat any other measurable NFR (uptime, error rate): write it down as a target, attach a metric and a condition, and let that target constrain the choices you make later.
+
+## Three categories of performance NFRs
+
+Performance isn't one thing. A page can load quickly but feel sluggish once interactive; it can respond to clicks instantly but take a long time to become visible in the first place. Splitting performance into three categories keeps requirements precise and stops "performance" from becoming a catch-all.
+
+### Load performance
+
+How long it takes for the page to go from "nothing" to "usable" on first visit. This covers metrics like Largest Contentful Paint (how long until the main content is visible) and Time to Interactive (how long until the page actually responds to input). Load performance is dominated by network and parse/compile cost: bundle size, number of round trips, server response time, and how much JavaScript has to run before the page is usable.
+
+### Runtime and interaction performance
+
+How the app behaves once it's already loaded and the user is actively using it: does a click respond immediately, does scrolling stay smooth, does typing in a search box keep up with keystrokes. This is governed by main-thread work — expensive re-renders, layout thrashing, large synchronous computations — rather than network cost. A page can have great load performance and still feel terrible if every click blocks the main thread for half a second.
+
+### Perceived performance
+
+How fast the experience *feels*, which isn't always the same as what the raw timing numbers say. Two pages with an identical 3-second load time feel different if one shows a blank white screen the whole time and the other shows a skeleton layout and a progress indicator within 200ms. Perceived performance requirements — show a skeleton, show optimistic UI, show a spinner after some threshold — are legitimate design requirements even when they don't change the underlying metric.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Performance NFR] --> B[Load]
+  A --> C[Runtime / Interaction]
+  A --> D[Perceived]
+  B --> B1["Target: LCP under 2.5s, p75, mid-tier phone/4G"]
+  C --> C1["Target: input response under 100ms"]
+  D --> D1["Target: first visual feedback under 200ms"]
+  B1 --> E[Architecture decisions]
+  C1 --> E
+  D1 --> E
+  E --> F["SSR vs CSR, code splitting, caching, virtualization..."]
+`} />
+
+## Phrasing performance requirements concretely
+
+A well-phrased performance requirement has three parts: a metric, a target value, and the condition it's measured under.
+
+- **Metric** — what's being measured (Largest Contentful Paint, Time to Interactive, input latency, frame rate).
+- **Target** — a specific number, usually stated at a percentile rather than an average, since averages hide your worst users. "p75 under 2.5 seconds" tells you 75% of visits meet the bar; a plain average can look fine while a quarter of your users have a broken experience.
+- **Condition** — the device and network the target applies to. "Fast" on a developer's laptop over office Wi-Fi and "fast" on a five-year-old Android phone over throttled 4G are different engineering problems.
+
+Compare the two requirement statements below:
+
+- Vague: "The dashboard should load quickly."
+- Concrete: "Largest Contentful Paint under 2.5 seconds at p75, tested on a mid-tier Android device over a throttled 4G connection; interactions (filter, sort) respond within 100ms on the same device."
+
+The second statement is checkable in a performance budget, can be tested in CI, and — critically for a design interview — tells you what to prioritize. If the number is 2.5 seconds on a mid-tier phone, you probably can't ship an unbundled client-heavy SPA with a 2MB initial payload; you're leaning toward server rendering, aggressive code splitting, or both.
+
+## Worked example: a product listing page
+
+Say you're asked to design a product listing page for an e-commerce site. Instead of accepting "it should be fast," push for numbers:
+
+- **Load**: LCP under 2 seconds at p75 on a mid-tier phone over 4G, since a large share of traffic is mobile shoppers who bounce quickly on slow pages.
+- **Runtime/interaction**: applying a filter or sorting the list should update the visible results within 100ms of the tap, even with a few thousand items in the list.
+- **Perceived**: while a filter request is in flight, show the existing results dimmed rather than a blank loading state, so the page never looks broken.
+
+Those three targets now drive real decisions. The load target pushes you toward server-rendering the initial listing (so the browser doesn't have to fetch data, then fetch JS, then render) and toward pagination or virtualization instead of shipping every product up front. The interaction target pushes you toward client-side filtering of an already-fetched page of results rather than a network round trip per filter click, and toward virtualizing the list so re-renders stay cheap regardless of item count. The perceived-performance target pushes you toward keeping stale results visible during a refetch instead of unmounting them. None of these decisions are obvious from "make it fast" alone — they fall out of the specific numbers.
+
+<Callout type="warning">
+  A common mistake: stating a performance target as a single average number with no condition ("average load time is 1.2 seconds"). Averages are dragged down toward your best-connected users and hide the tail — the p90 or p99 user on a slow device might be waiting 8 seconds while the average looks healthy. Always state targets at a percentile (p75 is a common default) and name the device/network condition, otherwise the "requirement" can be technically true while a large chunk of users have a broken experience.
+</Callout>
+
+## Where this leads
+
+Once performance targets exist as numbers, they stop being an afterthought and start shaping the architecture conversation from the beginning — rendering strategy, bundling, caching, and virtualization choices covered later in Performance & Optimization all trace back to a load, runtime, or perceived-performance target set here. The other Nonfunctional Requirements lessons follow the same pattern: accessibility-and-compatibility and localization-and-internationalization both need to be scoped as concrete, checkable requirements before they can influence a design, rather than left as vague goals.
+
+<Quiz
+  lessonId="performance-as-a-requirement"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A teammate proposes the requirement "the app should feel fast." What is the strongest fix to make this a usable nonfunctional requirement?',
+      options: [
+        { id: 'a', text: 'Attach a metric, a target value at a percentile, and the device/network condition it applies to', correct: true, explanation: 'This is what turns a vague goal into something checkable and something that can actually constrain architecture decisions.' },
+        { id: 'b', text: 'Rewrite it as "the app should be very fast" for emphasis', correct: false, explanation: 'Adding emphasis without a metric or number does not make the requirement any more checkable or actionable.' },
+        { id: 'c', text: 'Leave it as-is since performance is always subjective', correct: false, explanation: 'Performance is measurable — metrics like load time and input latency can be captured objectively and tested against a target.' },
+        { id: 'd', text: 'Replace it with a requirement about accessibility instead', correct: false, explanation: 'Accessibility is a separate, equally important NFR, but it does not address the performance goal at all.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are examples of runtime/interaction performance rather than load performance? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A filter click updating the visible list within 100ms', correct: true, explanation: 'This is about responsiveness during use after the page has already loaded — a runtime/interaction concern.' },
+        { id: 'b', text: 'Scrolling a long list staying smooth without dropped frames', correct: true, explanation: 'This happens during active use of an already-loaded page, so it is a runtime/interaction concern, not a load-time metric.' },
+        { id: 'c', text: 'Largest Contentful Paint on first visit', correct: false, explanation: 'LCP measures how long it takes for main content to appear on first load — this is a load performance metric.' },
+        { id: 'd', text: 'Time to Interactive on a cold page load', correct: false, explanation: 'Time to Interactive describes the initial load sequence before the page is usable, making it a load performance metric.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Stating a performance target as "average load time is 1.2 seconds" is just as useful as stating it at a percentile (e.g. p75) with a device/network condition.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'An average is dragged toward well-connected users and can hide a slow tail of users on weaker devices or networks, so it is not equivalent to a percentile-based target.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — a percentile target with a stated condition (e.g. p75 on a mid-tier phone over 4G) reveals how the worst-served users experience the app, which an average conceals.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A page takes 3 seconds to load, but shows a skeleton layout and a progress indicator within 200ms instead of a blank screen. Which category of performance NFR does this improvement target?',
+      options: [
+        { id: 'a', text: 'Perceived performance', correct: true, explanation: 'The raw load time is unchanged, but showing early visual feedback makes the wait feel shorter — this is exactly what perceived-performance requirements address.' },
+        { id: 'b', text: 'Load performance', correct: false, explanation: 'Load performance is about the raw timing metrics (like LCP); adding a skeleton does not change those numbers, only how the wait feels.' },
+        { id: 'c', text: 'Runtime/interaction performance', correct: false, explanation: 'Runtime/interaction performance is about responsiveness after the page has loaded, not about the initial loading experience.' },
+      ],
+    },
+  ]}
+/>

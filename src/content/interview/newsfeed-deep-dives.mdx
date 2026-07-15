@@ -1,0 +1,287 @@
+---
+title: "Newsfeed: Deep Dives — Data Flow, Performance & Edge Cases"
+module: "Case Study: Newsfeed"
+moduleOrder: 1
+order: 3
+track: "interview"
+summary: "Goes deep on pagination, virtualization, optimistic updates, and edge cases for a newsfeed."
+cheatsheet:
+  - "Use cursor-based pagination (an opaque pointer like `after: post_88213`) for feeds, not offset-based (`page=3`) — offsets shift and skip/duplicate items whenever posts are inserted above the current page."
+  - "Poll or subscribe for new-posts-at-top separately from pagination — buffer them behind a 'X new posts' banner instead of injecting them mid-scroll, so the reader's position never jumps."
+  - "Virtualize the feed list (render only the visible window plus a small overscan buffer) once the list can grow past a couple hundred DOM nodes, or scroll performance degrades and memory climbs unbounded."
+  - "Optimistic UI for likes/comments: flip the UI instantly, fire the request, and roll back to the prior state plus a toast if the server rejects it — never make the user wait on a round trip for a like button."
+  - "Dedupe posts by ID after every fetch (cursor page or top-of-feed poll) — cursor shifts and out-of-order network responses are the two most common sources of duplicate cards."
+  - "Handle 'post deleted while in view' as a soft removal: mark it gone in the store, collapse its slot with a short transition, and swallow any queued like/comment actions against it instead of throwing."
+  - "For media, request downscaled/CDN-resized images sized to the actual card width, lazy-load anything below the fold, and never autoplay video with sound — only preload metadata until a video is mostly in view."
+tags: ["case-study","newsfeed","deep-dive"]
+estMinutes: 14
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The high-level architecture from the previous lesson gets you a feed that
+renders. It doesn't get you a feed that survives an interview follow-up
+question, and it definitely doesn't get you a feed that survives production
+traffic. Every experienced interviewer will push past "we fetch pages of
+posts and render them" into the parts that actually distinguish a strong
+answer: how pagination behaves when the feed is changing underneath the
+reader, how you keep a list with thousands of rendered posts scrolling
+smoothly, how a like button feels instant without lying to the user, and
+what happens when a post disappears or the network drops mid-scroll. This
+lesson is about those specifics.
+
+## Pagination: cursor-based versus offset-based
+
+**Offset-based pagination** asks the server for "give me posts 40 to 60"
+(`page=3&size=20` or `offset=40&limit=20`). It's simple to implement and
+easy to reason about — until the underlying data changes between requests.
+
+**Cursor-based pagination** asks instead for "give me the 20 posts after
+this specific post" (`after=post_88213`), where the cursor is an opaque
+pointer tied to a stable ordering key (typically a timestamp plus post ID
+to break ties). The server has no notion of "page number" at all.
+
+For a newsfeed, cursor-based pagination wins almost every time, because the
+core failure mode of offset pagination is exactly what a feed does
+constantly: new items get inserted at the top while the reader is scrolling
+through older ones.
+
+Walk through the offset failure concretely. You've fetched posts 0-19
+(offset 0, limit 20). Three new posts get created by people you follow.
+You scroll and request offset 20, limit 20 — but the server's "position 20"
+has shifted by three, because three new rows were inserted above it. You now
+either re-see three posts you already saw (duplicates) or skip three posts
+entirely (gaps), depending on which direction the offset drifted.
+
+A cursor sidesteps this because it's anchored to a specific post, not a
+row count. "Give me 20 posts after `post_88213`" returns the same answer
+regardless of how many posts were inserted above `post_88213` in the
+meantime.
+
+### New posts inserted at the top
+
+Cursor pagination solves *backward-scroll consistency*, but it doesn't
+automatically solve the separate problem of *new posts appearing above
+the reader's current position*. That's typically handled as its own
+mechanism: a lightweight poll (or a push notification over a WebSocket)
+that checks "are there posts newer than the newest one I currently have?"
+On a positive answer, don't inject those posts into the DOM immediately —
+that would yank content up and disorient anyone mid-read. Instead, buffer
+them and show a small "3 new posts" banner pinned above the feed; only
+merge them into the rendered list when the reader taps it (or scrolls to
+the top themselves).
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Feed scrolled down, cursor = post_88213] --> B{Poll: newer posts exist?}
+  B -- no --> A
+  B -- yes --> C[Buffer new posts, show 'N new posts' banner]
+  C --> D{User taps banner or scrolls to top}
+  D -- yes --> E[Prepend buffered posts, dedupe by ID]
+  D -- not yet --> C
+  A --> F[User scrolls down, request page after cursor]
+  F --> G[Append page, advance cursor, dedupe by ID]
+`} />
+
+## Virtualizing the feed list
+
+A chronological or algorithmic feed is, by design, meant to be scrolled
+indefinitely. If you render every post card the user has ever fetched as a
+real DOM node, two things go wrong as the session goes on: scroll and
+layout work grows with total posts loaded (not just visible posts), and
+memory for images/video elements climbs without bound. A session that's
+been open for twenty minutes with 400 posts loaded shouldn't be five times
+heavier to scroll than one with 80 posts loaded.
+
+**List virtualization** fixes this by rendering only the posts currently
+in (or near) the viewport, plus a small overscan buffer above and below —
+enough rows to cover 1-2 extra screens' worth of scrolling — and recycling
+DOM nodes as the user scrolls past them. The list keeps a lightweight
+in-memory record of every post's data, but only a small, constant-size
+slice of that data actually becomes DOM.
+
+The main complication specific to a newsfeed (versus a virtualized table
+of uniform rows) is **variable row height**: a text-only post might be
+120px tall, a post with an image might be 480px, and one with an embedded
+video plus a long caption might be 640px. A naive virtualizer that assumes
+fixed row height will miscalculate scroll position and cause visible
+jumps. The fix is to measure each row's real height after it first
+renders, cache that measurement keyed by post ID, and use cached (or an
+estimated) height for scroll-offset math on rows not yet measured.
+
+<Callout type="tip">
+  Virtualization interacts with "restore scroll position on back
+  navigation" — a common newsfeed requirement. Keep the post ID the user
+  was viewing (not just a raw pixel offset) as the scroll anchor, since
+  pixel offsets become wrong the moment row heights are re-measured or new
+  posts are prepended above.
+</Callout>
+
+## Optimistic UI for likes and comments
+
+Waiting on a network round trip before a like button visibly updates feels
+broken — users expect the heart to fill in immediately. The standard fix
+is optimistic UI:
+
+1. On tap, update local state immediately (increment the like count, fill
+   the icon, mark "liked by me" `true`) and re-render.
+2. Fire the mutation request in the background.
+3. On success, reconcile with the server's actual response (usually a
+   no-op if your optimistic guess matched).
+4. On failure, roll back to the prior state and surface a small,
+   non-blocking error (a toast, not a modal) so the user knows the action
+   didn't stick.
+
+The same pattern applies to comments: append the new comment to the list
+immediately (often visually marked as "sending" via reduced opacity),
+then either confirm it in place once the server returns the persisted
+comment (swap in the real ID/timestamp) or remove it and show a retry
+option on failure.
+
+The part interviewers probe hardest here is the rollback: keep enough of
+the *previous* state around to restore it cleanly, and handle a user
+tapping "like" then "unlike" rapidly before either request resolves. A
+robust approach tracks a small pending-mutation queue per post and
+reconciles actions in order, rather than trusting a single boolean that a
+fast double-tap can race.
+
+## Media loading strategy
+
+A media-heavy feed is dominated by image and video bytes, not JSON. The
+core techniques (responsive image sizing, modern formats, lazy-loading,
+video-specific concerns like poster frames and adaptive bitrate) are
+covered in depth in the <a href="../concepts/image-and-media-optimization">Image
+& Media Optimization</a> concept lesson — bring that lesson's toolkit into
+this design rather than re-deriving it:
+
+- Request images already sized to the rendered card width via a CDN
+  transformation parameter, not a full-resolution original scaled down by
+  the browser.
+- Lazy-load media below the fold, and pair it with virtualization so
+  images scrolled out of the overscan window can be safely unmounted and
+  their memory reclaimed.
+- Never autoplay video with sound; only start loading video data (beyond a
+  poster frame and metadata) once a card crosses some visibility
+  threshold, and pause/unload it once it scrolls back out.
+
+The one newsfeed-specific twist: because cards get virtualized in and out,
+an image that finished loading once shouldn't reload every time its card
+remounts. Cache resolved CDN URL and load status at the store level, keyed
+by post ID, so scrolling back up to a previously-viewed post doesn't
+refetch media or show a loading flicker for content the user just saw.
+
+## Edge cases
+
+### Duplicate posts after a cursor shifts
+
+Even with cursor pagination, duplicates can creep in: a post you already
+have gets re-returned because a top-of-feed poll and a bottom-of-feed
+pagination request race, or a retried request after a timeout succeeds
+twice. The fix is to treat the client-side store as the source of truth
+for dedup: every time a batch of posts arrives, merge by post ID into a
+normalized store (a map keyed by ID plus an ordered ID list for rendering)
+instead of naively concatenating arrays. A `Map` merge makes duplicate IDs
+a non-issue by construction.
+
+### A post is deleted while it's in view
+
+If the author (or a moderator) deletes a post the reader is currently
+looking at, a hard delete-from-array-and-re-render can be jarring — the
+whole list shifts. Handle it as a soft removal: mark the post `deleted` in
+the store, render a brief "this post is no longer available" placeholder
+with a short collapse transition, then drop it from the ID list shortly
+after. Also guard in-flight like/comment mutations against a now-deleted
+post — check the post still exists before applying a server response, and
+silently drop the action rather than throwing if it doesn't.
+
+### Slow or offline networks
+
+Two distinct situations need distinct handling. A **slow network** should
+degrade gracefully: show skeleton placeholders for posts still loading
+rather than a blank screen, cache the last-fetched feed so a reload isn't
+a blank slate, and set a reasonable request timeout with a visible retry
+action instead of an infinite spinner. A **fully offline** state should be
+detected explicitly (via the browser's online/offline events, not
+inferred from failed requests) and surfaced clearly — disable
+pull-to-refresh and new-page fetches, keep already-loaded posts readable,
+and queue like/comment actions taken while offline to replay once
+connectivity returns, rather than dropping them silently.
+
+## Worked example: scrolling into a burst of new posts
+
+Say a reader loaded the feed, scrolled down 15 screens (600 posts fetched
+across 30 cursor pages), and has been reading for two minutes. During that
+window, 12 new posts were created above the original top of the feed, and
+one post the reader scrolled past 90 seconds ago just got deleted by its
+author.
+
+A well-built feed handles this without the reader noticing anything
+break: the top-of-feed poll detects the 12 new posts and shows a "12 new
+posts" banner (not injected into the scroll), the virtualizer has already
+unmounted the DOM nodes for posts far above the current viewport so
+memory hasn't grown unbounded across those 600 posts, and the deleted post
+— currently outside the overscan window — gets soft-marked in the store so
+that if the reader scrolls back up to it, they see a graceful "no longer
+available" slot instead of a broken card or a console error. None of this
+requires the reader to refresh the page.
+
+<Callout type="warning">
+  A common mistake: implementing "check for new posts" by re-fetching page
+  one of the feed and diffing it against what's rendered. This reintroduces
+  every offset-pagination problem (shifted rows, duplicates) even if your
+  main pagination is cursor-based, and it wastes bandwidth re-fetching
+  posts you already have. Use a dedicated "is there anything newer than
+  cursor X" check that only asks for genuinely new items, and merge them
+  through the same ID-keyed dedup path as every other batch of posts.
+</Callout>
+
+<Quiz
+  lessonId="newsfeed-deep-dives"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does cursor-based pagination handle a newsfeed better than offset-based pagination?',
+      options: [
+        { id: 'a', text: 'It requires fewer round trips to the server', correct: false, explanation: 'Both approaches typically need one request per page — the difference is correctness under a changing list, not request count.' },
+        { id: 'b', text: 'It stays correct when items are inserted above the current page, since it anchors to a specific item rather than a row count', correct: true, explanation: 'A cursor like "after post_88213" is unaffected by insertions above that post, while an offset like "skip 40 rows" shifts and produces duplicates or gaps when rows are inserted above it.' },
+        { id: 'c', text: 'It lets the client sort posts locally instead of trusting the server order', correct: false, explanation: 'Sort order is still determined by the server/ordering key in both schemes; cursors do not change who owns sorting.' },
+        { id: 'd', text: 'It avoids the need for a database index on the ordering column', correct: false, explanation: 'Cursor pagination generally still relies on an index on the ordering key(s) to be efficient — it does not remove that need.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are good reasons to virtualize a long feed list? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It keeps the number of live DOM nodes roughly constant regardless of how many posts have been fetched in the session', correct: true, explanation: 'Virtualization renders only the visible window plus overscan, so DOM size stays bounded even as the total fetched post count grows into the hundreds.' },
+        { id: 'b', text: 'It reduces memory used by images and video elements for posts that have scrolled far out of view', correct: true, explanation: 'Unmounting off-screen rows lets their media elements be garbage collected instead of staying resident indefinitely.' },
+        { id: 'c', text: 'It eliminates the need for cursor-based pagination', correct: false, explanation: 'Virtualization is a rendering-layer optimization; it does not address how pages of data are fetched or how new posts get merged in — that is a separate, still-necessary concern.' },
+        { id: 'd', text: 'It guarantees every post loads with zero layout shift on first paint', correct: false, explanation: 'Variable row heights (text-only vs. image vs. video posts) still require measuring and caching heights; virtualization alone does not eliminate layout shift.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'If a like-button mutation fails after an optimistic update, the correct behavior is to leave the UI in its optimistic state and just log the error, since retrying automatically will usually fix it.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Leaving the UI in a state that does not match the server would silently lie to the user (e.g. showing "liked" when the like never persisted). The optimistic update must be rolled back on failure, paired with a lightweight, non-blocking error indicator.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — on failure the client should roll back to the pre-optimistic state and surface a small error (like a toast), not leave a UI state that does not reflect what actually happened on the server.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: "A post the reader scrolled past a minute ago gets deleted by its author. What's the best way to handle this in the feed's UI?",
+      options: [
+        { id: 'a', text: 'Immediately splice it out of the array so the list re-renders without it', correct: false, explanation: 'A hard, immediate removal can cause a visible jump in the list, especially disruptive if the reader scrolls back near that position — a jarring experience for something that does not need to be instant.' },
+        { id: 'b', text: 'Ignore the deletion until the next full page reload', correct: false, explanation: 'Leaving a deleted post fully interactive (likeable, commentable) risks confusing errors when those actions hit a post that no longer exists server-side.' },
+        { id: 'c', text: 'Mark it deleted in the store, show a brief "no longer available" placeholder with a short collapse transition, and guard any in-flight mutations against it', correct: true, explanation: 'This gives a graceful, expected-feeling transition instead of a jump or a broken card, and prevents queued like/comment actions from erroring against a post that is gone.' },
+        { id: 'd', text: 'Replace it with the next unfetched post from the pagination cursor', correct: false, explanation: 'Silently substituting different content in place of a deleted post is confusing and unrelated to correct deletion handling — the slot should reflect that the original post is gone, not swap in unrelated content.' },
+      ],
+    },
+  ]}
+/>

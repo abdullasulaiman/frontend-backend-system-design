@@ -1,0 +1,174 @@
+---
+title: "Component Design Patterns"
+module: "Design Patterns & Architectures"
+moduleOrder: 6
+order: 1
+track: "concept"
+summary: "Covers reusable component patterns and how they affect reusability and testability at scale."
+cheatsheet:
+  - "Container/presentational separation: keep data-fetching and business logic out of components that only render markup — the presentational component becomes trivially reusable and testable with plain props."
+  - "Compound components (e.g. Tabs.List, Tabs.Panel) share implicit state via context so consumers control markup and layout without the parent needing a giant props API."
+  - "Custom hooks extract stateful logic without controlling render output — prefer them over render props for new code; reach for render props only in class-based or non-hook constraints."
+  - "Controlled components take value and onChange from a parent (single source of truth, easy to validate/sync); uncontrolled components manage their own state internally (simpler, less re-rendering, harder to intercept)."
+  - "A component that is both controlled and uncontrolled depending on whether a prop is passed (an 'uncontrolled-by-default' pattern) gives consumers an escape hatch without forcing state lifting on everyone."
+  - "Pick the pattern based on the actual reuse boundary: one-off internal component needs none of this ceremony; a shared design-system component used by dozens of teams needs the flexibility compound components and controlled APIs provide."
+  - "Testability tracks logic isolation, not pattern novelty — a presentational component with no side effects is easy to snapshot-test; a component that fetches and renders in one blob needs a mocked network for every test."
+tags: ["patterns", "components"]
+estMinutes: 11
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A frontend system design interview rarely asks "how do you write a React component." It asks "how would you structure the `ProductList` feature so five engineers can work on it without stepping on each other, and so a bug in the sort logic doesn't require clicking through the UI to catch it." The answer is component design patterns — not a specific library API, but a handful of recurring shapes for splitting responsibility: what fetches data, what renders markup, what owns state, and who gets to control it.
+
+Get this wrong and you get components that are hard to reuse (because logic and markup are welded together) and hard to test (because every test needs a mocked API, a router, and a store just to render a button). Get it right and most of your components become boring, swappable, and testable in isolation — which is exactly what you want at scale.
+
+## Container vs. presentational components
+
+This is the foundational split: separate *what data a component needs and how it gets it* from *how that data is displayed*.
+
+- **Container components** fetch data, hold state, subscribe to a store, and handle events — but render little to no markup themselves. They pass everything a presentational component needs as props.
+- **Presentational components** receive props and render UI. No API calls, no direct store access, ideally no internal state beyond pure UI mechanics like "is this dropdown open."
+
+The payoff: a presentational component can be rendered with any props you like in a test or a Storybook story, with zero mocking. The container can be tested separately by asserting it calls the right service and passes the right props down — no DOM rendering required.
+
+This split doesn't mean every component must be one or the other forever. Modern function components with hooks blur the line constantly (a component can call a data-fetching hook *and* render markup). The pattern still matters as a mental model: know which parts of a component are "data plumbing" and which are "presentation," even if they live in the same file, so you can pull them apart the moment reuse or testing demands it.
+
+## Compound components
+
+Some UI elements are really a family of related pieces that need to coordinate: a `Tabs` component needs a list of tab buttons and a set of panels that stay in sync on which one is active. You could pass all of that through one giant props object (`tabs={[{ label, content }, ...]}`), but that caps how much consumers can customize each piece's markup.
+
+The compound component pattern instead exposes several components that share implicit state through context, and lets the consumer compose them directly:
+
+```
+<Tabs defaultIndex={0}>
+  <Tabs.List>
+    <Tabs.Tab index={0}>Overview</Tabs.Tab>
+    <Tabs.Tab index={1}>Reviews</Tabs.Tab>
+  </Tabs.List>
+  <Tabs.Panel index={0}>...</Tabs.Panel>
+  <Tabs.Panel index={1}>...</Tabs.Panel>
+</Tabs>
+```
+
+`Tabs` sets up a context holding the active index and a setter. `Tabs.Tab` and `Tabs.Panel` read from that context instead of receiving props from a parent that has to know about every child's needs. The consumer can now reorder tabs, wrap one in a badge, or add an icon to just one tab — all without the top-level `Tabs` API growing a new prop for every variation. This is the pattern behind most flexible design-system primitives (menus, accordions, selects).
+
+The cost is indirection: you can't understand `Tabs.Tab` in isolation — you have to know it depends on being rendered inside `Tabs`. That's an acceptable trade for a shared design-system component used across dozens of screens; it's overkill for a one-off internal list.
+
+## Composition: hooks vs. render props
+
+Both patterns solve the same problem — sharing *stateful logic* across components without sharing *markup*. A "mouse position tracker," a "paginated fetch," or a "form validation" behavior are all useful in many components that each want to render completely differently.
+
+**Render props** share logic by taking a function as a prop (or as `children`) and calling it with the internal state, letting the consumer decide what to render:
+
+```
+<MousePosition render={(pos) => <Cursor x={pos.x} y={pos.y} />} />
+```
+
+**Custom hooks** extract the same logic into a function you call directly inside your own component, no wrapper component or extra nesting required:
+
+```
+const pos = useMousePosition();
+return <Cursor x={pos.x} y={pos.y} />;
+```
+
+Hooks avoid the "wrapper hell" that stacked render-prop components tend to produce — extra tree depth visible in DevTools for every shared behavior. They're also easier to compose with each other and to unit-test — call the hook in a test harness and assert on its return value directly. Render props still earn their keep when you need to control *rendering timing* explicitly (e.g. a virtualized list handing you a render function per row) or in codebases that can't use hooks. Default to a hook for new component APIs; reach for render props only when the caller genuinely needs to control what gets rendered, not just what data it gets.
+
+## Controlled vs. uncontrolled components
+
+This split is about who owns the state of an interactive value — a text input, a checkbox, an accordion's open state.
+
+- **Controlled**: the parent owns the value and passes it in as a prop, along with a change handler (`value` + `onChange`). The component itself holds no independent state — it's a pure reflection of what the parent tells it to show.
+- **Uncontrolled**: the component manages its own internal state and just reports changes upward (or not at all) — the parent doesn't dictate the current value.
+
+Controlled components give you a single source of truth: you can validate on every keystroke, sync the value elsewhere, or reset it programmatically, because the parent is authoritative. The cost is a re-render on every change, routed through the parent, which matters if that parent re-renders something expensive.
+
+Uncontrolled components are simpler and cheaper — the DOM (or the component's local state) is the source of truth, and you read it only when you need to (e.g. on submit via a ref). This is usually the right default for a plain form field where nothing else in the UI needs to react to every keystroke.
+
+Many reusable components support both by making the controlling prop optional: if you pass `value`, the component behaves as controlled; if you omit it, it manages its own state internally and starts from `defaultValue`. This "uncontrolled-by-default, controlled-if-you-need-it" shape is common in design systems because it doesn't force every consumer to wire up state just to use a checkbox.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Feature: ProductList] --> B[Container: fetches products, sorting state]
+  B --> C[Presentational: ProductGrid]
+  C --> D["Compound: Filters.Root"]
+  D --> E[Filters.PriceRange]
+  D --> F[Filters.Category]
+  B -.uses.-> G[useProductSort hook]
+  E -.controlled by.-> B
+`} />
+
+## Worked example: a reusable `PriceRangeFilter`
+
+Say three teams each need a price-range filter widget: one for a product catalog, one for a job-listings search, and one for a rental marketplace. Each wants slightly different markup (labels, currency symbol, layout) but the same underlying behavior — two bounded numeric inputs that stay in sync and emit a `{min, max}` range.
+
+A naive first pass builds one component per team, copying the clamping/validation logic three times. A better structure:
+
+1. **A hook, `useRangeFilter(min, max, step)`**, owns the validation logic (clamping, ensuring `min < max`, snapping to `step`) and returns `{ range, setMin, setMax }`. No markup, fully unit-testable with plain function calls — no rendering needed.
+2. **A presentational `RangeSlider` component** takes `range` and the setters as props and renders two inputs. It's controlled: the parent (or the hook consumer) is the source of truth, so validation stays centralized in the hook rather than duplicated per input.
+3. Each team's feature wraps `useRangeFilter` and renders `RangeSlider` with their own labels and currency formatting — no copy-pasted clamping logic, and each team's test suite only needs to mock their own data-fetching container, not the range math.
+
+The hook is tested once, thoroughly, with edge cases like `min` greater than `max` or a `step` that doesn't evenly divide the range. Every team's actual UI test then only has to check that the right label renders next to the right value — because the hard logic already has its own test coverage.
+
+<Callout type="warning">
+  A common mistake: making a component "flexible" by giving it a dozen boolean and callback props (`showIcon`, `iconPosition`, `onIconClick`, `variant`, `dense`, ...) instead of composing smaller pieces. This looks reusable but actually couples every consumer to one component's ever-growing API — a new requirement from any one team means editing the shared component and re-testing every existing consumer. Compound components and hook-based composition avoid this by letting consumers assemble behavior instead of requesting it through more props.
+</Callout>
+
+## Choosing a pattern under system design pressure
+
+Don't reach for every pattern reflexively — justify the choice against the reuse and testability the requirements actually call for:
+
+- One-off component, unlikely to be reused: plain props are fine; compound components are overkill.
+- Shared primitive consumed by many teams with different layout needs: compound components pay for their indirection.
+- State that needs to be inspected, overridden, or synced from outside (a form library validating a field, a parent enforcing a max selection count): make the component controllable, at least optionally.
+- Logic (not markup) duplicated across components: extract a hook before reaching for a heavier abstraction.
+
+## Quiz
+
+<Quiz
+  lessonId="component-design-patterns"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A component fetches data from an API, holds the loading/error state, and also renders the full markup for a product card. What is the main testability problem with this structure?',
+      options: [
+        { id: 'a', text: 'Testing the rendered markup requires mocking the network call, even for tests that only care about layout', correct: true, explanation: 'Because data-fetching and rendering are fused, you cannot test the visual output without also standing up (or mocking) the data dependency — splitting into container/presentational fixes this.' },
+        { id: 'b', text: 'The component will re-render too often', correct: false, explanation: 'Re-render frequency depends on how state is managed, not on whether fetching and rendering live in the same component.' },
+        { id: 'c', text: 'It cannot be styled with CSS', correct: false, explanation: 'Styling is unrelated to whether data-fetching and rendering are combined in one component.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements about compound components are accurate? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Child components typically read shared state via context rather than receiving it all through props from a single parent', correct: true, explanation: 'That is the core mechanism — Tabs.Tab and Tabs.Panel read active-index state from context set up by the parent Tabs component.' },
+        { id: 'b', text: 'They let consumers customize markup and composition of each piece without the top-level component needing a prop for every variation', correct: true, explanation: 'This is the main reuse benefit: consumers compose subcomponents directly instead of configuring one giant props object.' },
+        { id: 'c', text: 'A child subcomponent can always be understood and reused correctly outside of its parent, with no coupling', correct: false, explanation: 'The opposite is true — compound component children are coupled to being rendered inside their parent, since they depend on that parent’s context.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A controlled component manages its own internal state and only reports changes to the parent when convenient.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'That describes an uncontrolled component. A controlled component holds no independent state — its value comes entirely from the parent as a prop.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. In a controlled component, the parent is the single source of truth via a value prop and change handler; the component itself does not own the state.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'You need to share "fetch and paginate a list" logic across five components that each render completely different markup. Which approach avoids the deep wrapper nesting that render-prop chains tend to accumulate?',
+      options: [
+        { id: 'a', text: 'A custom hook, e.g. usePaginatedFetch, called directly inside each component', correct: true, explanation: 'Hooks let each component pull in the shared logic without adding an extra wrapper component to the tree, avoiding the nesting depth that stacked render-prop components introduce.' },
+        { id: 'b', text: 'A higher-order component that wraps each of the five components', correct: false, explanation: 'HOCs solve the sharing problem but add a wrapper layer per usage, which is exactly the extra nesting/indirection hooks were designed to avoid.' },
+        { id: 'c', text: 'Copy the fetch-and-paginate logic into each of the five components', correct: false, explanation: 'This avoids nesting but reintroduces duplicated logic that has to be fixed in five places whenever it changes — the problem composition patterns exist to solve.' },
+      ],
+    },
+  ]}
+/>

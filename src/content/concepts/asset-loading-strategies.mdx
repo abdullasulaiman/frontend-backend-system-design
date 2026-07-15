@@ -1,0 +1,143 @@
+---
+title: "Asset Loading Strategies"
+module: "Performance & Optimization"
+moduleOrder: 4
+order: 2
+track: "concept"
+summary: "Covers resource hints and loading order strategies for JS, CSS, and font assets."
+cheatsheet:
+  - "`preload` says 'fetch this now, I need it for this navigation' — reserve it for the LCP image, hero font, or a script the page can't render without."
+  - "`prefetch` says 'fetch this at idle priority, I'll probably need it soon' — good for the next likely route, bad for anything the current page needs."
+  - "`preconnect` only opens the connection (DNS + TCP + TLS) — pair it with a real fetch or it wastes a socket the browser will close unused."
+  - "`defer` runs scripts in document order after parsing finishes; `async` runs each script the moment it downloads, in arbitrary order — never `async` a script another script depends on."
+  - "Bundling trades request count for cache granularity: one giant bundle invalidates entirely on any change; over-splitting adds request overhead. Split by change-frequency (vendor vs. app code), not by file count."
+  - "Order assets by what blocks the first paint of visible content, not by what's 'important' to the business — a marketing pixel is never more urgent than the hero image."
+  - "A resource hint is a request to the browser's scheduler, not a guarantee — over-hinting (preloading everything) just recreates contention and can push out the actual LCP resource."
+tags: ["performance", "loading"]
+estMinutes: 9
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A page with a fast server and lean code can still feel slow if the browser fetches assets in the wrong order. Every additional script, stylesheet, and font competes for a limited number of connections and a single main thread, and the browser's default loading order is a reasonable guess, not an informed one — it doesn't know that your hero image is the thing the user is staring at, or that your analytics script can wait five seconds without anyone noticing. Asset loading strategy is how you correct that guess: telling the browser what matters now, what can wait, and what to skip parsing entirely until it's needed.
+
+This is a different lever than code splitting or lazy loading (covered in the sibling lessons in this module) — those change *what* gets shipped and *when* the JavaScript runs. This lesson is about *scheduling*: given a fixed set of assets a page needs, in what order and with what priority should the browser fetch and process them.
+
+## Resource hints: preload, prefetch, preconnect
+
+These three `<link>` hints tell the browser about future network needs before it would otherwise discover them.
+
+- **`preload`** — "fetch this at high priority, for this page, right now." Use it for a resource the browser wouldn't discover early enough on its own: a font referenced only inside a CSS `@font-face` rule (which the browser can't see until it parses that CSS), or the specific hero image that will become the Largest Contentful Paint element. `<link rel="preload" href="/hero.avif" as="image" fetchpriority="high">` moves that fetch to the front of the queue instead of waiting for the image tag to be parsed.
+- **`prefetch`** — "fetch this at low priority, I probably need it later." This is for the *next* likely page, not the current one — a checkout page's assets fetched at idle time while the user browses the cart, or the JS chunk for a route the user is likely to click next. Because it runs at low priority, it never competes with the current page's critical assets.
+- **`preconnect`** — "open the connection to this origin now, before I know what I'll fetch from it." It runs DNS lookup, TCP handshake, and TLS negotiation early so the first real request to that origin doesn't pay that latency. Use it for third-party origins you know you'll hit soon (a font CDN, an image CDN, an analytics endpoint) — but only two or three; each preconnected origin holds a socket open, and preconnecting to a dozen origins burns resources for connections that might sit idle.
+
+The common mistake is treating these as free performance — they're not. Each hint claims scheduler priority and, for `preconnect`, an actual socket. Preloading ten resources means the browser now has ten "urgent" fetches instead of one, which just moves the contention problem rather than solving it.
+
+## Priority hints and script loading
+
+Beyond hints, `fetchpriority="high"` or `fetchpriority="low"` on `<img>`, `<link>`, and `<script>` tags lets you nudge the browser's own priority calculation directly — useful for telling it "this below-the-fold image is genuinely low priority" without needing `loading="lazy"`, or "this above-the-fold image matters even though it's not the first `<img>` in the DOM."
+
+For scripts, the default behavior is the worst case: a plain `<script src="...">` blocks HTML parsing while it downloads and executes. Two attributes fix that:
+
+- **`async`** — downloads in parallel with parsing, then executes the moment it's ready, pausing the parser at that point. Multiple `async` scripts can finish and execute in any order relative to each other. Use it for independent scripts with no dependency on DOM state or other scripts — analytics, ads, most third-party widgets.
+- **`defer`** — downloads in parallel with parsing but executes only after parsing completes, in document order. Use it for anything that touches the DOM or depends on another script having already run — most application bundles belong here, not on `async`.
+
+If a script needs the DOM to exist and needs to run before another script, `defer` is the only one of the two that gives you that ordering guarantee.
+
+## Bundling and minification trade-offs
+
+Bundling merges many small files into fewer larger ones; minification strips whitespace, comments, and shortens identifiers. Both reduce bytes and request count, but each has a cost worth naming explicitly:
+
+- A single monolithic bundle means any one-line change invalidates the entire cached file for every returning visitor — they redownload everything. Splitting a stable "vendor" bundle (React, lodash, etc.) from a frequently-changing "app" bundle means the vendor chunk stays cached across deploys while only the small app chunk gets refetched.
+- Over-splitting into dozens of tiny files reintroduces request overhead — even on HTTP/2, each response still costs a bit of scheduling and compression setup, and browsers cap parallelism per origin.
+- Minification is close to free — always do it in production — but don't confuse it with compression. Minifying reduces source size; gzip/brotli (covered in the Network Optimization lesson) reduces transfer size on top of that, and both should run together.
+
+The practical default: split by change-frequency and by route, not by an arbitrary file-count target. A vendor/app split plus route-based code-splitting (see the Code Splitting lesson) covers most real apps well.
+
+## Deciding what to load eagerly vs. defer
+
+The deciding question is always: **does this asset affect what the user sees or can interact with in the first viewport, right now?**
+
+- Above-the-fold CSS, the font used in the headline, and the hero image: eager, and worth a `preload` if the browser wouldn't otherwise discover them early.
+- The application's core interactive JS (nav, primary CTA): `defer`, so it doesn't block parsing but still runs as soon as the DOM is ready.
+- Below-the-fold images, a comments widget, a chat bubble: lazy-loaded or `async`-loaded, since nothing above the fold depends on them.
+- Third-party scripts with no visual role (analytics, A/B testing, support widgets): `async`, or loaded after a `load` event fires, so they never compete with content the user is looking at.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Above-the-fold CSS + hero font] -->|preload, render-blocking| P[First paint]
+  B[Hero image] -->|preload + fetchpriority high| P
+  C[Core app JS] -->|defer| I[Interactive]
+  D[Below-fold images] -->|native lazy loading| L[Loaded on scroll]
+  E[Analytics / chat widget] -->|async, after load event| L
+  F[Next-route chunk] -->|prefetch, idle priority| N[Ready if user navigates]
+`} />
+
+## Worked example: ordering a content-heavy article page
+
+Picture a news article page: a headline in a custom font, a large hero photo, article body text, a related-articles rail, a comment section below the fold, and a third-party ad script.
+
+Loading order that respects the above:
+
+1. **Preconnect** to the image CDN and font CDN in the document head — these origins will be hit within milliseconds.
+2. **Preload** the headline's woff2 font file and the hero image, both with `fetchpriority="high"`, since the browser can't discover either early enough on its own (the font is referenced from CSS; the image, if it's a `background-image`, is invisible to the preload scanner).
+3. Inline or link the critical CSS needed for the headline and hero layout as render-blocking — it's small and the page can't paint correctly without it.
+4. **Defer** the core article JS (share buttons, reading-progress bar) so it runs right after parsing without blocking the initial render.
+5. Give the related-articles images `loading="lazy"` — they're below the fold and shouldn't compete with the hero image for bandwidth.
+6. Skip loading the comment section's JS entirely until the user scrolls near it (an `IntersectionObserver`, covered in the Lazy Loading lesson).
+7. Load the ad script **`async`**, ideally after the `load` event, so a slow ad network never delays the article itself.
+
+The result: the browser's limited early bandwidth goes to the headline font and hero image first — the two things that visually define "the page has loaded" for this article — while everything the user doesn't need in the first second is deferred, lazy, or deprioritized.
+
+<Callout type="warning">
+  A common mistake is preloading everything that "seems important": the hero image, three fonts, the main JS bundle, the CSS, and an analytics script, all with `rel="preload"`. Preload is a priority *escalation*, not a magic accelerator — if everything is marked urgent, the browser has no real signal left to act on, and the actual LCP resource ends up competing with five other "high priority" fetches instead of winning outright. Preload the one or two resources that truly gate the first meaningful paint, and let everything else follow the browser's normal (already fairly good) heuristics.
+</Callout>
+
+<Quiz
+  lessonId="asset-loading-strategies"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A font is only referenced inside a CSS `@font-face` rule, and it turns out to be the font used in the page headline. Which resource hint gets the browser fetching it earlier?',
+      options: [
+        { id: 'a', text: 'preload', correct: true, explanation: 'preload tells the browser to fetch a specific resource immediately, before it would normally be discovered — exactly the case for a font hidden inside CSS that has not been parsed yet.' },
+        { id: 'b', text: 'prefetch', correct: false, explanation: 'prefetch runs at low priority for resources likely needed on a future navigation, not for something the current page needs right now.' },
+        { id: 'c', text: 'preconnect', correct: false, explanation: 'preconnect only opens the network connection to an origin; it does not fetch the font file itself.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements about `async` and `defer` script attributes are correct? (Select all that apply.)',
+      options: [
+        { id: 'a', text: '`defer` scripts execute in document order, after HTML parsing completes.', correct: true, explanation: 'Correct — defer preserves document order and waits until parsing is done before running.' },
+        { id: 'b', text: '`async` scripts can execute in a different order than they appear in the document.', correct: true, explanation: 'Correct — each async script runs as soon as it finishes downloading, so a later script that downloads faster can execute first.' },
+        { id: 'c', text: 'A plain `<script src="...">` with neither attribute does not block HTML parsing.', correct: false, explanation: 'Wrong — that is precisely the default, render-blocking behavior async and defer exist to avoid.' },
+        { id: 'd', text: '`async` is a safe choice for a script that must run after another script it depends on.', correct: false, explanation: 'Wrong — async scripts have no guaranteed order relative to each other, so a dependency between two async scripts is not safe; use defer in that case.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Preloading every asset on a page (fonts, hero image, main JS bundle, CSS, and analytics) generally makes the page load faster, since the browser fetches more resources up front.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False in practice: marking everything high priority removes the signal the browser needs to prioritize correctly, so the resources that truly gate first paint end up competing with resources that do not matter yet.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — preload should be reserved for the one or two resources that genuinely block the first meaningful paint; over-using it recreates the same contention it is meant to fix.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A single-page app currently ships one large JavaScript bundle containing both third-party libraries and application code. Every deploy invalidates the entire bundle for returning visitors. What is the most direct fix?',
+      options: [
+        { id: 'a', text: 'Split a stable vendor bundle from the frequently-changing app bundle.', correct: true, explanation: 'Correct — since third-party library code changes far less often than app code, splitting them lets the vendor chunk stay cached across most deploys while only the small app chunk needs redownloading.' },
+        { id: 'b', text: 'Minify the bundle more aggressively.', correct: false, explanation: 'Minification reduces size but does not address cache invalidation — any code change still busts the whole (still monolithic) bundle.' },
+        { id: 'c', text: 'Add `preload` for the bundle.', correct: false, explanation: 'Preload changes fetch priority, not what gets invalidated on redeploy — it does not solve the caching problem described.' },
+      ],
+    },
+  ]}
+/>

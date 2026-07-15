@@ -1,0 +1,169 @@
+---
+title: "DOM Manipulation"
+module: "Fundamentals"
+moduleOrder: 3
+order: 3
+track: "concept"
+summary: "Explains the cost of direct DOM manipulation and how frameworks batch updates to mitigate it."
+cheatsheet:
+  - "Reading layout properties (offsetHeight, getBoundingClientRect, scrollTop) forces the browser to run layout synchronously if styles were changed since the last layout — this is a 'forced synchronous layout.'"
+  - "Layout thrashing happens when you interleave reads and writes in a loop: write, read, write, read... each read forces a fresh layout pass before it can return a value."
+  - "Fix: batch all your reads first, then do all your writes — read every measurement you need, then apply every style change, so layout only runs once."
+  - "Build offscreen DOM with a DocumentFragment (or just build in JS/detached nodes), then append it once — this avoids N separate reflows for N appended children."
+  - "Frameworks like React don't manipulate the DOM per state change; they diff a virtual representation and batch the resulting real-DOM writes into one pass per commit."
+  - "Reconciliation exists to turn 'many small imperative DOM edits' into 'one minimal, batched set of edits' — same goal as manual read/write batching, done automatically."
+  - "Not every DOM write is equally expensive: changing `transform`/`opacity` skips layout and often paint (compositor-only), while changing `width`, `top`, or adding/removing elements triggers layout."
+tags: ["fundamentals", "dom"]
+estMinutes: 9
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Open the dev tools performance tab on almost any janky page and you'll find the same culprit: JavaScript that touches the DOM in a loop, one element at a time, reading a measurement and writing a style back and forth. Each of those touches looks cheap in isolation — it's "just" reading `offsetHeight` or setting `style.left`. But strung together across a few hundred nodes, they can cost tens of milliseconds of blocked main thread, which is exactly the kind of thing that shows up as a dropped frame in an interview follow-up question like "why is this list scroll janky?"
+
+This lesson builds directly on the rendering pipeline lesson (`the-browser-rendering-pipeline`): here we look at how *your code's access pattern* to the DOM — not just what it changes — determines how many times that pipeline has to run, and what frameworks do differently.
+
+## Why a single DOM write isn't "free"
+
+The DOM isn't a plain JavaScript object graph — it's a live tree that the browser keeps in sync with layout, paint, and compositing. When you write `element.style.width = '200px'`, the browser doesn't necessarily do anything synchronously. Most browsers mark the tree as "layout dirty" and defer the actual layout/paint work until the next frame, batching whatever else your script does in the meantime.
+
+That deferral is what makes DOM writes fast *when you don't ask for anything back*. The problem is reads. Certain properties and methods — `offsetWidth`, `offsetHeight`, `clientWidth`, `scrollTop`, `getBoundingClientRect()`, `getComputedStyle()` — can only return a correct answer if layout is up to date. If you call one of these after a write that dirtied the tree, the browser can't wait for the next frame; it has to run layout right now, synchronously, on the spot, just to answer your read. This is called a **forced synchronous layout** (sometimes "forced reflow").
+
+One forced layout is a minor cost. The expensive pattern is doing it repeatedly in a loop.
+
+## Layout thrashing: reads and writes interleaved
+
+"Layout thrashing" is what happens when a loop alternates writes and reads across many elements: write to element 1, read from element 2 (forces layout), write to element 2, read from element 3 (forces layout again), and so on. Every single iteration pays for a full layout pass, even though the browser could have batched all of that into one pass if the reads and writes weren't interleaved.
+
+### Before: thrashing
+
+```js
+// Resize N boxes to match a reference box's height, one at a time.
+const boxes = document.querySelectorAll('.box');
+const reference = document.querySelector('.reference');
+
+boxes.forEach((box) => {
+  const refHeight = reference.getBoundingClientRect().height; // READ (forces layout)
+  box.style.height = `${refHeight * 1.5}px`;                   // WRITE (dirties layout)
+});
+```
+
+This looks harmless — it's one read and one write per box. But because the write on iteration `n` dirties the layout, the read on iteration `n + 1` (even though it reads a *different* element) forces a fresh layout computation to satisfy it. With 500 boxes, that's roughly 500 forced layouts instead of one.
+
+### After: batched reads, then batched writes
+
+```js
+const boxes = document.querySelectorAll('.box');
+const reference = document.querySelector('.reference');
+
+// 1. Read everything first — layout runs once, up front.
+const refHeight = reference.getBoundingClientRect().height;
+
+// 2. Write everything second — no reads in between, so writes
+//    just dirty the tree and the browser batches them for the
+//    next frame instead of computing layout on every iteration.
+boxes.forEach((box) => {
+  box.style.height = `${refHeight * 1.5}px`;
+});
+```
+
+Same visual result, but now there's exactly one layout computation instead of hundreds. The fix isn't "do less work" — it's "don't interleave the kind of work that invalidates layout with the kind of work that depends on it."
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A["Loop over N elements"] --> B{"Read then write,\ninterleaved?"}
+  B -- "Yes: thrashing" --> C["Write dirties layout"]
+  C --> D["Next read forces\nsynchronous layout"]
+  D --> C
+  D --> E["N layouts for N elements"]
+  B -- "No: batched" --> F["Read all measurements first\n(one layout)"]
+  F --> G["Write all styles second\n(no reads in between)"]
+  G --> H["1 layout total"]
+`} />
+
+## Building nodes offscreen: DocumentFragment
+
+A second, related cost comes from *inserting* many nodes into a live document one at a time. Each `appendChild` on an element that's already attached to the visible tree can trigger the browser to recompute layout for the affected subtree — again, potentially once per node.
+
+A `DocumentFragment` is a lightweight container that isn't part of the rendered document. You build a subtree inside it — appending as many children as you like — with zero layout cost, because nothing in a fragment is on-screen yet. Only when you append the *fragment itself* to the live DOM does the browser do the layout/paint work, and it does it once, for the whole subtree at once.
+
+```js
+const list = document.querySelector('#results');
+const fragment = document.createDocumentFragment();
+
+items.forEach((item) => {
+  const li = document.createElement('li');
+  li.textContent = item.label;
+  fragment.appendChild(li); // no layout cost — fragment isn't rendered
+});
+
+list.appendChild(fragment); // one insertion, one layout pass
+```
+
+This is the insertion-side equivalent of "batch your writes": instead of 500 individual mutations to a live tree, you do the assembly work off to the side and commit it as a single mutation.
+
+## Why frameworks batch updates for you
+
+Manually batching reads/writes and using fragments works, but it requires the engineer to think about DOM access order on every feature. That's easy to get right in a 20-line script and easy to get wrong once ten different components each independently read and write the DOM in response to the same event.
+
+Reactive frameworks (React, Vue, Solid, and friends) solve this structurally rather than by convention. Instead of your code issuing DOM writes directly, you describe *what the UI should look like* given the current state, and the framework computes the difference between the previous description and the new one — this is reconciliation, often backed by a virtual DOM (a plain JS object tree that's cheap to create and diff, unlike the real DOM). The framework then applies the resulting minimal set of real DOM writes in one batched pass, after your event handlers and state updates finish running, rather than interleaved with them.
+
+This buys you two things at once: you stop writing imperative "read this, then write that" code by hand, and the framework's scheduler naturally avoids interleaving reads and writes because *it* controls when DOM writes happen (during a commit phase) versus when your component code runs (during render, which only touches the virtual representation, not the real DOM). That's the core reason reconciliation exists — it's not primarily about "diffing is clever," it's about decoupling *when you decide what changes* from *when the browser actually applies those changes*, so the apply step can always be a single batched pass.
+
+It's worth being precise here: a virtual DOM doesn't make an individual DOM write faster than doing it yourself, and it doesn't eliminate layout costs for changes that genuinely require layout (resizing an element still costs what it costs). What it buys you is consistently *batched, non-interleaved* writes without you having to reason about ordering by hand, plus skipping writes for parts of the tree that didn't actually change.
+
+<Callout type="warning">
+  A common mistake: measuring inside the same loop where you also mutate style, assuming it's fine because "it's just one property." Any layout-dependent read (`getBoundingClientRect`, `offsetHeight`, `scrollTop`, `getComputedStyle`) after a prior write in the same tick forces layout — it doesn't matter that the read and write target different elements. The fix is always the same shape: separate the measure phase from the mutate phase, don't interleave them, and if you're doing this repeatedly across a codebase, that's a signal to let a reconciliation-based framework own the DOM writes instead of hand-rolling it.
+</Callout>
+
+## Where this shows up in a system design interview
+
+If you're asked to design something like a virtualized list, a drag-and-drop board, or a live dashboard with frequent updates, "how do you avoid layout thrashing" is a natural deep-dive question. A strong answer names the specific pattern (batched reads before writes, `requestAnimationFrame` to align writes with the browser's paint cycle, fragments for bulk inserts) rather than a vague "we'd optimize it." It's also reasonable to say "in practice I'd reach for a framework's batching rather than hand-rolling this," as long as you can explain *why* that batching helps — which is what this lesson covered.
+
+<Quiz
+  lessonId="dom-manipulation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does calling `element.offsetHeight` right after a style write on a different element cause a performance problem?',
+      options: [
+        { id: 'a', text: 'It forces the browser to run layout synchronously to produce an accurate value, because a prior write left the tree dirty', correct: true, explanation: 'Layout-dependent reads must reflect the latest writes, so the browser computes layout on the spot instead of deferring it to the next frame.' },
+        { id: 'b', text: 'It triggers a full network request to re-fetch styles', correct: false, explanation: 'Layout is computed locally by the rendering engine; no network activity is involved.' },
+        { id: 'c', text: 'It permanently disables batching for the rest of the page lifetime', correct: false, explanation: 'Forced layout is a one-time cost for that read; it does not disable future batching opportunities.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are valid ways to avoid layout thrashing when updating many elements? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Read all needed measurements first, then apply all writes afterward', correct: true, explanation: 'This is the core fix: separating the measure phase from the mutate phase means layout only needs to run once.' },
+        { id: 'b', text: 'Build new nodes inside a DocumentFragment and append it once instead of appending each node individually', correct: true, explanation: 'A fragment is not part of the rendered tree, so building it costs no layout; only the final single append triggers layout work.' },
+        { id: 'c', text: 'Interleave each read immediately after its corresponding write to keep code readable', correct: false, explanation: 'This is exactly the thrashing pattern — each read forces a synchronous layout because it follows a write that dirtied the tree.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A virtual DOM makes each individual DOM write operation execute faster than writing to the real DOM directly.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A virtual DOM does not make individual writes faster; the real DOM write still costs what it costs. The benefit is batching and skipping unnecessary writes, not speeding up any single write.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. The value of a virtual DOM and reconciliation is computing a minimal, batched set of real writes applied in one pass — not making any one write itself cheaper.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A loop resizes 300 elements based on measuring a reference element\'s height on every iteration. What is the best fix?',
+      options: [
+        { id: 'a', text: 'Measure the reference height once before the loop, then only write inside the loop', correct: true, explanation: 'Since the measurement does not change between iterations, reading it once and reusing the value avoids 299 unnecessary forced layouts.' },
+        { id: 'b', text: 'Wrap each iteration in its own `setTimeout` to spread the work across more frames', correct: false, explanation: 'This spreads the same total forced-layout cost across more frames rather than eliminating it, and adds scheduling overhead and visible staggering.' },
+        { id: 'c', text: 'Replace `querySelectorAll` with `getElementsByClassName`', correct: false, explanation: 'The choice of selector API does not affect layout thrashing; the problem is the interleaved read/write pattern inside the loop, not how elements were selected.' },
+      ],
+    },
+  ]}
+/>

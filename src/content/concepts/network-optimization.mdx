@@ -1,0 +1,155 @@
+---
+title: "Network Optimization"
+module: "Performance & Optimization"
+moduleOrder: 4
+order: 9
+track: "concept"
+summary: "Covers network-layer optimizations and designing for flaky or slow connections."
+cheatsheet:
+  - "HTTP/2 multiplexes many requests over one TCP connection, which removes the old 6-connections-per-origin ceiling — domain sharding to work around that limit is now actively harmful."
+  - "HTTP/3 runs over QUIC (UDP), so one dropped packet only blocks the stream it belongs to, not every in-flight request like a lost TCP packet does under HTTP/2 (head-of-line blocking)."
+  - "Brotli beats gzip by roughly 15-20% on text assets at similar CPU cost — serve pre-compressed .br files with a gzip fallback via Content-Encoding negotiation."
+  - "Reducing request count still matters even on HTTP/2: each request carries its own compressed-header overhead and competes for a shared, often-constrained bandwidth budget."
+  - "Retry idempotent GETs with exponential backoff plus jitter; never blindly retry a POST without a dedup key, or a flaky network turns into duplicate side effects."
+  - "Optimistic UI updates local state immediately and reconciles on server response — pick it for actions with a very low realistic failure rate, and always design the rollback path first."
+  - "Design for the median device on a real network (mid-tier Android on throttled 4G), not your dev machine on fiber — the network is a design input, not an afterthought to patch later."
+tags: ["performance", "networking"]
+estMinutes: 10
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every other lesson in this module has assumed the browser eventually gets the bytes it asked for. In the real world that assumption is shaky: a user on a train drops to 2G, a coffee-shop Wi-Fi hairpins through three hops of latency, a mobile carrier throttles a data plan mid-video-call. Frontend system design interviews increasingly test whether you treat the network as a first-class design constraint rather than an implementation detail you'll "optimize later." This lesson covers the protocol-level levers (HTTP/2, HTTP/3, compression, connection reuse), the payload-level levers (fewer, smaller requests), and — the part candidates skip most — how to design a UI that stays usable when the network misbehaves.
+
+## Protocol-level wins: HTTP/2 and HTTP/3
+
+HTTP/1.1 opens a new TCP connection per request (browsers cap it around 6 per origin) and serializes requests on each one — a slow response at the front of the queue blocks everything behind it. Two protocol generations fixed different parts of that problem.
+
+**HTTP/2** multiplexes many requests and responses over a single TCP connection using interleaved frames, so the browser no longer needs 6 parallel connections per origin to get concurrency. It also adds **HPACK header compression**: since most headers (cookies, user-agent, accept-encoding) repeat on every request, HTTP/2 keeps a shared compression table and sends only the diff, shrinking overhead that used to be paid in full on every request.
+
+The catch: HTTP/2 still rides on one TCP connection, and TCP guarantees in-order delivery. If one packet is lost, TCP holds *every* stream's data until it's retransmitted — one flaky packet stalls requests that have nothing to do with it. This is **TCP head-of-line blocking**, and HTTP/2 doesn't solve it.
+
+**HTTP/3** replaces TCP with **QUIC**, a transport built on UDP with its own reliability and multiplexing. QUIC tracks each stream independently, so a lost packet stalls only its own stream — the rest of the page keeps loading. QUIC also folds the TCP and TLS handshakes into one round trip (versus two separate round trips for HTTP/2 over TLS), which matters most on high-latency connections: a mobile user on a weak signal saves a full round trip before the first byte even arrives.
+
+For frontend design purposes, the takeaway isn't "implement QUIC" — that's an infra decision — it's knowing *why* a flaky, high-latency mobile network benefits disproportionately from HTTP/3, so you can name it when asked how you'd serve an app to users on unreliable connections.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph H1["HTTP/1.1"]
+      A1[Connection 1] --> R1[Request/Response]
+      A2[Connection 2] --> R2[Request/Response]
+      A3["...up to 6 connections"] --> R3[Request/Response]
+    end
+    subgraph H2["HTTP/2 over TCP"]
+      B1[One TCP connection] --> B2["Multiplexed streams"]
+      B2 -.->|"one lost packet stalls all streams"| B3[Head-of-line blocking]
+    end
+    subgraph H3["HTTP/3 over QUIC"]
+      C1[One QUIC connection] --> C2["Independent streams"]
+      C2 -->|"lost packet stalls only its own stream"| C3[Other streams unaffected]
+    end
+`} />
+
+## Connection reuse and compression
+
+Two lower-effort wins sit underneath the protocol choice:
+
+- **Keep-alive / connection reuse**: opening a TCP connection costs a round trip, and TLS adds one or two more. Reusing an already-open connection for later requests to the same origin skips that cost entirely. This is why consolidating third-party requests onto fewer origins (or self-hosting fonts/analytics scripts) beats scattering requests across many origins — each distinct origin is a fresh connection to pay for.
+- **Text compression**: gzip and Brotli both shrink JS, CSS, HTML, and JSON substantially before they hit the wire — often 60-80% smaller for typical JS bundles. Brotli, at a comparable level, typically produces 15-20% smaller output than gzip because its dictionary is tuned for web content, at similar CPU cost to decompress. The common setup: pre-compress build output to both `.gz` and `.br` at build time, and let the server pick based on the client's `Accept-Encoding` header.
+
+Compression and connection reuse are "turn it on and get it for free" wins — table stakes, not something worth much interview time beyond mentioning them.
+
+## Reducing request count and payload size
+
+Even with HTTP/2's multiplexing removing the *connection* bottleneck, each request still costs something: headers still have a floor size, and multiplexed streams share one bandwidth budget and one congestion-control window — a hundred small requests don't download in parallel at full speed just because they're multiplexed. So the request-count and payload-size levers from this module still pay off under HTTP/2:
+
+- **Bundle related small requests.** A page firing 40 individual icon requests still pays 40x the per-request overhead versus one sprite sheet or inlined SVG set, even sharing a connection.
+- **Trim the payload, not just the request count.** Tree-shaking unused code, shipping only the locale/date library you need instead of the whole package, and paginating an API response instead of returning 500 rows when 20 are visible — all reduce bytes on the wire, which matters more than request count on a bandwidth-constrained mobile connection.
+- **Prefer fewer round trips over fewer bytes when latency dominates.** On a high-latency, decent-bandwidth connection (satellite, some mobile networks), one request for a slightly larger payload can beat two small sequential requests, since each round trip costs 100-300ms regardless of payload size — the same reasoning behind favoring a single composed response over a chain of dependent calls, as covered in [code splitting](/concepts/code-splitting)'s discussion of request waterfalls.
+
+## Designing for flaky or slow networks
+
+Protocol and payload optimizations reduce how often the network is the bottleneck. They don't eliminate the case where a request is slow, or fails outright, and the UI has to do something sensible.
+
+### Retry with backoff
+
+A naive retry-immediately-on-failure loop can turn one struggling client into a thundering herd against a recovering backend, and can create duplicate side effects if the original request actually succeeded but the response was lost. The standard pattern:
+
+- Retry only **idempotent** requests automatically (`GET`, and `PUT`/`DELETE` if your API guarantees idempotency). For a `POST` that creates a resource, either avoid auto-retry or send a client-generated idempotency key so a duplicate request is a no-op server-side.
+- Use **exponential backoff** (wait 1s, then 2s, then 4s...) so retries space themselves out instead of hammering a struggling endpoint.
+- Add **jitter** (a small random offset to each wait) so many clients that failed at the same moment don't all retry in lockstep and re-create the exact spike that caused the failure.
+- Cap the number of retries and surface a clear failure state — a UI that retries silently forever with no user feedback is worse than one that fails fast and offers a manual "try again."
+
+### Optimistic UI
+
+For actions with a low realistic failure rate — liking a post, checking off a to-do, sending a chat message — updating the UI immediately and reconciling with the server response afterward makes the app feel instantaneous regardless of network latency. The obligation that comes with it: you must have a rollback path. If the request fails, the UI needs to revert the optimistic change and say why, not silently leave a lie on screen. "Optimistic UI" without "here's how I roll it back on failure" is an incomplete interview answer.
+
+### Offline-first patterns
+
+For apps that need to function with no connection at all, the design shifts from "network first, cache as backup" to "local store first, network as sync." Reads come from a local cache (IndexedDB, or a service-worker cache — see [caching strategies](/concepts/caching-strategies)) and writes go into a local queue that syncs when connectivity returns. This is a bigger commitment than retry/backoff — it usually means a conflict-resolution strategy (last-write-wins, operational transforms, CRDTs) for anything a user can edit while offline, since two offline edits to the same record can't both simply "win."
+
+## Worked example: a form submission on a spotty connection
+
+Say you're designing a comment-submission flow for a mobile-first feed app, and the target audience regularly drops to a weak 3G signal.
+
+1. **Submit tap**: show the comment optimistically in the feed immediately (optimistic UI), tagged with a local "sending" indicator.
+2. **Request sent** with a client-generated `idempotencyKey` (a UUID created at submit time), so if the network stalls and the client retries, the server can recognize and dedupe the second attempt instead of creating two comments.
+3. **On timeout** (say, no response after 5s): retry once with a 2s backoff plus jitter, still using the same idempotency key.
+4. **On confirmed success**: swap the "sending" indicator for a delivered state, using the server's authoritative comment ID/timestamp.
+5. **On confirmed failure** (after retries exhausted): roll back the optimistic entry to a "failed to send — tap to retry" state, so the user isn't left staring at a comment that silently vanished or, worse, one that looks sent but never made it.
+
+Every piece of that flow — the retry policy, the idempotency key, the optimistic rollback — is a direct consequence of designing for a flaky connection instead of assuming a clean happy path.
+
+<Callout type="warning">
+  A common mistake: treating "add a spinner" as the whole answer to network resilience. A spinner communicates that something is happening; it does nothing about duplicate submissions from an unguarded retry, a stuck request that never resolves and never times out, or a UI that offers no path forward when the request genuinely fails. If you mention retries in an interview, also mention idempotency and a retry cap — otherwise the interviewer will (correctly) ask what happens when the retry itself fails or duplicates.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="network-optimization"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does HTTP/3 (over QUIC) handle a lost packet better than HTTP/2 (over TCP) when multiple requests are multiplexed on one connection?',
+      options: [
+        { id: 'a', text: 'QUIC compresses headers more aggressively than HPACK', correct: false, explanation: 'Header compression (HPACK vs QUIC/QPACK) is a separate concern from packet loss handling — both compress headers, but that is not why QUIC tolerates loss better.' },
+        { id: 'b', text: 'QUIC tracks each stream independently, so a lost packet only stalls the stream it belongs to', correct: true, explanation: 'This is the key difference: TCP guarantees in-order delivery for the whole connection, so one lost packet blocks every multiplexed stream until it is retransmitted. QUIC multiplexes at the transport layer with independent per-stream delivery, so loss on one stream does not stall the others.' },
+        { id: 'c', text: 'QUIC opens a separate connection per request, avoiding shared state entirely', correct: false, explanation: 'The opposite is true — QUIC, like HTTP/2, multiplexes many requests over a single connection. It just does so without TCP’s connection-wide ordering guarantee.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are still worth doing to reduce request count/payload size even on a page served over HTTP/2? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Bundling many small icon requests into a single sprite sheet or inlined SVG set', correct: true, explanation: 'Multiplexing removes the connection-count limit, but each request still carries its own overhead and the streams share one bandwidth budget, so cutting request count still helps.' },
+        { id: 'b', text: 'Tree-shaking unused code out of a JS bundle', correct: true, explanation: 'Fewer bytes on the wire matters regardless of protocol, especially on bandwidth-constrained mobile connections — HTTP/2 does not change how many bytes a bundle contains.' },
+        { id: 'c', text: 'Splitting every request across as many different domains as possible to maximize parallel connections', correct: false, explanation: 'That is the old HTTP/1.1-era domain-sharding trick to work around the 6-connections-per-origin cap. Under HTTP/2, it actively hurts, since each new origin means a fresh connection (and often a fresh TLS handshake) instead of reusing one multiplexed connection.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'It is safe to automatically retry a failed POST request that creates a new resource, the same way you would retry a failed GET, as long as you use exponential backoff.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Backoff controls timing, not duplication. If the original POST actually succeeded server-side but the client never saw the response (e.g. the response was lost), a blind retry creates a second resource. You need an idempotency key (or to avoid auto-retrying non-idempotent requests) to make this safe.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Automatic retries are safe for idempotent requests (GET, or PUT/DELETE with idempotent semantics) by default. A POST that creates a resource needs an explicit idempotency key so the server can recognize and dedupe a retried attempt, or it should not be auto-retried at all.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A "like" button updates the UI instantly on tap, before the server confirms the like was recorded. What is the essential design requirement this pattern imposes?',
+      options: [
+        { id: 'a', text: 'The app must switch to WebSockets instead of HTTP requests', correct: false, explanation: 'Optimistic UI is a client-side rendering pattern, independent of transport. It works fine over plain HTTP requests; the transport choice is unrelated.' },
+        { id: 'b', text: 'A rollback path that reverts the optimistic change and informs the user if the server request ultimately fails', correct: true, explanation: 'Optimistic UI trades "wait for confirmation" for "assume success and show it immediately" — that trade only holds up if there is a defined way to undo the assumption and surface the failure when the server disagrees.' },
+        { id: 'c', text: 'The request must be retried indefinitely until it succeeds', correct: false, explanation: 'Retrying forever with no cap and no user-visible failure state is an anti-pattern on its own (see the pitfalls callout), and it does not substitute for having a rollback path when the action genuinely cannot succeed.' },
+      ],
+    },
+  ]}
+/>

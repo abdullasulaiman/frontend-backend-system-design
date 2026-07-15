@@ -1,0 +1,167 @@
+---
+title: "Ride-Hailing App: High-Level Architecture"
+module: "Case Study: Ride-Hailing App"
+moduleOrder: 4
+order: 2
+track: "interview"
+summary: "Presents an architecture built around a live-location pipeline and a trip-state machine."
+cheatsheet:
+  - "Split the screen into four concerns: the map layer, the live-location pipeline, the trip-state machine, and the trip/fare API layer — each should be swappable without touching the others."
+  - "Treat the map SDK as a boundary, not a UI library: wrap it in a MapView adapter so imperative marker/camera calls never leak into your React (or equivalent) component tree."
+  - "Drive every screen off a single trip-state machine (requesting to matched to en_route_pickup to in_progress to completed to cancelled) — never let component-local booleans decide what's on screen."
+  - "Location updates and trip-state transitions are two separate streams that both mutate the same map/UI — keep them as distinct inputs into one render, not entangled in one handler."
+  - "Prefer a persistent connection (WebSocket or SSE) over polling for location once a trip is active — polling adds latency and battery cost that a live product can't tolerate during matching and en-route phases."
+  - "Fare and trip-summary data (mostly static once fetched) belongs in ordinary request/response API calls; only position data needs a streaming channel — don't stream everything just because one thing needs to stream."
+tags: ["case-study", "ride-hailing", "architecture"]
+estMinutes: 13
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Once you've scoped a ride-hailing interview question (see `ride-hailing-requirements-and-scope`), the interviewer wants to see you turn "there's a map and it updates live" into an actual system. A ride-hailing screen is really three things stacked on top of each other — a map that a third-party SDK owns and renders, a stream of position updates arriving on its own schedule, and a trip that moves through a strict sequence of states, each of which changes what the map, the buttons, and the bottom sheet all show. Get the boundaries between these three wrong and you end up with a component that re-renders the whole map on every location tick and can't answer "what happens if we reconnect mid-trip." This lesson lays out the architecture that keeps those concerns separate.
+
+## The four building blocks
+
+At a high level, a ride-hailing frontend decomposes into four pieces, each with one job:
+
+1. **Map rendering layer** — wraps a third-party map SDK (Google Maps, Mapbox, or similar) and exposes a small, declarative surface to the rest of the app: "show these markers," "draw this route," "center on this point." It owns none of the app's business logic.
+2. **Live-location pipeline** — the connection (streaming or polled) that receives driver/rider position updates and feeds them to the map layer and to any ETA calculation.
+3. **Trip-state machine** — the single source of truth for where a trip currently is (`requesting`, `matched`, `en_route_pickup`, `in_progress`, `completed`, `cancelled`) and what UI is valid in each state.
+4. **API layer** — ordinary request/response calls for everything that isn't a live position: requesting a trip, fetching a fare estimate, fetching driver/trip details, submitting a rating.
+
+The trip-state machine is the piece that ties the other three together — it's what decides "the map should currently be showing a route to the pickup pin" versus "the map should be showing a route to the destination," and it's what an interviewer is really probing when they ask you to "design the ride-hailing app."
+
+## The map rendering layer: treat the SDK as a boundary
+
+Every real ride-hailing app embeds a third-party map SDK rather than building map rendering from scratch — but that SDK is imperative (`marker.setPosition(...)`, `map.panTo(...)`) while the rest of your app is almost certainly declarative (React, Vue, or similar). Let SDK calls scatter across your components and you end up with rendering logic split across two paradigms and no single place to reason about "what does the map look like right now."
+
+The fix is a thin `MapView` adapter component that owns the SDK instance and translates props into imperative calls internally:
+
+- It accepts declarative props — `driverPosition`, `routePolyline`, `pickupPin`, `destinationPin` — and diffs them against the SDK's current state, issuing only the imperative calls needed (move this marker, redraw this polyline) rather than tearing down and rebuilding the whole map on every update.
+- It isolates SDK-specific quirks: tile-request rate limits, bundle size and lazy-load timing, coordinate system differences, and how it handles a dropped API key or network failure (most SDKs fail by rendering a blank gray tile grid, which you want to detect and show a fallback for).
+- It's the seam you'd swap at if the business ever needed to change map providers — everything above `MapView` only knows about positions and pins, never the specific SDK's API.
+
+A common mistake is treating the map as "just a div with a library in it" and letting every consumer call SDK methods directly — that couples your app to one vendor's API and turns every update into a full internal re-render instead of a targeted marker move.
+
+## The live-location pipeline
+
+Location data has different requirements depending on trip state. Before a trip starts, you mostly care about *the rider's own* position (to center the map and request a ride from). Once a trip is `matched` or later, you care about the *driver's* live position relative to the rider, and that needs to feel closely tied to reality — a driver icon that jumps or lags noticeably breaks trust in the ETA the app just promised.
+
+Two designs are on the table, and the interview-worthy answer is picking the right one per phase rather than defaulting to one for everything:
+
+- **Periodic polling** (e.g., a REST call every few seconds) is simple to build and reason about, and it's fine for low-frequency needs — checking on a scheduled trip an hour out. Its downsides are latency (always up to several seconds stale) and wasted requests when nothing has changed.
+- **A persistent connection** (WebSocket or Server-Sent Events) lets the server push a position the instant it changes, which is what an active, en-route trip needs — riders are watching that dot move in real time, and every extra second of staleness is visible.
+
+State it plainly in an interview: open the streaming connection when a trip becomes active (`matched` onward) and close it once the trip reaches `completed` or `cancelled` — don't hold a live socket open for the app's entire lifetime, and don't fall back to naive polling once a trip is live. The deep-dives lesson covers smoothing and interpolating these updates so the driver marker doesn't visibly "jump" between messages; this lesson is about where that stream sits architecturally.
+
+Wherever the updates come from, they flow into the same place: a small location store (current driver position, current rider position, last-updated timestamp) that both `MapView` and any ETA display read from. Neither the map nor the state machine talks to the socket/poll directly — they read the store, which is the only thing that knows how positions actually arrive.
+
+## The trip-state machine
+
+A ride's lifecycle is a strict, mostly linear sequence, and modeling it explicitly (rather than as independent booleans like `isMatched`, `isPickedUp`, `isDone`) is the single highest-leverage decision in this design. With independent flags, invalid combinations become representable (`isMatched: false, isPickedUp: true` should never happen, but nothing stops it) and every screen must defensively check several flags to know what to render. With one state variable, only valid states exist, and each screen just asks "which state are we in."
+
+The core states for a rider-facing screen:
+
+- **`requesting`** — rider has submitted a trip request; app waits for a driver match. Map shows the rider's location and a searching indicator.
+- **`matched`** — a driver has accepted; map shows the driver's live position and route to the pickup point, plus an ETA.
+- **`en_route_pickup`** — driver is actively moving toward the rider (sometimes merged with `matched`, but separating them lets you show "driver assigned" versus "driver moving").
+- **`in_progress`** — rider has been picked up; map shows the route to the destination, and fare accrues for trips metered by distance/time.
+- **`completed`** — trip has ended; screen shows a fare summary and rating prompt.
+- **`cancelled`** — reachable from several earlier states; terminal, like `completed`.
+
+<Mermaid client:visible chart={`
+stateDiagram-v2
+    [*] --> requesting
+    requesting --> matched: driver accepts
+    requesting --> cancelled: rider cancels
+    matched --> en_route_pickup: driver starts moving
+    matched --> cancelled: rider or driver cancels
+    en_route_pickup --> in_progress: driver arrives, rider picked up
+    en_route_pickup --> cancelled: rider or driver cancels
+    in_progress --> completed: destination reached
+    completed --> [*]
+    cancelled --> [*]
+`} />
+
+Each state maps to exactly one map configuration and one set of visible controls, which is what makes this a *UI-driving* state machine rather than just a data model: `TripScreen` reads the current state and renders a lookup — `matched` renders `<MapView route={toPickup} /> <DriverCard/>`, `in_progress` renders `<MapView route={toDestination} /> <FareMeter/>`, and so on. Transitions are triggered by events arriving over the API layer or the live-location pipeline (a driver-accepted push, a "picked up" signal, a "trip ended" signal) — the state machine reacts to events, it doesn't poll for its own transitions.
+
+## The API layer: trip and fare data
+
+Everything that isn't a live position is an ordinary request/response concern, and keeping it that way (rather than shoving it onto the streaming channel "since we already have a socket open") keeps the two concerns clean:
+
+- **Requesting a trip** — `POST /trips` with pickup/destination, returns a trip ID and initial state (`requesting`).
+- **Fare estimate** — `GET /fare-estimate` given pickup/destination/ride type, called before the rider confirms and again if they change ride type. A plain fetch-and-cache; the estimate doesn't need to be live.
+- **Trip details** — `GET /trips/:id` for the current state snapshot on load or reconnect, so resuming a trip after the app was killed and reopened doesn't depend purely on a stream that may have missed messages while you were gone.
+- **Trip completion / fare finalization** — once `in_progress` transitions to `completed`, a final `GET`/`POST` fetches the actual fare, which can differ from the estimate due to route changes, waiting time, or surge.
+
+This trip-details fetch is the piece interviewers listen for: without a way to fetch "what state is this trip in right now" independent of the stream, a dropped connection or an app restart mid-trip has no way to recover except waiting for another push that may never come.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    LOC[Location source<br/>WebSocket / poll] -->|driver position| STORE[Location store]
+    STORE --> MAP[MapView]
+    SM[Trip-state machine] -->|current state| SCREEN[TripScreen]
+    SCREEN -->|route + pins for this state| MAP
+    API[API layer] -->|trip/fare data| SM
+    API -->|trip/fare data| SCREEN
+`} />
+
+## Worked example: a trip through every layer
+
+Trace a single ride end to end. The rider taps "request ride"; the API layer sends `POST /trips`, the response sets the state machine to `requesting`, and `TripScreen` renders a searching spinner over `MapView` centered on the rider. A driver accepts; a push (or poll response) moves the state to `matched`, and at that moment the live-location pipeline opens a WebSocket for this trip's driver. Position updates arrive every second or two into the location store; `MapView` reads the store and moves the driver marker, while `TripScreen`, still in `matched`, keeps showing the route-to-pickup and an ETA computed from the current position.
+
+The driver arrives and taps "start trip"; that event flips the state to `in_progress`. `TripScreen`'s state-lookup swaps the rendered route from "to pickup" to "to destination" and shows a live fare meter instead of an ETA countdown — same `MapView`, same location store, different props because the state changed. When the destination is reached, the state moves to `completed`, the socket closes, and one final API call fetches the finalized fare for the summary screen.
+
+<Callout type="warning">
+  A common mistake: letting the map component itself hold trip state (e.g., a `showRouteToDestination` boolean set directly by a location-update handler). This scatters trip logic across the map layer and the data layer, and it's exactly how you end up with bugs like "the map still shows the pickup route after the driver picked up the rider, because the location handler forgot to flip that flag on this particular update." Keep `MapView` a dumb renderer of whatever route/pins it's told to show, and make the trip-state machine the only thing that decides which route that is.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="ride-hailing-high-level-architecture"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why wrap the third-party map SDK in a MapView adapter instead of calling SDK methods directly from multiple components?',
+      options: [
+        { id: 'a', text: 'It isolates the SDK\'s imperative API and SDK-specific quirks behind one declarative surface, so a provider swap or SDK failure only affects one place', correct: true, explanation: 'Correct — that is the whole point of the boundary: components only ever pass positions/pins as props, never touch the SDK directly.' },
+        { id: 'b', text: 'It makes the map SDK load faster over the network', correct: false, explanation: 'Wrapping a component does not change network loading behavior on its own; lazy-loading the SDK bundle is a separate technique you could apply either way.' },
+        { id: 'c', text: 'Map SDKs require being wrapped in a single component to function at all', correct: false, explanation: 'No such technical requirement exists — most SDKs can be called from anywhere. The wrapper is a design choice for maintainability, not a constraint imposed by the SDK.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'mcq',
+      prompt: 'Which of these should open only once a trip becomes active (matched or later), rather than being held open for the whole app session?',
+      options: [
+        { id: 'a', text: 'The live-location WebSocket/streaming connection for the driver\'s position', correct: true, explanation: 'Correct — streaming position data is only needed while a trip is active; holding it open the whole session wastes battery and server connections for no benefit.' },
+        { id: 'b', text: 'The GET /fare-estimate API call', correct: false, explanation: 'Fare estimates are a plain request/response call made before a trip is confirmed and again if inputs change; they are not a persistent connection at all.' },
+        { id: 'c', text: 'A persistent socket dedicated to fetching the rider\'s own initial map-centering position before requesting a ride', correct: false, explanation: 'Getting the rider\'s own device location is a local geolocation API concern, not a server-pushed stream, and does not need a persistent connection.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Modeling trip status as several independent boolean flags (isMatched, isPickedUp, isCompleted) is generally a safer choice than a single trip-state variable, because each flag can be updated independently.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'It is the opposite: independent booleans allow invalid combinations to exist in memory (e.g., isPickedUp true while isMatched false) and force every screen to defensively check multiple flags. A single state machine makes invalid states unrepresentable.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. A single trip-state variable with well-defined transitions is the safer, more maintainable model — exactly why the trip-state machine is the architecture\'s centerpiece.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why does the architecture keep an ordinary GET /trips/:id endpoint alongside the live-location stream?',
+      options: [
+        { id: 'a', text: 'To let the app fetch the current trip state snapshot on load or reconnect, independent of whatever the stream may have missed', correct: true, explanation: 'Correct — if the app was killed or the connection dropped mid-trip, this endpoint is how the client recovers the current state without depending on a stream message that may never arrive.' },
+        { id: 'b', text: 'Because WebSockets cannot carry trip-state data, only position data', correct: false, explanation: 'WebSockets can carry any data, including trip-state changes; the separation here is a design choice for recoverability, not a technical limitation of the protocol.' },
+        { id: 'c', text: 'To reduce the number of markers rendered on the map', correct: false, explanation: 'This endpoint is about recovering trip state, not about map rendering or marker count.' },
+      ],
+    },
+  ]}
+/>

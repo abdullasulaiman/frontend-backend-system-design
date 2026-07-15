@@ -1,0 +1,236 @@
+---
+title: "CSS Layout & Positioning"
+module: "Fundamentals"
+moduleOrder: 3
+order: 2
+track: "concept"
+summary: "Covers the core CSS layout models and positioning schemes relevant to system-design trade-offs."
+cheatsheet:
+  - "Normal flow (block/inline) is the cheapest layout mode — nothing to opt into, and browsers optimize it heavily."
+  - "Flexbox is for one-dimensional distribution (a row or a column) with alignment and flexible sizing; grid is for two-dimensional layout where rows and columns both need explicit control."
+  - "`position: fixed` and `sticky` (while stuck) are removed from normal flow and composited against the viewport/scroller, so they don't trigger reflow of the rest of the page on scroll."
+  - "`top`/`left`/`width`/`height` changes trigger layout even on absolutely positioned elements — prefer `transform: translate()` for movement you animate."
+  - "Animating `transform` and `opacity` can skip layout and paint entirely and run on the compositor thread; animating `width`, `top`, or `margin` forces layout on every frame."
+  - "A flex or grid container with many children becomes a single reflow boundary — resizing it recomputes the whole subtree, so keep hot animation loops out of large flex/grid containers."
+  - "Sticky positioning is scoped to the nearest scrolling ancestor — a sticky child inside a container with `overflow: hidden`/`auto` won't stick to the page, only to that container."
+tags: ["fundamentals", "css"]
+estMinutes: 10
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You already know how to write `display: flex` and `position: absolute`. What
+matters for system design isn't the syntax — it's knowing which layout
+decisions are cheap and which ones you'll pay for on every frame. A sticky
+header, a virtualized list, a drag-and-drop board, and an infinite feed all
+live or die on whether the layout model you picked forces the browser to
+recompute geometry constantly or lets it composite changes for nearly free.
+This lesson connects the layout models you already use — normal flow,
+flexbox, grid, and positioning — to the rendering pipeline from the previous
+lesson (see the-browser-rendering-pipeline), so you can reason about reflow
+cost when a design has options.
+
+## Normal flow: the default, and the cheapest
+
+Without any layout property set, every element renders in normal flow:
+block-level elements (`div`, `p`, `section`) stack vertically, and
+inline-level elements (`span`, `a`, text) flow horizontally and wrap. This is
+the browser's native layout algorithm, and it's the one browsers have
+optimized the longest and hardest. If a design is just "stack these things
+vertically with some spacing," reaching for flexbox or grid adds container
+overhead and a slightly more expensive layout pass for no visual benefit.
+Normal flow should be your default; layout models are for when flow alone
+can't express what you need — alignment across a row, equal-height columns,
+or content that needs to occupy a precise 2D grid cell.
+
+## Flexbox: one-dimensional distribution
+
+Flexbox lays out children along a single axis (row or column) and is built
+for distributing space and aligning items along that axis. It shines at:
+
+- A navbar with a logo on the left, links in the middle, and a button on
+  the right (`justify-content: space-between`).
+- A card whose footer should stick to the bottom regardless of how much
+  text is above it (`flex-direction: column`, footer pushed with `margin-top:
+  auto`).
+- A row of chips or tags that should wrap onto multiple lines as space runs
+  out (`flex-wrap: wrap`).
+
+Flexbox's sizing model (`flex-grow`/`flex-shrink`/`flex-basis`) is what makes
+it good at "distribute the remaining space among these items proportionally"
+— something normal flow can't do without extra markup and grid can only do
+along one axis at a time.
+
+## Grid: two-dimensional layout
+
+Grid lays out children against both rows and columns simultaneously, with
+named or sized tracks you control explicitly. Reach for it when the layout
+genuinely has two independent axes to control:
+
+- A dashboard with a sidebar, header, and main content area, defined once
+  with `grid-template-areas` instead of nested flex containers.
+- A photo gallery or product grid where items need to align into consistent
+  rows and columns regardless of content length (`grid-template-columns:
+  repeat(auto-fill, minmax(200px, 1fr))`).
+- A form where labels in one column must align with inputs in another,
+  across many rows.
+
+The rule of thumb: if you find yourself nesting flex containers inside flex
+containers to control both horizontal and vertical alignment at once, that's
+usually a sign the layout wants grid instead. Conversely, don't reach for
+grid to center one item in a box — that's a single flex container away.
+
+## Positioning schemes
+
+`position` changes where an element sits relative to normal flow, and each
+value has a different cost profile:
+
+- **`static`** (default) — the element sits in normal flow. No special
+  behavior.
+- **`relative`** — stays in normal flow (it still occupies its original
+  space) but can be visually offset with `top`/`left`/etc. Also establishes
+  a positioning context for absolutely-positioned descendants.
+- **`absolute`** — removed from normal flow entirely and positioned against
+  the nearest ancestor with a non-static position (or the initial
+  containing block if none exists). Nothing else in flow shifts to
+  accommodate it.
+- **`fixed`** — removed from flow and positioned against the viewport,
+  ignoring scroll. Used for things like a persistent "back to top" button.
+- **`sticky`** — behaves like `relative` until the scroll position crosses a
+  threshold (e.g. `top: 0`), then behaves like `fixed` *within its nearest
+  scrolling ancestor* until that ancestor's bounds run out.
+
+Because `absolute` and `fixed` elements are pulled out of flow, changing
+their position doesn't force the rest of the page to reflow — only the
+element itself needs a layout pass, and often just a repaint/composite if
+you move it via `transform` rather than `top`/`left`.
+
+## How layout choices hit the rendering pipeline
+
+This is the part that actually matters for system design conversations.
+Every CSS change falls into one of three buckets:
+
+1. **Layout-triggering** — changes to width, height, margin, `top`/`left`
+   on a non-transform move, font size, or adding/removing DOM nodes.
+   The browser must recompute geometry for the changed element and
+   potentially its ancestors and siblings.
+2. **Paint-only** — changes to color, background, box-shadow, visibility.
+   Geometry stays the same, but the browser has to re-rasterize pixels.
+3. **Compositor-only** — changes to `transform` and `opacity` on an element
+   promoted to its own compositor layer. The GPU can reposition or fade a
+   pre-rasterized layer with no layout or paint work at all.
+
+Flexbox and grid don't change this classification — a flex container is
+still just an element whose children get laid out. What changes is *scope*:
+a flex or grid container is a single layout unit, so resizing one child (or
+the container) typically forces recomputation of every sibling's position
+inside it, not just that child. A 50-item flex row that wraps means adding
+item 51 can shift the position of items 1 through 50. Absolute/fixed
+elements avoid this because they're taken out of the flow calculation
+entirely — moving one never repositions siblings.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    A[CSS change] --> B{What changed?}
+    B -->|width, height, top/left, font-size, DOM add/remove| C[Layout: recompute geometry]
+    B -->|color, background, box-shadow| D[Paint: re-rasterize pixels]
+    B -->|transform, opacity on own layer| E[Composite only: GPU repositions layer]
+    C --> D
+    D --> E
+    E --> F[Pixels on screen]
+`} />
+
+## Worked example: an animated sticky sidebar filter panel
+
+Say you're building a filter sidebar that stays visible while the user
+scrolls a long results list, and slides open/closed on a toggle.
+
+**Sticking it:** `position: sticky; top: 0` on the sidebar, inside a
+container whose height exceeds the viewport. No JavaScript scroll listener
+needed, and since sticky is handled by the compositor once "stuck," scrolling
+past it doesn't force a reflow on every scroll tick the way a
+`position: fixed` toggled by a scroll-position JS check would.
+
+**Opening/closing it:** you have two implementation choices with very
+different cost:
+
+- Animate `width` from `0` to `280px`. Every frame of the animation forces a
+  full layout recompute of the sidebar and reflows the main content next to
+  it, because the content's available width is genuinely changing every
+  frame. On a low-end device this can visibly drop frames.
+- Keep the sidebar at a fixed `280px` width and animate
+  `transform: translateX(-280px)` to `translateX(0)`, with the content area
+  laid out once via grid (`grid-template-columns: 280px 1fr`) so it doesn't
+  need to reflow at all during the animation. The sidebar slides via
+  transform — compositor-only — while the content column width is stable.
+
+The second approach does the same visual job with far less rendering work,
+because the geometry decision (`280px 1fr`) is made once by grid, and the
+open/close motion is delegated entirely to the compositor.
+
+<Callout type="warning">
+  A common mistake: assuming `position: absolute` or `fixed` makes an
+  animation "free." It removes the element from *flow*, so it stops
+  reflowing siblings, but animating that element's own `top`/`left`/`width`
+  still triggers a layout pass for that element on every frame — the browser
+  has to recompute its box before it can paint and composite it. If you're
+  animating position or size repeatedly (a dragged panel, a resizing modal),
+  animate `transform` instead of `top`/`left`, even on absolutely positioned
+  elements.
+</Callout>
+
+## Choosing flexbox vs. grid quickly
+
+When you're mid-design-review and need to decide fast:
+
+- One row or column of items, sized relative to each other or wrapping as
+  needed → **flexbox**.
+- A layout with defined rows *and* columns, or content that needs to span
+  multiple cells → **grid**.
+- Centering a single child, or distributing a handful of items along one
+  line with gaps → **flexbox**, it's simpler for this than grid.
+- A page-level or component-level structural skeleton (header/sidebar/main/
+  footer) → **grid**, defined once with named areas, instead of nested flex
+  wrappers that each need their own alignment rules.
+
+They're not mutually exclusive — a grid page shell with flex rows inside
+each grid cell is the normal shape of a real layout.
+
+<Quiz
+  lessonId="css-layout-and-positioning"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'You need a dashboard shell with a fixed header, a sidebar, and a main content area, all aligned on both a horizontal and vertical axis. Which layout model fits best?',
+      options: [
+        { id: 'a', text: 'CSS Grid', correct: true, explanation: 'A structural shell needs independent control over rows and columns at once — exactly what grid-template-areas is built for.' },
+        { id: 'b', text: 'Flexbox', correct: false, explanation: 'Flexbox distributes along a single axis; a two-axis shell usually ends up as nested flex containers with duplicated alignment rules instead of one clean definition.' },
+        { id: 'c', text: 'Normal flow with floats', correct: false, explanation: 'Floats can approximate multi-column layout but require clearfix hacks and do not give explicit row/column control the way grid does.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these style changes can be handled by the compositor alone, without a layout or paint step, assuming the element already has its own compositor layer? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Animating `transform: translateX(...)`', correct: true, explanation: 'Transform changes reposition an already-rasterized layer, which the GPU can do without recomputing geometry or re-rasterizing.' },
+        { id: 'b', text: 'Animating `opacity`', correct: true, explanation: 'Opacity blends an existing rasterized layer, also purely a compositor operation on its own layer.' },
+        { id: 'c', text: 'Animating `width`', correct: false, explanation: 'Width changes the element geometry, which forces a layout recompute (and usually affects siblings), then paint, then composite.' },
+        { id: 'd', text: 'Animating `top` on an absolutely positioned element', correct: false, explanation: 'Even though the element is out of flow, changing `top` still changes its box position, which requires a layout pass for that element before it can be painted and composited.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A `position: sticky` element only sticks relative to the browser viewport, the same as `position: fixed`.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Sticky is scoped to the nearest scrolling ancestor, not necessarily the viewport. If that ancestor is a scrollable div, the element sticks within that div, not the whole page.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — sticky behaves like relative until a scroll threshold, then like fixed, but bounded by its nearest scrolling ancestor rather than always the viewport.' },
+      ],
+    },
+  ]}
+/>

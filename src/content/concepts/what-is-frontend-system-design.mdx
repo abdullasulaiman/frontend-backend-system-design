@@ -1,0 +1,132 @@
+---
+title: "What Is Frontend System Design?"
+module: "Introduction"
+moduleOrder: 1
+order: 1
+track: "concept"
+summary: "Defines frontend system design as a discipline and distinguishes it from backend system design and UI craft."
+cheatsheet:
+  - "Frontend system design is about architecture, data flow, and client behavior at scale — not pixel-level UI craft and not server-side data infrastructure."
+  - "Backend system design asks 'how do we store and serve this data reliably at scale?'; frontend system design asks 'how does this data reach the screen, stay fresh, and stay usable under bad conditions?'"
+  - "In-scope decision areas: rendering strategy (CSR/SSR/SSG/hybrid), state management (server cache vs. client/UI state), API shape, performance budgets, and client-side reliability (offline, retries, partial failure)."
+  - "A component that 'looks right' in Figma can still be a bad system design if it re-renders the whole tree on every keystroke or blocks on a synchronous fetch — visual correctness and architectural correctness are separate axes."
+  - "Interviewers test this skill separately because a strong backend designer and a strong visual/UI designer can both fail to reason about client-side trade-offs like cache invalidation, hydration cost, or network variability."
+  - "Senior/staff frontend engineers are expected to own these trade-offs because the app's performance and reliability now live mostly in decisions made on the client, not just the server."
+tags: ["introduction", "fundamentals"]
+estMinutes: 8
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Ask a room of frontend engineers what "system design" means and half will describe drawing boxes for a load balancer and a database. That's backend system design. Frontend system design is a different discipline entirely, and it's the subject of this whole course: how do you architect a client application — its rendering strategy, its data flow, its state, its failure modes — so that it stays fast, correct, and maintainable as the product, the team, and the user base all grow.
+
+This distinction matters for two reasons. First, if you're interviewing for a senior or staff frontend role, more and more companies now run a dedicated frontend system design round, and it's graded on criteria that a generic "design a URL shortener" answer won't satisfy. Second, and more importantly, it's a real skill you use on the job every time you decide how a feature should fetch its data, whether a page should render on the server, or how a client should behave when the network drops mid-request.
+
+## What frontend system design actually covers
+
+Think of it as everything between "the API exists" and "the user successfully sees and interacts with the right thing on screen." That includes:
+
+- **Rendering strategy** — client-side rendering, server-side rendering, static generation, or some hybrid (streaming SSR, islands, partial hydration), and which parts of a page need which strategy.
+- **State management** — separating server-derived data (cached, revalidated, potentially stale) from local UI state (a modal being open, a form's draft value), and choosing tools that match each kind.
+- **API shape** — what the client asks for and how: REST vs. GraphQL vs. RPC-style endpoints, how much aggregation happens server-side vs. client-side, pagination and batching strategy.
+- **Performance** — what loads first, what's deferred, what's code-split, and what budget (in milliseconds or kilobytes) each piece is held to.
+- **Client-side reliability** — what happens on a flaky connection, a slow API, a partial failure, or a stale cache; how errors are surfaced and recovered from without losing user input.
+
+None of this is about backend infrastructure, and none of it is about choosing a font size. It's the architecture layer that sits between those two things.
+
+## Contrast with backend system design
+
+Backend system design centers on data: how it's stored, replicated, partitioned, and served reliably to many clients at once. A backend design interview asks about things like consistency models, sharding, and queueing — problems that exist because a service has to handle concurrent access to shared state across many machines.
+
+Frontend system design has almost none of that. There's exactly one client per session, running on hardware and a network you don't control, and the "distributed systems" problem you actually face is different in kind: keeping a local cache in sync with a server that other users are also mutating, recovering gracefully when a request fails partway through, and doing meaningful work within a UI thread's frame budget instead of across a fleet of servers.
+
+Where the two disciplines connect is at the API boundary. A frontend engineer designing how a page fetches data needs to know enough about the backend's data model to shape a sane request (don't ask for a full user graph to render a username), but the actual work — normalizing that data into a store, deciding when to refetch it, deciding what renders before it arrives — is frontend system design, not backend.
+
+## Contrast with UI/visual design
+
+The other line people blur is between frontend system design and UI/visual design — typography, spacing, color, interaction micro-details. That's a real and valuable skill, but it's largely orthogonal to this course.
+
+A component can be visually flawless and architecturally broken: a beautifully styled comment thread that re-fetches its entire dataset on every keystroke in the reply box, or a pixel-perfect dashboard that blocks the whole page behind one slow, unbatched request. Conversely, a component can look plain but be architecturally sound: it fetches once, caches correctly, degrades gracefully offline, and only re-renders the parts of the tree that actually changed.
+
+Interviewers treat frontend system design as a distinct skill precisely because these two things don't correlate. Someone can nail the visual craft and never have thought about cache invalidation, or vice versa. The system design round is checking for the architectural half specifically.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph BE["Backend system design"]
+        B1[Data storage & replication]
+        B2[Sharding / partitioning]
+        B3[Service-to-service messaging]
+    end
+    subgraph FE["Frontend system design"]
+        F1[Rendering strategy]
+        F2[Client state & caching]
+        F3[Performance budgets]
+        F4[Client-side reliability]
+    end
+    subgraph UI["Visual / UI design"]
+        U1[Typography & layout]
+        U2[Interaction micro-details]
+    end
+    API[API boundary] --- BE
+    API --- FE
+    FE -.informs.- UI
+`} />
+
+## A worked example: the same feature, two very different designs
+
+Say the feature is a product detail page for an e-commerce site: title, images, price, stock status, and a "reviews" section below the fold.
+
+A design that ignores frontend system design might: fetch everything — product data and all reviews — in one client-side request after the page mounts, render nothing until it resolves, store reviews in the same component state as the add-to-cart button, and have no plan for what happens if the request times out.
+
+A design that applies it deliberately might: server-render the product title, price, and images so they're visible immediately (this is the content that matters for both users and SEO), defer the reviews section to a separate, lazily-fetched request that loads once it scrolls into view, keep "is this in the cart" as local UI state entirely separate from the server-fetched product data, and show a retry affordance scoped to just the reviews section if that particular fetch fails — without taking down the rest of the page.
+
+Same feature, same visual mockup even — but one version is resilient to slow reviews APIs and one isn't. That's the difference frontend system design is concerned with.
+
+<Callout type="warning">
+  A common mistake in interviews (and in real codebases) is treating "frontend system design" as "draw the component tree." A component hierarchy is necessary but not sufficient — it says nothing about *when* data is fetched, *where* it's cached, *what* renders while it's loading, or *how* the page behaves when a request fails. If your design doesn't address data flow and failure modes, you've only done half the job.
+</Callout>
+
+## Why this is expected at senior and staff level
+
+Junior and mid-level frontend work is mostly implementation: given a design and an API, build the component. Senior and staff engineers are expected to make (and defend) the decisions that junior engineers implement: should this route be server-rendered, what's the caching strategy for this data, is this state local or global, what's the fallback when the network is unreliable.
+
+These decisions compound. A rendering strategy chosen for one page shapes how every subsequent page in that app gets built. A state management approach picked early determines how painful it is to add the next ten features. Getting these choices right — and being able to articulate the trade-offs out loud — is what separates "can build a screen" from "can be trusted to architect a product." That's the skill this course builds, one lesson at a time; see [How to Use This Course](/concepts/how-to-use-this-course) for how the lessons and case studies fit together, and [The Role of Frontend System Design in Modern Apps](/concepts/role-of-frontend-system-design-in-modern-apps) for why this discipline has become unavoidable as apps have grown.
+
+<Quiz
+  lessonId="what-is-frontend-system-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Which of these is most clearly a frontend system design decision, as opposed to a backend or pure visual design decision?',
+      options: [
+        { id: 'a', text: 'Choosing between server-side rendering and client-side rendering for a page', correct: true, explanation: 'Rendering strategy is squarely a frontend system design concern — it shapes how data reaches the screen and how fast the page becomes usable.' },
+        { id: 'b', text: 'Choosing how a database table is partitioned across shards', correct: false, explanation: 'Sharding is a backend/data-infrastructure concern; it does not involve the client at all.' },
+        { id: 'c', text: 'Choosing the corner radius and spacing scale for buttons', correct: false, explanation: 'This is a visual/UI design decision — it affects appearance, not architecture or data flow.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of the following are examples of decisions squarely inside the scope of frontend system design? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'How the client separates server-derived data from local UI state', correct: true, explanation: 'This is a core state-management decision that frontend system design is concerned with.' },
+        { id: 'b', text: 'How a client should behave when a request fails partway through', correct: true, explanation: 'Client-side reliability and error handling are explicitly in scope.' },
+        { id: 'c', text: 'How many replicas a database maintains for durability', correct: false, explanation: 'That is backend/data-infrastructure scope — it has nothing to do with the client.' },
+        { id: 'd', text: 'What performance budget a page is held to in milliseconds or kilobytes', correct: true, explanation: 'Performance budgets are a named in-scope concern for frontend system design.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A component that is visually polished and matches its design mockup exactly is, by definition, also well-designed from a frontend system design perspective.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Visual correctness and architectural correctness are separate axes — a pixel-perfect component can still re-fetch unnecessarily, block the page on a slow request, or handle failures poorly.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. A component can look exactly right and still be architecturally unsound (bad data flow, no failure handling, unnecessary re-renders), which is exactly why interviewers test the two skills separately.' },
+      ],
+    },
+  ]}
+/>

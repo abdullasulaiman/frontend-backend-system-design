@@ -1,0 +1,292 @@
+---
+title: "Ride-Hailing App: Requirements & Scope"
+module: "Case Study: Ride-Hailing App"
+moduleOrder: 4
+order: 1
+track: "interview"
+summary: "Scopes a ride-hailing app frontend: map-based matching, live tracking, and clarifying questions."
+cheatsheet:
+  - "Clarify rider app, driver app, or both first — a driver app adds background-location and always-on-screen constraints a rider app never has."
+  - "Functional core: map-based matching UI, live location tracking, fare estimation, and a trip-state machine (requesting to matched to en route to in progress to completed)."
+  - "State ETA precision explicitly: 'within a block' needs frequent GPS samples plus interpolation; 'within a few minutes' can tolerate coarse, infrequent updates."
+  - "Nonfunctional scope centers on three things phones actually fight you on: update latency, GPS/network flakiness, and battery/data budget — not raw scale."
+  - "Multiple ride types (economy, XL, pool) mainly affect the matching/selection UI and fare display, not the location pipeline or state machine underneath."
+  - "Say out loud what's out of scope: payments processing, driver onboarding/background checks, and in-app chat/support are usually backend or separate-surface concerns."
+tags: ["case-study","ride-hailing","requirements"]
+estMinutes: 12
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design the frontend for a ride-hailing app" sounds like a single prompt,
+but it's really three or four different products wearing the same map.
+Uber's rider app, Uber's driver app, and Uber Eats all share a location
+pipeline and a state-machine mental model, yet each has a different UI, a
+different battery budget, and a different tolerance for stale data. If you
+start sketching screens before pinning down which of these you're actually
+building, you'll spend half the interview redesigning something the
+interviewer never asked for.
+
+This lesson is the scoping pass for that prompt. We'll separate the
+functional requirements (what the app has to let a rider or driver do),
+the nonfunctional requirements (what has to be true about location data,
+mobile resource use, and network conditions for the app to feel
+trustworthy), and the clarifying questions that pin down which version of
+the problem you're solving in the first few minutes.
+
+## Why scope matters more here than in most case studies
+
+Most frontend system design prompts are primarily about data and rendering.
+A ride-hailing app adds a third axis that most other case studies don't
+have at all: **physical reality drifts and lags**. A phone's GPS reading is
+never exactly correct, a driver's phone can lose signal in a tunnel, and a
+location update sent two seconds ago is already stale by the time it
+renders. None of that is a bug to be fixed — it's the baseline condition
+the whole design has to be built around. An interviewer using this prompt
+is listening for whether you treat "the map shows a driver where they
+currently are" as an engineering problem with real constraints, not as a
+solved primitive you can wave past.
+
+Two or three minutes of scoping up front — rider, driver, or both; how
+precise the ETA needs to be; how many ride types exist — tells you exactly
+how hard that problem needs to be for your specific interview.
+
+## Functional requirements
+
+For the canonical "design a ride-hailing app" prompt, a solid functional
+scope covers:
+
+- **A map-based matching UI.** The rider sees a map, drops or confirms a
+  pickup location, and — once a driver is assigned — sees that driver's
+  position moving toward them in near-real time.
+- **Live location tracking.** Both the rider's own position (to set
+  pickup) and the assigned driver's position (to show progress) need to be
+  reflected on the map as they change, not just fetched once.
+- **Fare estimation.** Before confirming a request, the rider sees an
+  estimated price (and often a price range or multiple ride-type options),
+  computed from pickup, destination, and current conditions like surge
+  pricing.
+- **Trip-state transitions driving the UI.** The screen a rider or driver
+  sees changes as the trip moves through distinct states — requesting a
+  ride, matched with a driver, driver en route to pickup, trip in
+  progress, trip completed — and each state has its own map view, its own
+  available actions (cancel, contact driver, rate trip), and its own
+  copy.
+
+What's usually **out of scope** unless the interviewer says otherwise:
+payment processing itself (card entry, charging), driver
+onboarding/background-check flows, in-app chat or support ticketing, and
+promotions/referral systems. Say this explicitly — "I'll treat payment
+capture as a solved backend integration and focus on the trip and
+location experience" — so the interviewer can redirect you if they
+disagree.
+
+### Rider app vs. driver app: not the same problem
+
+A rider app is mostly passive: watch a map, wait for state to change,
+occasionally tap a button. A driver app is active and always-on during a
+shift: it needs to keep tracking location even when the screen is off or
+another app is in the foreground, it has a persistent turn-by-turn
+navigation view, and it needs a "go online/offline" toggle with no rider
+equivalent. If the prompt is "design the rider experience," background
+location and continuous-navigation battery use are secondary concerns. If
+it includes the driver side, they become first-class requirements.
+
+## Nonfunctional requirements
+
+The functional list above is fairly stable across ride-hailing products.
+The nonfunctionals are where this case study earns its place as a distinct
+lesson from a newsfeed or chat app — they're dominated by the realities of
+a mobile device tracking physical movement, not by data volume.
+
+### Low-latency location updates
+
+The core promise of the UI is "this map reflects where the driver actually
+is, right now." That means:
+
+- Updates need to arrive frequently enough that driver movement on the map
+  reads as continuous motion, not a car teleporting between points every
+  few seconds.
+- The gap between an update arriving and the map reflecting it needs to
+  stay small enough that a rider watching the screen doesn't notice a lag
+  between "driver turns onto my street" and the map showing that turn.
+
+### Resilience to GPS and network flakiness
+
+Phones lose GPS lock in tunnels, parking garages, and dense urban canyons,
+and lose network connectivity switching between cell towers or entering a
+dead zone. A ride-hailing frontend has to keep the UI coherent through
+all of that:
+
+- A missed or delayed location update shouldn't make the driver's marker
+  visibly jump or disappear — the UI needs a strategy for "we haven't
+  heard from the driver in N seconds" that's graceful, not alarming.
+- A trip's state has to survive a dropped connection and reconnect cleanly
+  — a rider who loses signal for ten seconds mid-trip should come back to
+  the correct current state, not a stale or broken one.
+
+### Battery and network efficiency on mobile
+
+This app runs for the entire duration of a trip (rider side) or an entire
+shift (driver side), often as the foreground app on a phone that also
+needs enough battery left to, say, get the rider home. That constrains the
+design:
+
+- Location can't be sampled and transmitted at maximum GPS precision and
+  frequency at all times — the update cadence and precision need to trade
+  off against battery and data cost deliberately, not by accident.
+- Map re-renders triggered by location updates need to be cheap; a map
+  that repaints heavily on every update burns battery and can visibly
+  stutter on a mid-range phone.
+
+## The clarifying questions to ask
+
+<Mermaid client:visible chart={`
+flowchart TD
+  Q1["Rider app, driver app, or both?"] -->|rider only| A1["Focus: map viewing, fare display, trip states"]
+  Q1 -->|driver too| A2["Add: background location, turn-by-turn nav, online/offline toggle"]
+  Q2["How precise does live ETA need to be?"] -->|block-level| B1["Frequent samples + client-side interpolation"]
+  Q2 -->|minute-level| B2["Coarser, less frequent updates are acceptable"]
+  Q3["One ride type or several?"] -->|several| C1["Selection UI + per-type fare comparison"]
+  Q3 -->|one| C2["Simpler request flow, single fare estimate"]
+`} />
+
+### "Are we designing the rider app, the driver app, or both?"
+
+This is the highest-leverage question, and it's specific to this case
+study. A **rider-only** scope means you can treat location tracking as
+"receive updates and render them" — a comparatively contained problem. A
+**driver app**, or both sides, pulls in background location tracking
+(keeping GPS live while the screen is off or the app is backgrounded),
+a persistent navigation view, and a distinct state machine for the
+driver's own availability (`offline` to `online` to `en route to pickup` to
+`on trip`). If the interviewer says "both," say out loud that you'll
+design the shared trip-state machine and location pipeline once, then
+note where each app's UI diverges — that's a stronger answer than
+designing two apps from scratch.
+
+### "How precise does the real-time ETA and driver position need to be?"
+
+An ETA that only needs to be right to within a couple of minutes tolerates
+infrequent, coarse location updates — say, every 10-15 seconds — with the
+UI just showing a number that updates occasionally. An ETA (and driver
+marker position) that needs to feel accurate to within a city block
+requires far more frequent samples and, critically, **client-side
+interpolation** between samples so the car appears to move continuously
+on the map rather than jumping. This single answer determines whether your
+location-pipeline deep dive is a paragraph or a significant chunk of the
+interview.
+
+### "Is there one ride type, or does the rider choose among several (economy, XL, pool, etc.)?"
+
+A single ride type keeps the request flow to "confirm pickup and
+destination, see one fare, request." Multiple ride types add a selection
+UI showing several options side by side, each with its own fare estimate
+and ETA, and usually a comparison view. It's a meaningful but contained
+addition — it changes the request screen and the fare-estimation data
+shape, not the underlying trip-state machine or location pipeline.
+
+### A few second-tier questions worth asking if time allows
+
+- "Does the rider see multiple nearby drivers before a match, or does
+  matching happen entirely server-side?" (Changes whether the map ever
+  shows more than one moving driver marker at once.)
+- "Is scheduling a ride for later in scope, or only on-demand rides?"
+  (Adds a distinct pre-trip flow with its own state before "requesting.")
+- "Does the app need to degrade gracefully on a very poor connection, as
+  a baseline expectation in the target market?" (Raises how aggressively
+  you cache trip state and handle gaps.)
+
+## Worked example: how two sets of answers diverge
+
+Suppose the interviewer says: "rider app only; ETA precision at the
+minute level is fine, this isn't a delivery-tracking app; and yes, there
+are three ride types to choose from."
+
+That tells you:
+
+- You can skip background-location and driver-navigation design entirely
+  — the whole lesson is the rider's map, matching, and trip states.
+- Your location pipeline can be comparatively simple: periodic updates
+  (say, every 8-10 seconds) rendered directly, without needing to build
+  interpolation logic for smooth continuous motion.
+- You do need a clean ride-type selection UI and a fare-estimate data
+  shape that scales to several simultaneous options, which becomes a
+  meaningful chunk of your component design.
+
+Now contrast with: "both rider and driver apps; ETA needs to feel
+accurate to the block; single ride type only." That's a much heavier
+location-and-state-machine interview: real time on background location
+tracking, an interpolation strategy so the map reads as smooth motion,
+and the shared trip-state machine driving two different UIs — and
+little time on ride-type selection, since there's only one. Same opening
+prompt, two very different fifteen-minute deep dives, from three answers.
+
+<Callout type="warning">
+  A common mistake is skipping straight to "I'll poll the driver's location
+  every few seconds and update the marker" without asking how precise the
+  ETA needs to be. If the interviewer actually wants block-level accuracy,
+  raw periodic updates will make the driver's marker visibly teleport
+  between positions — you'll need interpolation between samples to get
+  smooth motion, which is a meaningfully different design than "just
+  poll and re-render." Ask the precision question before committing to an
+  update strategy.
+</Callout>
+
+## Where this goes next
+
+Once scope is settled, the next lesson
+(`ride-hailing-high-level-architecture`) turns these requirements into a
+concrete architecture: the map rendering layer, the live-location data
+pipeline, and the trip-state machine that drives the UI through its
+stages. The deep-dive lesson after that (`ride-hailing-deep-dives`) is
+where the location-update smoothing, reconnect handling, and edge cases
+implied by your answers here get worked out in detail.
+
+<Quiz
+  lessonId="ride-hailing-requirements-and-scope"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Which clarifying question most changes whether you need to design client-side location interpolation for the driver marker?',
+      options: [
+        { id: 'a', text: 'How precise the real-time ETA and driver position need to feel to the rider', correct: true, explanation: 'Block-level accuracy requires frequent samples plus interpolation so the marker moves smoothly; minute-level accuracy tolerates coarse, infrequent updates rendered directly with no interpolation needed.' },
+        { id: 'b', text: 'Whether the rider can choose among multiple ride types', correct: false, explanation: 'Ride-type selection affects the request/fare UI, not the location-tracking or interpolation strategy.' },
+        { id: 'c', text: 'Whether scheduled rides are in scope', correct: false, explanation: 'Scheduling adds a pre-trip flow but does not change how driver position is tracked or rendered once a trip is underway.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'The interviewer says both the rider app and driver app are in scope. Which concerns become first-class because of the driver side specifically? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Keeping location tracking active while the app is backgrounded or the screen is off', correct: true, explanation: 'Drivers run the app for an entire shift and often have the screen off or another app in front; a rider app has no equivalent requirement.' },
+        { id: 'b', text: 'An online/offline availability toggle and its own state machine', correct: true, explanation: 'Going online or offline to accept trips is a driver-side concept with no rider-app equivalent.' },
+        { id: 'c', text: 'Displaying a fare estimate before confirming a request', correct: false, explanation: 'Fare estimation is a rider-facing concern before requesting a trip; it is not something the driver-app scope adds.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'For this case study, the nonfunctional requirements are dominated by handling very large numbers of concurrent users, similar to a newsfeed at scale.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The distinguishing nonfunctionals here are location-update latency, resilience to GPS/network flakiness, and battery/data efficiency on mobile devices — raw concurrent-user scale is a backend concern, not the frontend-specific focus of this prompt.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. This case study is defined by physical-reality constraints (GPS drift, signal loss, battery budget) rather than by request volume, which is what makes it a distinct lesson from a data-volume-heavy case study like a newsfeed.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A trip moving through "requesting", "matched", "en route", "in progress", and "completed" is best described as what kind of concern for the frontend?',
+      options: [
+        { id: 'a', text: 'A trip-state machine that drives which screen, map view, and actions are shown at each stage', correct: true, explanation: 'Each stage has distinct available UI (cancel button, contact driver, rating screen) and distinct map behavior, which is exactly what a state machine is for — and it is one of the functional requirements named in scope.' },
+        { id: 'b', text: 'A purely cosmetic detail that does not affect component structure', correct: false, explanation: 'The stage determines what is rendered and what actions are available, so it directly shapes the component and state design, not just visual styling.' },
+        { id: 'c', text: 'An implementation detail entirely owned by the backend with no frontend involvement', correct: false, explanation: 'While the backend tracks authoritative trip state, the frontend still needs to model and react to these transitions to drive its own UI correctly, including through reconnects.' },
+      ],
+    },
+  ]}
+/>

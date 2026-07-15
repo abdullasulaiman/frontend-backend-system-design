@@ -1,0 +1,285 @@
+---
+title: "Chat Application: Requirements & Scope"
+module: "Case Study: Chat Application"
+moduleOrder: 3
+order: 1
+track: "interview"
+summary: "Scopes a real-time chat application: messaging, delivery guarantees, and clarifying questions."
+cheatsheet:
+  - "Scope 1:1 and group messaging together up front — group chat isn't '1:1 times N,' it changes fan-out, read receipts, and typing indicators into per-member state."
+  - "Split delivery guarantees into three UI-visible states: sent (left the client), delivered (reached a device), and read (seen) — each needs its own signal and its own icon."
+  - "Nonfunctional scope for chat: sub-second perceived delivery latency, message ordering that survives out-of-order network delivery, and an offline queue that survives app restarts."
+  - "Ask about group size early — a 6-person group and a 500-person channel are different systems: per-member read receipts stop making sense past a few dozen members."
+  - "Ask if end-to-end encryption is in scope before designing anything server-assisted, like server-side search or link-preview generation — E2EE forecloses both unless done carefully client-side."
+  - "Multi-device sync turns 'is this message read' from a per-user boolean into a per-device state machine — flag this early since it changes your data model, not just your UI."
+  - "State scope out loud: assume no voice/video calling, no bot/integration platform, and no admin/moderation tooling unless the interviewer says otherwise."
+tags: ["case-study","chat-app","requirements"]
+estMinutes: 12
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design a real-time chat application" sounds narrower than a newsfeed or a
+video platform, but it packs in more distributed-systems-flavored edge
+cases per minute of interview time than almost any other frontend prompt.
+A feed can get away with "eventually consistent, refresh if unsure." A
+chat app can't — users notice immediately when a message shows up twice,
+arrives out of order, or gets stuck in "sending..." forever. That's
+exactly why interviewers like this prompt: it forces you to reason about
+ordering, retries, and state sync under bad network conditions, not just
+component layout.
+
+Before touching WebSockets or a component tree, spend the first few
+minutes of the interview scoping the problem. This lesson covers the
+functional and nonfunctional requirements a strong candidate states out
+loud, and the clarifying questions whose answers meaningfully change the
+rest of the design.
+
+## Why chat is unusually unforgiving of vague scope
+
+Most frontend system design prompts tolerate some ambiguity — you can
+sketch a newsfeed and adjust ranking assumptions later without redoing
+your architecture. Chat doesn't give you that room. Whether the app needs
+to support groups, whether encryption is in scope, and whether a user's
+messages need to sync across a phone and a laptop each change the data
+model, not just a visual detail. Committing to an architecture before
+asking these questions means real risk of re-deriving your whole design
+mid-interview.
+
+Two to three minutes of scoping, spoken out loud, is what separates "I
+designed a toy 1:1 messenger" from "I designed the thing the interviewer
+actually asked for."
+
+## Functional requirements
+
+For the canonical "design a chat app" prompt, a strong functional scope
+looks like this:
+
+- **1:1 messaging.** Two users exchange text messages in a conversation
+  thread, ordered by time sent.
+- **Group messaging.** A conversation with more than two participants;
+  every member sees every message in order, and membership can change
+  (people join/leave).
+- **Delivery and read receipts.** The sender sees whether a message has
+  left their device, reached the recipient's device, and been seen —
+  typically rendered as sent/delivered/read states (think single check,
+  double check, colored double check).
+- **Typing indicators.** A lightweight, ephemeral signal ("Alex is
+  typing...") shown to other participants while someone is composing a
+  message.
+- **Media attachments.** Images, short video, and files sent inline in
+  the conversation, with some kind of upload progress and thumbnail/preview
+  behavior distinct from plain text.
+
+What's usually **out of scope** unless the interviewer says otherwise:
+voice/video calling, a bot or third-party integration platform, message
+search infrastructure, and admin/moderation tooling. Say this out loud —
+"I'll assume calling and admin tooling are out of scope, and focus on the
+core messaging and sync path" — so the interviewer can redirect you if
+they disagree.
+
+## Nonfunctional requirements
+
+The functional list is fairly stable across interviewers. The
+nonfunctionals are where chat gets interesting, and where a frontend-
+specific answer (not a backend replication story) is expected.
+
+### Real-time delivery latency
+
+A chat app that takes three seconds to show a sent message on the
+recipient's screen feels broken, not just slow. The frontend needs a
+persistent connection strategy (not polling) so that new messages, typing
+signals, and receipt updates arrive with sub-second perceived latency
+while the app is in the foreground. Equally important: the **sender's own
+UI** should show the message immediately via optimistic rendering, before
+any server acknowledgment arrives — the perceived latency budget for "my
+message appeared" is close to zero, even though the true round trip to
+the server and back is not.
+
+### Message ordering guarantees
+
+Messages can arrive out of order — a slow network path, a reconnect after
+a drop, or two people sending near-simultaneously in a group chat can all
+cause this. The UI has to guarantee a **stable, consistent per-conversation
+order** regardless of arrival order, which means ordering can't simply be
+"append whatever arrives, whenever it arrives." This is a first-class
+nonfunctional requirement to state explicitly, because it drives real
+design decisions (client-generated IDs, sequence numbers) that the deep-dive
+lesson covers in detail.
+
+### Offline message queuing
+
+Mobile networks drop constantly — a subway tunnel, an elevator, an airplane
+mode toggle. A message the user tries to send while offline shouldn't be
+lost or silently fail; it should queue locally and send automatically once
+connectivity returns, with the UI reflecting a distinct "queued, will send"
+state rather than looking identical to "sent." This has to survive not just
+brief disconnects but the app being killed and relaunched later.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  Q1["1:1 only, or groups too?"] -->|groups| A1["Per-member fan-out + per-member receipts"]
+  Q1 -->|1:1 only| A2["Simple two-party state, no fan-out"]
+  Q2["Group size limit?"] -->|small, tens| B1["Per-member read receipts feasible"]
+  Q2 -->|large, hundreds+| B2["Aggregate 'seen by N' instead of per-member list"]
+  Q3["End-to-end encryption in scope?"] -->|yes| C1["No server-side search/previews on plaintext"]
+  Q3 -->|no| C2["Server can assist search, previews, receipts"]
+  Q4["Multi-device sync required?"] -->|yes| D1["Read/typing state is per-device, needs reconciliation"]
+  Q4 -->|no| D2["Single device is source of truth"]
+`} />
+
+## The clarifying questions to ask
+
+### "Is there a limit on group size?"
+
+This changes more than it sounds like it would. A group capped at a few
+dozen members can reasonably track and render **per-member** read
+receipts ("seen by Priya, Alex, and 3 others") and per-member typing
+indicators. A group of hundreds or thousands can't — rendering and
+transmitting per-member state for that many participants doesn't scale,
+so the design shifts to an aggregate signal ("seen by 214 people") and
+typing indicators are often dropped entirely for large groups. If the
+interviewer says "up to a few hundred," say explicitly that you're
+switching from per-member to aggregate receipts past some threshold —
+that's a senior-level scoping call, not a cop-out.
+
+### "Is end-to-end encryption in scope?"
+
+If E2EE is required, the server can only ever relay opaque ciphertext —
+it cannot read message content to power server-side full-text search,
+generate link previews, or scan attachments. Those features either move
+entirely to the client (search over locally-decrypted history, client-side
+preview generation) or get scoped out. If E2EE is explicitly **not**
+required, you have a much simpler story: the server can assist with
+search indexing, moderation, and preview generation, and you can spend
+your interview time elsewhere. This is worth asking early because
+retrofitting E2EE onto a design that assumed server-side search is a
+rewrite, not a patch.
+
+### "Does state need to sync across a user's multiple devices?"
+
+If a user is logged into the same account on a phone and a laptop
+simultaneously, "has this message been read" stops being a simple
+per-user boolean — it becomes per-device state that needs to be
+reconciled ("read on phone, not yet opened on laptop, so is the overall
+conversation read?"). The same applies to typing indicators and message
+drafts. If multi-device sync is out of scope, your client can treat its
+local state as close to authoritative; if it's in scope, the server needs
+to be the source of truth for read/receipt state, and every device
+needs to reconcile against it on reconnect. This is a data-model decision,
+not just a UI one, so it's worth asking before you sketch a component
+tree.
+
+### A few second-tier questions worth asking if time allows
+
+- "Do messages need to be edited or deleted after sending, and if so, for
+  how long?" (Affects whether message state is mutable and how that
+  propagates to already-delivered copies.)
+- "Is there a maximum attachment size, and are attachments required to be
+  previewable inline, or is a download link acceptable?" (Changes the
+  upload/preview pipeline's complexity.)
+- "Do conversations need to be searchable, and if so, just by the current
+  user or across the group?" (Determines whether search runs against
+  local history, a server index, or both.)
+
+## Worked example: how the answers reshape the design
+
+Suppose the interviewer answers: "groups are capped at 20 people; no
+end-to-end encryption required; and yes, users can be logged in on phone
+and desktop at the same time."
+
+That set of answers already tells you a lot:
+
+- A group of 20 is small enough to justify full per-member read receipts
+  and typing indicators — you don't need to design an aggregate-count
+  fallback.
+- Without E2EE, the server can own search indexing and link-preview
+  generation, which simplifies the attachment/media pipeline
+  significantly — you don't need a client-side crypto or search story.
+- Multi-device sync means "read" state must live server-side as the
+  source of truth, and each device needs to reconcile its local read
+  cursor against the server on connect/reconnect — this is a real data-flow
+  concern you should flag now, even before you've drawn the architecture
+  diagram, because it affects what the local cache stores.
+
+Now contrast with an interviewer who instead says: "groups can be up to
+2,000 people, like a large team channel; end-to-end encryption is
+required; single device only." That's a meaningfully different system —
+per-member receipts are out, aggregate "seen by" counts are in; search
+and previews move client-side or get scoped out entirely; and you get to
+skip multi-device reconciliation altogether, freeing up interview time for
+the encryption-aware media pipeline instead. Same opening prompt, two very
+different fifteen-minute deep dives — driven entirely by three questions
+asked in the first two minutes.
+
+<Callout type="warning">
+  The most common mistake here is treating "delivered" and "read" as the
+  same signal, or worse, collapsing sent/delivered/read into a single
+  boolean `isSent`. They're three distinct events with three distinct
+  transports: sent is a local optimistic update, delivered is an ack from
+  the recipient's device (or a server queue, if the recipient is offline),
+  and read is a signal the recipient's client sends only once the message
+  is actually visible on screen. Conflating them either shows a false
+  "read" before the recipient has opened the app, or never shows
+  "delivered" for offline recipients until they're read — both are bugs
+  interviewers will probe on if you gloss over the distinction.
+</Callout>
+
+## Where this goes next
+
+Once scope is settled, the next lesson
+(`chat-app-high-level-architecture`) turns these requirements into a
+concrete architecture centered on a persistent WebSocket connection, a
+local message cache, and a component tree for the conversation list,
+thread, and composer. The deep-dive lesson after that
+(`chat-app-deep-dives`) is where message ordering, deduplication, offline
+retry, and multi-device sync — all implied by the questions above — get
+worked out in detail.
+
+<Quiz
+  lessonId="chat-app-requirements-and-scope"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does asking about group size limits early meaningfully change the design of a chat application?',
+      options: [
+        { id: 'a', text: 'Small groups can support per-member read receipts and typing indicators; very large groups need aggregate signals instead, since per-member state does not scale', correct: true, explanation: 'Per-member receipts and typing indicators are feasible for a handful of participants but become impractical to render and transmit at scale, forcing a shift to aggregate signals like a total "seen by" count.' },
+        { id: 'b', text: 'Group size determines whether the app needs a database at all', correct: false, explanation: 'Every chat application needs persistent storage regardless of group size; group size affects receipt/typing-indicator granularity, not whether storage exists.' },
+        { id: 'c', text: 'Group size only affects styling, like how many avatars fit in a header', correct: false, explanation: 'While avatar display is a real UI detail, the more consequential impact is on data model and fan-out design for receipts and typing state, not just visual layout.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'A candidate learns that end-to-end encryption is required for the chat app. Which of these design choices should change as a result? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Server-side full-text search over message content should be scoped out or redesigned to work client-side', correct: true, explanation: 'With E2EE, the server only ever sees ciphertext, so it cannot index plaintext for search — search must move client-side over locally-decrypted history or be dropped from scope.' },
+        { id: 'b', text: 'Server-generated link previews for URLs shared in messages need to be reconsidered', correct: true, explanation: 'Generating a link preview requires reading the message content; under E2EE the server cannot do this, so preview generation has to move to the client or be scoped out.' },
+        { id: 'c', text: 'The WebSocket connection can be replaced entirely with a request-response REST API', correct: false, explanation: 'Encryption is orthogonal to transport choice — a persistent connection is still the right tool for real-time delivery whether or not payloads are encrypted.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: '"Delivered" and "read" receipts can be safely implemented as the same underlying signal, since both just mean the recipient has the message.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: '"Delivered" means the message reached the recipient\'s device (or a server queue); "read" means the recipient has actually seen it on screen. Treating them as one signal produces incorrect UI, like showing "read" before the user has opened the conversation.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Sent, delivered, and read are three distinct events fired from different points in the flow, and each needs its own signal and UI state to be accurate.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'The interviewer confirms multi-device sync is required: a user can be logged in on both a phone and a laptop at once. What is the most important consequence for the design?',
+      options: [
+        { id: 'a', text: 'Read/typing state must be tracked server-side as the source of truth, since each device needs to reconcile its local state against it', correct: true, explanation: 'Once multiple devices can be active for one user, a single device\'s local state can no longer be treated as authoritative — the server needs to own state like "read" so devices can reconcile on connect or reconnect.' },
+        { id: 'b', text: 'It means the app no longer needs a local message cache on any device', correct: false, explanation: 'Local caching remains important for fast rendering and offline support regardless of multi-device sync; sync changes who owns the source of truth for state like read receipts, not whether caching happens at all.' },
+        { id: 'c', text: 'It means group messaging must be removed from scope', correct: false, explanation: 'Multi-device sync and group messaging are independent requirements; a chat app can, and often does, support both at once.' },
+      ],
+    },
+  ]}
+/>

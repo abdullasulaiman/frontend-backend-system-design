@@ -1,0 +1,144 @@
+---
+title: "Monorepo vs Polyrepo"
+module: "Design Patterns & Architectures"
+moduleOrder: 6
+order: 4
+track: "concept"
+summary: "Compares organizing a frontend codebase as a monorepo versus multiple repositories."
+cheatsheet:
+  - "Monorepo: one repo, many packages/apps, shared tooling and atomic cross-package commits. Polyrepo: one repo per app/package, independent release cadences."
+  - "Monorepos make cross-cutting refactors and shared design-system changes a single PR; polyrepos turn the same change into a coordinated multi-repo rollout with version bumps."
+  - "Code sharing in a polyrepo means publishing and versioning a package (semver, a registry, consumers upgrading on their own schedule); a monorepo can just import the source directly."
+  - "Monorepos need investment in build tooling (Nx, Turborepo, Bazel) for affected-only builds and remote caching, or CI time grows linearly with repo size."
+  - "Team ownership boundaries have to be enforced by convention (CODEOWNERS, lint rules) in a monorepo; a polyrepo gets that boundary for free from the repo wall itself."
+  - "Micro-frontends don't require a polyrepo, and a monorepo doesn't force build-time coupling — the deployment architecture and the source-control layout are independent decisions."
+  - "Default to a monorepo for a single team or a handful of tightly-coupled teams sharing a design system; lean polyrepo once teams need independent release trains, different tech stacks, or hard security/access isolation."
+tags: ["patterns", "tooling", "org"]
+estMinutes: 9
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every frontend org eventually has more than one deployable thing: a marketing site, a dashboard app, a design-system package, a handful of shared utilities. Where you put the source code for all of that — one repository or many — sounds like a housekeeping decision, but it quietly shapes how fast a team can ship a cross-cutting change, how painful upgrading a shared dependency is, and how cleanly team ownership boundaries map onto the code. Get it wrong at scale and you either drown in coordination overhead or drown in copy-pasted code and version drift. This lesson compares the two models on the axes that actually matter in a system design interview: build tooling, code sharing, versioning, and ownership.
+
+## What each model actually is
+
+A **monorepo** puts multiple packages and applications in a single version-controlled repository, sharing one root configuration, one CI pipeline, and (usually) one dependency lockfile. It doesn't mean "no boundaries" — packages still have their own `package.json` and can be independently built or published — it means those boundaries live inside one repo instead of across many.
+
+A **polyrepo** puts each application or package in its own repository, each with its own CI pipeline, its own release process, and its own version history. Sharing code between repos means publishing it somewhere consumable — an npm package, a Git submodule, a private registry entry — and each consumer pulls in that dependency on its own schedule.
+
+Neither term says anything about how the resulting apps are deployed or composed at runtime. That's a separate axis, and conflating the two is the single most common mistake people make when discussing this trade-off — more on that below.
+
+## Build tooling implications
+
+In a polyrepo, each repo's build is self-contained: checkout, install, build, test, ship. CI cost per repo is small and predictable because each repo only ever builds itself.
+
+In a monorepo, the naive approach — every CI run rebuilds and retests everything in the repo — gets slower as the repo grows, until a one-line change to a leaf utility triggers a 40-minute pipeline. That's why monorepos live or die on their tooling:
+
+- **Task graphs and affected-only builds.** Tools like Nx, Turborepo, and Bazel compute a dependency graph between packages and only rebuild/retest what actually changed plus its downstream consumers, instead of the whole tree.
+- **Remote caching.** If a package's inputs (source files, lockfile hash) haven't changed, reuse a previous build/test result from a shared cache instead of recomputing it — including across different developers' machines and CI runs.
+- **Workspace-aware package managers.** npm/pnpm/Yarn workspaces let packages reference each other by name and resolve to local source instead of a published version, so a change in a shared package is visible to consumers instantly, without a publish step.
+
+Without that investment, a monorepo's CI time grows roughly with the number of packages rather than with the size of a given change — the opposite of what you want.
+
+## Code sharing and versioning
+
+This is where the two models diverge the most sharply.
+
+**Polyrepo code sharing** goes through a package boundary: you extract shared logic into its own repo, publish it to a registry under a semver version, and every consumer declares a version range and upgrades deliberately. This gives you an explicit contract (the published API) and lets different consumers sit on different versions — useful when consumers can't or don't want to upgrade in lockstep. The cost is upgrade lag: a bug fix or breaking change in the shared package doesn't reach consumers until each one bumps its dependency, which in practice means some apps run a shared component three major versions behind for months.
+
+**Monorepo code sharing** usually skips the publish step entirely — a package still has a name and a `package.json`, but consumers resolve it to local source via the workspace, so there's no version to bump for internal use. A fix to a shared `Button` component is visible to every app in the repo the moment it merges. That's powerful for keeping a design system consistent, but it also means a single commit can touch a shared package and every one of its dozen consumers at once — which is exactly the coordination monorepos are good at, and exactly the blast radius that makes some teams nervous.
+
+<Callout type="warning">
+  A common mistake is treating "monorepo" as a substitute for API discipline. Because internal packages resolve to source instantly, it's tempting to skip defining a real public interface for a shared package and let consumers reach into its internals. That works fine until someone changes an "internal" implementation detail and breaks four apps that depended on it accidentally. Monorepos remove the *publishing* friction, not the need for a stable, intentional package boundary — keep treating shared packages as if they had a real contract, and enforce it with `exports` fields, lint rules, or code review, not just convention.
+</Callout>
+
+## Team ownership boundaries
+
+A polyrepo gets ownership boundaries almost for free: a repo has a name, a set of maintainers, its own access controls, and its own PR review requirements. If Team A owns `checkout-service-frontend`, that's unambiguous.
+
+A monorepo has to build that same boundary deliberately, usually with:
+
+- **CODEOWNERS-style rules** mapping directories to teams, so PRs touching `packages/payments-ui/` automatically require payments-team review.
+- **Lint or dependency-graph rules** (e.g. via Nx's module boundaries or a custom ESLint rule) that forbid one team's package from importing another team's "private" internals, keeping the *logical* boundary as real as the *physical* repo boundary would have been.
+- **Per-package CI ownership**, so a broken build in `packages/search/` pages the search team, not everyone watching the root pipeline.
+
+The trade-off: monorepo gives you cheap cross-team refactors and consistent shared code at the cost of needing explicit boundary tooling; polyrepo gives you boundaries for free at the cost of expensive cross-team refactors and code sharing.
+
+## How this interacts with micro-frontends
+
+This is the axis people conflate most. A micro-frontend architecture (see the micro-frontends lesson) is about **independent deployability** at runtime — separate teams shipping separate bundles that compose into one product, whether via build-time integration, an approach like Module Federation, or runtime composition. Monorepo vs. polyrepo is about **where the source lives**. These are orthogonal:
+
+- You can run micro-frontends from a monorepo: each micro-frontend is its own package/app in the repo, each with its own independent deploy pipeline, but they share the repo, the shared component library, and often the same PR for a coordinated change.
+- You can run micro-frontends from a polyrepo: each team's app lives in its own repo entirely, and they only ever meet at runtime through a documented integration contract (a Module Federation remote, an iframe, a shared shell's routing config).
+- You can also run a **single monolithic app** — no micro-frontend split at all — as either a monorepo (one app, plus some internal packages) or, less commonly, spread thinly across a polyrepo of tightly-coupled repos (usually a sign the split should be reconsidered).
+
+The practical implication: when evaluating "should our micro-frontend teams share a repo," answer with the code-sharing/ownership trade-offs above, not "micro-frontends require polyrepo" — they don't. Many large orgs run independent micro-frontend teams out of one monorepo specifically to get shared-tooling benefits without giving up runtime independence.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph Monorepo["Monorepo: one repo"]
+        direction LR
+        A1["Team A app"] --- S1["shared-ui package"]
+        B1["Team B app"] --- S1
+        S1 --- C1["shared config/lint/CI"]
+    end
+    subgraph Polyrepo["Polyrepo: separate repos"]
+        direction LR
+        A2["Team A repo"] -->|"npm install\nshared-ui@2.3.0"| R["shared-ui registry"]
+        B2["Team B repo"] -->|"npm install\nshared-ui@1.9.0"| R
+    end
+`} />
+
+## Worked example: splitting a growing product
+
+Say a 6-person team owns one React app. It's a monorepo of one, effectively — the question doesn't arise yet. The team grows to 30 engineers across three feature teams (search, checkout, account), still shipping one product, still sharing a design system and a set of API clients.
+
+The right call here is almost always **one monorepo with three app packages plus shared packages** (`ui`, `api-client`, `utils`), each team owning their app directory and reviewing changes to their own package, with CODEOWNERS enforcing that. Splitting into three separate repos this early would mean every design-system tweak becomes three PRs and three version bumps for a company that's still moving fast and coupled — pure coordination tax with no real benefit, since all three teams ship the same product on the same cadence anyway.
+
+Now fast-forward: the company acquires a team building a separate product (different stack, different release cycle, needing SOC 2 isolation the main app doesn't). That's when polyrepo starts to make sense for *that* piece — not because of team count, but because of low coupling and a genuine need for independent access control. The heuristic: monorepo scales well with **team count** as long as **coupling stays high**; reach for polyrepo boundaries when coupling drops — different products, stacks, compliance domains, or fully independent release schedules.
+
+## Quick recommendation
+
+- **Small team, one product, shared components:** monorepo — coordination benefits dominate and the tooling investment is small.
+- **Multiple teams, one product, shared design system:** monorepo, with Nx/Turborepo-style affected-builds and CODEOWNERS-enforced boundaries.
+- **Multiple products, different stacks, independent release trains, or compliance walls:** polyrepo, accepting the versioning overhead for real isolation.
+- **In between:** a "few big monorepos" model — one per product line, polyrepo across lines — is often the pragmatic middle ground for genuinely independent business units.
+
+<Quiz
+  lessonId="monorepo-vs-polyrepo"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A team wants a change to a shared Button component to be visible to every consuming app the moment it merges, without anyone bumping a dependency version. Which setup gives them that for free?',
+      options: [
+        { id: 'a', text: 'Polyrepo with the Button published as a versioned npm package', correct: false, explanation: 'Publishing to a registry means consumers still need to bump their declared version to pick up the change — it is not instant.' },
+        { id: 'b', text: 'Monorepo with workspace-resolved internal packages', correct: true, explanation: 'In a workspace-based monorepo, internal packages resolve to local source directly, so a merged change is immediately visible to every consumer in the repo without a publish/version-bump step.' },
+        { id: 'c', text: 'Either setup, since this is unrelated to repo layout', correct: false, explanation: 'It is directly related — instant, unversioned propagation of a shared package change is a defining property of monorepo workspace resolution, not something polyrepo publishing gives you.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'boolean',
+      prompt: 'Adopting a micro-frontend architecture requires splitting the codebase into a polyrepo, since each team needs to deploy independently.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Independent deployability is a runtime/CI concern, not a source-control one. Teams can each own an independently deployed app or package while all of it lives inside one monorepo.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — micro-frontends and monorepo/polyrepo are orthogonal decisions. Many orgs run independently deployed micro-frontends out of a single monorepo to keep shared tooling and a shared design system.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'multi',
+      prompt: 'Which of these are real costs of a monorepo that a polyrepo does not have to pay? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'CI time can grow with total repo size unless affected-only builds and caching are set up', correct: true, explanation: 'Without task-graph-aware tooling (Nx, Turborepo, Bazel), a naive monorepo CI setup rebuilds and retests everything on every change, which does not scale.' },
+        { id: 'b', text: 'Team ownership boundaries have to be enforced explicitly (CODEOWNERS, lint rules) rather than coming from repo access controls', correct: true, explanation: 'A polyrepo gets ownership boundaries for free from the repo wall itself; a monorepo has to recreate that boundary with tooling and convention.' },
+        { id: 'c', text: 'Sharing code between two packages always requires publishing a versioned package to a registry', correct: false, explanation: 'This is backwards — a monorepo is exactly what lets you skip the publish/version step for internal sharing via workspace-resolved packages. Registry publishing is the polyrepo cost.' },
+      ],
+    },
+  ]}
+/>

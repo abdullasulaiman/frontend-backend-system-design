@@ -1,0 +1,233 @@
+---
+title: "Rendering Architectures"
+module: "Design Patterns & Architectures"
+moduleOrder: 6
+order: 5
+track: "concept"
+summary: "Covers architectural patterns that combine rendering strategies to reduce hydration cost."
+cheatsheet:
+  - "Islands architecture ships static HTML by default and hydrates only the interactive widgets — hydration cost scales with the number and size of islands, not with total page weight."
+  - "Streaming SSR sends HTML in chunks as it becomes ready, so a slow data-dependent section no longer blocks the whole response — pair it with a loading placeholder for that section."
+  - "Resumability (Qwik's model) serializes framework state into the HTML itself, so the client doesn't need to re-run component code to attach listeners — it skips hydration's replay step entirely, not just shrinks it."
+  - "Edge rendering moves the render step to a CDN point of presence near the user, cutting the network-latency portion of TTFB — it doesn't by itself reduce hydration cost, which is a separate axis."
+  - "These four patterns are composable, not competing: a real production stack is usually edge rendering + streaming + islands (or resumability) working together, not a single one chosen in isolation."
+  - "This course's own site (built on Astro) is a working islands example: prose ships zero JS, while `Quiz` and `Mermaid` hydrate independently via `client:visible`."
+  - "When justifying an architecture in an interview, separate the question into two: 'when is HTML ready' (streaming, edge) versus 'when is the page interactive' (islands, resumability) — most real trade-offs live in that second question."
+tags: ["patterns", "architecture", "rendering"]
+estMinutes: 11
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The Rendering Strategies lesson earlier in this course covers CSR, SSR, SSG,
+and ISR as if you pick exactly one for a page. Real production frontends
+don't work that way. A single page might render at the edge, stream its
+HTML in pieces, and hydrate only three of its twenty components — all at
+once. The strategies aren't mutually exclusive tools you choose between;
+they're layers you combine. This lesson covers the architectural patterns
+that do the combining: islands, streaming SSR, resumability, and edge
+rendering. All four exist to answer the same underlying question — how do
+you get content on screen fast *and* make it interactive fast, without one
+goal taxing the other.
+
+## Why hydration became the bottleneck
+
+Classic SSR solved "content appears fast" by rendering HTML on the server.
+But it left a second cost on the table: the browser still has to download
+the same component JavaScript that rendered the page, execute it, rebuild
+an in-memory tree, and attach event handlers to DOM nodes that already
+exist. That process — hydration — used to scale with total page size: a
+page with 200 components meant hydrating 200 components, whether or not
+most of them were static text and images. As apps grew, hydration itself
+became the dominant cost on time-to-interactive, even when first paint was
+fast. Every pattern below is a different answer to "how do we stop paying
+for hydration we don't need."
+
+## Islands architecture
+
+An islands-based framework treats the page as static HTML by default and
+lets you opt individual components into hydration, one at a time. Each
+"island" ships its own small JS bundle and hydrates independently, using
+its own trigger — on page load, when it scrolls into view, when the browser
+is idle, or on first interaction. Everything that isn't an island — the
+article body, the nav, the footer — is plain HTML with zero attached JS,
+because it never needed to respond to input in the first place.
+
+This course's own site is a working example. It's built on Astro, and every
+interactive piece — the `Quiz` component, the `Mermaid` diagram renderer,
+the theme toggle — is a separate island that only hydrates once it's
+visible on screen (the `client:visible` directive you'll see throughout
+these lessons). The surrounding lesson prose, headings, and code samples
+ship as inert HTML. If this lesson had 40 paragraphs and 2 quiz questions,
+the browser only ever executes JS for those 2 quiz components, not the 40
+paragraphs around them. Compare that to a monolithic React SSR app, where
+hydrating "the page" typically means re-running the render function for
+the entire component tree, static text included.
+
+The trade-off: islands need explicit boundaries, so cross-island
+communication (an island in the header needs to know about state in an
+island in the body) has to go through some shared mechanism — a store, URL
+state, or custom events — since islands don't share a component tree the
+way a single-page app does.
+
+## Streaming SSR
+
+Streaming addresses a different problem: what happens when part of the
+page is fast to render and part of it is slow, because it's waiting on a
+slow data source? Classic SSR is all-or-nothing — the server can't send any
+HTML until the *entire* page has finished rendering, so one slow API call
+anywhere on the page delays the whole response.
+
+Streaming SSR sends HTML in chunks as each part becomes ready, instead of
+waiting for the full page. The shell, header, and any content with data
+already in hand go out immediately; a slower section (think a
+personalized recommendations block, or a comments count) is sent later,
+along with a script that swaps a loading placeholder for the real content
+once it resolves — all inside the same response, no extra round-trip. The
+browser starts parsing and painting the fast parts of the page while the
+server is still working on the slow part.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant B as Browser
+    participant S as Server (streaming)
+    B->>S: Request page
+    S-->>B: Chunk 1 -- shell + head + fast content
+    Note over B: Browser paints chunk 1 immediately
+    S-->>B: Chunk 2 -- slow section resolves
+    Note over B: Placeholder swapped for real content
+    S-->>B: Stream closed
+`} />
+
+Streaming changes *when HTML arrives*, not how much JS the client executes
+— it composes cleanly with islands (stream the shell, then hydrate only
+the islands inside each chunk as it lands) rather than replacing them.
+
+## Resumability
+
+Islands still pay one cost: each island's component code has to run on the
+client to figure out what the DOM should look like and attach listeners —
+even though the server already rendered that exact output. Resumability,
+the model Qwik is built around, removes that step. The server serializes
+not just HTML but a snapshot of the framework's internal state (what
+listeners are needed, where, and what data they close over) directly into
+the page. The client never re-executes component render logic to "catch
+up" — it lazily wires up a listener only at the moment a user actually
+interacts with that element, using the serialized state that's already
+sitting in the HTML.
+
+The distinction from islands matters: an island still hydrates (runs JS to
+attach handlers) even if that hydration is scoped to a small piece of the
+page and deferred until visible. A resumable app skips the
+attach-handlers-by-re-running-code step almost entirely — interactivity is
+"resumed" from serialized state on demand, not rebuilt from scratch. The
+payoff is a time-to-interactive curve that barely rises with page
+complexity, at the cost of a framework built from the ground up around
+serializable state (you can't easily bolt resumability onto an existing
+component model).
+
+## Edge rendering
+
+Edge rendering runs your server-render step — SSR, streaming, or a
+lightweight per-request personalization layer — inside a CDN's points of
+presence instead of one central origin server. A user in Singapore hitting
+an edge function running in a Singapore PoP saves the round trip to a
+single origin server that might be in Virginia; that round trip is often
+100-200ms right there, before any rendering work even starts.
+
+Edge rendering is orthogonal to the other three patterns: it's about
+*where* rendering happens, not *how much* JS the client runs afterward. You
+can (and often should) combine it with streaming — start streaming the
+response from the nearest edge location — and with islands or resumability
+for the client-side story. None of this replaces SSG/ISR for content that
+truly doesn't need per-request logic; edge rendering earns its cost for
+requests that need some server-side decision (auth check, A/B bucketing,
+locale) but don't need a full origin round trip to make it.
+
+## Worked example: a global news homepage
+
+Say you're designing a news homepage read by users worldwide, with a
+personalized "recommended for you" rail and a global top-story section
+that's the same for everyone.
+
+- The top-story section and page shell are edge-rendered from a cache
+  close to the reader — no origin round trip, sub-100ms TTFB almost
+  everywhere.
+- The personalized rail depends on a per-user recommendation service call
+  that takes 150-300ms. Rather than blocking the whole page on it, the
+  server streams the shell and top stories immediately, then streams the
+  rail's HTML in a second chunk once the recommendation call resolves.
+- On the client, the rail and a handful of interactive widgets (a "save
+  article" button, a comments-count badge) are islands, hydrating with
+  `client:visible` as the user scrolls. The article bodies themselves are
+  plain HTML — never hydrated, because they're never interactive.
+
+The result: fast global TTFB (edge), no single slow dependency blocking the
+whole response (streaming), and a time-to-interactive that only pays for
+the few components that actually need JS (islands) — three different
+patterns, each solving a distinct piece of the problem, composed on one
+page.
+
+<Callout type="warning">
+  A common mistake is treating these as a menu where you pick exactly one
+  ("we're an islands app" or "we're an edge-rendered app") instead of a set
+  of independent axes. Edge rendering without streaming still forces a slow
+  data dependency to block the entire response — you've moved rendering
+  physically closer to the user but kept the same all-or-nothing wait.
+  Islands without any server rendering at all still leaves you with an
+  empty shell for first paint. Ask "where does rendering happen," "does
+  HTML arrive in one piece or many," and "how much JS does the client
+  execute to become interactive" as three separate questions — an
+  architecture usually needs an answer to each.
+</Callout>
+
+<Quiz
+  lessonId="rendering-architectures"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the main difference between an islands architecture and a traditional SSR app when it comes to hydration?',
+      options: [
+        { id: 'a', text: 'Islands hydrate the whole page at once, just faster', correct: false, explanation: 'That describes classic SSR hydration, not islands — islands specifically avoid hydrating the whole page.' },
+        { id: 'b', text: 'Islands only hydrate the components explicitly marked as interactive, leaving the rest as static HTML with no attached JS', correct: true, explanation: 'That is the core idea: static-by-default, with opt-in per-component hydration, so JS cost scales with interactive surface area, not total page size.' },
+        { id: 'c', text: 'Islands render everything on the client instead of the server', correct: false, explanation: 'That describes CSR. Islands still render the page as server/build-time HTML; only the interactive pieces get client-side JS.' },
+        { id: 'd', text: 'Islands eliminate the need for a server entirely', correct: false, explanation: 'Islands are typically paired with SSR or SSG for the initial HTML — they change what happens after that HTML arrives, not whether a server is involved.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements about streaming SSR are correct? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It lets the server send fast-ready parts of a page before slower, data-dependent parts finish', correct: true, explanation: 'That is the point of streaming: chunked delivery so one slow section does not block the whole response.' },
+        { id: 'b', text: 'It reduces the amount of JavaScript the client has to execute to become interactive', correct: false, explanation: 'Streaming changes when HTML arrives, not how much client JS runs afterward — that is the job of islands/resumability, a separate concern.' },
+        { id: 'c', text: 'It replaces classic SSR, which must finish rendering the entire page before sending any HTML', correct: true, explanation: 'Classic SSR is all-or-nothing per response; streaming SSR sends chunks as they become ready instead of waiting for the full render.' },
+        { id: 'd', text: 'It only works for statically generated pages', correct: false, explanation: 'Streaming is a server-rendering technique for per-request responses — it is not tied to static generation at all.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Resumability (as implemented by Qwik) still requires the client to re-execute component render logic to attach event listeners, just like an island does.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The whole point of resumability is skipping that re-execution step: framework state is serialized into the HTML, and listeners are wired up lazily on interaction from that serialized state, not by re-running render logic.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Resumability serializes enough state into the page that the client can resume interactivity on demand without replaying component render logic, which is a step beyond what islands do.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A team moves their SSR rendering step from one origin server to CDN edge locations worldwide. What should they expect?',
+      options: [
+        { id: 'a', text: 'Faster TTFB from reduced network latency, but no automatic change to hydration cost or time-to-interactive', correct: true, explanation: 'Edge rendering shortens the network round trip to the render step; it does not by itself change how much client JS runs to become interactive — that needs islands, resumability, or partial hydration on top.' },
+        { id: 'b', text: 'Automatically less client-side JavaScript, since rendering happens closer to the user', correct: false, explanation: 'Where rendering happens does not change what the client has to execute afterward — those are independent axes.' },
+        { id: 'c', text: 'No change at all, since edge rendering only affects build time', correct: false, explanation: 'Edge rendering affects the per-request render step and its network distance to the user — it is very much a runtime, not build-time, change.' },
+        { id: 'd', text: 'Worse SEO, since crawlers cannot reach edge-rendered content', correct: false, explanation: 'Edge rendering still returns full server-rendered HTML to any requester, including crawlers — SEO is unaffected or improved compared to CSR, not worsened.' },
+      ],
+    },
+  ]}
+/>

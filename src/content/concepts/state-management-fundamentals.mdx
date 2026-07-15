@@ -1,0 +1,163 @@
+---
+title: "State Management Fundamentals"
+module: "Fundamentals"
+moduleOrder: 3
+order: 4
+track: "concept"
+summary: "Introduces the categories of frontend state and why conflating them causes complexity."
+cheatsheet:
+  - "Name the state's category before picking a tool: local, shared UI, server cache, or URL. The category, not habit, should drive the mechanism."
+  - "Prop drilling is fine for 1-2 levels; past that, or when many unrelated components need the same value, it's a signal to lift the state to context or a store."
+  - "Context re-renders every consumer on any value change — don't put fast-changing or unrelated values in one big context object."
+  - "Server data isn't state you own — it's a cache of something else's truth. Treat staleness, refetching, and cache invalidation as first-class concerns, not afterthoughts."
+  - "Reach for a server-state library (React Query, SWR, Apollo cache) once you're manually tracking loading/error flags and re-fetch logic in useEffect — that's the tool's whole job."
+  - "URL state (filters, tab, pagination, search query) belongs in the URL, not component state, so it survives refresh and is shareable/bookmarkable."
+  - "A global store for everything is a common overcorrection — it forces unrelated features into one dependency and re-render graph. Scope stores to a feature when you can."
+tags: ["fundamentals", "state"]
+estMinutes: 11
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Ask five engineers "where should this piece of state live?" and you'll often get five different answers, followed by a Redux store that holds a modal's open/closed flag next to a cached list of API results next to the current page number. That's not a Redux problem — it's a category error. Picking a mechanism before naming the category is how small apps end up with global stores nobody trusts and re-renders nobody can explain.
+
+This lesson builds that vocabulary: the four categories of frontend state, the trade-offs between the common ways to share state across components, and when a purpose-built server-state cache beats a general-purpose store. The follow-up lesson on state architecture patterns builds concrete designs on top of what's introduced here.
+
+## The four categories of frontend state
+
+### Local component state
+
+State that only one component (and maybe its direct children) cares about: whether a dropdown is open, the current value of a text input before it's submitted, whether a hover tooltip is visible. It's created when the component mounts and dies when it unmounts — nothing outside the tree needs to read or write it.
+
+This is the easiest category to get right and the most commonly over-engineered — pulling a component's internal toggle into a global store "just in case" adds a dependency and an indirection layer for zero benefit.
+
+### Shared / global UI state
+
+State that multiple, often distant, components need to read or write, but that still describes the *application's UI*, not data from a server: the current theme, whether a sidebar is collapsed, which item in a list is selected, the contents of a multi-step form wizard. It doesn't come from an API and doesn't need cache invalidation — it just needs to be reachable from more than one place in the tree.
+
+This is the category where prop drilling, context, and dedicated stores actually compete, covered in the next section.
+
+### Server / remote cache state
+
+Data that lives on a server and that your app is merely holding a *copy* of: a user's profile, a list of orders, search results. The defining trait is that it can go stale — someone else can change it, and the "correct" value is asynchronous, from a network call, not your app's own logic. It needs things local and UI state don't: loading/error states, retries, deduplication of in-flight requests, and cache invalidation when the underlying data changes.
+
+Treating server data like ordinary state is the single most common source of frontend state bugs: stale lists after a mutation, duplicate fetches from two components that both "own" the same data, and race conditions from out-of-order responses.
+
+### URL state
+
+State that describes *where the user is*: the current route, a search query, active filters, the selected tab, the page number. It deserves its own category because the URL is a serialization format with properties no other state has — it survives a refresh, it's shareable via a link, and back/forward navigation should move through it naturally.
+
+Storing "current filter" in `useState` instead of a query param works until someone refreshes the page, shares a link, or hits back expecting the previous filter — and it silently breaks all three.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    Q{What kind of<br/>state is this?}
+    Q -->|Only this component<br/>cares| A[Local component state<br/>useState / useReducer]
+    Q -->|Multiple components,<br/>no server, no URL| B[Shared UI state<br/>prop drilling / context / store]
+    Q -->|Copy of data<br/>from a server| C[Server cache state<br/>React Query / SWR / Apollo]
+    Q -->|Describes current<br/>view / filters / route| D[URL state<br/>query params / router]
+`} />
+
+<Callout type="warning">
+  The most common mistake here isn't picking the wrong tool — it's skipping the categorization step entirely and dumping everything into one global store because "that's where state goes in this app." A store that mixes a fetched order list, a sidebar-collapsed flag, and the current search filter means every one of those concerns now depends on the same library, the same re-render behavior, and the same mental model — even though they have almost nothing in common. Name the category first; the mechanism follows from that, not the other way round.
+</Callout>
+
+## Sharing UI state: prop drilling vs. context vs. a store
+
+Once you've identified state as "shared UI state," you still need a way to move it across the tree. Three common options trade off differently.
+
+### Prop drilling
+
+Passing a value (and its setter) down through props, component by component, until it reaches the consumer. It's the default and often the right choice: it's explicit — you can see exactly where a value comes from and where it's used just by reading the component tree — and it adds no new concept for a reader to learn.
+
+It breaks down when the tree between producer and consumer gets deep or has many unrelated branches. Passing `currentUser` through four layers of components that don't use it themselves, just to get it to a fifth, means every middle component now carries an irrelevant prop, and a rename or refactor has to touch all of them.
+
+### Context
+
+Context lets a value skip the intermediate layers: a provider higher up the tree makes a value available, and any descendant can read it directly with no props threaded through. It solves prop drilling's "irrelevant middle props" problem cleanly.
+
+The trade-off is re-render granularity. Every component that consumes a context re-renders whenever that context's value changes, even if it only cares about part of it. A single `AppContext` holding theme, user, and notification count means a component that only reads `theme` still re-renders every time `notificationCount` ticks up. The fix is to split contexts by what changes together (a `ThemeContext`, a separate `UserContext`), not to have one context swallow everything a component might need.
+
+### Dedicated state libraries
+
+Libraries like Redux, Zustand, or Jotai add selective subscriptions (a component re-renders only when the specific slice of state it reads changes), devtools for inspecting state changes over time, and patterns for updating state outside of React's render cycle entirely. They cost a new dependency, a new concept for every contributor to learn, and — for the more structured ones — boilerplate per action.
+
+The practical rule: reach for a dedicated store when shared UI state is genuinely complex (many independent pieces, frequent updates, cross-cutting reads) and context's re-render-everything behavior becomes a measurable performance problem, not a hypothetical one. Plenty of apps never need to cross that line.
+
+## Why server state needs its own tool
+
+Server state looks like it fits the "shared UI state" mold — it's just a value some components need to read — but it has requirements the other mechanisms weren't built for:
+
+- **Staleness**: the data can be outdated the moment it arrives, and different consumers might need different freshness guarantees.
+- **Deduplication**: two components mounting at once and requesting the same resource should share one network call, not fire two.
+- **Loading and error states**: every fetch has a lifecycle (idle → loading → success/error) tracked per request, not per component.
+- **Invalidation on mutation**: after a `POST`/`PUT`/`DELETE`, cached copies elsewhere in the app need to be told they're stale.
+
+Reimplementing this with `useState` + `useEffect` means hand-rolling all four, per feature, forever. Server-state libraries (React Query, SWR, Apollo's cache, RTK Query) exist to own this lifecycle: you describe *what* to fetch and *when it's stale*, and the library handles deduplication, caching, background refetch, and invalidation.
+
+Rule of thumb: once you're writing `isLoading`/`error` state and a `useEffect` fetch-on-mount pattern more than once or twice, that's the signal to bring in a server-state tool instead.
+
+## Worked example: a product listing page
+
+Say you're building a product listing page with filters, a sidebar, and paginated results. A first pass might put everything in one Redux store: `products`, `isFilterSidebarOpen`, `selectedCategory`, `currentPage`, `isLoading`. It works, but every piece behaves differently under the hood, and the store hides that.
+
+Split by category instead:
+
+- **`isFilterSidebarOpen`** — local component state. Nothing outside that UI region cares.
+- **`selectedCategory` and `currentPage`** — URL state, as query params (`?category=shoes&page=2`). A user refreshing, sharing a link, or hitting back should land on the same filtered, paginated view — that only happens if it lives in the URL.
+- **`products`** — server cache state, owned by a query hook keyed on `category` and `page`. When the category changes, the hook fetches the new page; the library handles loading/error state and caches earlier pages so paging back doesn't refetch.
+- **A cart item count shown in the header** — shared UI state, read by the header (far from the listing page) and written by an "add to cart" button on each product card. Context fits here since it changes rarely enough that its whole-subtree re-render cost is a non-issue.
+
+Four kinds of state, four different mechanisms, none fighting for ownership. Categorizing state up front is what makes each individual choice easy.
+
+## Where this goes next
+
+This lesson deliberately stopped at "what are the categories and roughly how do I share each one." It didn't cover concrete architectural patterns like the flux/reducer pattern, atomic state, or where to draw store boundaries in a large app — that's the state architecture patterns lesson later in the Design Patterns & Architectures module, which builds directly on the categories introduced here.
+
+<Quiz
+  lessonId="state-management-fundamentals"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A team stores the currently selected product-category filter in a plain useState hook inside the page component. What breaks first?',
+      options: [
+        { id: 'a', text: 'Refreshing the page or sharing the link loses the selected filter', correct: true, explanation: 'Filter selections are URL state — they need to survive refresh and be shareable. Plain component state resets on reload and never appears in the URL.' },
+        { id: 'b', text: 'The component re-renders too often', correct: false, explanation: 'A single filter value changing occasionally is not a meaningful re-render cost; the real problem is that it does not survive navigation or refresh.' },
+        { id: 'c', text: 'It causes duplicate network requests', correct: false, explanation: 'Duplicate requests are a server-cache-state concern (missing deduplication), not a consequence of where the filter value itself is stored.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine downsides of putting a frequently changing value into a broad React context that many components consume? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Every consumer of that context re-renders on each change, even ones that only read unrelated fields', correct: true, explanation: 'Context re-renders all consumers on any value change, so bundling a fast-changing field with rarely-changing ones costs unrelated consumers extra renders.' },
+        { id: 'b', text: 'Context cannot be updated outside of a React event handler', correct: false, explanation: 'Context values can be updated from effects, timers, or async callbacks just like any other React state — that is not a real restriction.' },
+        { id: 'c', text: 'It couples unrelated consumers to one shared value shape, making later refactors touch more components', correct: true, explanation: 'A single broad context forces every reader to depend on its whole shape, so splitting or renaming fields later has wider blast radius than a scoped context would.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A general-purpose state library like Redux or Zustand is generally a better fit than a server-state library for caching and refetching data fetched from an API.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'General-purpose stores do not natively handle deduplication, staleness, background refetch, or cache invalidation — you would have to hand-build all of that yourself.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Server-state libraries (React Query, SWR, Apollo cache, etc.) are purpose-built for the fetch lifecycle: deduping in-flight requests, tracking staleness, and invalidating on mutation. A general store makes you reimplement that by hand.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A dropdown menu tracks whether it is open. No other component in the app needs to read or set that value. Which category and mechanism fit best?',
+      options: [
+        { id: 'a', text: 'Local component state, via useState inside the dropdown', correct: true, explanation: 'Nothing outside the dropdown needs this value, so it should stay local — introducing context or a store here adds indirection with no benefit.' },
+        { id: 'b', text: 'Shared UI state, via a context provider at the app root', correct: false, explanation: 'Lifting a single component\'s internal toggle to app-wide context is unnecessary overhead when no other component needs to read or write it.' },
+        { id: 'c', text: 'URL state, as a query parameter', correct: false, explanation: 'A dropdown\'s open/closed state is transient UI, not something a user would expect to survive a refresh or be shareable via a link.' },
+      ],
+    },
+  ]}
+/>

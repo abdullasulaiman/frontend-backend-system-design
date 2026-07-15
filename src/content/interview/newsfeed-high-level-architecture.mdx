@@ -1,0 +1,137 @@
+---
+title: "Newsfeed: High-Level Architecture"
+module: "Case Study: Newsfeed"
+moduleOrder: 1
+order: 2
+track: "interview"
+summary: "Presents a component and data-flow architecture for a paginated, media-rich newsfeed."
+cheatsheet:
+  - "Split the feed into a container (FeedPage) that owns data-fetching state and dumb, reusable presentational pieces (PostCard, MediaRenderer) — the container is the only thing that talks to the API layer or the store."
+  - "MediaRenderer should be its own component, not inline `img`/`video` tags inside PostCard — it owns aspect-ratio reservation, lazy-loading, and format fallback, and it's the piece you'll swap out first when media requirements change."
+  - "Keep a normalized client-side store keyed by post ID (not an array of full post objects) so a like/comment update on one post doesn't require finding-and-replacing it inside a giant array."
+  - "SSR (or SSG-plus-hydration) the first feed page for fast first paint and good SEO/social-preview support; switch to plain CSR fetches for every page after that, since there's no crawler or perceived-load benefit to paying SSR cost per scroll event."
+  - "The API layer is the seam that isolates pagination-cursor bookkeeping and response-shape parsing from the components — components ask for 'next page,' they never touch fetch or cursor logic directly."
+  - "A common mistake: re-fetching or re-rendering the whole feed list on every like/comment tick. Update just the one post's entry in the store and let the list use stable keys so only that row re-renders."
+tags: ["case-study", "newsfeed", "architecture"]
+estMinutes: 13
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Once you've scoped a newsfeed interview question (see `newsfeed-requirements-and-scope`), the next thirty seconds decide how the rest of the interview goes. Jump straight into "I'll use React with `useState`" and you've skipped the part the interviewer actually wants to hear: how you break a genuinely complex, high-traffic, media-heavy screen into pieces that can each be built, tested, and optimized independently. This lesson lays out that architecture — the component tree, the API layer, the client-side store, and the rendering strategy that ties them together.
+
+## The component tree
+
+A newsfeed looks simple from the outside but hides real complexity in how much state and behavior each row needs (media loading, like counts, comment previews, in-view detection for autoplay or lazy-loading). The cleanest split is a small number of layers, each with one job:
+
+- **`FeedPage`** — the container. Owns pagination state, talks to the API layer and the store, and decides what to render (loading skeleton, error state, empty state, or the list).
+- **`FeedList`** — a virtualized list that renders only the `PostCard`s currently near the viewport (covered in depth in the deep-dives lesson). It receives an array of post IDs and hands each one to a `PostCard`.
+- **`PostCard`** — a presentational component for a single post: author header, text body, action bar (like/comment/share), and a slot for media.
+- **`MediaRenderer`** — handles the image-or-video decision, aspect-ratio reservation to prevent layout shift, lazy-loading below the fold, and format fallback. It's deliberately its own component rather than inline markup inside `PostCard`, because media handling is the part of this design most likely to get revisited (new formats, adaptive bitrate, CDN changes).
+
+Keeping `PostCard` and `MediaRenderer` "dumb" (props in, events out, no direct API calls) means you can unit-test them with static post data and swap the data layer under them without touching a single rendering component.
+
+## The API layer
+
+Everything that talks to the network lives behind a small API layer — think a `feedApi.getPage(cursor)` function, not `fetch` calls scattered across components. Its job:
+
+- Accept a cursor (or page token) and a page size, and return a page of posts plus the next cursor.
+- Normalize the response shape so components never see backend quirks (inconsistent field names, nested envelopes, etc.).
+- Own retry/backoff for transient failures, so a flaky request doesn't have to be handled in every calling component.
+
+This seam matters for the interview: it's what lets you say "cursor-based pagination is an implementation detail behind `getPage()` — if we need to switch to offset-based pagination later, only this layer changes," which signals you're thinking about maintainability, not just today's happy path.
+
+## The client-side store
+
+As pages load, posts accumulate on the client. Two bad approaches show up constantly in practice interviews:
+
+1. Storing posts as a plain array and mutating it in place for every like/comment — this makes updates to a single post an `O(n)` search-and-replace and invites subtle bugs when the same post appears twice (e.g., after a pagination cursor shift).
+2. Storing posts as component-local `useState` inside `FeedPage` with no separation from fetch logic — this works for a toy version but falls apart the moment you need optimistic updates, cross-component reads (e.g., a "jump to post" deep link), or caching across navigations.
+
+The fix is a small normalized store: a map from post ID to post object, plus an ordered list of IDs representing feed order. A like action updates one entry in the map; the list of IDs doesn't need to change at all, so only the affected `PostCard` re-renders if the list uses stable keys. This store can be as simple as a `Map` behind a context provider, or a lightweight state library — the specific tool matters far less than the shape (normalized, keyed by ID) and where it fits (below the API layer, above the components).
+
+<Mermaid client:visible chart={`
+flowchart TD
+    U[User scrolls / opens app] --> FP[FeedPage container]
+    FP -->|getPage cursor| API[API layer]
+    API -->|HTTP request| BE[(Backend feed service)]
+    BE --> API
+    API -->|normalized posts + nextCursor| STORE[Client-side store<br/>id to post map]
+    STORE --> FL[FeedList - virtualized]
+    FL --> PC1[PostCard]
+    FL --> PC2[PostCard]
+    PC1 --> MR1[MediaRenderer]
+    PC2 --> MR2[MediaRenderer]
+    PC1 -->|like/comment action| STORE
+`} />
+
+Data flows in one direction: user intent triggers `FeedPage`, `FeedPage` asks the API layer for a page, the API layer normalizes and hands results to the store, and the store is the single source of truth that every `PostCard` reads from. Actions (likes, comments) flow back up into the store rather than being applied directly to whatever array a component happens to be holding — that's what keeps a `PostCard` appearing twice (a legitimate edge case after cursor shifts) consistent instead of showing stale data in one copy.
+
+## Rendering strategy: SSR first, CSR after
+
+This is the part interviewers specifically probe, because a naive answer ("just render it all client-side with React") misses a real trade-off:
+
+- **The first feed page should be server-rendered** (SSR, or SSG with revalidation if the feed can tolerate a few seconds of staleness for a logged-out view). This gets content in front of the user before any JavaScript has downloaded or executed, which matters enormously on slow networks and low-end devices — exactly the nonfunctional requirement called out in the scoping lesson. It also makes the initial post visible to link-preview crawlers and search engines, which a pure CSR app can't do without extra work.
+- **Every page after the first is fetched client-side (CSR)**, driven by scroll or an explicit "load more." There's no SEO or first-paint benefit to server-rendering page 2 — nobody lands on your site expecting to see post 47, and by the time a user scrolls that far, the app is already fully hydrated and interactive. Paying SSR round-trip cost per scroll event would only add latency for no benefit.
+
+The practical pattern: the server renders `FeedPage` with page one's data embedded (so there's no client-side "loading" flash on first paint), and that same data seeds the client-side store on hydration. From that point on, `FeedList`'s "load more" trigger calls the same `feedApi.getPage(cursor)` used server-side, just from the browser. One API layer, two callers (server during SSR, client during CSR) — you don't need two different fetching code paths.
+
+<Callout type="warning">
+  A frequent mistake in this part of the interview: describing SSR and CSR as if you have to pick one for the *entire* feed. If you SSR every subsequent page, you add a server round trip to something that should feel instant and local; if you CSR the first page, you hand the user a blank screen (or a spinner) on the slowest, most latency-sensitive part of the experience. State explicitly that the choice is *per page*, not per app, and justify why page one is different from the rest.
+</Callout>
+
+## Worked example: opening the app on a slow connection
+
+Trace a cold load on a throttled 3G connection. The server has already rendered `FeedPage` with the first 10 posts embedded in the HTML, so the user sees content — author names, text, and low-resolution image placeholders reserved at the right aspect ratio — within a second or two, even before React has hydrated. `MediaRenderer` swaps in full-resolution images as they load, without shifting layout, because the aspect ratio was already reserved server-side.
+
+Once JavaScript hydrates, the embedded posts seed the client-side store. The user scrolls near the bottom of `FeedList`; that triggers `FeedPage` to call `feedApi.getPage(nextCursor)`, purely client-side now — no server round trip for a full page render, just a lightweight JSON fetch. The response merges into the store's ID map, `FeedList`'s ID array grows, and the newly virtualized rows mount. A like on post #3 updates only that entry in the store; `PostCard` #3 re-renders, nothing else does.
+
+## Quiz
+
+<Quiz
+  lessonId="newsfeed-high-level-architecture"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why keep MediaRenderer as its own component instead of putting img/video markup directly inside PostCard?',
+      options: [
+        { id: 'a', text: 'Because media logic (aspect-ratio reservation, lazy-loading, format fallback) is the part most likely to change, and isolating it keeps PostCard stable', correct: true, explanation: 'Correct — separating volatile concerns from stable layout components means changes to media handling do not risk breaking the post layout, and vice versa.' },
+        { id: 'b', text: 'Because React requires media elements to be in a separate component', correct: false, explanation: 'React has no such requirement; you can render any element anywhere. The separation is a design choice, not a framework constraint.' },
+        { id: 'c', text: 'Because it makes the bundle smaller', correct: false, explanation: 'Splitting a component into a child does not by itself reduce bundle size unless paired with code-splitting/lazy-loading, which is a separate technique.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which responsibilities belong in the API layer rather than inside FeedPage or PostCard? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Translating a cursor and page size into an HTTP request and parsing the response', correct: true, explanation: 'This is exactly the kind of backend-shape detail the API layer should hide from components.' },
+        { id: 'b', text: 'Retrying a failed page request with backoff', correct: true, explanation: 'Centralizing retry logic in the API layer means every caller gets consistent resilience without duplicating retry code.' },
+        { id: 'c', text: 'Deciding which posts are currently visible enough to render', correct: false, explanation: 'That is a rendering/virtualization concern that belongs to FeedList, not the API layer, which only knows about fetching data.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Server-rendering every subsequent feed page (not just the first) generally improves the user experience of infinite scroll.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'It generally does not: by the time a user scrolls further, the app is already hydrated and interactive, so a server round trip per page only adds latency with no first-paint or SEO benefit.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. SSR earns its cost on the first page (fast first paint, crawlable content); subsequent pages are better served by lightweight client-side fetches.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A user likes a post while scrolled far down the feed. With a normalized, ID-keyed store, what should re-render?',
+      options: [
+        { id: 'a', text: 'Only the PostCard for that specific post ID', correct: true, explanation: 'Correct — updating one entry in the id-to-post map, combined with stable keys on the list, means only that row needs to re-render.' },
+        { id: 'b', text: 'The entire FeedList, since the underlying data changed', correct: false, explanation: 'This is exactly the cost a normalized store avoids: re-rendering the whole list for a single-field change on one post is wasteful and can cause visible jank.' },
+        { id: 'c', text: 'Nothing, until the next page fetch', correct: false, explanation: 'The like should reflect immediately (typically via optimistic UI) rather than waiting for an unrelated future fetch.' },
+      ],
+    },
+  ]}
+/>

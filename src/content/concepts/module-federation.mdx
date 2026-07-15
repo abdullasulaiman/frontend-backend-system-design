@@ -1,0 +1,168 @@
+---
+title: "Module Federation"
+module: "Design Patterns & Architectures"
+moduleOrder: 6
+order: 3
+track: "concept"
+summary: "Explains Module Federation as a runtime mechanism for composing micro-frontends."
+cheatsheet:
+  - "Module Federation loads code from a remote's own build output at runtime — there's no shared build step and no monorepo requirement between host and remote."
+  - "`exposes` (remote side) publishes modules under a public name; `remotes` (host side) maps a name to the remote's `remoteEntry.js` URL; `shared` de-dupes common libraries like React between them."
+  - "A shared singleton (e.g. React) loaded at two incompatible major versions either errors at runtime or silently produces two React instances — the classic 'invalid hook call' bug with no build-time warning."
+  - "`shared` needs a version range plus `singleton: true` for anything that breaks with multiple instances (React, a router, a global store) — pin ranges deliberately, don't leave them to defaults."
+  - "iframes give hard isolation with almost no integration work, at the cost of no shared state, janky cross-frame UX, and duplicated framework payloads — pick them when isolation matters more than a seamless feel."
+  - "single-spa-style routing composes apps at the shell/router level without deep dependency sharing; Module Federation goes further, letting one team's component tree call into another's at the module level."
+  - "Reach for Module Federation when teams need independent deploys *and* a genuinely shared visual/interaction surface (embedding a live remote component, not just a routed page) — otherwise the added coordination cost usually isn't worth it."
+tags: ["patterns", "architecture", "tooling"]
+estMinutes: 10
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Splitting a frontend into micro-frontends is a decision about team ownership. Module Federation is one specific way to make that decision *work at runtime* — it's the plumbing that lets one team's bundle load and render another team's component, in the same browser tab, without either team rebuilding or redeploying the other's code. If you've ever wired up an iframe to embed another team's widget and felt the pain of it (no shared auth state, no shared design tokens, jarring visual seams), Module Federation is the tool built to solve exactly that problem — at the cost of a much sharper set of failure modes.
+
+This lesson treats Module Federation as a mechanism, not a philosophy. We'll look at how it exposes and consumes modules, how dependency sharing actually works under the hood, where it breaks, and when the complexity is worth taking on versus reaching for something simpler.
+
+## What problem Module Federation solves
+
+A large frontend split across teams usually needs one of two integration styles:
+
+- **Build-time integration**: one team's component gets published as an npm package, the consuming team installs it and rebuilds. Simple, but every consumer is now on a release train tied to a version bump plus a deploy.
+- **Runtime integration**: the consuming app fetches and renders another team's code *without rebuilding*, at page-load or navigation time.
+
+Module Federation is a runtime-integration mechanism, originally shipped as a webpack 5 feature and now also available for Vite via community plugins (`@originjs/vite-plugin-federation` and similar). Instead of an app being one big bundle, a "remote" app builds and exposes a small manifest (`remoteEntry.js`) that describes which of its modules are loadable, plus the code to fetch them. A "host" app declares that remote and can `import()` a specific exposed module from it at runtime, as if it were a lazy-loaded chunk of its own bundle.
+
+The distinguishing feature versus "just load another app's script and mount it" is **dependency sharing**: the host and remote can agree to share a single copy of React, a design-system package, or any other library, instead of each bundle shipping its own copy.
+
+## Exposing and consuming remote modules
+
+On the remote side, a build config marks specific modules as exposed:
+
+```js
+// remote app's webpack config (conceptual)
+new ModuleFederationPlugin({
+  name: 'checkoutApp',
+  filename: 'remoteEntry.js',
+  exposes: {
+    './CheckoutButton': './src/components/CheckoutButton',
+  },
+  shared: ['react', 'react-dom'],
+})
+```
+
+On the host side, the config declares where to find that remote and can then import it like any dynamic import:
+
+```js
+// host app's webpack config (conceptual)
+new ModuleFederationPlugin({
+  name: 'shell',
+  remotes: {
+    checkoutApp: 'checkoutApp@https://checkout.example.com/remoteEntry.js',
+  },
+  shared: ['react', 'react-dom'],
+})
+
+// in host application code
+const CheckoutButton = React.lazy(() => import('checkoutApp/CheckoutButton'));
+```
+
+At runtime, the host fetches `remoteEntry.js` from the URL it was given, which tells it what `checkoutApp/CheckoutButton` actually resolves to and how to load it. Nothing about this requires the host and remote to be built together, live in the same repo, or even deploy on the same schedule — the remote's URL is the only coupling point, and it can even be swapped per environment (staging vs. prod) via config.
+
+## How shared dependencies actually work
+
+The `shared` block is where most of Module Federation's value — and most of its pitfalls — lives. When both host and remote list `react` as shared, the runtime doesn't just "pick one automatically." It builds a small resolution step:
+
+1. Each participant declares the version range of the library it can work with (from its own `package.json` plus federation config).
+2. At runtime, the federation runtime compares what's already loaded (or about to load) against what's requested.
+3. If ranges are compatible, everyone uses one shared instance — one copy of React in memory, one React context, one set of hooks.
+4. If ranges are incompatible (or `singleton` isn't set and the mismatch isn't caught), you can end up with **two separate copies of the library loaded side by side** — each remote/host silently falls back to its own bundled copy.
+
+This matters enormously for libraries with global or singleton-like behavior: two React instances mean a component tree crosses a boundary where hooks from one React don't work against the other's reconciler — the well-known "invalid hook call" error, except now triggered by cross-team versioning instead of a duplicate `node_modules` install.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph Host["Shell app (host)"]
+      H1["shared: react@18.2"]
+      H2["React.lazy(import('checkoutApp/CheckoutButton'))"]
+    end
+    subgraph Remote["Checkout app (remote)"]
+      R1["shared: react@18.2"]
+      R2["exposes ./CheckoutButton"]
+      RE["remoteEntry.js"]
+    end
+    H2 -- "fetch at runtime" --> RE
+    RE --> R2
+    H1 <-- "version negotiated, one shared React instance" --> R1
+`} />
+
+## Contrast: iframes and single-spa-style routing
+
+Module Federation sits at one end of a spectrum of composition approaches. It's worth being explicit about what the simpler options give up and gain:
+
+- **iframes**: each app runs in its own document, its own JS realm, its own React (if any) — total isolation. You get that isolation almost for free (an `<iframe src="...">` and some `postMessage` plumbing for cross-frame communication), and a bug in one frame can't crash another. The cost: no shared state without manual message-passing, duplicated framework payloads (every iframe ships its own React), and UX seams — focus management, scroll behavior, and responsive sizing across frame boundaries are all extra work.
+- **single-spa-style routing**: a shell registers multiple independently-built applications and mounts/unmounts them based on the active route (or explicitly, side by side). Each app still ships its own dependencies unless the team manually externalizes shared libraries via import maps or a similar mechanism — single-spa itself is a lifecycle/routing layer, not a dependency-sharing runtime. This is simpler to adopt and reason about than Module Federation, but it composes at the *page/route* level, not the *component* level: you're deciding which whole app owns the current view, not embedding one team's live component inside another team's tree.
+- **Module Federation**: components (not just whole routed apps) can be embedded live, mid-tree, with a shared library runtime underneath. That's strictly more powerful — a checkout team's `<AddToCartButton>` can sit directly inside a product-page team's layout, sharing the same React instance and the same design-system CSS-in-JS runtime — but it means taking on version-compatibility risk between independently-deployed teams as an ongoing operational concern, not a one-time integration cost.
+
+The right choice tracks how deep the integration needs to be. If two apps just need to sit on different routes of the same domain, single-spa-style routing (or even separate top-level apps behind a reverse proxy) is simpler and has fewer moving parts. If a design mandates a live, deeply nested component from another team's codebase — not just "route to their app" — Module Federation is the tool built for that job, and iframes typically can't deliver the visual/interaction seamlessness the design calls for.
+
+## Worked example: a product page embedding checkout
+
+Say a product-detail page (owned by the Catalog team) needs to embed a "Buy now" widget that the Checkout team owns, complete with live inventory checks and a mini cart preview — not a link to a separate checkout page, but the actual component rendered inline, sharing the page's design tokens and React tree.
+
+With Module Federation: the Checkout team exposes `./BuyNowWidget` from their remote build. The Catalog team's host app declares `checkoutApp` as a remote and lazily imports the widget where it belongs in the layout. Both teams share `react`, `react-dom`, and the shared design-system package as `singleton: true` entries, so the widget renders using the exact same React tree and CSS variables as the host page — no visual seam, no duplicate React.
+
+The Checkout team can now ship a fix to `BuyNowWidget` by deploying their own remote independently; the Catalog team's page picks it up on the next page load, no rebuild required on their side. That's the payoff. The cost shows up the day the Checkout team bumps their internal design-system version to a range the Catalog team's host hasn't adopted yet — the shared-version negotiation either falls back to two copies of the design-system runtime (silent visual/behavioral drift) or, if `singleton: true` was set without a compatible range, throws at runtime in production for users on the Catalog page, even though the Catalog team changed nothing.
+
+<Callout type="warning">
+  The single biggest Module Federation footgun is treating `shared` config as "set once, forget about it." A remote that bumps a shared singleton (React, a router, a state library) past the version range the host negotiated for can silently duplicate that library at runtime instead of failing the build — there's no compile-time error to catch it, only a runtime bug that might only reproduce for some users depending on load order. Treat shared dependency ranges as a cross-team API contract: version them deliberately, monitor for duplicate-instance warnings in production, and don't let `singleton: true` hide a real incompatibility behind "it happened to still boot."
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="module-federation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What does the `shared` configuration in Module Federation primarily control?',
+      options: [
+        { id: 'a', text: 'Which routes the host app exposes to remotes', correct: false, explanation: 'Routing is not part of Module Federation\'s dependency-sharing mechanism — that is a separate concern (e.g. handled by a router or shell).' },
+        { id: 'b', text: 'Whether host and remote can negotiate using a single shared instance of a library instead of each bundling their own copy', correct: true, explanation: 'That is exactly what `shared` does: it lets compatible version ranges resolve to one shared instance of a library like React, avoiding duplication and singleton-state bugs.' },
+        { id: 'c', text: 'The build order in which remotes must be compiled before the host', correct: false, explanation: 'Module Federation is designed so host and remote can be built, and deployed, entirely independently — there is no required build ordering between them.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are realistic consequences of a shared-dependency version mismatch between a Module Federation host and remote? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Two separate copies of a library (e.g. React) end up loaded, causing subtle bugs like invalid hook calls', correct: true, explanation: 'When ranges are incompatible, the runtime can fall back to each side loading its own bundled copy instead of sharing one — exactly the scenario that produces cross-instance hook errors.' },
+        { id: 'b', text: 'A build-time TypeScript error prevents the host from compiling', correct: false, explanation: 'Version negotiation for shared dependencies happens at runtime, not at the host\'s build/typecheck step — the host can compile fine and still hit the mismatch in the browser.' },
+        { id: 'c', text: 'A runtime error can appear in production for users on a page that itself received no code changes', correct: true, explanation: 'Because the remote can be redeployed independently, a version bump on the remote side can break the host at runtime even though the host team shipped nothing new.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Compared to Module Federation, an iframe-based composition approach gives stronger isolation between apps but requires more manual work to share application state across the boundary.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'iframes run in a separate browsing context entirely, so a crash or global-scope pollution in one cannot affect the other — but that same isolation means there is no shared React tree or module scope, so state must be passed manually (typically via postMessage).' },
+        { id: 'false', text: 'False', correct: false, explanation: 'iframes are in fact more isolated (separate JS realm and document) than Module Federation, precisely because Module Federation intentionally shares a module/runtime scope that iframes do not.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A team needs two independently-deployed apps to live on different URL paths of the same site, with no requirement to embed one team\'s component inside the other\'s layout. Which approach best fits, with the least added complexity?',
+      options: [
+        { id: 'a', text: 'Module Federation with shared singletons for the UI framework', correct: false, explanation: 'This is more machinery than the problem calls for — Module Federation\'s value is embedding live components across teams, which this scenario does not need.' },
+        { id: 'b', text: 'single-spa-style routing that mounts the right app based on the active route', correct: true, explanation: 'Route-level composition matches the requirement exactly: each app owns a URL space, deploys independently, and there is no need for deep component-level or dependency-level sharing.' },
+        { id: 'c', text: 'A single shared monolithic bundle built from both teams\' source', correct: false, explanation: 'That reintroduces a single build/deploy pipeline across teams, which defeats the independent-deploy goal the scenario is asking for.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,243 @@
+---
+title: "API Styles: REST, GraphQL, gRPC, WebSocket, and SSE"
+module: "API Architecture Styles, Protocols & Data Formats"
+moduleOrder: 5
+order: 2
+track: "concept"
+summary: "Compares the major API styles a frontend integrates with and when to choose each."
+cheatsheet:
+  - "REST is the safe default: cacheable, well-understood, great tooling — but fixed response shapes cause over-fetching (extra fields) or under-fetching (extra round trips for nested data)."
+  - "GraphQL fixes over/under-fetching by letting the client specify exactly which fields it needs in one request, at the cost of HTTP-cache-ability and a query-complexity attack surface."
+  - "gRPC-web gives you strongly-typed, code-generated, compact binary calls — best for internal service-to-service-style calls from a web client, not for public APIs consumers hand-craft requests against."
+  - "WebSocket is for bidirectional, low-latency, high-frequency traffic in both directions (chat, collaborative editing, multiplayer) — it costs you a stateful connection to manage and scale."
+  - "SSE is the simple choice for one-way server-to-client push (live scores, notification feeds, streaming AI tokens) — plain HTTP, automatic reconnection, no bidirectional complexity."
+  - "In an interview, justify your pick by directionality (one-way vs two-way), update frequency, and payload shape (fixed vs client-driven) — not by name-dropping the trendiest protocol."
+  - "You can mix styles in one product: REST/GraphQL for CRUD screens, WebSocket or SSE only for the one feature that actually needs a live channel."
+tags: ["api", "protocols"]
+estMinutes: 13
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every frontend architecture decision eventually runs into the same question:
+how should the client talk to the backend? Pick REST and you get simple,
+cacheable endpoints but sometimes ship a dashboard that needs six round
+trips to assemble one screen. Pick GraphQL and that dashboard becomes one
+request — but now you're operating a query engine with its own failure
+modes. Pick WebSocket for a settings page that never needs real-time
+updates, and you've built a stateful connection you now have to scale,
+reconnect, and monitor for no reason.
+
+Interviewers ask "which API style would you use here?" specifically to see
+whether you reason from the problem's shape — directionality, frequency,
+payload structure — or just reach for whichever protocol is fashionable.
+This lesson gives you that reasoning, plus the trade-offs to name out loud.
+
+## REST: the default, and why it isn't always enough
+
+REST models your API as resources (`/users/42`, `/orders/42/items`) accessed
+through standard HTTP verbs. Its strengths are exactly why it's the
+default: it maps directly onto HTTP semantics, so browsers, CDNs, proxies,
+and API gateways all understand it natively. `GET` requests are cacheable
+by URL out of the box. Tooling — from curl to API gateways to browser dev
+tools — assumes REST-shaped traffic.
+
+The weakness shows up as your UI gets more complex. A resource's shape is
+fixed by the server: if a mobile client needs only a user's name and avatar
+but the endpoint returns twenty fields, that's over-fetching — wasted
+bytes on every request. If a screen needs a user, their last five orders,
+and each order's line items, and the API only exposes one resource per
+call, that's under-fetching — you chain three or four sequential requests
+to assemble one view, each one adding latency.
+
+## GraphQL: client-driven queries
+
+GraphQL replaces "fixed resource shape" with "the client declares the
+shape it wants" in a single query. A screen that needed four REST calls can
+ask one GraphQL query for exactly the user fields, order fields, and
+line-item fields it renders — nothing more, nothing less, in one round
+trip. This is the direct fix for over/under-fetching, and it's the reason
+teams building large, field-hungry dashboards or feeds gravitate toward it.
+
+The cost is real, though. A GraphQL endpoint is usually a single `POST /graphql`
+URL, so the URL-based HTTP caching that REST gets for free doesn't apply —
+you need a caching layer at the client (Apollo/Relay's normalized cache) or
+a persisted-query + CDN setup instead. Because the client controls query
+shape, a deeply nested or wide query can generate an expensive database
+fan-out server-side; production GraphQL services need query-depth and
+complexity limits or they become a self-inflicted denial-of-service vector.
+There's also a schema and resolver layer to build and keep in sync with
+what clients actually need — non-trivial ongoing cost for a small team.
+
+## gRPC-web: typed contracts, binary efficiency
+
+gRPC defines calls as strongly-typed RPC methods in a `.proto` schema, and
+generates client/server code from it, communicating over HTTP/2 with a
+compact binary encoding (Protocol Buffers). Browsers can't speak raw gRPC
+directly (no HTTP/2 trailer support in fetch/XHR), so browser clients use
+**gRPC-web**, a variant proxied through an intermediary (like Envoy) that
+translates it to real gRPC for the backend.
+
+The payoff is a generated, type-safe client — no hand-written fetch calls
+or manually kept-in-sync TypeScript types — plus a noticeably smaller wire
+payload than JSON for the same data, which matters at high call volume.
+The trade-off is friction: you need the proxy layer, the tooling is heavier
+than "write a fetch call," and a binary payload isn't something you can
+eyeball in a network tab the way you can JSON. It's the strongest fit
+when a frontend is really just another client of an internal
+service-to-service-style API (e.g., a web client calling the same backend
+RPCs your mobile app and internal tools already call) — less so for a
+public API where third parties want to poke at it with curl.
+
+## WebSocket: bidirectional, real-time
+
+REST, GraphQL, and gRPC-web are all request/response: the client always
+initiates. Some features need the *server* to push data at any time, or
+need both sides sending frequently — a chat app, a multiplayer cursor
+view, a collaborative document. WebSocket opens one persistent,
+full-duplex TCP-based connection where either side can send a message at
+any moment with minimal per-message overhead (no repeated HTTP headers).
+
+That persistence is also the cost: you're now managing connection
+lifecycle — reconnect logic after a network blip, presence/heartbeat
+messages, and horizontal scaling of a stateful connection across server
+instances (usually via a pub/sub backplane like Redis so a message from
+one server reaches a client connected to another). Skip WebSocket if
+you only need the server to push and the client never talks back — that's
+a simpler problem, covered next.
+
+## SSE: one-way server push, the simple way
+
+Server-Sent Events let the server stream a sequence of text events to the
+client over a single long-lived HTTP connection, with the browser's
+built-in `EventSource` handling reconnection automatically. It's plain
+HTTP — no proxy or upgrade handshake — so it works through existing
+infrastructure with less operational surprise than WebSocket.
+
+SSE's constraint is also its focus: it's one-way, server-to-client only.
+If the client needs to send data back, it does so via an ordinary separate
+HTTP request, not over the SSE channel. That makes SSE a great fit for
+live sports scores, a notification feed, a build/CI log tailing view, or
+token-by-token streaming of an LLM response — all cases where the client
+is a passive receiver. It's the wrong tool the moment the interaction
+becomes two-way, like a chat box where the user also sends messages
+through the same live channel.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    Client[Frontend client]
+    Client -->|"REST: GET /users/42"| REST[REST API]
+    Client -->|"GraphQL: one query, exact fields"| GQL[GraphQL endpoint]
+    Client -->|"gRPC-web: typed RPC call"| GRPC[gRPC-web proxy]
+    Client <-->|"WebSocket: either side sends anytime"| WS[WebSocket server]
+    SSE[SSE stream] -->|"server pushes events"| Client
+`} />
+
+## Comparison table
+
+| Style | Direction | Typical payload | Great for | Watch out for |
+|---|---|---|---|---|
+| REST | Request/response | JSON, fixed per resource | CRUD screens, public APIs, cacheable reads | Over/under-fetching on complex views |
+| GraphQL | Request/response | JSON, client-shaped | Field-hungry dashboards, aggregating many resources in one call | Cache complexity, query-cost abuse |
+| gRPC-web | Request/response | Binary (protobuf) | Internal/typed service calls from web clients | Needs a proxy, payload isn't human-readable |
+| WebSocket | Bidirectional, persistent | JSON or binary frames | Chat, multiplayer, collaborative editing | Connection lifecycle, scaling stateful sockets |
+| SSE | Server-to-client only, persistent | Text event stream | Live feeds, notifications, streaming tokens | Not for client-to-server data |
+
+## Worked example: picking a style for three features in one app
+
+Say you're designing the frontend for a project-management tool with
+three features: (1) a task board that loads a project's tasks, assignees,
+and comment counts on open, (2) a live "who's viewing this task right now"
+presence indicator, and (3) a notification bell that lights up when
+someone assigns you a task.
+
+For (1), the task board needs tasks joined with assignee names/avatars and
+comment counts — three different resources assembled into one view.
+Fetching that via REST means either three sequential calls or a bespoke
+"board summary" endpoint the backend has to maintain by hand. GraphQL lets
+the frontend ask for exactly `task { title, assignee { name, avatarUrl },
+commentCount }` in one query, without a new backend endpoint per new
+screen shape.
+
+For (2), presence is inherently bidirectional and frequent: your client
+needs to say "I'm viewing task 42" and other clients need to find out
+immediately, in both directions, many times a minute across many users.
+That's WebSocket — a persistent channel where the server fans out
+presence changes to every connected viewer of that task.
+
+For (3), the notification bell only needs the server to tell the client
+"you have a new notification" — the client never sends anything back over
+that channel; clicking the bell is a normal REST call to fetch the list.
+That's a textbook SSE case: cheap, one-way, auto-reconnecting.
+
+Notice the same app uses three different styles for three different
+shapes of problem — that's the point. You don't pick one style for the
+whole system; you pick per feature, based on directionality and payload
+shape. (For the broader question of polling vs. long-polling vs.
+persistent connections that underlies this choice, see
+`client-server-communication-models`; for how the bytes on the wire differ
+between JSON and binary formats, see `data-formats-and-transport`.)
+
+<Callout type="warning">
+  A common interview (and real-world) mistake is reaching for WebSocket
+  because a feature is "real-time-ish," without checking whether the
+  client ever actually needs to send data back over that same channel. A
+  live stock ticker, a build-log viewer, and a notification feed are all
+  one-way — SSE handles them with a fraction of the operational
+  complexity (no connection-scaling backplane, automatic browser
+  reconnection, plain HTTP). Reserve WebSocket for when the client
+  genuinely needs to push data too, not just receive it fast.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="api-styles-rest-graphql-grpc-websocket-sse"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A dashboard screen needs data assembled from four different REST resources, and different client screens each need a different subset of fields from each. Which API style most directly addresses this?',
+      options: [
+        { id: 'a', text: 'GraphQL', correct: true, explanation: 'GraphQL lets each client specify exactly the fields it needs across multiple underlying types in a single query, fixing both over-fetching and the multiple-round-trips problem at once.' },
+        { id: 'b', text: 'WebSocket', correct: false, explanation: 'WebSocket solves bidirectional/real-time delivery, not the shape-of-a-single-response problem described here.' },
+        { id: 'c', text: 'Server-Sent Events', correct: false, explanation: 'SSE is for one-way server push over time, not for shaping a one-time aggregated query response.' },
+        { id: 'd', text: 'gRPC-web', correct: false, explanation: 'gRPC-web gives typed, efficient RPC calls, but the response shape per call is still fixed by the .proto definition, not chosen per-client-screen the way GraphQL allows.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these features are a good fit for Server-Sent Events rather than WebSocket? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A live-updating feed of stock prices the user only views', correct: true, explanation: 'Purely one-way server-to-client push with no client data going back over the same channel — a classic SSE case.' },
+        { id: 'b', text: 'A collaborative text editor where multiple users type simultaneously', correct: false, explanation: 'This needs frequent, low-latency data flowing in both directions between all participants — that requires WebSocket, not one-way SSE.' },
+        { id: 'c', text: 'A notification bell that lights up when the server has new alerts', correct: true, explanation: 'The client only receives push notifications here; any action (like opening the list) is a separate normal request, so SSE is a clean fit.' },
+        { id: 'd', text: 'A multiplayer game where each player’s moves must reach all other players instantly', correct: false, explanation: 'Every player is both sending and receiving in real time, so this needs a bidirectional channel like WebSocket, not one-way SSE.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Because GraphQL responses are typically served from a single POST /graphql endpoint, they get the same free URL-based HTTP caching that REST GET requests get.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False, in fact: a single shared endpoint URL and POST-based queries mean standard HTTP/CDN caching by URL does not apply the way it does for REST GET requests to distinct resource URLs.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. GraphQL loses REST’s free URL-based caching; teams typically add a client-side normalized cache or persisted queries to compensate.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A team is building a web client that calls the same internal backend RPCs already used by their mobile app and internal admin tools, and wants strongly-typed, generated clients with compact payloads. Which style fits best?',
+      options: [
+        { id: 'a', text: 'gRPC-web', correct: true, explanation: 'This is exactly gRPC-web’s sweet spot: internal, typed, code-generated RPC calls with compact binary payloads, shared across multiple client types via a proxy.' },
+        { id: 'b', text: 'REST', correct: false, explanation: 'REST would work but gives up the generated typed clients and compact binary encoding the team explicitly wants.' },
+        { id: 'c', text: 'Server-Sent Events', correct: false, explanation: 'SSE only handles one-way server push; it does not address the typed-RPC-call requirement described.' },
+        { id: 'd', text: 'WebSocket', correct: false, explanation: 'WebSocket solves persistent bidirectional messaging, not typed RPC contracts or payload compactness for request/response calls.' },
+      ],
+    },
+  ]}
+/>

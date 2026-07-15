@@ -1,0 +1,250 @@
+---
+title: "Core Web Vitals"
+module: "Performance & Optimization"
+moduleOrder: 4
+order: 8
+track: "concept"
+summary: "Explains LCP, INP, and CLS precisely, including causes and fixes for poor scores."
+cheatsheet:
+  - "LCP measures when the largest visible element renders (target under 2.5s) — usually a hero image, a background image, or a large text block; fix by preloading the LCP resource and removing render-blocking CSS/JS ahead of it."
+  - "INP measures the full latency of the worst (or near-worst) interaction over the page's lifetime, not just the first one — long main-thread tasks during event handling are the usual cause."
+  - "CLS measures how much visible content moves unexpectedly — reserve space (`width`/`height`, `aspect-ratio`, skeletons) for anything that loads after initial layout: images, ads, injected banners, web fonts."
+  - "Lab tools (Lighthouse, WebPageTest) give reproducible scores for debugging; RUM (`web-vitals` JS library, CrUX) gives the real distribution across your actual users' devices and networks — you need both, and RUM is what search ranking and business dashboards actually use."
+  - "A metric can pass in the lab and fail in the field (or vice versa) because lab runs use one fixed device/network profile while real users vary wildly — always ship RUM before declaring a fix worked."
+  - "In interviews, don't just name the metrics — tie each one to the specific architectural decision that affects it (e.g., 'lazy-loading this hero image would hurt LCP, so I'd only lazy-load below-the-fold content')."
+tags: ["performance", "metrics"]
+estMinutes: 10
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every technique in this module — shortening the critical rendering path,
+splitting bundles, lazy-loading media, choosing a rendering strategy — exists
+to move a number. Core Web Vitals are how the industry (and, concretely,
+Google Search ranking and most RUM dashboards) turns "the page feels fast"
+into three measurable scores. Miss what each one actually measures and you
+can spend weeks shipping a real improvement — a smaller bundle, a faster
+API — that never touches the metric your users or your ranking depend on.
+
+This lesson defines each metric precisely, lists concrete causes and fixes
+for a poor score, and covers measuring them in production versus in a lab —
+a distinction that trips people up constantly, because the two can disagree.
+
+## The three metrics
+
+### Largest Contentful Paint (LCP)
+
+LCP measures the render time of the largest visible element within the
+viewport during page load — typically a hero image, a poster image, a large
+background image, or a large block of text. It answers "how long until the
+main content the user came for is actually visible?" Google's threshold: a
+"good" LCP is under 2.5 seconds; anything past 4 seconds is "poor."
+
+Common causes of a poor LCP: slow server response (a slow time-to-first-byte
+delays everything downstream); render-blocking CSS/JS ahead of the LCP
+element (see the Critical Rendering Path lesson); the LCP resource being
+discovered late (an image only referenced inside a CSS `background-image`
+rule, or mistakenly marked `loading="lazy"` above the fold); and client-side
+rendering the main content, where the largest element waits on bundle
+download, execution, and a data fetch instead of arriving with the initial
+HTML.
+
+Fixes: preload the LCP image (`<link rel="preload" as="image">`), never mark
+it `loading="lazy"`, serve it from a CDN with a properly sized/compressed
+format (see the Image & Media Optimization lesson), and — if the content is
+server-renderable — render it server-side or statically instead of waiting
+on a client fetch (see the Rendering Strategies lesson).
+
+### Interaction to Next Paint (INP)
+
+INP measures interaction responsiveness across the entire page visit: for
+every click, tap, or keypress, it tracks the time from the interaction to
+the next frame the browser paints in response, then reports a single
+representative value (roughly the worst or near-worst interaction observed)
+for the whole session. It replaced First Input Delay in 2024 because FID
+only measured the *first* interaction's input delay, not the full cost of
+handling any interaction later in the visit. A "good" INP is under 200
+milliseconds.
+
+Common causes of a poor INP: long JavaScript tasks on the main thread (a
+task longer than 50ms blocks any tap that lands mid-task in a queue);
+heavy work inside the event handler itself (synchronous re-renders, layout
+recalculation, or an expensive computation before the next paint can
+happen); third-party scripts (ad tags, analytics, chat widgets) running
+uninterruptible work at unpredictable times; and large component trees
+re-rendering on every keystroke because a heavy list re-render isn't
+memoized or windowed.
+
+Fixes: break long tasks into smaller chunks (yield to the main thread with
+`setTimeout`, `scheduler.yield`, or `requestIdleCallback` for non-urgent
+work), move genuinely expensive computation off the main thread with a Web
+Worker, memoize or window large re-renders, and audit third-party scripts
+for ones that block interaction handling.
+
+### Cumulative Layout Shift (CLS)
+
+CLS measures unexpected visual movement of content already on screen — it
+sums up (weighted by how much of the viewport moved and how far) every
+layout shift that isn't the direct, immediate result of a user interaction. A
+"good" CLS is under 0.1. Note the qualifier "unexpected": content that shifts
+because the user just tapped a button to expand it doesn't count against
+CLS; content that shifts because an ad slot late-loaded above it does.
+
+Common causes of a poor CLS: images/iframes/ads without reserved dimensions
+(no `width`/`height` or `aspect-ratio`, so the browser lays out a
+zero-height box and reflows everything below it once real content
+arrives); web fonts causing a FOIT/FOUT reflow (a fallback font renders at
+different metrics than the webfont, so text reflows on swap); content
+injected above existing content (a cookie banner or promo strip that
+inserts itself after initial render, pushing everything else down); and
+animations that trigger layout instead of compositing (animating
+`top`/`left`/`width` instead of `transform` forces a recompute every
+frame).
+
+Fixes: always set `width`/`height` (or CSS `aspect-ratio`) on media, reserve
+space for known-size injected content (ads, banners) even before it loads,
+use `font-display: optional` or size-matched fallback fonts to minimize font
+swap reflow, and animate with `transform`/`opacity` instead of layout
+properties.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Page load starts] --> B[LCP: time to largest visible element]
+  A --> C[CLS: unexpected shifts accumulate through the visit]
+  D[User clicks, taps, types] --> E[INP: worst interaction latency across the visit]
+  B --> F{All three within target?}
+  C --> F
+  E --> F
+  F -- yes --> G[Good Core Web Vitals score]
+  F -- no --> H[Diagnose with RUM field data + lab profiling]
+`} />
+
+## Lab data versus real-user monitoring
+
+These metrics can be collected two different ways, and conflating them is a
+common source of confusion.
+
+**Lab data** comes from running a controlled test — Lighthouse, WebPageTest,
+or Chrome DevTools' performance panel — on a fixed device profile and network
+throttle, in a single run. It's reproducible and great for debugging: you
+can change one thing, rerun, and see the delta in isolation. But it's a
+simulation of one scenario, not what your actual users experience.
+
+**Real-user monitoring (RUM)** — sometimes called "field data" — measures
+these metrics on actual visits, on whatever device and network each real
+user has. Google's Chrome User Experience Report (CrUX) aggregates this
+across Chrome users at large and is what search ranking actually uses. Most
+teams also instrument their own RUM with the `web-vitals` JS library,
+reporting each metric to an analytics endpoint as users browse, so you get
+your own site's real distribution broken down by page, device, or segment —
+not just Chrome's aggregate.
+
+Why both matter: lab data on a fast dev laptop over an unthrottled
+connection can look great while real users on a mid-tier phone over 4G see
+a very different LCP. The practical workflow: use lab tools to debug and
+validate a fix locally, then confirm the fix actually moved the field data
+before calling it done — a regression fixed only in the lab isn't fixed for
+your users.
+
+## Worked example: diagnosing a slow product page
+
+Say a product listing page has a CrUX-reported LCP of 4.2 seconds (poor) for
+mobile users, but Lighthouse on a fast connection shows 1.8 seconds (good).
+The gap is the network/device profile difference, so the fix has to target
+what real mobile users experience, not just what the lab shows.
+
+Steps:
+
+1. Confirm the LCP element with the DevTools Performance panel or the
+   `web-vitals` library's attribution build — it's the main product photo,
+   inside a component that fetches price and stock data before rendering.
+2. Notice the image URL is only known after a client-side fetch resolves,
+   so the browser can't start downloading the image until JS runs, the
+   fetch completes, and React re-renders — three sequential delays before
+   the LCP resource request even starts.
+3. Fix: render the image URL server-side (it's already known from the
+   route's product ID) so the `<img src>` is present in the initial HTML,
+   and add `<link rel="preload" as="image" href="...">` so the browser
+   fetches it at the highest priority, in parallel with everything else.
+4. Re-run Lighthouse to confirm the lab number improved, then watch the RUM
+   dashboard over the following days of real traffic to confirm the p75 LCP
+   for mobile actually dropped — the number that matters for both user
+   experience and Search ranking.
+
+This same page might also have a CLS problem if the price/stock badge
+renders after the image (typical: badge pops in above the "add to cart"
+button, shoving it down) — reserving a fixed height for that badge slot
+fixes it independently of the LCP work above.
+
+<Callout type="warning">
+  A common mistake: chasing a good lab score and declaring victory without
+  ever checking field data. A local Lighthouse run uses one throttled
+  profile that may not resemble your real traffic mix — if half your users
+  are on mid-tier Android phones over spotty 4G, your lab machine's fast
+  CPU and clean network can mask real regressions. Always confirm a
+  performance fix against RUM (CrUX or your own `web-vitals` instrumentation)
+  before treating the metric as fixed.
+</Callout>
+
+## Bringing this up in an interview
+
+Core Web Vitals are a natural way to ground a performance discussion in
+concrete numbers instead of vague "make it faster" statements. When you
+propose a technique elsewhere in a design (preloading, code splitting,
+choosing SSR over CSR, reserving image dimensions), name which metric it
+targets: "I'd server-render the hero section since that's currently the LCP
+element" is stronger than "I'd make the page load faster." It also signals
+you understand these metrics trade off against each other — preloading more
+resources to help LCP can compete for bandwidth with scripts that affect
+INP — so a strong answer acknowledges the tension instead of listing fixes
+in isolation.
+
+## Quick check
+
+<Quiz
+  lessonId="core-web-vitals"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A page renders its hero image only after a client-side API call resolves and React re-renders. Which Core Web Vital is most directly harmed by this pattern?',
+      options: [
+        { id: 'a', text: 'LCP', correct: true, explanation: 'The largest visible element (the hero image) can only start loading after JS runs, the fetch completes, and a re-render happens — every one of those steps delays when the image can even begin downloading, which delays LCP.' },
+        { id: 'b', text: 'CLS', correct: false, explanation: 'This pattern could contribute to CLS if the image pops in without reserved space, but the described problem (late image request) is fundamentally a timing issue, which is what LCP measures.' },
+        { id: 'c', text: 'INP', correct: false, explanation: 'INP measures interaction responsiveness (clicks, taps, keypresses), not initial content render timing.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these would help reduce a poor INP score? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Breaking a long JavaScript task into smaller chunks that yield to the main thread', correct: true, explanation: 'Yielding lets the browser handle a queued interaction between chunks instead of waiting for one long task to finish entirely.' },
+        { id: 'b', text: 'Moving expensive, non-UI computation into a Web Worker', correct: true, explanation: 'Work done off the main thread cannot block event handling or painting, directly helping interaction responsiveness.' },
+        { id: 'c', text: 'Adding width and height attributes to all images', correct: false, explanation: 'That addresses CLS (layout shift from unsized media), not interaction latency — it has no effect on INP.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A performance fix that improves the Lighthouse (lab) score for a page is guaranteed to also improve the real-user (RUM/CrUX) score for that page.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Lab data reflects one fixed device/network profile in a single run; real users vary widely in device power and connection quality, so a lab improvement does not guarantee the same improvement — or any improvement — shows up in the field distribution.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — lab and field data can diverge, which is exactly why a fix should be confirmed against RUM data before being considered done.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A cookie-consent banner slides in above the main content 1.5 seconds after page load, pushing everything below it down without any user interaction triggering it. Which metric captures this as a problem?',
+      options: [
+        { id: 'a', text: 'CLS', correct: true, explanation: 'CLS sums unexpected layout shifts — content moving because of something other than a direct user interaction. A banner injected above existing content that pushes it down is a textbook CLS hit.' },
+        { id: 'b', text: 'LCP', correct: false, explanation: 'LCP is about when the largest visible element first renders, not about later content shifting position.' },
+        { id: 'c', text: 'INP', correct: false, explanation: 'INP measures interaction responsiveness; this scenario describes an unprompted layout shift, not a slow response to a user action.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,259 @@
+---
+title: "Lazy Loading"
+module: "Performance & Optimization"
+moduleOrder: 4
+order: 4
+track: "concept"
+summary: "Covers lazy loading of images, components, and below-the-fold content, and its trade-offs."
+cheatsheet:
+  - "Use native `loading=\"lazy\"` for below-the-fold `<img>`/`<iframe>` tags — it's free, requires no JS, and the browser handles the load-distance heuristics for you."
+  - "Never lazy-load anything visible in the initial viewport — it delays LCP instead of helping it. Lazy loading only pays off for content the user has to scroll to reach."
+  - "Always reserve space for lazy content (`width`/`height`, `aspect-ratio`, or a fixed-height skeleton) — an unsized placeholder that pops in later is a CLS hit."
+  - "IntersectionObserver is the general-purpose tool for lazy-loading anything that isn't a plain image or iframe: components, video players, comment sections, ads."
+  - "Lazy loading and code splitting are complementary: code splitting decides what bundle boundary exists; lazy loading decides when that boundary's code and data actually get fetched."
+  - "Rootless nested lazy imports (a lazy component whose own children are also lazy) create request waterfalls — prefetch the next likely chunk instead of waiting for each IntersectionObserver to fire in sequence."
+  - "Fire the data fetch and the component import in parallel when a section becomes visible, don't chain them — chaining doubles the visible latency for no reason."
+tags: ["performance", "loading"]
+estMinutes: 8
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every image, ad slot, and comment thread you ship down to the client costs
+bytes, decode time, and JS execution — whether or not the user ever scrolls
+far enough to see it. A news feed with 40 article cards and their images
+doesn't need all 40 images decoded before the first three are usable. Lazy
+loading is the technique of deferring the fetch (and often the render) of
+content until it's actually about to matter to the user, instead of paying
+for everything up front.
+
+Done well, it shrinks the initial page weight and speeds up the content
+that's actually on screen. Done carelessly, it either creates layout shift
+when placeholders swap in without warning, or — worse — it delays content
+the user is looking at right now, which is the exact opposite of what you
+wanted.
+
+## The building blocks
+
+### Native `loading="lazy"`
+
+For plain images and iframes, the browser already does this for you:
+
+```html
+<img src="/feed/photo-42.jpg" loading="lazy" width="640" height="360" alt="..." />
+```
+
+The browser estimates how far the element is from the viewport (factoring
+in scroll speed and connection quality) and only issues the network request
+once it's within a reasonable distance of becoming visible. No JavaScript
+required, and it degrades safely — browsers that don't recognize the
+attribute just load the image eagerly, as if the attribute weren't there.
+
+This is the right default for any `<img>` or `<iframe>` you know is below
+the fold: avatar grids, article thumbnails further down a feed, embedded
+maps or videos in a long article.
+
+### `IntersectionObserver` for everything else
+
+Native lazy loading only covers `<img>` and `<iframe>`. For anything more
+custom — a React/Vue component, a chart that only renders when scrolled
+into view, an ad slot, a comment section — you need to detect visibility
+yourself, and `IntersectionObserver` is the tool for that. It watches a
+target element and fires a callback when it crosses a visibility threshold,
+without the layout-thrashing cost of polling `getBoundingClientRect` on
+every scroll event.
+
+```js
+const observer = new IntersectionObserver(
+  (entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) {
+        loadCommentSection(entry.target);
+        observer.unobserve(entry.target);
+      }
+    }
+  },
+  { rootMargin: '200px' } // start loading 200px before it enters the viewport
+);
+
+observer.observe(document.querySelector('#comments-placeholder'));
+```
+
+The `rootMargin` option is the key tuning knob: a positive margin starts
+the fetch *before* the element is actually visible, trading a bit of wasted
+work (if the user never scrolls that far) for a section that's already
+loaded by the time they arrive, instead of popping in mid-scroll.
+
+## Lazy loading and code splitting
+
+Code splitting and lazy loading solve different problems that compose
+together. Code splitting (covered in the previous lesson) decides *where
+the bundle boundaries are* — which components live in their own chunk
+instead of the main bundle. Lazy loading decides *when* a chunk actually
+gets requested.
+
+A component can be code-split without being lazy-loaded (you `import()` it
+dynamically but trigger the import immediately on route load, purely to
+keep the initial bundle smaller). And a component can be visibility-lazy
+without necessarily being its own chunk (though in practice, if you're
+gating something behind scroll visibility, you almost always want it
+in its own chunk too — otherwise you've paid the download cost anyway,
+you've just deferred using it).
+
+The common pattern for below-the-fold widgets is: dynamic `import()` for
+the JS chunk, triggered by an `IntersectionObserver` callback, fetching the
+component's data at the same time rather than after the chunk resolves.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Feed renders] --> B[Placeholder with reserved height observed]
+  B --> C{Scrolled near viewport?}
+  C -- no --> B
+  C -- yes --> D[Fire component import and data fetch in parallel]
+  D --> E[Chunk + data both resolve]
+  E --> F[Replace placeholder in place, no layout shift]
+`} />
+
+## The layout-shift trade-off
+
+The most common way lazy loading backfires is shipping a placeholder with
+no reserved dimensions. The browser lays out the page assuming the
+placeholder's natural size (often zero height for an empty div), then the
+real content arrives and shoves everything below it down the page — a
+classic CLS (Cumulative Layout Shift) hit, and a jarring one if the user
+was mid-read or about to tap something.
+
+The fix is always the same: reserve space before the content loads.
+
+- For images: set `width` and `height` attributes (or `aspect-ratio` in
+  CSS) so the browser computes the box size before the pixels arrive.
+- For components: give the placeholder a fixed or estimated min-height
+  that matches the eventual content's typical size, ideally with a
+  skeleton screen so it doesn't look broken while empty.
+- For genuinely variable-height content (a comment thread that could be 1
+  reply or 200), pick a reasonable estimated height and accept that some
+  shift is unavoidable — but keep it small and make sure it happens above
+  where the user is currently reading, not right under their cursor.
+
+## When lazy loading hurts
+
+Lazy loading is a below-the-fold technique. Applied above the fold, it
+actively makes perceived performance worse:
+
+- **Hero images and LCP candidates**: if the largest above-the-fold image
+  has `loading="lazy"`, you've told the browser to deprioritize the exact
+  resource that Largest Contentful Paint is measuring. This is one of the
+  most common real-world LCP regressions — a well-meaning "lazy-load
+  everything" pass that catches the hero image too.
+- **Content visible on initial load in general**: anything in the first
+  viewport shouldn't wait for a scroll-triggered fetch, because there's no
+  scroll happening yet to trigger it — the user is just staring at an empty
+  placeholder for a section they can already see.
+- **SEO-sensitive content for crawlers that don't execute scroll-based JS**:
+  some crawlers or link-preview bots don't scroll or run
+  `IntersectionObserver` callbacks, so IntersectionObserver-gated content
+  can end up invisible to them. Native `loading="lazy"` doesn't have this
+  problem because it's a browser-level hint, not a script that requires a
+  real scroll event.
+
+The rule of thumb: lazy-load the *distance* between the user and the
+content, not the *importance* of the content. If it's importance you're
+worried about (e.g., "this API call is slow, defer it"), that's a
+different problem — solve it with a loading state or streaming, not by
+tying it to scroll position.
+
+## Worked example: lazy-loading a comment section
+
+Take a social feed post: the post body and image render immediately, but
+the comment section below it can easily be the heaviest part of the DOM —
+dozens of comment rows, avatars, and reply threads. Loading every post's
+full comment tree on initial page load is wasteful; most posts in the feed
+are never scrolled to, let alone have their comments opened.
+
+The approach:
+
+1. Render each post with a comments placeholder that reserves height
+   (roughly the size of a "collapsed comments" summary bar, maybe 48px)
+   instead of an empty div.
+2. Attach an `IntersectionObserver` to that placeholder with a `rootMargin`
+   of around 300px, so loading starts slightly before the user actually
+   scrolls the section into view.
+3. On intersection, kick off two things at once: `import()` the comment
+   thread component chunk, and fetch that post's comments from the API.
+   Don't await the import before starting the fetch — they're independent
+   and should run in parallel.
+4. Once both resolve, swap the placeholder for the rendered comment list.
+   If the real content's height differs from the placeholder, animate the
+   height change over ~150ms instead of snapping, so it doesn't read as a
+   layout jump even though technically some shift still occurs.
+5. Unobserve the placeholder once loaded so the observer isn't doing
+   pointless work as the user keeps scrolling past already-loaded posts.
+
+The net effect: a feed with 50 posts fetches maybe 3-5 comment sections'
+worth of data and JS on initial scroll, instead of 50, and the ones that
+do load are ready by the time the user's eyes reach them rather than
+after.
+
+<Callout type="warning">
+  A common mistake is lazy-loading a whole vertical stack of independent
+  widgets each with their own `IntersectionObserver`, where each one's
+  visibility check triggers *its own* dynamic import of a shared dependency
+  (a chart library, a markdown renderer) with no coordination between them.
+  The first widget's import resolves, then the second widget scrolls into
+  view and starts its own fetch of the same shared chunk instead of reusing
+  the one already in flight, producing a duplicate-request waterfall. Fix
+  it by deduping the import (bundlers cache repeated `import()` calls to the
+  same module by default, but hand-rolled fetch-based lazy loaders often
+  don't) and by warming the shared chunk once, the first time any consumer
+  needs it.
+</Callout>
+
+## Quick check
+
+<Quiz
+  lessonId="lazy-loading"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A page’s hero image, visible immediately on load, is marked with loading="lazy". What is the most likely effect?',
+      options: [
+        { id: 'a', text: 'Faster Largest Contentful Paint, since the browser deprioritizes non-critical work', correct: false, explanation: 'The opposite happens: the hero image is likely the LCP element, and lazy-loading it delays exactly the resource LCP measures.' },
+        { id: 'b', text: 'Worse or delayed LCP, because the browser deprioritizes a resource that’s already visible', correct: true, explanation: 'loading="lazy" tells the browser to defer the fetch based on distance from viewport. An above-the-fold image has zero distance to defer, so the hint only adds delay to a critical resource.' },
+        { id: 'c', text: 'No effect, because loading="lazy" only applies to iframes', correct: false, explanation: 'loading="lazy" applies to both <img> and <iframe> elements.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these reduce the layout-shift risk of lazy-loaded content? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Reserving a fixed or estimated height for the placeholder before content loads', correct: true, explanation: 'Reserving space means the layout doesn’t change size when the real content swaps in, avoiding a CLS hit.' },
+        { id: 'b', text: 'Setting width and height attributes (or aspect-ratio) on lazy images', correct: true, explanation: 'This lets the browser compute the image’s box size before the bytes arrive, so no reflow happens on load.' },
+        { id: 'c', text: 'Loading all lazy content as early as possible regardless of visibility', correct: false, explanation: 'That defeats the purpose of lazy loading entirely and doesn’t address layout shift — shift comes from unreserved space, not from load timing.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Code splitting and lazy loading are the same technique described with two different names.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'They’re complementary but distinct: code splitting defines where a bundle boundary is; lazy loading decides when that boundary’s code (and often its data) actually gets fetched.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — a chunk can be code-split without being visibility-gated, and the two concepts solve different problems even though they’re usually combined in practice.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the comment-section example, why fetch the comment data and dynamically import the comment component in parallel rather than importing first and fetching after?',
+      options: [
+        { id: 'a', text: 'Because the two operations are independent, so chaining them only adds latency with no benefit', correct: true, explanation: 'The component chunk and the comment data don’t depend on each other, so running them concurrently means the section is ready as soon as the slower of the two finishes, instead of the sum of both.' },
+        { id: 'b', text: 'Because dynamic import() cannot be awaited', correct: false, explanation: 'Dynamic import() returns a promise and can absolutely be awaited — that’s not the reason for parallelizing here.' },
+        { id: 'c', text: 'Because browsers block network requests while a script is executing', correct: false, explanation: 'This isn’t about a browser limitation; it’s about avoiding unnecessary sequential dependency between two independent async operations.' },
+      ],
+    },
+  ]}
+/>

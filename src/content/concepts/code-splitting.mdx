@@ -1,0 +1,141 @@
+---
+title: "Code Splitting"
+module: "Performance & Optimization"
+moduleOrder: 4
+order: 3
+track: "concept"
+summary: "Explains route- and component-based code splitting and how to choose split boundaries."
+cheatsheet:
+  - "A single bundle means one big parse/compile cost before anything is interactive — code splitting trades that for several smaller, independently-cacheable chunks."
+  - "Route-based splitting (one chunk per page/route) is almost always worth doing first — users typically only need the code for the route they landed on."
+  - "Component-based splitting via dynamic `import()` targets specific expensive widgets (rich editors, charts, modals) that most sessions never touch."
+  - "More chunks isn't free: each chunk is a request, and on HTTP/2 those multiplex over one connection, but still cost round-trip latency, cache lookups, and duplicated shared-code risk if boundaries aren't planned."
+  - "A request waterfall happens when a lazy component imports another lazy component, which imports another — each additional lazy `import()` inside an already-lazy chunk adds a serial round trip before render can continue."
+  - "Split at boundaries with low interaction frequency and high code weight: a settings modal, a PDF viewer, a chart library — not a button or a small hook."
+  - "Always pair a lazy-loaded component with a loading fallback (`Suspense` or equivalent) — the chunk fetch is asynchronous even on a fast network."
+tags: ["performance","bundling"]
+estMinutes: 9
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Ship one JavaScript bundle for a large app and you're asking every visitor to download, parse, and execute code for features they may never touch — a settings page, an admin panel, a rich text editor, a checkout flow — before they can even see the homepage. Code splitting is how you stop paying that tax upfront: instead of one bundle, the build produces many smaller chunks, and the browser fetches each one only when it's actually needed. Get the boundaries right and initial load gets dramatically lighter. Get them wrong and you trade one problem (a bloated bundle) for another (a cascade of blocking network requests).
+
+This lesson covers the two common ways to split a frontend app, how bundlers actually implement the split, and the trade-off curve between "few big bundles" and "many small requests" that you need to reason about explicitly rather than just splitting everything you can.
+
+## Route-based splitting
+
+The most common and highest-leverage split boundary is the route. Instead of bundling your entire app into one file, each top-level page (or route) becomes its own chunk, loaded only when the user navigates there.
+
+This maps naturally onto how users actually move through an app: someone landing on a product listing page doesn't need the code for the checkout flow, the account settings page, or the admin dashboard yet — maybe ever. Every modern router (React Router, Next.js, Vue Router, Astro's own page-based routing) either does this automatically or makes it a one-line change, because the win is so consistently large: less JS to parse and execute before the first route is interactive, and each route's chunk can be cached independently, so shipping a change to the checkout page doesn't invalidate the cached bundle for the homepage.
+
+## Component-based splitting
+
+Within a single route, some components are expensive but rarely used in a given session: a modal that only opens on a specific action, a rich text editor, a chart library, a code-diff viewer. Bundling these into the main chunk means every visitor pays their weight even if they never open that modal.
+
+Component-based splitting pulls these out into their own chunk, fetched only when the component is actually rendered — typically triggered by a user interaction (clicking "edit," opening a modal) rather than at initial page load.
+
+### How bundlers implement it: dynamic `import()`
+
+Both route- and component-based splitting are built on the same underlying mechanism: the dynamic `import()` expression (as opposed to a static `import` at the top of a file). A static `import` is resolved at build time and gets folded into whatever chunk the importing module belongs to. A dynamic `import()` call returns a promise and tells the bundler "this is a separate download, fetch it lazily, at runtime, when this code path actually executes."
+
+Bundlers (webpack, Rollup/Vite, esbuild) treat every dynamic `import()` call as a split point: they extract the imported module (and anything only it depends on) into its own output file, and replace the `import()` call with runtime code that fetches that file and resolves the promise once it's loaded and executed. Framework helpers like React's `lazy()` or Vue's `defineAsyncComponent` are thin wrappers around exactly this — they don't do anything a raw dynamic `import()` couldn't do, they just wire the resulting promise into the component tree with a suspense/loading state.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Initial HTML request] --> B[Main bundle: shell + router]
+  B --> C{User navigates to /reports}
+  C --> D[dynamic import fetches reports chunk]
+  D --> E[User clicks Export chart]
+  E --> F[dynamic import fetches chart-library chunk]
+  F --> G[Chart renders]
+`} />
+
+## The trade-off: fewer big bundles vs. many small requests
+
+Splitting isn't free, so "split everything possible" is the wrong instinct. Two forces pull in opposite directions:
+
+- **One big bundle**: minimal request count, but the browser can't start executing anything until the whole file downloads and parses — including code for features the current user will never touch. On a slow connection this delays time-to-interactive noticeably.
+- **Many tiny chunks**: each feature only costs what it weighs, but every chunk is a separate request with its own overhead — a cache lookup, TLS/connection considerations, and (in JS bundles specifically) the risk of duplicating shared dependencies across chunks if the bundler's shared-chunk logic isn't configured well.
+
+HTTP/2 (and HTTP/3) changes this calculus but doesn't eliminate it. Multiplexing lets many requests share a single connection, so you no longer pay a full new-connection cost per chunk the way you did on HTTP/1.1 — this is *why* "just split more" became viable in the HTTP/2 era. But multiplexed requests still each carry their own latency for the round trip, still get queued behind higher-priority resources by the browser's scheduler, and still add JS-engine overhead (each chunk parses and instantiates its module scope separately). Splitting a 200KB bundle into forty 5KB chunks is not free just because HTTP/2 removed the connection tax.
+
+The practical rule: split at boundaries that are large enough to matter (tens of KB, not a handful of lines) and infrequent enough in typical usage that most sessions skip them. A route is almost always a good boundary. A single small utility function is never a good boundary — the request overhead exceeds the savings.
+
+## Choosing split boundaries for a large app
+
+For a large app, work top-down:
+
+1. **Split every top-level route.** This is the default, near-zero-cost win — do it everywhere first.
+2. **Split heavy, conditionally-used components within a route** — modals, editors, charting libraries, anything gated behind a click or a feature flag that most users in that route don't trigger.
+3. **Split heavy third-party dependencies** even if the component using them is always rendered — e.g., a date-picker library used on one form field can often load asynchronously alongside the rest of the page rather than blocking it, if it's not needed for the very first paint.
+4. **Don't split shared, always-needed code** — your design system's core components, state management setup, or the router itself belong in the main chunk (or a dedicated shared vendor chunk); splitting these just adds request overhead for code every route needs anyway.
+
+A useful gut check: for each candidate boundary, ask "what fraction of sessions on this route actually execute this code?" Low fraction and non-trivial size means split it. High fraction (even if the code is sizeable) usually means keep it in the main path — you're not saving most users anything, you're just adding a request most of them will trigger anyway.
+
+## Worked example: a dashboard app
+
+Say you're building an analytics dashboard with a route list — `/overview`, `/reports`, `/settings`, `/admin` — and `/reports` contains a heavy charting library plus a CSV export feature that opens a modal.
+
+A sensible split:
+
+- Each route (`/overview`, `/reports`, `/settings`, `/admin`) is its own chunk via route-based splitting — visiting `/overview` never fetches `/admin`'s code.
+- Inside `/reports`, the charting library is dynamically imported when the report component mounts, not bundled into the `/reports` route chunk itself — because some users on `/reports` only look at tabular data and never render a chart.
+- The CSV export modal is dynamically imported only when the user clicks "Export," since most visits to `/reports` don't trigger an export.
+
+The result: a user just checking `/overview` downloads a small shell plus the overview chunk — no charting library, no export modal, no admin code — while a user who drills into reports and exports a CSV pays for exactly the extra code that feature needs, in the order they actually need it.
+
+<Callout type="warning">
+  **The nested-lazy-import waterfall.** A common mistake in component-based splitting: a lazily-loaded component itself contains another dynamic `import()` for a sub-component, which contains another. Each level only starts fetching once the previous chunk has finished downloading *and executing*, because the bundler can't know what the next import is until that code runs. Three levels of nested lazy imports means three sequential round trips before the user sees anything, even though the total code weight might have fit in a single request. If you find yourself lazy-loading a lazy-loaded component's lazy-loaded child, consider flattening those into one chunk, or use bundler hints (webpack's magic comments, Vite's manual chunking) to fetch them in parallel instead of serially.
+</Callout>
+
+## Quick check
+
+<Quiz
+  lessonId="code-splitting"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the most common first code-splitting boundary for a large multi-page app, and why?',
+      options: [
+        { id: 'a', text: 'Route-based splitting, because most sessions only need the code for the page they are on', correct: true, explanation: 'Routes map naturally to what a given session actually uses, making them the highest-leverage, lowest-risk split boundary.' },
+        { id: 'b', text: 'Splitting every individual function into its own chunk, for maximum granularity', correct: false, explanation: 'Splitting at too fine a grain adds request overhead per chunk that exceeds the savings — tiny chunks are usually not worth splitting out.' },
+        { id: 'c', text: 'Splitting the CSS file away from the JS bundle', correct: false, explanation: 'That is a separate concern (asset type separation), not the JS code-splitting boundary this lesson covers.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are good candidates for component-based (dynamic import) code splitting? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A rich text editor that only appears when a user clicks "compose"', correct: true, explanation: 'It is both heavyweight and conditionally used — exactly the profile that benefits from lazy loading.' },
+        { id: 'b', text: 'A charting library used only on a reports page some users never visit', correct: true, explanation: 'Sizeable dependency, low usage fraction relative to the whole app — a good split boundary.' },
+        { id: 'c', text: 'The app\'s shared button component used on every single screen', correct: false, explanation: 'Code that nearly every route needs immediately is a poor split candidate — splitting it just adds a request every session pays anyway.' },
+        { id: 'd', text: 'A small formatting utility function used in three places', correct: false, explanation: 'Its size is tiny; the request/connection overhead of a separate chunk would exceed any savings from not bundling it.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Because HTTP/2 multiplexes requests over a single connection, splitting a bundle into many more, smaller chunks has effectively no downside.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'HTTP/2 removes the per-request connection-setup cost, but each chunk still adds round-trip latency, scheduling/priority overhead, and separate module-instantiation cost in the JS engine.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — multiplexing reduces but does not eliminate the cost of splitting; over-splitting into too many tiny chunks still has real overhead.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A component lazily loads a sub-component, which itself lazily loads another sub-component, three levels deep. What problem does this create?',
+      options: [
+        { id: 'a', text: 'A request waterfall, since each chunk can only be requested after the previous one has downloaded and executed', correct: true, explanation: 'The bundler cannot discover the next import until the current chunk runs, so nested lazy imports serialize into sequential round trips.' },
+        { id: 'b', text: 'No problem, since HTTP/2 fetches all chunks in parallel regardless of nesting', correct: false, explanation: 'Parallel fetching only helps once the bundler/browser knows a request is needed — nested dynamic imports are discovered one at a time at runtime, not upfront.' },
+        { id: 'c', text: 'It forces the whole app to fall back to a single bundle', correct: false, explanation: 'Nested lazy imports still produce separate chunks; the issue is the serial fetch order, not a fallback to one bundle.' },
+      ],
+    },
+  ]}
+/>

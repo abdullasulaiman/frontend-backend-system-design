@@ -1,0 +1,117 @@
+---
+title: "The Role of Frontend System Design in Modern Apps"
+module: "Introduction"
+moduleOrder: 1
+order: 3
+track: "concept"
+summary: "Surveys why frontend architecture decisions matter more as apps grow in scale, team size, and device diversity."
+cheatsheet:
+  - "Frontend architecture becomes a distinct discipline once more than one team ships into the same app — module boundaries and ownership rules replace 'just talk to the other engineer.'"
+  - "Design for the slowest realistic device and network on your user list, not your dev laptop on office wifi — a mid-range Android phone on 3G is a different runtime environment, not just a slower version of yours."
+  - "A single unbounded or chatty component (an infinite feed, a busy dashboard widget) can degrade the whole page if it isn't isolated with its own loading, error, and memory boundaries."
+  - "Client-side reliability (retries, offline handling, partial-failure UI) is now part of the frontend's job, not something you can assume the network or backend will always guarantee."
+  - "Bundle size and initial JS cost are shared team liabilities — one team's heavy dependency slows every page that imports it, even ones that team doesn't own."
+  - "Push architectural decisions (data fetching strategy, state ownership, rendering mode) to the point in a feature's design where they're cheapest to change — usually before the first line of a component is written."
+tags: ["introduction", "architecture"]
+estMinutes: 8
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Fifteen years ago, "frontend" often meant one or two engineers wiring up jQuery against a server-rendered page. Today a single product surface — a social feed, a video player, an admin console — can be built by a dozen teams, shipped to millions of devices spanning five-year-old Android phones and new laptops, and expected to feel instant regardless of network conditions. That gap between "a page with some JavaScript" and "a distributed system that happens to run in a browser" is exactly why frontend system design exists as its own discipline. This lesson looks at the forces driving that shift and grounds them in real failure stories, so the rest of the course has a clear "why" behind it.
+
+## Why frontend architecture became its own discipline
+
+Three pressures, compounding together, turned frontend work from "write the UI" into "design a system."
+
+### Scale of the application itself
+
+Modern frontends aren't one component tree anymore — they're often composed of dozens of independently deployed pieces: a checkout flow, a recommendations widget, a chat panel, each potentially owned by a different codebase or micro-frontend. Decisions that used to be implicit (how state flows, who owns a piece of data, what happens when one part fails) now have to be explicit contracts, because no single engineer holds the whole system in their head.
+
+### Multiple teams, one app
+
+When five teams ship into the same product, the frontend needs the same kind of boundaries a backend gets from service ownership. Without them, a change in one team's component can silently break another team's page — a shared design-system update alters padding no one signs off on, or one team's new dependency doubles the JS payload for a page they don't even own. Frontend system design is largely about drawing those boundaries deliberately: what's a shared platform concern (routing, auth, design system) versus what's a team's local concern (a feature's internal state).
+
+### Diversity of devices and networks
+
+A backend engineer usually designs for a fleet of servers with fairly uniform, controlled specs. A frontend engineer designs for whatever hardware and connection a user happens to have — a `flagship phone on 5G`, a five-year-old Android device on a spotty train connection, a desktop on a corporate VPN with a restrictive proxy. Median engagement time and CPU power on the low end of that range can differ from the high end by an order of magnitude. A component that renders instantly in a dev environment can take multiple seconds to become interactive on a real low-end device, and a request that resolves immediately on office wifi can hang or fail entirely on a train.
+
+### Rising expectations for speed and reliability
+
+Users increasingly treat "the page didn't load in two seconds" or "my draft disappeared when the connection blipped" as bugs, not acceptable limitations — because plenty of competing apps have already trained them to expect better. That expectation raises the bar for every team: performance and resilience aren't optional polish anymore, they're baseline requirements that have to be designed for from the start, not patched in after launch.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    U1[User on flagship phone, wifi] --> APP[Your frontend]
+    U2[User on budget phone, 3G] --> APP
+    U3[User on desktop, corporate proxy] --> APP
+    APP --> T1[Team: Feed]
+    APP --> T2[Team: Player]
+    APP --> T3[Team: Platform / Shared UI]
+    T1 -.shared components.-> T3
+    T2 -.shared components.-> T3
+`} />
+
+The diagram above is the core tension in one picture: many teams contribute to one runtime, and that runtime has to work for a much wider range of users and conditions than any one team designs against in isolation. Frontend system design is the set of decisions — rendering strategy, state ownership, data fetching, performance budgets, failure handling — that keeps that combination from collapsing.
+
+## Three scenarios where poor architecture caused real damage
+
+Concrete failure modes motivate this course better than abstract principles do. Here are three shapes of problem that recur across companies, phrased around the kind of app, not any specific product.
+
+### The social feed that could not stop growing
+
+A feed team ships an infinite-scroll timeline where every rendered post keeps its full DOM node, event listeners, and cached media references alive, on the assumption that "we'll clean it up later." Early on with a few hundred posts it's fine. Months later, power users scrolling for ten minutes accumulate thousands of live nodes, and the tab's memory footprint climbs until low-end devices start crashing the tab or the whole browser. The root cause isn't a single bug — it's an architectural gap: nobody decided up front how the feed would virtualize rendered items or bound memory growth, so the fix now requires retrofitting virtualization into a component with a thousand hidden assumptions built on top of it.
+
+### The video platform that buffered on cue
+
+A video product launches with adaptive bitrate logic tuned and tested entirely on the engineering team's office network. It looks great in every demo. In production, users on inconsistent mobile connections get stuck in a loop: the player picks a bitrate that's too optimistic for the real connection, buffers, drops a level, buffers again while catching up on the backlog it already started downloading. Support tickets pile up specifically from users on the network conditions nobody tested against. The lesson isn't "adaptive bitrate is hard" (it is) — it's that the architecture treated "our office network" as representative of "the network," which is a frontend system design failure, not a codec problem.
+
+### The shared internal dashboard that took the whole page down
+
+An internal analytics dashboard lets each team embed their own widget on a shared page — a natural way to let teams self-serve without a central bottleneck. One team's widget makes an unbounded number of API calls while a chart re-renders, with no error boundary around it. When that team's backend gets slow one afternoon, their widget's failure cascades: the request queue backs up, the shared page's other widgets stall waiting on a browser connection limit, and the entire dashboard becomes unusable for every team, not just the one with the bug. The fix that should have existed from day one is architectural: isolate each widget's failure domain (its own error boundary, its own request budget) so one team's mistake can't take down everyone else's view.
+
+<Callout type="warning">
+  The common thread across all three scenarios: each team made a locally reasonable decision (keep post nodes alive for a smooth back-scroll, tune bitrate against the network you have, let teams self-serve widgets) that became a systemic problem only at scale. Frontend system design is largely the practice of asking "what happens when this decision multiplies by 10x users, 10x posts, or 10x teams?" *before* shipping, not after the incident review.
+</Callout>
+
+## What this means for how you design frontends now
+
+None of this means every app needs the full weight of a distributed-systems mindset — a marketing landing page doesn't need a virtualized list or a bitrate ladder. It means the *questions* have shifted. Instead of just "how do I build this component," you now also ask: who else touches this surface, what's the worst device and network someone will run it on, and what happens when a part of it fails or grows past what I tested. Those questions are exactly what the rest of this course works through — rendering strategy, state management, data fetching, performance, and reliability — one topic at a time, building toward a repeatable way to reason about frontend architecture decisions instead of relearning the lesson from an incident.
+
+<Quiz
+  lessonId="role-of-frontend-system-design-in-modern-apps"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Which factor most directly explains why frontend architecture became its own discipline, distinct from simply "building UI"?',
+      options: [
+        { id: 'a', text: 'CSS frameworks became more complex over time', correct: false, explanation: 'Styling complexity is a real concern but is not the driver behind treating frontend architecture as a systems discipline — scale, ownership, and environment diversity are.' },
+        { id: 'b', text: 'Apps grew in scale, team ownership, and device/network diversity simultaneously', correct: true, explanation: 'It is the combination of a bigger app, more teams sharing it, and a much wider range of real-world devices and networks that turns UI-building into systems design.' },
+        { id: 'c', text: 'Browsers began supporting more JavaScript APIs', correct: false, explanation: 'More browser APIs expanded what frontends can do, but that alone does not explain why architecture-level thinking became necessary.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'In the video platform scenario described in this lesson, which statements accurately describe what went wrong? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Bitrate logic was tuned and validated mainly against a good office network', correct: true, explanation: 'That is exactly the gap — the logic worked well against the conditions it was tested on, but those conditions were not representative of real users.' },
+        { id: 'b', text: 'The player got stuck alternating between picking an optimistic bitrate and rebuffering on real-world connections', correct: true, explanation: 'This is the buffering loop the lesson describes: overly optimistic bitrate selection followed by stalls and downgrades under real network conditions.' },
+        { id: 'c', text: 'The core issue was that adaptive bitrate streaming is fundamentally unworkable', correct: false, explanation: 'The lesson is explicit that adaptive bitrate itself is not the problem — the failure was designing and testing against unrepresentative network conditions.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In the shared internal dashboard scenario, isolating each team’s widget with its own error boundary and request budget would have prevented one widget’s backend slowdown from stalling the whole page.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Isolating failure domains per widget is precisely the architectural fix — it stops one widget’s unbounded requests and errors from exhausting shared browser resources that every other widget depends on.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'The lesson identifies missing failure isolation (no error boundary, no per-widget request budget) as the root architectural gap, and isolating it as the fix.' },
+      ],
+    },
+  ]}
+/>

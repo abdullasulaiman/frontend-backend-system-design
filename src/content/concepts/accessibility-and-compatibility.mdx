@@ -1,0 +1,150 @@
+---
+title: "Accessibility & Compatibility"
+module: "Nonfunctional Requirements"
+moduleOrder: 2
+order: 2
+track: "concept"
+summary: "Covers accessibility and cross-device/browser compatibility as nonfunctional requirements to clarify up front."
+cheatsheet:
+  - "Treat accessibility and compatibility as requirements to scope in the first five minutes of an interview, not an afterthought bolted on after the design is drawn."
+  - "Ask three scoping questions: who are the users (any known assistive-tech usage), is there a compliance target (e.g. WCAG 2.1 AA), and what's the actual browser/device matrix (not 'everything')."
+  - "Semantic HTML (button, nav, dialog, headings in order) gives you keyboard support and screen reader structure for free — reaching for a div with an onClick throws that away."
+  - "Color contrast has numeric targets: 4.5:1 for normal text, 3:1 for large text and UI components under WCAG AA — 'looks fine to me' is not a spec."
+  - "Progressive enhancement (build the baseline up) is more robust than graceful degradation (build the ideal down) because the baseline never depends on a feature that might fail to load."
+  - "A single accessibility requirement (e.g. 'must be operable by keyboard') can force real design changes — a custom dropdown needs a documented interaction model, not just CSS."
+  - "Compatibility scope drives real cost: supporting one more browser or a screen reader isn't free — it changes what components, libraries, and polyfills you can use."
+tags: ["nonfunctional", "accessibility"]
+estMinutes: 10
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Picture two candidates designing the same "product image gallery" component. One jumps straight to a carousel with custom swipe gestures and a slick fade transition. The other spends thirty seconds asking: does this need to work with a screen reader, is keyboard-only navigation required, and which browsers and devices are actually in scope? That second question changes the entire component design — a swipe-only carousel with no keyboard handling and no ARIA labeling might look identical in a demo, but it's unusable for a meaningful slice of real users, and in some industries it's a legal requirement to fix.
+
+Accessibility and compatibility are nonfunctional requirements exactly like performance: they don't show up as a feature on a product spec, but they constrain every design decision underneath the features. Sibling lesson [Performance as a Requirement](/performance-as-a-requirement) covers turning "make it fast" into measurable targets — this lesson does the same thing for "make it usable by everyone, everywhere."
+
+## Accessibility: designing for how people actually use the page
+
+Accessibility means the app is usable by people with visual, motor, auditory, or cognitive differences, and by people using assistive technology to interact with it. In an interview, don't treat it as a single checkbox — break it into the concrete mechanisms you'd actually design for.
+
+### Semantic HTML first
+
+The cheapest accessibility win is using the HTML element that already does what you need. A `<button>` is focusable, triggers on Enter and Space, and is announced as "button" by a screen reader — automatically. A `<div onClick={...}>` has none of that; you'd have to hand-roll `tabIndex`, keyboard event handlers, and an ARIA role to get back to where `<button>` started. The same logic applies to `<nav>`, `<header>`, `<dialog>`, form `<label>`s tied to inputs, and heading levels (`<h1>`–`<h6>`) that describe the actual document outline rather than being chosen for font size.
+
+### Keyboard navigation
+
+Every interactive element needs to be reachable and operable without a mouse: tab order that follows visual/logical order, a visible focus indicator (don't strip `outline: none` without replacing it), and support for the keys users expect (Escape to close a modal, arrow keys inside a menu or tab list). This matters for people who can't use a mouse, and for power users and screen reader users who navigate by keyboard as a matter of course.
+
+### Screen reader support
+
+Screen readers convert the DOM into speech or braille, so structure matters more than appearance. This means meaningful `alt` text on informative images (and empty `alt=""` on purely decorative ones), `aria-label` or `aria-labelledby` on controls that have no visible text label (an icon-only close button), and `aria-live` regions for content that updates without a page reload (a toast notification, a live search result count) so the update actually gets announced.
+
+### Color contrast
+
+Contrast has numeric, testable targets under WCAG 2.1 AA: at least 4.5:1 for normal text against its background, and 3:1 for large text (roughly 18pt+) and for meaningful UI components like icons and input borders. This is a design-system concern as much as a component concern — pick a palette that passes contrast checks up front, rather than discovering a failing gray-on-white button label during a later audit.
+
+## Compatibility: which matrix are you actually supporting
+
+Compatibility is about the range of browsers, devices, screen sizes, input methods, and assistive technologies the app must work correctly on. "Support everyone" is not a requirement — it's a refusal to scope one. A real requirement looks like: "last two versions of Chrome, Firefox, Safari, and Edge; iOS Safari and Android Chrome on the last two OS major versions; screen reader support tested with VoiceOver and NVDA; no support required for Internet Explorer."
+
+### Scoping the question in an interview
+
+When a prompt doesn't specify accessibility or compatibility needs, ask. A few sharp questions do more work than a paragraph of assumptions:
+
+- Who are the users, and is there any known usage of assistive technology (a healthcare portal has very different odds than an internal analytics tool)?
+- Is there a compliance target — WCAG 2.1 AA is the common baseline for public-facing and government-adjacent products, and some regions and industries mandate it legally.
+- What's the actual browser and device matrix — pinned by product analytics or support policy, not "as many as possible"?
+
+The answer changes real decisions: if IE11 is out of scope, you can use modern CSS (`grid`, custom properties) and skip a chunk of polyfills. If VoiceOver support is required, custom components (dropdowns, date pickers, drag-and-drop) need an explicit ARIA pattern and keyboard model, not just visual polish.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Scope the requirement] --> B{Compliance target?}
+  B -->|WCAG 2.1 AA required| C[Semantic HTML + ARIA patterns + contrast checks]
+  B -->|No formal target| D[Best-effort: semantic HTML, keyboard support]
+  A --> E{Browser/device matrix?}
+  E -->|Modern evergreen only| F[Use modern CSS/JS APIs directly]
+  E -->|Must include older browsers| G[Progressive enhancement + polyfills/fallbacks]
+  C --> H[Component design reflects both]
+  D --> H
+  F --> H
+  G --> H
+`} />
+
+## Graceful degradation vs. progressive enhancement
+
+These are two strategies for the same underlying problem — the app must keep working when a browser, device, or assistive technology doesn't support everything you'd like to use.
+
+**Graceful degradation** starts from the full, ideal experience and adds fallbacks for cases that can't support it: build the rich carousel with animations and gestures, then patch in a "if this API is missing, hide the fancy bits" branch. The risk is that the fallback path is untested and under-designed, because it was an afterthought — it's easy to ship a broken fallback nobody exercised.
+
+**Progressive enhancement** starts from a functional baseline that works everywhere — plain HTML links and buttons that do the job with no JavaScript — and layers richer behavior on top for browsers that support it. The baseline is the actual product experience for older or constrained clients, not a patched-together escape hatch, so it tends to be more robust and more accessible by construction (semantic HTML is naturally keyboard- and screen-reader-friendly).
+
+The trade-off is upfront cost: progressive enhancement asks you to design and build the baseline deliberately, which takes more thought early on, while graceful degradation feels faster because you start with the impressive version. In an interview, naming this trade-off and picking one deliberately (rather than not mentioning it at all) is a strong signal.
+
+## Worked example: a custom dropdown menu
+
+Say the prompt is "design a filter dropdown for a product listing page." Without an accessibility requirement, a reasonable-looking design is: a `<div>` styled as a button that toggles a `<div>` of options on click, each option a styled `<div>` with an `onClick`.
+
+Now add the requirement "must be usable via keyboard and screen reader, WCAG 2.1 AA target." That single sentence changes the component:
+
+- The trigger becomes a real `<button>` with `aria-haspopup="listbox"` and `aria-expanded` reflecting open/closed state.
+- The options list gets `role="listbox"` with each option as `role="option"`, and focus moves programmatically with arrow keys instead of relying on mouse hover.
+- Escape closes the menu and returns focus to the trigger button; Enter/Space selects the focused option.
+- The selected option's label is announced via `aria-live` or reflected in the trigger's accessible name, so a screen reader user knows the filter changed after selection.
+- Contrast on the selected/hovered state background needs a check against the 3:1 UI-component threshold, not just the un-selected state.
+
+None of this changes what the feature does from a product-manager's perspective — it's still "a filter dropdown" — but it meaningfully changes the component's internal design, the state it needs to track (focused index, open/closed, selection), and the testing needed before it ships.
+
+<Callout type="warning">
+  A common mistake: treating accessibility as a final QA pass instead of a design input. Retrofitting keyboard support and ARIA attributes onto a component built purely around mouse and touch interactions usually means redesigning its internal state model, not just adding attributes — the "focused option" and "open" states needed for keyboard navigation often don't exist yet in a mouse-only implementation. Scoping the requirement before the first line of the component is written is far cheaper than fixing it after.
+</Callout>
+
+<Quiz
+  lessonId="accessibility-and-compatibility"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Under WCAG 2.1 AA, what is the minimum contrast ratio required for normal-sized body text against its background?',
+      options: [
+        { id: 'a', text: '3:1', correct: false, explanation: '3:1 is the AA threshold for large text (roughly 18pt+) and for meaningful UI components/icons, not normal body text.' },
+        { id: 'b', text: '4.5:1', correct: true, explanation: 'Correct — WCAG 2.1 AA requires at least 4.5:1 contrast for normal text against its background.' },
+        { id: 'c', text: '7:1', correct: false, explanation: '7:1 is the stricter AAA-level target for normal text, not the AA baseline most products target.' },
+        { id: 'd', text: 'There is no numeric target, only subjective review', correct: false, explanation: 'WCAG defines exact numeric ratios precisely so contrast can be tested objectively rather than judged by eye.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are good scoping questions to ask early in an interview when a prompt does not specify accessibility or compatibility needs? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Is there a compliance target, such as WCAG 2.1 AA?', correct: true, explanation: 'A compliance target directly determines how rigorous your semantic HTML, ARIA, and contrast decisions need to be.' },
+        { id: 'b', text: 'What is the actual browser and device matrix in scope?', correct: true, explanation: 'The real matrix (not "everything") determines which modern APIs are safe to use directly versus needing fallbacks or polyfills.' },
+        { id: 'c', text: 'Is any assistive technology usage known or expected among users?', correct: true, explanation: 'Knowing whether screen reader or switch-device usage is expected shapes how much investment keyboard/ARIA support deserves.' },
+        { id: 'd', text: 'What animation library does the team prefer?', correct: false, explanation: 'This is a useful implementation detail eventually, but it does not help scope accessibility or compatibility requirements.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Progressive enhancement means building the full, ideal experience first and then patching in fallbacks for browsers or devices that cannot support parts of it.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'That description is graceful degradation. Progressive enhancement works the opposite direction: start from a working baseline and layer richer behavior on top.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — progressive enhancement starts from a functional baseline that works everywhere and adds enhancements for capable clients, rather than starting from the ideal and patching downward.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A team adds the requirement "the filter dropdown must be fully operable by keyboard" after the component was already built as a div-based menu that only responds to mouse clicks. What is the most likely consequence?',
+      options: [
+        { id: 'a', text: 'A few CSS tweaks are enough to satisfy the requirement', correct: false, explanation: 'Keyboard operability needs actual state (which option is focused, open/closed) and event handling, not just visual styling.' },
+        { id: 'b', text: 'The component likely needs new internal state (focus index, open state) and real elements/ARIA roles, not just an attribute added on top', correct: true, explanation: 'Keyboard and screen reader support usually require tracking state the mouse-only version never needed, which often means a partial redesign of the component internals.' },
+        { id: 'c', text: 'Nothing changes, since keyboard support is a browser default for all elements', correct: false, explanation: 'Only certain semantic elements (like button, a, input) get keyboard behavior for free; custom div-based widgets get none of it automatically.' },
+      ],
+    },
+  ]}
+/>

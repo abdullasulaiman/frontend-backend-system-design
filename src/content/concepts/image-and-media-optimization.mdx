@@ -1,0 +1,305 @@
+---
+title: "Image & Media Optimization"
+module: "Performance & Optimization"
+moduleOrder: 4
+order: 6
+track: "concept"
+summary: "Covers responsive images, modern formats, and video-specific optimization concerns."
+cheatsheet:
+  - "Use `srcset` + `sizes` (or a CDN transform URL) so the browser downloads a resolution matched to the actual rendered size, not a single huge master image."
+  - "AVIF beats WebP beats JPEG/PNG on compression for most photographic content, but AVIF decode is CPU-heavier — fall back gracefully with `<picture>` for older browsers and low-power devices."
+  - "`loading=\"lazy\"` on offscreen `<img>`/`<iframe>` is nearly free and built into the browser — always reserve `width`/`height` (or `aspect-ratio`) alongside it to prevent layout shift."
+  - "Never lazy-load the LCP image — it delays the metric the whole page is scored on. Mark it `fetchpriority=\"high\"` and skip `loading=\"lazy\"` instead."
+  - "Video isn't a big image: serve it as adaptive-bitrate HLS/DASH with multiple renditions, not a single fixed-quality MP4, and always ship a `poster` frame so the player has something to paint before the first segment loads."
+  - "A CDN image-transformation service (resize, re-encode, quality tune, format negotiation via `Accept` header) turns 'optimize this image' into a URL parameter change instead of a build-time asset pipeline problem."
+  - "Quality/size/decode-cost is a three-way trade-off, not two — a smaller file that takes longer to decode can be a worse user-perceived outcome than a slightly larger, cheaper-to-decode one, especially on low-end mobile CPUs."
+tags: ["performance", "media"]
+estMinutes: 9
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Images and video are usually the heaviest bytes on a page, and they're
+frequently the resource that determines Largest Contentful Paint. A product
+page with a 4000px-wide product photo served untouched to a 360px-wide phone
+screen isn't a rare bug — it's the default outcome if nobody thought about
+image delivery. Getting this right isn't just "compress the JPEG harder";
+it's a set of decisions about which pixels actually need to reach which
+device, in which format, decoded how cheaply, and when.
+
+This lesson covers the four levers you have: responsive image sizing,
+format selection, deferred loading, and video-specific delivery. It also
+covers the trade-off framework — quality versus byte size versus decode
+cost — that lets you reason about any of these levers in an interview
+instead of reciting rules.
+
+## Responsive images: ship the size that will actually render
+
+A single `<img src="hero.jpg">` forces every device to download the same
+file, whether it's rendered at 320px or 2400px wide. `srcset` and `sizes`
+fix this by letting the browser pick from a set of candidate files based on
+the viewport and the image's layout width.
+
+```html
+<img
+  src="hero-800.jpg"
+  srcset="hero-400.jpg 400w, hero-800.jpg 800w, hero-1600.jpg 1600w"
+  sizes="(max-width: 600px) 100vw, 50vw"
+  alt="Product hero shot"
+/>
+```
+
+`srcset` lists candidate files with their intrinsic widths (`400w` means
+"this file is 400px wide"). `sizes` tells the browser how wide the image
+will actually be rendered at each viewport width, so it can compute which
+candidate is the best match *before* it knows the final layout. The browser
+combines that with the screen's device-pixel ratio to pick a file — a
+narrow phone at 2x DPR requesting a half-viewport-width image will still
+reasonably pick something in the 400–800px range, not the 1600px one.
+
+The `<picture>` element extends this to *art direction* — swapping which
+crop or composition is shown, not just resolution:
+
+```html
+<picture>
+  <source media="(max-width: 600px)" srcset="hero-square.jpg" />
+  <img src="hero-wide.jpg" alt="Product hero shot" />
+</picture>
+```
+
+Use `srcset`/`sizes` when it's the same image at different resolutions;
+use `<picture>` with `media` queries when the crop itself should change
+(e.g. a wide banner on desktop, a square crop on mobile).
+
+## Modern formats: same picture, fewer bytes
+
+For a given visual quality, format choice matters as much as resizing:
+
+- **JPEG** — universal support, lossy, no transparency. The safe default.
+- **PNG** — lossless, supports transparency, but large for photos. Reserve
+  it for graphics/icons/screenshots with sharp edges and flat color.
+- **WebP** — typically 25–35% smaller than JPEG at comparable quality,
+  supports transparency and animation. Supported by essentially all
+  browsers still in active use today.
+- **AVIF** — typically smaller again than WebP (often another 20%+ on
+  photographic content), plus better handling of gradients/banding. The
+  trade-off: AVIF *encoding* is slow (fine, it's done once at build/CDN
+  time) and AVIF *decoding* is more CPU-intensive than JPEG/WebP, which
+  matters on low-end phones.
+
+The safe delivery pattern is layered fallback via `<picture>`, letting the
+browser pick the best format it supports:
+
+```html
+<picture>
+  <source type="image/avif" srcset="hero.avif" />
+  <source type="image/webp" srcset="hero.webp" />
+  <img src="hero.jpg" alt="Product hero shot" />
+</picture>
+```
+
+In practice, most teams don't hand-author this — a CDN image service
+negotiates format automatically from the request's `Accept` header (more
+on this below), so you write one canonical image URL and the format
+decision happens per-request.
+
+## Lazy-loading media
+
+Native lazy loading defers offscreen image and iframe downloads until
+they're near the viewport:
+
+```html
+<img src="thumb.jpg" loading="lazy" width="320" height="200" alt="…" />
+```
+
+This is nearly free to add and browser-native — no `IntersectionObserver`
+wiring required for the common case. Two rules make it safe:
+
+1. **Always set `width`/`height` (or CSS `aspect-ratio`)** so the browser
+   reserves layout space before the image loads — otherwise content below
+   an unloaded image jumps around as images pop in, hurting Cumulative
+   Layout Shift. (This overlaps with the [Lazy Loading](lazy-loading) and
+   [Core Web Vitals](core-web-vitals) lessons — the CLS mechanics are the
+   same regardless of *why* something loads late.)
+2. **Never lazy-load the image likely to be the LCP element** — typically
+   a hero image or above-the-fold banner. Lazy-loading it *adds* a
+   round trip (wait for scroll proximity, then fetch) to the exact metric
+   you're trying to optimize. For that image, do the opposite: skip
+   `loading="lazy"` and add `fetchpriority="high"` so the browser fetches
+   it early and eagerly.
+
+## Video-specific concerns
+
+Video shares the same instincts (right size, right format, defer what's
+offscreen) but adds two problems images don't have.
+
+**Adaptive bitrate streaming.** A single fixed-quality MP4 is either too
+big for a slow connection or too blurry for a fast one — you can't win
+with one file. Adaptive bitrate protocols (HLS, DASH) instead publish
+several renditions of the same video at different bitrates/resolutions,
+chunked into short segments (typically 2–10 seconds), described by a
+manifest file. The player monitors actual download throughput in real
+time and switches renditions segment-by-segment — dropping to a lower
+bitrate if the network degrades mid-playback, stepping up if it recovers.
+This is the mechanism that lets the same video URL serve a 240p stream to
+someone on a spotty connection and a 1080p stream to someone on fiber,
+without either of them re-requesting anything manually.
+
+**Poster frames.** A `<video>` element with no `poster` attribute shows a
+blank black box (or the first decoded frame, inconsistently, depending on
+browser and `preload` setting) until playback data arrives. A `poster`
+image gives the player something meaningful to paint immediately —
+functionally, it's the video's own LCP candidate:
+
+```html
+<video poster="preview.jpg" controls preload="metadata">
+  <source src="clip.mp4" type="video/mp4" />
+</video>
+```
+
+`preload="metadata"` (rather than `auto`) tells the browser to fetch just
+enough to know duration/dimensions, not the whole video, which matters a
+lot when a page embeds several videos that may never be played.
+
+We'll go much deeper on adaptive bitrate selection, buffering strategy,
+and player architecture in the later Video Streaming Platform case study
+— this lesson is the "what and why," that one is the full system design.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Browser requests media] --> B{Is it an image or video?}
+  B -->|Image| C[CDN picks format:\nAVIF, WebP, or JPEG\nvia Accept header]
+  C --> D[CDN resizes to\nrequested width]
+  D --> E[Browser decodes\nand paints]
+  B -->|Video| F[Player fetches manifest\nHLS/DASH]
+  F --> G[Player picks rendition\nbased on measured bandwidth]
+  G --> H[Segment-by-segment playback,\nswitching renditions as needed]
+`} />
+
+## The quality/size/decode-cost trade-off
+
+It's tempting to treat "smaller file" as the whole optimization goal, but
+that's only two of the three variables that matter:
+
+- **Quality** — visible fidelity: compression artifacts, color banding,
+  blurriness at the rendered size.
+- **Size** — bytes over the wire, which drives download time, especially
+  on constrained networks.
+- **Decode cost** — CPU/GPU work to turn bytes into pixels, which drives
+  time-to-paint *after* the bytes arrive and affects battery/thermal
+  throttling on low-end devices.
+
+AVIF is the clearest example of this three-way tension: it wins hard on
+size, is comparable or better on quality, but costs more to decode than
+JPEG. On a mid-range Android phone decoding a dozen AVIF images in a feed,
+that decode cost can show up as jank even though every individual file
+downloaded fast. The right call depends on context: a hero image (one
+image, decoded once, big size win matters most) is a great AVIF candidate;
+a densely-packed image grid decoded all at once on a low-end device is a
+case where you might deliberately choose WebP or even accept a slightly
+larger JPEG for cheaper, more parallel-friendly decoding.
+
+## CDN-based image transformation as a design lever
+
+Rather than pre-generating every size/format combination at build time,
+most production setups point image tags at a CDN image-transformation
+service (Cloudflare Images, Imgix, Cloudinary, or a cloud provider's
+equivalent) and encode the transform as URL parameters:
+
+```
+https://cdn.example.com/img/hero.jpg?width=800&format=auto&quality=80
+```
+
+The service resizes and re-encodes on request (caching the result for
+subsequent requests), and `format=auto` lets it pick AVIF/WebP/JPEG per
+request based on the client's `Accept` header — so you author one URL and
+every client gets the best format it supports without you maintaining a
+`<picture>` fallback chain by hand. Architecturally, this shifts image
+optimization from a build-time asset pipeline concern (generate N sizes ×
+M formats for every uploaded image, store them all) to a runtime,
+on-demand concern — which matters a lot for user-generated content where
+you don't control the source images and can't reasonably pre-generate
+every variant up front.
+
+## Worked example: an e-commerce product grid
+
+Say you're building a product listing page: a grid of 40 product cards,
+each with a thumbnail, plus one large hero image for a featured item at
+the top.
+
+For the hero image (the likely LCP element): serve it through the CDN
+transform at the exact rendered width, `format=auto`, skip
+`loading="lazy"`, and add `fetchpriority="high"` so it's requested as
+early as possible.
+
+For the 40 grid thumbnails: serve each through the same CDN transform but
+sized to the actual thumbnail width (say 240px, not the 1200px master),
+with `loading="lazy"` and a reserved `aspect-ratio` on the container so
+the grid doesn't reflow as thumbnails pop in while scrolling. Because
+they're small and off the critical path, decode cost per image is
+negligible even at AVIF — this is exactly the "one image, once" case
+where AVIF's size win is worth taking.
+
+If the page later adds a product demo video per card: don't autoplay 40
+videos. Load a `poster` frame per card (itself just another optimized
+image) and only fetch the actual video — ideally via adaptive bitrate —
+once a user interacts with a specific card.
+
+<Callout type="warning">
+  A common mistake: shipping a single "optimized" master image (say, one
+  1200px WebP) and calling the job done, without responsive `srcset`
+  sizing. That's a real improvement over an unoptimized JPEG, but a phone
+  rendering that image at 360px wide is still downloading roughly
+  10&times; more pixels than it will ever display. Format optimization and
+  size (resolution) optimization are separate levers — you need both,
+  not just whichever one is easier to bolt on.
+</Callout>
+
+<Quiz
+  lessonId="image-and-media-optimization"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A page has a large hero image that is almost certainly the Largest Contentful Paint element. What should you do with it?',
+      options: [
+        { id: 'a', text: 'Add loading="lazy" so it does not block other resources', correct: false, explanation: 'Lazy-loading the LCP candidate delays exactly the metric you are trying to optimize — it adds a proximity check before the fetch even starts.' },
+        { id: 'b', text: 'Skip loading="lazy" and use fetchpriority="high"', correct: true, explanation: 'The LCP image should be requested as early and eagerly as possible, not deferred — fetchpriority="high" signals the browser to prioritize it.' },
+        { id: 'c', text: 'Serve it only as PNG for maximum quality', correct: false, explanation: 'PNG is lossless but far larger than JPEG/WebP/AVIF for photographic content — format choice here hurts size for no meaningful quality gain on a photo.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements about srcset and sizes are correct? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'srcset lists candidate image files along with their intrinsic widths', correct: true, explanation: 'Each entry like "hero-800.jpg 800w" tells the browser that file is 800px wide intrinsically.' },
+        { id: 'b', text: 'sizes tells the browser how wide the image will render at different viewport widths', correct: true, explanation: 'sizes provides the layout width information the browser needs to pick the best srcset candidate before layout is finalized.' },
+        { id: 'c', text: 'srcset replaces the need for a CDN image-transformation service', correct: false, explanation: 'srcset only tells the browser which pre-existing file to pick — something still has to generate those differently-sized files, which is exactly what a CDN transform service or build pipeline does.' },
+        { id: 'd', text: 'srcset is used for swapping to a different crop or composition based on viewport', correct: false, explanation: 'That is art direction, which is what <picture> with media queries and separate <source> elements is for — srcset is for resolution swapping of the same image.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'AVIF produces smaller files than WebP or JPEG for most photographic content, so it is always the correct format choice regardless of device.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'AVIF wins on size but costs more to decode. On low-end devices decoding many AVIF images at once (e.g. a dense grid) can introduce jank even though bytes-over-the-wire improved.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — format choice is a three-way trade-off between quality, size, and decode cost, not a size-only decision, so the "best" format can depend on context like how many images decode at once and the target device.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why does adaptive bitrate streaming (HLS/DASH) use multiple video renditions and short segments instead of one fixed-quality file?',
+      options: [
+        { id: 'a', text: 'It lets the player switch quality mid-playback based on measured throughput, so no single quality has to fit every network condition', correct: true, explanation: 'That is the core purpose: segment-by-segment switching lets playback adapt to changing bandwidth instead of committing to one bitrate for the whole video.' },
+        { id: 'b', text: 'It reduces the number of HTTP requests the browser needs to make', correct: false, explanation: 'The opposite is true — segmenting a video into many small chunks increases request count compared to one file; the benefit is adaptability, not fewer requests.' },
+        { id: 'c', text: 'It is required to display a poster frame before playback starts', correct: false, explanation: 'Poster frames are a separate, unrelated feature — a simple single-file MP4 can have a poster attribute too.' },
+      ],
+    },
+  ]}
+/>

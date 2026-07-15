@@ -1,0 +1,130 @@
+---
+title: "Newsfeed: Mock Interview"
+module: "Case Study: Newsfeed"
+moduleOrder: 1
+order: 4
+track: "interview"
+summary: "A timed mock-interview prompt and rubric for designing a social media newsfeed from scratch."
+cheatsheet:
+  - "Spend the first 3-5 minutes on clarifying questions before drawing anything — ranked vs chronological, real-time requirements, and media mix change the whole design."
+  - "Draw the component tree and API/cache layers before writing any code — interviewers are grading structure, not syntax."
+  - "State your pagination strategy explicitly and name the edge case it creates: cursor-based pagination avoids the offset-shift duplicate problem when new posts land at the top."
+  - "Virtualization is not optional at feed scale — say why (bounded DOM nodes) and name a concrete technique (windowing, off-screen recycling)."
+  - "Optimistic updates need a rollback story, not just a happy path — mention what the UI shows during the request and what it does on failure."
+  - "Bring up at least one accessibility trade-off unprompted (e.g. announcing new posts to screen reader users without disrupting focus) — it signals senior-level thinking."
+  - "Budget your 35-40 minutes out loud: roughly 5 on requirements, 10 on architecture, 15 on deep dives, 5-10 on wrap-up and trade-offs."
+tags: ["case-study", "newsfeed", "mock-interview"]
+estMinutes: 20
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+import MockInterview from '../../components/MockInterview';
+
+You've now scoped the newsfeed problem (`newsfeed-requirements-and-scope`), sketched its architecture (`newsfeed-high-level-architecture`), and gone deep on pagination, virtualization, optimistic updates, and media loading (`newsfeed-deep-dives`) across the previous three lessons. This lesson puts it all together under interview conditions: one open-ended prompt, a strict time box, and a rubric you'd actually be graded against.
+
+If it's been a while since you read those lessons, skim them again before starting the timer below — the mock interview assumes you can produce that content cold, the way a real interviewer would expect, not that you're re-deriving it for the first time under pressure.
+
+The point isn't to memorize a script. It's to practice the thing that actually separates a strong system design answer from a weak one: managing your own time, structuring an answer before you start talking, and proactively surfacing trade-offs instead of waiting to be asked. Treat this like the real thing — set a timer, talk out loud (or write as if you were), and only look at the rubric after you've committed to an answer.
+
+## How to run this mock interview
+
+Give yourself 35-40 minutes, uninterrupted. Structure your time roughly like this:
+
+- **Minutes 0-5**: Ask clarifying questions and state the requirements you're designing for.
+- **Minutes 5-15**: Present a high-level architecture — component tree, data flow, rendering strategy.
+- **Minutes 15-30**: Go deep on two or three of the hardest sub-problems (pagination, virtualization, optimistic updates, media loading) and explicitly name edge cases.
+- **Minutes 30-40**: Discuss performance and accessibility trade-offs, and leave room for the interviewer's follow-up questions.
+
+A common failure mode is spending 20 minutes on requirements and diagrams and then rushing the deep dive, which is usually where the real signal is. Watch your own clock.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[0-5 min: Clarify requirements] --> B[5-15 min: High-level architecture]
+  B --> C[15-30 min: Deep dive - pick 2-3]
+  C --> D[30-40 min: Trade-offs and wrap-up]
+  C --> E[Pagination and virtualization]
+  C --> F[Optimistic updates and rollback]
+  C --> G[Media loading strategy]
+`} />
+
+## The prompt
+
+Read the prompt in the `<MockInterview>` box below once, then start your timer before you look at anything else on this page. Jot notes as you go — the component below gives you a scratchpad for that. Only click "reveal" once you've talked through a complete answer, even a rough one. Revealing early and reading the rubric as a checklist defeats the purpose; the skill being tested is generating the structure yourself under time pressure, not recognizing it when shown.
+
+When you're done, score yourself honestly against each rubric point rather than against a vague "did I do okay" feeling — the self-score is only useful if it's calibrated to specifics.
+
+## What "strong" looks like, briefly
+
+Before you dive in, here's the shape a strong answer takes, without giving away the content: it opens with 2-3 sharp clarifying questions (not five generic ones), states the resulting scope as constraints ("I'll design for a ranked, media-heavy feed with near-real-time updates"), walks through a component/data architecture with a diagram, picks a pagination strategy and defends it against the alternative, names the specific edge cases that strategy creates, and closes with concrete performance numbers or accessibility considerations rather than "make it fast and accessible."
+
+Weak answers tend to do the opposite: they skip clarifying questions and design for an imagined "generic" feed, they describe components without describing how data moves between them, and they mention "we'd use pagination" and "we'd virtualize the list" without ever explaining why or what breaks if you don't.
+
+<Callout type="warning">
+  The most common mistake in this exact interview is treating pagination and virtualization as a single throwaway sentence ("we'd paginate and virtualize the list") and then spending all remaining time on visual design or styling. Both of those are genuinely hard problems with real trade-offs — cursor vs offset pagination interacts directly with the "new posts inserted at top" edge case, and virtualization interacts directly with variable-height media cards. An interviewer who hears the throwaway sentence will almost always follow up by asking you to go deeper — have that depth ready rather than discovering the gap live.
+</Callout>
+
+<Callout type="interview">
+  If you get stuck mid-answer, narrate your uncertainty instead of going silent: "I'm trading off freshness for simplicity here by refetching page one on pull-to-refresh instead of merging a live delta — that's simpler but can duplicate items the user already saw." Interviewers consistently rate candidates who reason out loud about a trade-off higher than candidates who go quiet while deciding, even when the final decision is the same.
+</Callout>
+
+## Worked example: how a strong answer opens
+
+To make the abstract advice above concrete, here's roughly how the first two minutes of a strong answer sound (paraphrased, not a script to copy verbatim):
+
+"Before I design anything, three questions. First, is this a chronological feed or an algorithmically ranked one — that changes whether I can trust a simple cursor on `createdAt`, or whether I need a ranking service in the loop. Second, do we need near-real-time updates, like a 'new posts' banner, or is periodic refresh acceptable? Third, is this feed media-heavy — images and video — or mostly text, since that changes my loading and virtualization strategy significantly."
+
+Suppose the interviewer answers: ranked feed, no hard real-time requirement but a "new posts available" affordance is expected, and yes, media-heavy with mixed image and video posts. A strong candidate immediately restates this back as design constraints before touching architecture: "Okay — so I'll design for a ranked feed where the server decides order, an eventually-consistent 'N new posts' banner instead of live streaming, and a media pipeline that has to handle images and video without blocking scroll." That one sentence proves the clarifying questions weren't decorative — everything that follows visibly depends on the answers.
+
+## Quick check before you start
+
+<Quiz
+  lessonId="newsfeed-mock-interview"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'In a 35-40 minute newsfeed design interview, what is the most common mistake candidates make with their time?',
+      options: [
+        { id: 'a', text: 'Spending too much time on clarifying questions', correct: false, explanation: 'A tight 3-5 minutes on clarifying questions is rarely the problem — skipping them entirely, or spending far too long on diagrams afterward, is far more common.' },
+        { id: 'b', text: 'Front-loading requirements and architecture, then rushing the deep dive', correct: true, explanation: 'The deep dive (pagination, virtualization, optimistic updates, media loading) is usually where the real signal is, but candidates often burn most of the clock before reaching it.' },
+        { id: 'c', text: 'Discussing accessibility trade-offs too early', correct: false, explanation: 'Accessibility is usually under-discussed, not over-discussed, and bringing it up early is not a timing mistake.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are signs of a weak answer to this prompt, based on the rubric guidance in this lesson? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Saying "we\'d paginate and virtualize the list" without explaining why or what breaks otherwise', correct: true, explanation: 'This is called out directly as the most common pitfall — treating two genuinely hard problems as a single throwaway line.' },
+        { id: 'b', text: 'Designing for a generic feed without asking about ranking, real-time needs, or media mix', correct: true, explanation: 'Skipping clarifying questions means the resulting design is not actually anchored to a specific, defensible scope.' },
+        { id: 'c', text: 'Stating a rollback plan for optimistic like/comment updates', correct: false, explanation: 'This is a strength, not a weakness — a strong answer explicitly covers what happens in the UI when an optimistic update fails.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A strong answer to this prompt should reveal the rubric and read through it before attempting to talk through a full design.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Revealing the rubric before answering defeats the purpose of the exercise — the skill being practiced is generating structure under time pressure, not recognizing a checklist.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — commit to a full answer first, under the timer, and only reveal the rubric afterward to self-score.' },
+      ],
+    },
+  ]}
+/>
+
+<MockInterview
+  lessonId="newsfeed-mock-interview"
+  client:visible
+  prompt="Design the frontend for a social media newsfeed — think a scrolling feed of posts with text, images, and video, likes and comments, and near-real-time updates, similar in spirit to a Twitter/X or Instagram feed. Walk through your requirements, high-level architecture, data flow, and performance strategy as if this were a 35-40 minute system design interview. Assume a senior frontend engineer is interviewing you and expects you to drive the conversation."
+  rubric={[
+    { point: 'Clarifies requirements before designing', detail: 'Asks whether the feed is chronological or algorithmically ranked, whether updates need to be near-real-time or can be periodic, and whether the feed is media-heavy or text-first — then explicitly restates how the answers shape the design, rather than asking and moving on.' },
+    { point: 'Presents a sound component and data architecture', detail: 'Breaks the UI into a feed list, post card, and media renderer, describes an API layer that returns paginated pages of posts, and introduces a client-side store/cache that holds feed items separately from the components that render them — and can explain why that separation matters (re-renders, cache reuse, optimistic updates).' },
+    { point: 'Picks and defends a pagination and virtualization strategy', detail: 'Chooses cursor-based over offset-based pagination (or justifies offset for a specific reason), explains how it avoids or handles duplicate/missing items when new posts are inserted at the top, and explains why the rendered list must be virtualized/windowed at scale rather than just "paginated."' },
+    { point: 'Designs optimistic updates with real rollback handling', detail: 'For likes and comments, describes updating the UI immediately, sending the request in the background, and — critically — what happens on failure: reverting the UI state, surfacing an error, and avoiding a state where the UI and server permanently disagree.' },
+    { point: 'Names concrete edge cases, not just happy paths', detail: 'Proactively raises at least one or two of: a post being deleted while still visible in the viewport, duplicate posts appearing after the pagination cursor shifts, or the feed behavior on a slow or offline connection — and gives a concrete handling strategy for each, not just "we would handle that."' },
+    { point: 'Discusses performance and accessibility trade-offs explicitly', detail: 'Goes beyond "make it fast and accessible" — mentions a concrete lever (e.g. lazy-loading below-the-fold media, reserving layout space to avoid content shifting, or announcing newly loaded posts to screen reader users without stealing focus) and is honest about what it costs (extra complexity, a slightly less "live" feel, etc.).' },
+  ]}
+/>

@@ -1,0 +1,148 @@
+---
+title: "Calendar Application: Deep Dives — Data Flow, Performance & Edge Cases"
+module: "Case Study: Calendar Application"
+moduleOrder: 5
+order: 3
+track: "interview"
+summary: "Goes deep on recurring-event expansion, timezone/DST correctness, and dense-view rendering performance."
+cheatsheet:
+  - "Store a recurrence rule (frequency, interval, until/count, exceptions), never a materialized row per occurrence — a yearly meeting shouldn't require rewriting thousands of rows to change its time."
+  - "Expand recurrence rules into concrete instances server-side, scoped to the visible date range the client asked for — client-side expansion duplicates timezone/DST logic across platforms and risks expanding rules out to infinity."
+  - "Always store event start/end as an absolute instant (UTC or epoch millis) plus the creating timezone; render by converting to the viewer's current timezone at display time, never by storing a 'local' wall-clock string as the source of truth."
+  - "A single-instance edit to a recurring event needs an exception record keyed by the original occurrence's start time — the recurrence rule stays untouched, and expansion must check for overrides before applying the rule's math."
+  - "DST transitions can silently shift a recurring event's displayed local time by an hour if the rule was anchored to a fixed UTC offset instead of the event's timezone — always expand recurrence math in the event's own timezone, not in UTC-with-a-fixed-offset."
+  - "For dense month views, pack overlapping events into columns with a single sweep-line pass (O(n log n)) and virtualize offscreen weeks — don't run per-pixel collision detection on every render."
+tags: ["case-study", "calendar-app", "deep-dive"]
+estMinutes: 14
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The high-level architecture from the last lesson names an "event data layer" that expands recurring events into instances for a visible range. That's the easy sentence to say and the hard thing to get right. Nearly every calendar bug an interviewer will probe — "why did my 9am meeting show up at 8am after November," "why did editing one Tuesday move every Tuesday," "why does the month view freeze with fifty events on one day" — traces back to one of three decisions: how you store recurrence, how you store and convert time, and how you lay out dense collections of events on screen. This lesson goes deep on all three, plus the edge cases that fall directly out of getting them wrong.
+
+## Storing recurrence: rule versus materialized rows
+
+A recurring event needs a *rule*, not a row per occurrence. Store something like:
+
+```
+{
+  id: "evt_123",
+  title: "Team sync",
+  startTime: "2026-01-05T17:00:00Z",
+  endTime: "2026-01-05T17:30:00Z",
+  timezone: "America/New_York",
+  recurrence: { freq: "WEEKLY", interval: 1, byDay: ["MON"], until: "2026-12-31" }
+}
+```
+
+One row describes an indefinite series. Materializing every occurrence up front — writing a database row for every Monday through the end of the rule — breaks in two ways: it doesn't scale (a "forever" recurring event has no natural end to stop generating rows at), and it makes bulk edits expensive and error-prone (moving the whole series 30 minutes later means updating every materialized row instead of one field). The rule is the source of truth; concrete instances are a *derived, disposable* view of it for whatever date range is currently being displayed.
+
+The one thing you do materialize is **exceptions** — occurrences that deviate from the rule (moved, retitled, or cancelled). An exception is keyed by the *original* occurrence's start time and stores either an override payload or a "deleted" marker. Expansion always checks the exception table for a given occurrence before applying the rule's plain math.
+
+## Where expansion happens: client or server
+
+Expansion means: given a rule and a date range (`n < 10` visible weeks, say), produce the concrete list of instances that fall in that range. This can happen in two places, and the trade-off is worth stating plainly.
+
+- **Server-side expansion**: the client requests "events for March 2026," and the server does the rule math, applies exceptions, and returns a flat list of concrete instances with resolved start/end times. This is the right default. It keeps timezone and DST logic in one place instead of duplicated across web, iOS, and Android clients that will inevitably drift out of sync with each other. It also lets the server cap how far out any single rule gets expanded, protecting against a rule that would otherwise generate an unbounded list.
+- **Client-side expansion**: the client fetches raw rules once and expands them locally for whatever range it needs to render. This can feel appealing for offline support — a client with cached rules can still render next month without a network round trip — but it means shipping (and keeping correct) full recurrence-rule and IANA timezone-database logic on every client, and any bug in that logic now varies by platform and by how stale each client's timezone data is.
+
+A pragmatic middle ground: server does the authoritative expansion and is the source of truth for anything write-adjacent (editing, conflict resolution); the client keeps a *local* expansion path only as an offline fallback for read-only rendering of already-cached rules, and reconciles with the server's expansion once back online. This mirrors the "range caching" idea from the architecture lesson: cache expanded instances per visible range, not raw rules, so a re-render of a previously-viewed month is instant.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Client requests range: Mar 1-31] --> B[Server: load recurrence rules overlapping range]
+  B --> C[Apply rule math per rule, in event's own timezone]
+  C --> D{Exception exists for this occurrence?}
+  D -->|yes: moved/edited| E[Use override start/end/title]
+  D -->|yes: cancelled| F[Drop instance]
+  D -->|no| G[Use computed occurrence]
+  E --> H[Return flat instance list, UTC + tz]
+  G --> H
+  H --> I[Client renders in viewer local time]
+`} />
+
+## Timezone correctness: store absolute, render local
+
+The rule that prevents almost every timezone bug: **store an absolute instant, render a local time**. Concretely, `startTime` is UTC (or epoch millis) — an unambiguous point on the universal timeline — plus a separate `timezone` field recording what timezone the event was *created in* (needed for recurrence math, see below). The viewer's browser then converts that instant to whatever timezone the viewer is currently in for display. Never store "5:00 PM" as a bare string with no UTC anchor; there's no way to know what that string means later without also knowing which timezone and which date's offset it referred to.
+
+This matters most for recurring events, because DST offsets change but wall-clock times don't. A weekly meeting created as "5:00 PM America/New_York" should keep showing as 5:00 PM Eastern to a New York attendee across the March/November DST boundary — but its UTC instant is different before and after the transition (UTC-5 in winter, UTC-4 in summer). If you expanded the rule by adding a fixed offset to a UTC anchor, every occurrence after a DST transition would land at the wrong wall-clock hour. The fix is to run recurrence math in the event's *own* timezone (using proper timezone-database rules, e.g. via `Intl.DateTimeFormat` or a library like Luxon/date-fns-tz), computing each occurrence's local wall-clock time first, then converting *that* to UTC per-occurrence — not by adding a constant offset to the first occurrence's UTC time.
+
+A viewer in a different timezone than the creator sees the instant converted to *their* zone, which is exactly what you want for a meeting between people in different cities — everyone sees the same instant, expressed in their own local time.
+
+## Rendering performance for dense month views
+
+A month view can easily need to lay out 30+ days x several events per day, some spanning multiple days, many overlapping in time. Two performance concerns show up here.
+
+**Overlapping-event layout.** For a given day, events that overlap in time need to be placed in side-by-side columns rather than stacked illegibly. The standard approach is a sweep-line algorithm: sort events by start time, and for each event, find the leftmost column whose previous occupant has already ended; if none exists, open a new column. This runs in `O(n log n)` per day (dominated by the sort) and produces a clean column assignment in one pass — no need to compare every event against every other event pairwise (`O(n²)`), which is the naive approach that gets slow once a day has a few dozen entries.
+
+**Not re-computing or re-rendering more than necessary.** Two habits keep a month grid smooth even with hundreds of events: memoize the column-layout computation per day so it only re-runs when that day's event set actually changes (not on every parent re-render), and virtualize rows so weeks scrolled out of view aren't mounted in the DOM at all. Combined with the range-level caching from the architecture lesson, this means switching between months mostly toggles which cached, pre-laid-out data is visible rather than re-deriving everything from scratch.
+
+## Edge cases
+
+### Editing a single instance of a recurring series
+
+When a user edits "just this one" occurrence of a weekly meeting, the write creates (or updates) an **exception** keyed to that occurrence's original start time — the recurrence rule itself is untouched. Expansion for that date range then skips the rule-computed occurrence and substitutes the exception's data. Deleting a single instance is the same mechanism with a "cancelled" exception instead of an override. The UI prompt ("This event" / "This and following events" / "All events") maps directly to three different mutations: an exception, a rule split (end the old rule the day before, start a new rule from that date with the new fields), and a rule-level edit, respectively.
+
+### A DST transition changing an event's displayed time
+
+If a recurring 9:00 AM event is expanded correctly (per-occurrence, in its own timezone), the displayed local time never moves — 9:00 AM stays 9:00 AM across the DST boundary, only the UTC instant underneath shifts by an hour. If it *does* appear to shift, that's a symptom of expanding in UTC with a fixed offset baked in from the first occurrence, rather than recomputing the local-to-UTC conversion per occurrence using the timezone database's actual DST rules for that specific date.
+
+### Overlapping-event layout with a same-day conflict
+
+Two 30-minute events that overlap by 10 minutes should render as two narrower side-by-side columns for the overlapping day, not one event drawn on top of the other. The sweep-line approach above generalizes fine here; the detail worth stating in an interview is that column width should be computed from the *maximum concurrent overlap* for that day (so five overlapping events get five narrow columns, not two wide ones with three events invisibly stacked behind).
+
+## Worked example: a weekly standup across a DST boundary
+
+A team creates a weekly Monday 9:00 AM standup in `America/Los_Angeles`, starting October 2026 with no end date. The server stores one rule: `freq=WEEKLY, byDay=MO, timezone=America/Los_Angeles`, anchored at a UTC instant for the first occurrence. When the client requests November's instances, the server expands the rule by walking Mondays in November, computing each occurrence's 9:00 AM *local* time in `America/Los_Angeles`, and converting each to UTC individually. The November 2 occurrence converts using PDT's UTC-7 offset; after the DST-end transition on November 1, the November 9 occurrence converts using PST's UTC-8 offset. Both display as 9:00 AM to an LA-based viewer — correct — while a London-based teammate sees the meeting shift from 5:00 PM to 6:00 PM local time across that same boundary, because their offset from LA changed even though LA's own wall-clock time didn't. If, instead, the server had computed November 9's UTC instant by simply adding 7 days x 24 hours to November 2's UTC instant, the LA viewer would see the meeting silently slide to 8:00 AM — a real bug class, and the reason per-occurrence, timezone-aware expansion isn't optional.
+
+<Callout type="warning">
+  A common mistake is treating "recurring event" as a scheduling detail handled once at creation time and forgetting that every occurrence needs its own timezone conversion. Precomputing a fixed offset from the first occurrence and reusing it for all future ones works fine until the next DST transition, at which point every occurrence past that boundary is off by an hour. Recurrence expansion and timezone conversion aren't separate steps that happen once — they have to be re-run per occurrence, using that occurrence's actual date against the timezone database.
+</Callout>
+
+<Quiz
+  lessonId="calendar-app-deep-dives"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A weekly recurring event is stored as a UTC instant for its first occurrence plus a fixed UTC offset, and future occurrences are computed by adding whole-week increments to that UTC instant. What happens across a DST transition?',
+      options: [
+        { id: 'a', text: "The event's displayed local time silently shifts by an hour after the transition", correct: true, explanation: "Adding fixed-length increments to a UTC instant ignores the fact that the event's timezone changes its offset from UTC at the DST boundary, so the local wall-clock time computed from that instant shifts by an hour." },
+        { id: 'b', text: 'Nothing changes, because the event was already anchored to UTC', correct: false, explanation: 'Anchoring to UTC is necessary but not sufficient — recurrence math still needs to recompute each occurrence in the event’s own timezone, or the fixed offset baked in at creation time goes stale the moment DST changes.' },
+        { id: 'c', text: 'The event automatically cancels itself to avoid ambiguity', correct: false, explanation: 'Calendar systems do not cancel events over a DST transition; the real failure mode is a silent, incorrect time shift, which is exactly why per-occurrence timezone-aware expansion matters.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are correct reasons to expand recurrence rules on the server rather than purely on each client? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It keeps timezone and DST logic in one implementation instead of duplicated (and potentially drifting) across web, iOS, and Android', correct: true, explanation: 'Recurrence-plus-timezone math is easy to get subtly wrong; centralizing it avoids each client platform reimplementing (and possibly mis-implementing) the same logic.' },
+        { id: 'b', text: 'It lets the server bound how far into the future any single rule gets expanded, rather than trusting each client to stop', correct: true, explanation: 'An indefinite recurrence rule has no natural end; server-side expansion scoped to a requested date range avoids any client accidentally generating an unbounded instance list.' },
+        { id: 'c', text: 'Client-side expansion is impossible because browsers cannot perform timezone conversions', correct: false, explanation: 'Browsers can perform timezone conversions (e.g. via Intl.DateTimeFormat) — client-side expansion is possible, just less centralized and harder to keep consistent across platforms, which is the real trade-off.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Editing a single occurrence of a recurring event ("just this one") should be implemented by rewriting the recurrence rule itself to exclude that date.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Rewriting the rule to exclude a date loses the ability to represent the edited occurrence’s changed time or title; the standard approach is a separate exception record, not a mutation of the rule.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — a single-instance edit creates an exception record keyed to that occurrence’s original start time, storing the override (or a cancellation marker). The recurrence rule stays unchanged, and expansion checks for exceptions before applying the rule’s math.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A single day in the month view has six events, four of which overlap in time (two more start after the first four end). What is the correct way to size the overlapping columns?',
+      options: [
+        { id: 'a', text: 'Compute column width from the maximum concurrent overlap for that day, so the four overlapping events get four narrow columns', correct: true, explanation: 'Sizing columns off the peak concurrency for the day ensures every simultaneously-overlapping event gets its own visible column, rather than some events being hidden behind others.' },
+        { id: 'b', text: 'Give every event on the day an equally narrow column, based on the total count of six', correct: false, explanation: 'Sizing by total daily event count wastes width when events don’t all overlap at once — the two non-overlapping events don’t need to share width with the four that do.' },
+        { id: 'c', text: 'Stack all overlapping events at full width, on top of each other, and let the last one rendered win visually', correct: false, explanation: 'This hides events behind each other, which defeats the purpose of a calendar view — every event should remain visible and clickable.' },
+      ],
+    },
+  ]}
+/>

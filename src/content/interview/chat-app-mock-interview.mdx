@@ -1,0 +1,129 @@
+---
+title: "Chat Application: Mock Interview"
+module: "Case Study: Chat Application"
+moduleOrder: 3
+order: 4
+track: "interview"
+summary: "A timed mock-interview prompt and rubric for designing a real-time chat application."
+cheatsheet:
+  - "Open with clarifying questions that change the design, not filler ones: 1:1 vs group, multi-device sync, and whether offline queuing is in scope all shift your architecture before you draw a single box."
+  - "State your connection strategy explicitly: WebSocket for live messages, REST/GraphQL for history and search, and a named reconnection policy (exponential backoff, resync-on-reconnect) rather than 'we'd handle reconnects.'"
+  - "Ordering and dedup need a concrete mechanism: client-generated message IDs for optimistic sends, reconciled against server-assigned sequence numbers once the ack arrives — say what happens when the ack never comes."
+  - "Offline handling is optimistic-send plus a durable outbox: queue unsent messages locally, show a clear per-message state (sending/sent/delivered/failed), and flush the queue on reconnect without creating duplicates."
+  - "For long threads, name virtualization plus reverse-infinite-scroll explicitly, and mention the anchor problem: new messages arriving at the bottom must not visually yank a user who has scrolled up to read history."
+  - "Budget your time out loud in a 35-40 minute slot: roughly 5 minutes on requirements, 10 on architecture, 15-20 on the deep dive (ordering, offline, performance), and the rest on trade-offs."
+tags: ["case-study", "chat-app", "mock-interview"]
+estMinutes: 20
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+import MockInterview from '../../components/MockInterview';
+
+You've scoped a chat application, sketched its architecture around a persistent connection, and gone deep on ordering, deduplication, offline queuing, and long-thread performance across the previous three lessons. This lesson is where you put it together under interview conditions: one open-ended prompt, a strict time box, and a rubric you'd actually be graded against.
+
+The goal isn't reciting a script back. It's practicing the specific skill that separates a strong answer from a mediocre one on this case study: naming a concrete connection and reconnection strategy instead of waving at "WebSockets," and having a real mechanism for message ordering and offline handling instead of saying "we'd queue it and retry." Set a timer, talk out loud as if an interviewer is sitting across from you, and only look at the rubric after you've committed to a full answer.
+
+## How to run this mock interview
+
+Give yourself 35-40 minutes, uninterrupted. A reasonable time split:
+
+- **Minutes 0-5**: Clarifying questions and stated scope.
+- **Minutes 5-15**: High-level architecture — connection strategy, component tree, data flow between the WebSocket and the REST/GraphQL API.
+- **Minutes 15-30**: Deep dive on two or three of the hardest sub-problems: ordering/dedup, offline/optimistic send, long-thread performance.
+- **Minutes 30-40**: Edge cases, trade-offs, and leaving room for follow-ups.
+
+The most common failure mode on this specific prompt is spending ten minutes drawing a nice box-and-arrow diagram of "client, server, database" and then discovering with five minutes left that you haven't said anything concrete about what happens when a message is sent while offline. The diagram is necessary but not sufficient — the deep dive is where the signal is.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[0-5 min: Clarify scope] --> B[5-15 min: Architecture and connection strategy]
+  B --> C[15-30 min: Deep dive - pick 2-3]
+  C --> D[Ordering and deduplication]
+  C --> E[Offline queue and optimistic send]
+  C --> F[Long thread performance]
+  C --> G[30-40 min: Trade-offs and edge cases]
+`} />
+
+## The prompt
+
+Read the prompt in the `<MockInterview>` box below once, then start your timer before looking at anything else on the page. Use the scratchpad the component provides to jot notes as you talk through your answer. Resist revealing the rubric early — the point is to generate structure yourself under time pressure, not to check boxes off a list you've already seen. Once you're done, score yourself against each rubric point honestly and specifically, not against a vague sense of "that went fine."
+
+## What "strong" looks like, briefly
+
+A strong answer opens with two or three questions that actually change the design — not "what devices do we support" as a throwaway, but things like "is this 1:1 only, or does group messaging need to work too, since that affects fan-out" and "do messages need to sync across a user's phone and laptop simultaneously, since that's a different consistency problem than single-device delivery." It then states the resulting scope as constraints before drawing anything.
+
+From there, it presents a connection strategy with a name attached: a persistent WebSocket connection for live message delivery and presence, paired with a REST or GraphQL API for paginated history and search, and a reconnection policy that's more specific than "we'd retry" — something like exponential backoff with a cap, plus a resync step on reconnect that asks the server "what have I missed since sequence number N."
+
+The deep dive is where weak answers fall apart. A strong candidate explains message ordering with a concrete mechanism: the client generates a temporary ID and renders the message immediately (optimistic send), the server assigns a durable sequence number or timestamp once it accepts the message, and the client reconciles its optimistic copy with the server's authoritative version when the acknowledgment arrives — including what happens if the ack never comes (retry, then mark failed after some timeout, don't retry forever silently). Offline handling extends the same idea: queue unsent messages in a durable local store, show the user an explicit state per message (sending, sent, delivered, failed), and flush the queue on reconnect in a way that can't produce duplicates if the same message was already delivered before the connection dropped. Performance gets a concrete answer too: virtualize the message list so the DOM only holds what's visible, and handle the specific interaction between "new message arrives at the bottom" and "user has scrolled up to read history" — new messages shouldn't yank the viewport out from under a reading user.
+
+Weak answers substitute vague verbs for mechanisms: "we'd use WebSockets," "we'd queue messages and sync later," "we'd virtualize the list for performance" — each true, none of it demonstrating that the candidate has actually thought through what breaks and how the mechanism handles it.
+
+<Callout type="warning">
+  The single most common gap in this interview is answering "how do you handle ordering" with just "we timestamp each message and sort by timestamp." That falls apart the moment two clients on slightly different clocks send messages close together, or a message sent offline arrives at the server minutes after one sent later by someone else. A strong answer names client-generated IDs for optimistic rendering plus a server-assigned monotonic sequence number (or per-conversation counter) as the source of truth for final ordering — client clocks are for display only, never for correctness.
+</Callout>
+
+<Callout type="interview">
+  If the interviewer pushes on multi-device sync ("what if the same user has the chat open on their phone and laptop at once?"), don't freeze — narrate the trade-off: "I'd treat each device as an independent WebSocket connection subscribed to the same conversation stream, so both get the live message; for read/typing state I'd need the server to broadcast those events to all of a user's connected devices too, not just the sender's. That's more fan-out on the server, but keeping read state device-local would mean marking something read on your phone doesn't clear the unread badge on your laptop, which feels broken." Reasoning out loud about the cost, not just naming the solution, is what interviewers are listening for.
+</Callout>
+
+## Worked example: how a strong answer opens
+
+Here's roughly how the first two minutes of a strong answer might sound (paraphrased — not a script to copy):
+
+"Before I design anything, a few questions. First, is this 1:1 messaging only, or do I need to support group conversations too — group fan-out and read receipts across multiple participants are a meaningfully bigger problem than 1:1. Second, does a single user need their messages and read state synced live across multiple open devices, or is single-device usage an acceptable simplification for this session? Third, is end-to-end encryption in scope, since that changes where message content can be inspected, cached, or searched."
+
+Suppose the interviewer answers: group messaging up to a moderate group size is in scope, multi-device sync is expected, and end-to-end encryption is out of scope for this session. A strong candidate restates that immediately as a constraint: "Okay — so I'm designing for group conversations with live delivery, read receipts and typing indicators that need to reach every device a user has open, and I don't need to worry about the client being unable to read message content server-side." Every architectural decision that follows should visibly trace back to that sentence.
+
+## Quick check before you start
+
+<Quiz
+  lessonId="chat-app-mock-interview"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A candidate answers "how do you guarantee message ordering" with "we timestamp each message client-side and sort by timestamp." What is the strongest critique of this answer?',
+      options: [
+        { id: 'a', text: 'Client clocks can be skewed or wrong, so client-side timestamps cannot be trusted as the authoritative order — a server-assigned sequence number is needed', correct: true, explanation: 'Client clocks differ across devices and can drift, so relying on them for canonical ordering breaks down exactly when two clients send near-simultaneous messages; the server needs to assign the authoritative order.' },
+        { id: 'b', text: 'Timestamps are too slow to compute on the client', correct: false, explanation: 'Computing a timestamp is not a performance problem; the issue is trustworthiness and consistency across devices, not speed.' },
+        { id: 'c', text: 'Sorting by timestamp is fine as long as the UI re-renders on every new message', correct: false, explanation: 'Re-rendering does not fix the underlying correctness problem of an untrustworthy ordering key.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these demonstrate the concrete, mechanism-level answers this mock interview rubric is looking for? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Client-generated message IDs used for optimistic rendering, reconciled with a server-assigned sequence number on acknowledgment', correct: true, explanation: 'This is a specific, testable mechanism for ordering and dedup, not a restatement of the problem.' },
+        { id: 'b', text: 'A durable local outbox that queues unsent messages and flushes on reconnect without producing duplicates', correct: true, explanation: 'This names both the mechanism (durable outbox) and the specific failure mode it must avoid (duplicates on flush), which is what a strong offline-handling answer looks like.' },
+        { id: 'c', text: 'Saying "we would handle reconnects gracefully" without further detail', correct: false, explanation: 'This is exactly the vague, verb-only phrasing the lesson calls out as a weak-answer pattern — it names no actual mechanism (backoff policy, resync step, etc.).' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In this mock interview format, you should reveal and read the rubric before attempting a full answer, so you know what to cover.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Reading the rubric first defeats the exercise — the skill being tested is generating structure under time pressure on your own, not recognizing a checklist you were just shown.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — commit to a full timed answer first, then reveal the rubric afterward to self-score honestly.' },
+      ],
+    },
+  ]}
+/>
+
+<MockInterview
+  lessonId="chat-app-mock-interview"
+  client:visible
+  prompt="Design the frontend for a real-time chat application — think 1:1 and group messaging with delivery/read receipts, typing indicators, and media attachments, similar in spirit to a WhatsApp or Slack-style client. Walk through your requirements, connection strategy, message ordering and offline handling, and performance approach as if this were a 35-40 minute system design interview. Assume a senior frontend engineer is interviewing you and expects you to drive the conversation."
+  rubric={[
+    { point: 'Clarifies requirements before designing', detail: 'Asks whether group messaging (and roughly what group size) is in scope, whether multi-device sync is required, and whether offline usage and end-to-end encryption are in scope — then explicitly restates how the answers shape the rest of the design rather than moving on without connecting them back.' },
+    { point: 'States a concrete real-time connection and reconnection strategy', detail: 'Names a persistent WebSocket connection for live messages and presence/typing events, paired with a REST or GraphQL API for history and search, and describes a specific reconnection policy (backoff with a cap, resync-since-last-known-sequence on reconnect) rather than an unspecified "handle reconnects gracefully."' },
+    { point: 'Explains message ordering and deduplication with a real mechanism', detail: 'Describes client-generated message IDs for optimistic rendering, a server-assigned sequence number or monotonic counter as the source of truth for final order, and how the client reconciles its optimistic copy once the server acknowledgment arrives — including what happens if the ack times out or a duplicate arrives after a reconnect.' },
+    { point: 'Designs offline handling and optimistic sends with real state, not just a happy path', detail: 'Describes a durable local outbox that queues messages composed while offline, a visible per-message status (sending/sent/delivered/failed), and a flush-on-reconnect strategy that avoids re-delivering messages the server already received.' },
+    { point: 'Addresses performance of long message threads', detail: 'Names virtualizing the message list so the DOM holds only visible messages, describes loading older history on reverse/infinite scroll, and explicitly handles the interaction between new incoming messages and a user who has scrolled up (not auto-yanking their scroll position).' },
+    { point: 'Surfaces edge cases and trade-offs proactively', detail: 'Raises at least one or two of: out-of-order delivery across devices, duplicate delivery after a reconnect, or keeping read/typing state in sync across a user\'s multiple open devices — and gives a concrete handling approach rather than "we would handle that."' },
+  ]}
+/>

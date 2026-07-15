@@ -1,0 +1,225 @@
+---
+title: "How to Use This Course"
+module: "Introduction"
+moduleOrder: 1
+order: 2
+track: "concept"
+summary: "Explains the two tracks (concepts and case studies), how lessons build on each other, and how to practice effectively."
+cheatsheet:
+  - "Concepts track = fundamentals, patterns, performance, security, design framework. Interview Prep track = five case studies, each ending in a mock interview."
+  - "Don't binge one track — pair a couple of concept lessons with the matching part of a case study so the theory has somewhere to land."
+  - "Take the Quiz right after finishing a lesson's body, while the section headings are still fresh, not days later."
+  - "A mock interview isn't a reading exercise — write your own notes before revealing the rubric, or you're just grading someone else's thinking."
+  - "The cheatsheet bullets are your night-before-the-interview material — skim every module's bullets in one pass instead of re-reading full lessons."
+  - "If a mock interview reveals a gap (e.g. you skipped requirements clarification), go back to the specific concept lesson that covers it, not the whole module."
+tags: ["introduction", "meta"]
+estMinutes: 6
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+If you just landed here, it's worth spending five minutes deciding *how*
+you're going to move through this course before you start clicking into
+lessons. Frontend system design is a broad enough topic that a
+front-to-back read without a plan tends to produce a lot of passive
+familiarity and not much interview-ready fluency. The structure below is
+built to avoid that: two tracks that reinforce each other, plus two
+built-in checkpoints (quizzes and mock interviews) that force you to
+actually apply what you read instead of just recognizing it.
+
+This matters more for frontend system design than it might for a topic
+you can memorize. There's rarely a single "correct" architecture for a
+prompt like "design a chat application" — what an interviewer is actually
+evaluating is whether you can reason through trade-offs out loud, in
+real time, under a bit of pressure. Reading twenty lessons about caching
+strategies doesn't build that skill by itself; producing your own answer
+to a messy prompt and comparing it against a rubric does. The two tracks
+and the practice loop below are designed around that gap specifically.
+
+## The two tracks
+
+### Concepts track
+
+The Concepts track is the fundamentals layer. It's organized into modules
+covering nonfunctional requirements, design patterns and architectures,
+performance and optimization, security, and a dedicated design framework
+you can carry into any interview prompt. Each lesson here teaches one
+idea precisely — rendering strategies, state management trade-offs, caching,
+API shape, and so on — independent of any specific product.
+
+Think of this track as building your vocabulary and your mental toolbox.
+When a case study later asks "how should this client stay in sync with a
+server during a flaky connection," you want the answer to already live in
+your head from a concept lesson, not be something you're inventing live.
+
+The Concepts track modules build on each other roughly in this order:
+Introduction (what the discipline covers and how to use the course),
+Nonfunctional Requirements (performance, accessibility, and reliability as
+things you scope explicitly rather than assume), Design Patterns &
+Architectures (state management, component boundaries, data-fetching
+patterns), Performance & Optimization (rendering cost, bundle size,
+caching), Security (the client-side risks specific to frontend work), and
+finally the Design Framework module, which gives you a repeatable
+structure for approaching any open-ended design prompt from a blank page.
+That last module is deliberately placed near the end — it's most useful
+once you already have the vocabulary from the earlier modules to plug
+into it.
+
+### Interview Prep track
+
+The Interview Prep track is five end-to-end case studies: a newsfeed, a
+video streaming platform, a chat application, a ride-hailing app, and a
+calendar application. Each case study has four lessons that walk through
+requirements, architecture, and a deep-dive concern specific to that
+product (say, ordering and de-duplication for chat, or adaptive bitrate
+for video) — and every case study closes with a mock interview lesson
+built around the `MockInterview` component.
+
+This track is where the concepts get stress-tested against a realistic,
+messy prompt instead of a clean abstract question.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  subgraph C[Concepts track]
+    C1[Fundamentals] --> C2[Patterns] --> C3[Performance] --> C4[Security] --> C5[Design framework]
+  end
+  subgraph I[Interview Prep track]
+    I1[Case study: requirements] --> I2[Architecture] --> I3[Deep-dive concern] --> I4[Mock interview]
+  end
+  C -.reinforces.-> I
+  I -.motivates review of.-> C
+`} />
+
+## Recommended order
+
+Don't finish the entire Concepts track before touching a single case
+study, and don't jump straight into case studies with no foundation
+either. Both extremes waste time. A better pattern:
+
+1. Read the Introduction module (you're in it now) and the
+   Nonfunctional Requirements module first — they set up vocabulary every
+   later lesson assumes.
+2. Pick one case study and work through its four lessons, pausing to read
+   the matching concept lesson whenever the case study references an idea
+   you haven't covered yet (the case study lessons will point you to the
+   relevant concept by name).
+3. After finishing that case study's mock interview, go back and finish
+   the concept module it leaned on most heavily — by then you have a
+   concrete example to hang the abstract material on.
+4. Repeat for the remaining four case studies, working through the rest
+   of the Concepts track (Design Patterns & Architectures, Performance &
+   Optimization, Security, Design Framework) alongside them.
+
+If you only have a few days before an actual interview, invert the
+priority: do the Design Framework lesson first, then run through as many
+mock interviews as you can, using the concept lessons as lookups when a
+rubric point stumps you rather than reading them cover to cover.
+
+## How the quizzes and mock interviews reinforce learning
+
+A `<Quiz>` sits at the end of every concept lesson. It's short on purpose
+— 2 to 4 questions — because the goal isn't to test trivia, it's to catch
+the specific misunderstanding you're most likely to walk away with (mixing
+up two similar techniques, missing a trade-off's downside). Take it
+immediately after reading the lesson body. If you get a question wrong,
+re-read the section it maps to before moving on rather than just noting
+the correct answer and continuing.
+
+The `<MockInterview>` component works differently. It gives you an
+open-ended prompt and a rubric of 4 to 6 points a strong answer would hit,
+but the rubric stays hidden until you choose to reveal it. The value is
+almost entirely in the struggle before the reveal: set a timer (30-45
+minutes is realistic for these prompts), talk through your design out
+loud or write it down as if a whiteboard were involved, and only then
+compare against the rubric and self-score. Revealing the rubric first and
+reading it as a study guide teaches you what a good answer contains, but
+not the harder skill of producing one under the mild pressure of a timer
+and a blank page.
+
+## Using the cheatsheet bullets for revision
+
+Every lesson's frontmatter carries a `cheatsheet` — 3 to 7 short, standalone
+bullets that summarize the actual takeaway of that lesson, not just its
+title. These aren't meant to replace reading the lesson; they're meant for
+the week before an interview, when you don't have time to reread thirty
+lessons but do have time to skim thirty cheatsheets.
+
+A practical spaced-revision approach: after finishing a module, copy its
+lessons' cheatsheet bullets into your own notes. A few days later, skim
+just those bullets without opening the lessons — if a bullet doesn't fully
+make sense anymore, that's a signal to reopen that specific lesson rather
+than the whole module. Repeat that skim again the night before an actual
+interview.
+
+## Worked example: prepping for a chat-application interview
+
+Say you have two weeks and know your upcoming interview will likely be a
+messaging or collaboration-tool prompt. A reasonable plan:
+
+- Days 1-2: Introduction module, Nonfunctional Requirements module.
+- Days 3-5: Case Study: Chat Application — all four lessons, including its
+  mock interview, done honestly (timed, notes-first).
+- Days 6-7: The Design Patterns & Architectures and Performance &
+  Optimization modules, since real-time UI updates and connection
+  management lean on both heavily.
+- Days 8-9: Re-run the chat application's mock interview from scratch,
+  without looking at your first attempt's notes, and compare.
+- Days 10-13: One more case study end to end (ride-hailing or newsfeed
+  are good picks — they cover different concerns like geolocation and
+  infinite-scroll data fetching) to make sure your framework generalizes
+  beyond chat specifically.
+- Day 14: Skim every module's cheatsheet bullets in one pass.
+
+The second mock-interview attempt is doing the real work here — it's the
+difference between having read about a topic and being able to produce a
+structured answer to it under time pressure.
+
+<Callout type="warning">
+  The most common way people waste this course is reading every lesson
+  once, top to bottom, and never opening a `Quiz` or `MockInterview`
+  component at all. Passive reading feels like progress because the
+  material makes sense while you're looking at it, but recognition isn't
+  recall — the failure mode shows up in an actual interview when you need
+  to produce the structure from a blank page, not select it from options
+  on a screen. Budget real time for the interactive pieces, not just the
+  prose.
+</Callout>
+
+<Quiz
+  lessonId="how-to-use-this-course"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the recommended relationship between the Concepts track and the Interview Prep track?',
+      options: [
+        { id: 'a', text: 'Finish the entire Concepts track before starting any case study', correct: false, explanation: 'This delays applying anything you learn and tends to produce passive familiarity rather than interview-ready recall.' },
+        { id: 'b', text: 'Work through them together, using case studies to motivate which concept lessons to read next', correct: true, explanation: 'Pairing a case study with the concept lessons it draws on gives the abstract material a concrete anchor and keeps both tracks moving.' },
+        { id: 'c', text: 'Skip the Concepts track entirely and only do mock interviews', correct: false, explanation: 'Mock interviews assume you already have the vocabulary and trade-off knowledge the Concepts track builds; skipping it leaves gaps the rubric will expose.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are true about how to use the `MockInterview` component effectively? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Write your own notes/answer before revealing the rubric', correct: true, explanation: 'The value is in producing a structured answer under mild time pressure, not in recognizing a good answer once shown one.' },
+        { id: 'b', text: 'Reveal the rubric first and use it as a study guide, then read the prompt', correct: false, explanation: 'This inverts the exercise — you end up studying the answer instead of practicing producing one, which is the harder and more transferable skill.' },
+        { id: 'c', text: 'Time yourself roughly the way a real interview would be timed', correct: true, explanation: 'Working under a timer is part of what makes the practice transfer to an actual interview setting.' },
+        { id: 'd', text: 'Only do a mock interview after you have memorized every related concept lesson word for word', correct: false, explanation: 'Mock interviews are meant to surface gaps, not to be gated behind perfect prior knowledge — doing one earlier, imperfectly, tells you what to review next.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: "A lesson's cheatsheet bullets are meant to replace reading the lesson body, so you can skip straight to them.",
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Cheatsheet bullets are compressed revision aids for after you already understand the material — they are too terse to teach a concept from scratch.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — they are for spaced revision (a quick skim in the days before an interview), not a substitute for reading the full lesson the first time.' },
+      ],
+    },
+  ]}
+/>

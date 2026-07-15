@@ -1,0 +1,280 @@
+---
+title: "Calendar Application: Requirements & Scope"
+module: "Case Study: Calendar Application"
+moduleOrder: 5
+order: 1
+track: "interview"
+summary: "Scopes a calendar application frontend: views, recurrence, timezone handling, and clarifying questions."
+cheatsheet:
+  - "Nail down which views are in scope first — month is the cheapest to render correctly, day/week force you to solve overlapping-event layout, and each view has a different worst-case event density."
+  - "Recurring events are a data-modeling decision, not just a UI feature: decide up front whether you're storing a rule and expanding instances, or materializing every instance, because it changes almost everything downstream."
+  - "Timezone correctness means storing every event time in UTC and converting for display only at render time — never store or compare times in a 'local' string."
+  - "Shared/overlapping calendars turn 'render one calendar's events' into 'merge N calendars' worth of events into one visible grid with conflict-aware layout — ask about this explicitly, it's easy to assume single-user."
+  - "Offline editing isn't just 'cache the data' — you need optimistic local writes plus a conflict story for what happens when two edits to the same event reconcile after reconnecting."
+  - "Fast view switching (day <-> week <-> month) is a nonfunctional requirement people forget to name; it constrains how much event data you prefetch and cache per date range."
+  - "Ask about recurrence, views, and single-vs-shared calendars before designing anything — each answer changes the scope of the deep-dive interview that follows."
+tags: ["case-study","calendar-app","requirements"]
+estMinutes: 12
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design a calendar application" is a deceptively small-sounding prompt.
+Most people picture a grid of boxes and start sketching a month view
+within the first minute. But a calendar frontend has to get three genuinely
+hard things right at once: rendering a lot of small events into a
+constrained grid without the layout collapsing, expanding recurring events
+into concrete instances correctly, and displaying times correctly across
+timezones and daylight-saving transitions. Any one of these done sloppily
+produces a calendar that looks fine in the demo and is subtly wrong in
+production — an event that silently shows at the wrong hour after a DST
+change, or a "every Tuesday" meeting that vanishes from one attendee's view
+because of an off-by-one in the recurrence math.
+
+This lesson is the scoping pass. Before touching architecture or
+component design, we'll separate what the app has to *do* (functional
+requirements), what has to be *true* about how it behaves (nonfunctional
+requirements), and the handful of clarifying questions that determine how
+big each of those two lists actually is for your specific interview.
+
+## Why scope swings so hard on this prompt
+
+A calendar app can be a tiny personal to-do grid or it can be
+Google-Calendar-scale: multiple visible calendars layered together, shared
+events with attendees in different timezones, recurring series with
+per-instance overrides, and offline-first editing that has to reconcile
+later. The functional shape looks similar at every scale — a grid, events,
+an editor — but the *hard parts* only show up once you add recurrence,
+multiple timezones, or shared calendars. An interviewer who says "just a
+single user's personal calendar, no sharing" is asking a much shorter
+question than one who says "team calendars with overlapping events across
+timezones." Spending two or three minutes locking down scope tells you
+which of those interviews you're actually in.
+
+## Functional requirements
+
+For the canonical "design a calendar app" prompt, a solid functional scope
+covers:
+
+- **Multiple views: day, week, and month.** Each view is a different
+  rendering problem. A day view has plenty of vertical space per event; a
+  week view compresses seven days side by side; a month view has to fit an
+  entire day's events into a cell a few dozen pixels tall, which usually
+  means showing the first few events plus a "+3 more" affordance.
+- **Event CRUD.** Create, read, update, and delete an event, including the
+  core fields: title, start/end time, location, description, and
+  attendees. The editor is typically a modal or side panel, not a full
+  page navigation.
+- **Recurring events.** "Every Monday at 9am," "the last Friday of every
+  month," "every day until a given date." This is one axis where scope can
+  legitimately be cut — "no recurrence, every event is one-off" is a valid
+  answer that removes a large chunk of complexity.
+- **Multi-timezone display.** At minimum, rendering all events correctly
+  in the viewer's local timezone; at a more advanced scope, showing a
+  secondary timezone (e.g., a "world clock" strip) or letting a user view
+  the calendar as if they were in a different timezone.
+- **Shared and overlapping calendars.** Viewing more than one calendar's
+  events overlaid on the same grid — your own calendar plus a teammate's,
+  or a personal calendar plus a work calendar — which means the grid has
+  to merge events from multiple sources and lay out ones that overlap in
+  time without visually stacking them illegibly.
+
+What's usually **out of scope** unless stated otherwise: the actual invite
+and notification delivery system (emailing attendees, push reminders),
+calendar-account provisioning (OAuth linking Google/Outlook accounts), and
+free/busy scheduling-assistant features like "find a time that works for
+everyone." Naming these out loud — "I'll treat sending invite emails as a
+solved backend concern and focus on rendering and editing" — keeps the
+interview focused on the frontend problem.
+
+## Nonfunctional requirements
+
+The functional list above is fairly stable across calendar products. The
+nonfunctionals are where a calendar app earns its place as a distinct case
+study — they're less about raw scale and more about correctness and
+responsiveness under a surprisingly tricky data model.
+
+### Fast view switching
+
+Clicking from month to week to day, or paging to the next week, has to
+feel instant — this is a direct-manipulation UI, and a visible loading
+spinner every time someone clicks "next week" reads as broken. That
+pushes you toward prefetching and caching event data for date ranges
+adjacent to what's currently visible, so a view switch is usually a cache
+hit rather than a fresh network round trip.
+
+### Correctness of recurrence math
+
+A recurring event has to expand into exactly the right set of concrete
+instances for whatever date range is on screen — no duplicates, no
+missing instances, and instances that respect exceptions (a single
+occurrence moved or deleted without affecting the rest of the series).
+Getting this wrong doesn't crash anything; it quietly shows the wrong
+data, which is worse because nobody notices until a meeting gets missed.
+
+### Correctness of timezone math
+
+Every event has to render at the correct wall-clock time for whoever is
+viewing it, including across a daylight-saving transition — an event
+created before a DST change has to still land on the correct hour when
+viewed after one. This is a common source of real production bugs and a
+common interview probe.
+
+### Offline editing
+
+Calendars get checked and edited from a phone with inconsistent
+connectivity, so offline edits (create, move, delete) should apply
+locally and sync once connectivity returns rather than failing outright.
+That implies optimistic local writes plus a conflict strategy for when a
+synced edit collides with a change made elsewhere in the meantime.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  Q1["Single user or shared/overlapping calendars?"] -->|single| A1["One event source merged into the grid"]
+  Q1 -->|shared| A2["Merge N calendar sources + overlap layout"]
+  Q2["Are recurring events in scope?"] -->|no| B1["Skip recurrence-rule storage and expansion entirely"]
+  Q2 -->|yes| B2["Design recurrence rule model + instance expansion"]
+  Q3["Which views are required?"] -->|month only| C1["Optimize for dense '+N more' cells"]
+  Q3 -->|day/week too| C2["Also solve fine-grained overlapping-event layout"]
+`} />
+
+## The clarifying questions to ask
+
+### "Is this a single user's personal calendar, or do we need shared / overlapping calendars?"
+
+A single-user scope means one event source feeds the grid — comparatively
+simple. Shared calendars mean the grid renders events merged from multiple
+sources (your calendar, a teammate's, a room's booking calendar), which
+forces two extra problems: color-coding events by which calendar they
+belong to, and laying out events that overlap in time from *different*
+sources without becoming an unreadable pile. If the interviewer says
+"shared," say you'll design the single-calendar rendering path first and
+then generalize to merged sources — stronger sequencing than designing
+for N calendars from the first sketch.
+
+### "Are recurring events in scope?"
+
+This is the single biggest scope lever in this case study. "No recurrence"
+means every event is a standalone row with a start and end time — no
+recurrence-rule storage, no instance expansion, no per-instance exception
+handling. "Yes" pulls in a real data-modeling decision (do you store a
+rule like "every Monday" and expand it on demand, or precompute and store
+every instance?) that the architecture and deep-dive lessons in this
+module spend real time on. If recurrence is in scope, also ask whether
+editing a single instance of a series (as opposed to the whole series)
+needs to be supported — that's a meaningfully different editor UX.
+
+### "Which views are required — day, week, month, or all three?"
+
+Month view alone is the cheapest: you're mostly solving "fit a summary of
+a day's events into a small cell." Add week or day view and you now need
+fine-grained overlapping-event layout — two 3pm meetings need to render
+as side-by-side columns within the same hour, not stacked illegibly. If
+only one view is required, say so and skip designing layout logic the
+other views would need; if all three are required, note that the
+underlying event-expansion logic should be shared across views, with only
+the rendering/layout differing per view.
+
+### A few second-tier questions worth asking if time allows
+
+- "Do events need per-attendee timezones, or just correct display for the
+  single viewer?" (Adds a "shown in attendee's local time" annotation.)
+- "Is drag-to-resize/reschedule in scope, or is editing form-only?" (Adds
+  direct-manipulation gesture handling on top of CRUD.)
+- "Do all-day and multi-day events need support?" (Both need distinct
+  rendering from a normal timed event, especially in week/month views.)
+
+## Worked example: how two sets of answers diverge
+
+Suppose the interviewer says: "single user, no shared calendars; recurring
+events are in scope; only week and month views are required."
+
+That tells you:
+
+- You skip multi-calendar merging and overlap-by-source color-coding
+  entirely — one event source feeds the grid.
+- You do need a recurrence-rule data model and an expansion step that
+  turns "every Tuesday at 2pm" into concrete instances for whatever date
+  range each view is currently showing, including handling a single
+  edited-or-deleted occurrence as an exception to the rule.
+- You need overlapping-event layout for week view (side-by-side columns
+  within an hour) and dense-cell "+N more" handling for month view, but
+  you can skip day view's finer-grained layout concerns.
+
+Now contrast with: "shared team calendars — up to five overlaid at once;
+no recurring events; day view only." That's a very different fifteen
+minutes: no recurrence-rule modeling at all, but a real design problem
+merging five event sources into one grid, color-coding by source, and
+solving overlap layout at the granularity a single busy day demands (many
+short meetings back to back). Same opening prompt, two different scopes,
+purely from three answers.
+
+<Callout type="warning">
+  A common mistake is jumping straight into "I'll store `start` and `end`
+  as local date-time strings and render them directly" without asking
+  about timezones or recurrence first. Local-string storage breaks the
+  moment a second timezone or a DST transition is in scope — you'll need
+  to redo your entire data model mid-interview. Ask about single-vs-shared
+  calendars, recurrence, and required views *before* you commit to a data
+  model, not after you've already sketched one.
+</Callout>
+
+## Where this goes next
+
+Once scope is settled, the next lesson
+(`calendar-app-high-level-architecture`) turns these requirements into a
+concrete architecture: the date/grid rendering layer, the event data layer
+that expands recurring events into instances for a visible range, and the
+component tree tying the grid, event chips, and editor modal together. The
+deep-dive lesson after that (`calendar-app-deep-dives`) is where recurrence
+expansion strategy, timezone/DST correctness, and dense-view rendering
+performance — all set up by the answers you get here — get worked out in
+detail.
+
+<Quiz
+  lessonId="calendar-app-requirements-and-scope"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Which clarifying question most directly determines whether you need a recurrence-rule data model and an instance-expansion step at all?',
+      options: [
+        { id: 'a', text: 'Are recurring events in scope?', correct: true, explanation: 'If recurrence is out of scope, every event is a standalone row and there is no rule storage or expansion step to design at all — this single answer removes or adds a large chunk of the design.' },
+        { id: 'b', text: 'Which views are required — day, week, or month?', correct: false, explanation: 'The required views change grid rendering and overlap layout, but every view still needs recurring events expanded into instances if recurrence is in scope at all.' },
+        { id: 'c', text: 'Is drag-to-reschedule supported?', correct: false, explanation: 'This affects editing interaction, not whether recurring events exist or need to be expanded into concrete instances.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'The interviewer confirms shared, overlapping calendars are in scope. Which concerns become first-class because of that specifically? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Merging events from multiple calendar sources into one rendered grid', correct: true, explanation: 'A single-user calendar has one event source; shared calendars require merging events pulled from several sources before they can be laid out together.' },
+        { id: 'b', text: 'Visually distinguishing which calendar each event belongs to, usually via color-coding', correct: true, explanation: 'Once events from different calendars share a grid, the UI needs a way to show a viewer which source each event came from.' },
+        { id: 'c', text: 'Storing event times in UTC instead of local time', correct: false, explanation: 'UTC storage for correct timezone rendering is needed regardless of whether calendars are shared or single-user — it is not specific to the sharing scope.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'For this case study, the nonfunctional requirements are dominated by handling a very high volume of concurrent users, similar to a newsfeed at scale.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The distinguishing nonfunctionals here are fast view switching, correctness of recurrence and timezone math, and reliable offline editing — not raw concurrent-user throughput, which is more of a backend scaling concern.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. This case study is defined by correctness-under-complex-data-model concerns (recurrence, timezones, DST) and responsiveness, which is what makes it a distinct lesson from a volume-heavy case study.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A month view cell needs to show a day with 8 events but only has room for 3. What is this scenario primarily an instance of?',
+      options: [
+        { id: 'a', text: 'The month view\'s dense-cell rendering problem, typically solved with a "+N more" affordance', correct: true, explanation: 'Month view compresses an entire day into a small cell, so showing every event is often impossible — a summary plus an overflow indicator is the standard approach, and it is called out explicitly as a functional concern for month view.' },
+        { id: 'b', text: 'A recurring-event expansion bug', correct: false, explanation: 'Having many events on one day is unrelated to whether any of them are recurring — a day can be busy with entirely one-off events.' },
+        { id: 'c', text: 'A timezone-conversion error', correct: false, explanation: 'Event count in a cell has nothing to do with what timezone the events are displayed in; this is purely a layout-density problem.' },
+      ],
+    },
+  ]}
+/>

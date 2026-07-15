@@ -1,0 +1,204 @@
+---
+title: "Video Streaming Platform: Mock Interview"
+module: "Case Study: Video Streaming Platform"
+moduleOrder: 2
+order: 4
+track: "interview"
+summary: "A timed mock-interview prompt and rubric for designing a video streaming platform frontend."
+cheatsheet:
+  - "Open by pinning down live vs. on-demand, DRM/premium content, and offline downloads before naming a single component — each answer changes the player and caching design."
+  - "Draw the player as a pipeline: manifest fetch to segment fetch to buffer to decode/render, with custom controls layered on top of (not replacing) the native media element."
+  - "State the ABR loop out loud: measured throughput and buffer health feed a bitrate decision every few seconds, biased toward buffer health once you have more than a few seconds queued."
+  - "Name a concrete low-bandwidth fallback: shrink the target buffer, drop to the lowest safe rendition, and show a non-blocking 'reconnecting' indicator instead of a frozen frame or a hard error."
+  - "Cross-device resume needs a server-recorded playback position keyed to account, not device — write position on pause/interval, not only on unmount, or backgrounded tabs lose progress."
+  - "Don't over-engineer the answer with DRM/multi-CDN detail unless the interviewer asked for premium content — scope discipline is itself a signal in this round."
+tags: ["case-study","video-streaming","mock-interview"]
+estMinutes: 20
+---
+
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+import MockInterview from '../../components/MockInterview';
+import Quiz from '../../components/Quiz';
+
+This is the round where everything from the last three lessons has to come
+out of your head and into a coherent 35-45 minute answer, live, without the
+safety net of rereading a lesson mid-interview. You've scoped the problem,
+drawn the high-level architecture, and gone deep on adaptive bitrate and
+buffering. Now the question is whether you can reconstruct that thinking
+under time pressure, in the order an interviewer actually wants to hear it,
+while fielding follow-up questions that poke at the weak spots.
+
+Treat this lesson as a dry run of the real thing. Set a timer, talk out
+loud (even if it's just to yourself), and resist the urge to peek at the
+rubric before you've committed to an approach. The value of a mock
+interview evaporates the moment you start reverse-engineering the grading
+criteria instead of solving the problem.
+
+## Why video streaming is a distinct flavor of this interview
+
+Most frontend system design prompts (newsfeed, chat, search) are dominated
+by data-fetching and rendering concerns: what to fetch, when, and how to
+paint it efficiently. Video streaming shares those concerns but adds a
+layer that's almost entirely absent elsewhere — a continuous, real-time
+media pipeline that has to keep frames arriving at a steady rate even as
+network conditions change underneath it. A newsfeed that stalls for 400ms
+is a minor annoyance; a video player that stalls for 400ms is a visible,
+countable rebuffer event.
+
+That's why interviewers use this prompt to probe a different muscle: can
+you reason about a system that degrades gracefully under continuously
+changing conditions, rather than one that just needs to handle a fixed set
+of API responses. The player architecture and the adaptive bitrate logic
+are the two areas where strong and weak answers diverge hardest.
+
+## The prompt
+
+Read it once, then start your timer.
+
+<MockInterview
+  lessonId="video-streaming-mock-interview"
+  client:visible
+  prompt="Design the frontend for a video streaming platform where users browse a catalog and watch on-demand video content, similar in spirit to a YouTube- or Netflix-style product. Cover the watch page's player architecture, how you'd implement adaptive quality switching, and how the experience holds up for a user on a slow or unstable mobile network. Assume a backend team can build whatever APIs you need — focus on the client."
+  rubric={[
+    { point: 'Clarifies requirements before designing', detail: 'Asks whether this is live or on-demand (or both), whether DRM/premium content is in scope, whether offline downloads matter, and what devices to support, before sketching any architecture. States assumptions explicitly when the interviewer leaves something open.' },
+    { point: 'Lays out player and component architecture', detail: 'Describes a player component that wraps a native media element, with custom controls (play/pause, scrub bar, quality menu, captions toggle) built as a separate layer rather than fighting the native element for state. Separates the watch page shell (metadata, recommendations, comments) from the player itself, and can explain why the player is client-rendered while the surrounding page can be server-rendered.' },
+    { point: 'Explains the adaptive bitrate and buffering strategy', detail: 'Describes fetching a manifest that lists multiple quality renditions, downloading media in small segments, and picking a rendition per segment based on measured throughput and current buffer level — not just raw bandwidth. Explains why buffer health should dominate the decision once a few seconds are queued, and states a concrete target buffer size.' },
+    { point: 'Handles poor and unstable networks gracefully', detail: 'Has a concrete plan for what happens when throughput drops mid-playback or a segment request fails: shrink the buffer target, step down renditions instead of freezing, retry failed segment fetches with backoff, and show the user an honest loading state instead of a silent stall or a hard error screen.' },
+    { point: 'Addresses cross-device and resume-position concerns', detail: 'Explains how playback position is persisted (periodically and on pause, not only on unmount) and keyed to the account rather than the device, so a user can stop on mobile and resume on a TV or desktop at roughly the same point. Notes that resume position should tolerate small drift rather than seeking to an exact frame.' },
+    { point: 'Discusses trade-offs and probes edge cases under follow-up', detail: 'When pushed, can compare approaches (e.g. client-side ABR heuristics vs. a server-assisted hint, or aggressive prefetch vs. conserving mobile data) instead of defending a single answer as the only correct one, and flags what they would measure in production to validate the choice.' },
+  ]}
+/>
+
+## How to run your 35-40 minutes
+
+A rough allocation that leaves room for the interviewer to steer:
+
+1. **5-7 min — clarify and scope.** Live or on-demand? Single quality
+   stream acceptable for v1, or is adaptive bitrate explicitly required?
+   Any DRM/premium tier? What devices (mobile web, desktop, smart TV app)?
+2. **10-12 min — architecture.** Sketch the watch page: player component,
+   custom controls, metadata/recommendations panel, comments. Explain the
+   manifest-to-segment-to-buffer pipeline and where quality selection sits
+   in it.
+3. **10-12 min — the deep dive the interviewer steers you into.** Usually
+   adaptive bitrate logic or poor-network handling — this is where most of
+   the signal is generated, so don't rush past it in the architecture pass.
+4. **5-8 min — edge cases and trade-offs.** Network drop mid-stream,
+   cross-device resume, caption sync, mobile data conservation.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Requirements: live/on-demand, DRM, offline, devices] --> B[Watch page architecture]
+  B --> C[Player pipeline: manifest to segments to buffer to render]
+  C --> D[ABR: bandwidth + buffer health drive rendition choice]
+  D --> E[Poor-network handling: shrink buffer, step down, retry]
+  E --> F[Cross-device resume + trade-off discussion]
+`} />
+
+## Worked example: answering the ABR follow-up well
+
+A common follow-up after the architecture pass is some version of "walk me
+through exactly what happens when this user's bandwidth drops from 8 Mbps
+to 400 Kbps while watching 1080p."
+
+A weak answer says "it switches to a lower quality" and stops there. A
+strong answer narrates the mechanism: the player is already measuring
+throughput on every completed segment download; once a handful of
+consecutive segments come in slower than the current rendition's bitrate
+demands, the ABR logic re-evaluates and picks the highest rendition that
+the recent throughput estimate can sustain with margin, subject to the
+current buffer level — if the buffer is nearly empty, it picks
+conservatively even below what bandwidth alone would allow, because a
+rebuffer is worse than a visibly softer picture. It then fetches the next
+segment at that lower rendition, and because segments are aligned across
+renditions, the switch happens at a clean segment boundary with no
+decode glitch. If bandwidth keeps falling, the player also shrinks its
+target buffer size so it isn't holding open connections trying to
+pre-fetch data it can't afford, and if a segment request outright times
+out, it retries with backoff rather than immediately declaring the stream
+dead.
+
+That level of detail — mechanism, thresholds, and what happens next — is
+exactly what separates "I know the term adaptive bitrate" from "I could
+help build this."
+
+<Callout type="interview">
+  Don't let the deep dive turn into a monologue about codecs or manifest
+  formats. The interviewer wants to see you reason about client behavior
+  under changing conditions, not recite HLS/DASH trivia. If you find
+  yourself naming manifest file extensions instead of describing the
+  decision logic, redirect back to "here's what the client does and why."
+</Callout>
+
+<Callout type="warning">
+  A frequent mistake in this interview: describing the player as if it
+  only has to handle the happy path, then treating network failure as an
+  afterthought when the interviewer asks about it. Bring up buffering
+  strategy and failure handling proactively during the architecture pass —
+  even a single sentence like "and I'll come back to what happens when the
+  network gets bad" — so it's clear you're not being reminded of a case you
+  forgot.
+</Callout>
+
+## After you finish
+
+Compare your answer against the rubric above, point by point, and be
+honest about which points you covered fully versus glossed over. If you
+skipped clarifying questions and jumped straight to architecture, that's
+the single most common gap in this round — practice starting cold with
+just the prompt and forcing yourself to ask three questions before you
+draw anything. If your ABR explanation stayed at "it picks a lower
+quality" without naming what drives that decision, revisit the
+[deep dives lesson](/interview/video-streaming-deep-dives) before your
+next attempt.
+
+Before you move on, check your understanding of the concepts this mock
+interview leans on hardest with the quiz below.
+
+<Quiz
+  lessonId="video-streaming-mock-interview"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'In a strong answer to the ABR follow-up, what should primarily drive the decision to step down to a lower-quality rendition once a few seconds of video are already buffered?',
+      options: [
+        { id: 'a', text: 'Buffer health combined with recent measured throughput', correct: true, explanation: 'Once there is a healthy buffer, the decision should weigh how much is queued (a cushion against a rebuffer) alongside the throughput estimate, rather than reacting to bandwidth alone.' },
+        { id: 'b', text: 'The device\'s screen resolution only', correct: false, explanation: 'Screen resolution caps the *useful* top rendition, but it does not drive the moment-to-moment step-down decision when bandwidth or buffer changes.' },
+        { id: 'c', text: 'The total length of the video', correct: false, explanation: 'Video duration is irrelevant to a real-time quality decision — it does not reflect current network conditions or buffer state.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are concrete, correct responses to a mid-playback bandwidth drop, per the rubric in this lesson? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Shrink the target buffer size', correct: true, explanation: 'A smaller target buffer avoids holding open expensive fetches the connection cannot sustain, and keeps the player from over-committing to data it cannot download in time.' },
+        { id: 'b', text: 'Step down to a lower rendition at the next segment boundary', correct: true, explanation: 'Switching at a segment boundary avoids a decode glitch and keeps playback smooth even at reduced quality.' },
+        { id: 'c', text: 'Immediately stop playback and show a hard error screen', correct: false, explanation: 'A hard error on a recoverable bandwidth dip is the weak-answer pattern this lesson warns against — the player should degrade gracefully, not fail outright.' },
+        { id: 'd', text: 'Retry failed segment fetches with backoff instead of declaring the stream dead on the first timeout', correct: true, explanation: 'A single timeout is often transient; retrying with backoff avoids treating a brief network hiccup as a fatal stream failure.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A resume-position feature that saves playback position only in the component\'s unmount handler is sufficient for reliable cross-device resume.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Backgrounded tabs, app kills, and closed laptops often skip unmount entirely, so position never gets saved. Position should be written periodically and on pause, not only on unmount.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — relying solely on unmount loses progress whenever the page is closed abruptly, which is common enough that periodic and pause-triggered saves are necessary.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Per this lesson, why should custom player controls be built as a layer on top of the native media element rather than replacing its state management entirely?',
+      options: [
+        { id: 'a', text: 'Because the native element already owns playback state (current time, buffered ranges, play/pause), and fighting it for that state creates sync bugs', correct: true, explanation: 'The native media element is the source of truth for playback state; custom controls should read and command it, not duplicate and fight over that state.' },
+        { id: 'b', text: 'Because native controls are required by law in most regions', correct: false, explanation: 'This is not a real constraint — custom controls fully replacing the native UI are extremely common in production players.' },
+        { id: 'c', text: 'Because adaptive bitrate only works with native controls visible', correct: false, explanation: 'ABR operates on the underlying media pipeline and is unaffected by whether native or custom controls are shown to the user.' },
+      ],
+    },
+  ]}
+/>

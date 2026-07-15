@@ -1,0 +1,153 @@
+---
+title: "Client–Server Communication Models"
+module: "API Architecture Styles, Protocols & Data Formats"
+moduleOrder: 5
+order: 1
+track: "concept"
+summary: "Compares polling, long-polling, and persistent-connection models for client–server communication."
+cheatsheet:
+  - "Short polling trades freshness for simplicity: every interval is a full HTTP round trip, even when nothing changed."
+  - "Long-polling holds the request open server-side until there's data (or a timeout) — fewer wasted round trips than polling, but each response still needs a fresh reconnect."
+  - "WebSocket gives you one long-lived, bidirectional connection — pick it when the client also needs to send frequent messages (chat, collaborative editing, live cursors)."
+  - "SSE gives you one long-lived, server-to-client-only stream over plain HTTP — pick it when updates only flow one way (live scores, notification feeds, progress updates)."
+  - "The real decision axes are update frequency (rare vs constant) and directionality (one-way vs two-way), not just 'do I need it real-time.'"
+  - "Every persistent connection needs an explicit reconnect/backoff strategy — the network will drop it, and 'just keep the tab open' is not a plan."
+  - "Don't reach for WebSocket by default: a dashboard refreshing every 30 seconds is well served by polling, and adding a socket server just adds ops burden for no user-visible benefit."
+tags: ["api", "architecture"]
+estMinutes: 9
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every frontend eventually needs to answer one question: how does the browser find out that something changed on the server? A stock ticker, a chat thread, a shipment tracker, and a "you have unread notifications" badge all need fresh data, but they don't need it the same way or at the same frequency. Picking the wrong communication model shows up as either a laggy UI (you polled too slowly) or a backend getting hammered by requests that mostly return "nothing changed" (you polled too aggressively, or you should've used a push model in the first place).
+
+This lesson covers the three communication models a frontend engineer reaches for — short polling, long-polling, and persistent connections (WebSocket and SSE) — and how to decide between them based on two questions: how often does the data change, and does the client ever need to send data back on the same channel?
+
+## Short polling: ask again on a timer
+
+Short polling is the simplest model: the client sends a request on a fixed interval (`setInterval`, a `useEffect` timer, whatever), gets a response, and repeats. There's no persistent connection — each poll is its own independent HTTP request/response pair, complete with its own TCP handshake (or reused keep-alive connection) and HTTP headers.
+
+The appeal is that it needs nothing special on either end: any REST endpoint already supports it. The cost is a straight trade-off between freshness and waste. Poll every 5 seconds and you'll see updates up to 5 seconds late; poll every 500ms and you're fresher but now sending 10x the requests, most of which return "nothing new" if updates are infrequent. There's no way to tune polling that removes this trade-off — you can only shift where you sit on the freshness/waste curve.
+
+Short polling is the right default for data that changes occasionally and where a few seconds of staleness is fine: a dashboard tile, an order-status page, a "check if the export is ready" flow.
+
+## Long-polling: hold the request open
+
+Long-polling changes the server's behavior, not the client's request shape. The client still sends a plain HTTP request, but instead of answering immediately, the server *holds the request open* until either new data is available or a timeout elapses (commonly 20 to 60 seconds). When the server finally responds — either with data or an empty timeout response — the client immediately opens a new request and the cycle repeats.
+
+This gets you much better freshness than short polling without needing a new connection type: as soon as the server has something to say, it says it, rather than waiting for the client's next scheduled poll. The cost is that the server now needs to keep a request (and usually a thread or async handler) parked per waiting client, and every request that resolves — even from a timeout — requires immediately reopening a new one, so under high volume it isn't dramatically cheaper than aggressive short polling in total connection churn.
+
+Long-polling is a good fit when updates are irregular and you want low latency without standing up a new protocol on the server — it was, for years, the standard way to fake "real-time" over plain HTTP before WebSocket support was universal, and it's still a reasonable fallback path today.
+
+## Persistent connections: WebSocket and SSE
+
+Both models above pay a repeated setup cost: a new request (and its headers, and possibly a new TLS handshake) every cycle. A persistent connection avoids that by opening the connection once and keeping it open for the life of the session.
+
+### WebSocket: bidirectional, message-based
+
+A WebSocket starts as a normal HTTP request that asks to be upgraded (`Upgrade: websocket`), and once the server agrees, the underlying TCP connection stays open as a full-duplex channel — either side can send a message at any time, without waiting for a "request" from the other. This is the model for anything where the client is also a frequent sender: a chat app, a collaborative document where every keystroke or cursor move needs to reach other clients, a multiplayer game syncing state, or a trading UI that both subscribes to price ticks and submits orders on the same channel.
+
+The cost is operational complexity: WebSocket connections are stateful, so load balancers need sticky routing or a shared pub/sub backplane, connections need explicit heartbeat/ping-pong to detect silently-dead links, and the client needs its own reconnect-with-backoff logic since the browser won't retry a dropped WebSocket for you.
+
+### SSE: one-way, server-to-client streaming
+
+Server-Sent Events run over plain HTTP — the client opens a normal request with `Accept: text/event-stream`, and the server keeps writing chunks of a text-based event stream to that same response indefinitely. The browser's built-in `EventSource` API even handles automatic reconnection for you. The catch is directionality: SSE is server-to-client only. If the client needs to send something back, that's a separate, ordinary HTTP request — SSE just isn't a channel for client-to-server messages.
+
+SSE fits notifications feeds, live sports scores, a progress bar for a long-running job, or a live-updating activity log — anywhere the server needs to keep pushing updates but the client isn't sending a comparable stream back.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    rect rgb(235,235,245)
+    Note over C,S: Short polling
+    C->>S: GET /status
+    S-->>C: 200 (no change)
+    C->>S: GET /status (after interval)
+    S-->>C: 200 (new data)
+    end
+    rect rgb(230,245,235)
+    Note over C,S: Long-polling
+    C->>S: GET /status (held open)
+    Note over S: waits for data or timeout
+    S-->>C: 200 (new data)
+    C->>S: GET /status (reopen immediately)
+    end
+    rect rgb(245,235,230)
+    Note over C,S: WebSocket
+    C->>S: Upgrade request
+    S-->>C: 101 Switching Protocols
+    C->>S: message
+    S-->>C: message (any time, either side)
+`} />
+
+## Worked example: a live order-tracking page
+
+Say you're building the order-tracking page for a food delivery app. Requirements: show order status ("preparing" → "out for delivery" → "delivered"), and once it's out for delivery, show the driver's live location on a map.
+
+Order status changes maybe 3–4 times over 30 minutes and there's no client-to-server data involved — a customer never "sends" a status update. Short polling every 15–20 seconds is more than good enough here; anything fancier is wasted engineering effort for a value that changes a handful of times.
+
+Driver location is a different profile entirely: it updates every 1–3 seconds while out for delivery, is strictly server-to-client (the customer's browser never pushes location data), and needs low latency so the pin doesn't visibly jump. That's SSE territory — one persistent stream, server pushes coordinates as they arrive, no need for the client to send anything back on that channel. If this same app also had an in-app chat between customer and driver, *that* feature — two-way, frequent, low-latency — is the one place on this page that would justify WebSocket.
+
+Notice the app doesn't need one model for the whole page. Communication models are chosen per data stream, based on that stream's own update frequency and directionality, not applied uniformly across a whole feature.
+
+<Callout type="warning">
+  A common mistake is reaching for WebSocket as the default "real-time" solution and standing up a socket server for data that's actually one-way and infrequent — e.g. a notification bell that updates a few times an hour. That adds a stateful connection to scale, load-balance, and reconnect-handle for no benefit the user can perceive. Match the model to the actual traffic shape: one-way and infrequent is polling; one-way and frequent is SSE; two-way and frequent is WebSocket. Don't skip straight to the most powerful tool.
+</Callout>
+
+## Choosing between them
+
+Two questions settle most of these decisions:
+
+1. **How often does the data actually change?** Rare or occasional changes rarely justify anything beyond polling. Frequent or continuous changes push you toward a persistent connection.
+2. **Does the client need to send data on the same channel, not just receive it?** If yes, and it's frequent, that's WebSocket. If the client only receives, SSE (or long-polling as a fallback) covers it without the operational overhead of a bidirectional socket.
+
+Latency requirements matter too, but they usually follow from question 1: if updates need to be reflected within a second or two of happening, you're already past what polling can offer without extreme resource waste.
+
+<Quiz
+  lessonId="client-server-communication-models"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A live collaborative text editor needs to broadcast every keystroke from any connected user to all other connected users within a few hundred milliseconds. Which model fits best?',
+      options: [
+        { id: 'a', text: 'Short polling', correct: false, explanation: 'Polling on any reasonable interval would either be far too slow for per-keystroke updates or would flood the server with requests that mostly return nothing new.' },
+        { id: 'b', text: 'Server-Sent Events', correct: false, explanation: 'SSE only pushes from server to client. This feature needs every client to also send its own keystrokes, which SSE cannot carry.' },
+        { id: 'c', text: 'WebSocket', correct: true, explanation: 'The traffic is frequent and bidirectional (every client sends and receives), which is exactly the case WebSocket is built for.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine downsides of long-polling compared to a persistent WebSocket connection? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Each resolved request must be immediately reopened as a brand-new request', correct: true, explanation: 'Unlike a WebSocket, which stays open indefinitely, long-polling always needs a fresh request cycle once the current one resolves — whether from data or a timeout.' },
+        { id: 'b', text: 'It cannot be implemented using standard HTTP', correct: false, explanation: 'Long-polling is plain HTTP — a normal request that the server simply delays answering. It needs no protocol upgrade at all.' },
+        { id: 'c', text: 'The server must hold request state open per waiting client until it has data or hits a timeout', correct: true, explanation: 'This is real overhead: the server is tying up a connection/handler per client while it waits, similar in spirit to what a WebSocket server also has to manage, just via a different mechanism.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Server-Sent Events (SSE) allow the client to send frequent messages back to the server over the same event stream connection.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'SSE is a one-way, server-to-client stream. Anything the client needs to send back has to go over a separate, ordinary HTTP request.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — SSE is strictly server-to-client. If a feature needs frequent two-way traffic on one channel, that calls for WebSocket instead.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A dashboard widget shows an aggregate metric that the backend recomputes roughly once every 5 minutes. What is the most appropriate communication model?',
+      options: [
+        { id: 'a', text: 'Short polling every minute or so', correct: true, explanation: 'With updates this infrequent, a modest polling interval gets acceptable freshness with minimal complexity — no persistent connection is warranted.' },
+        { id: 'b', text: 'A dedicated WebSocket connection', correct: false, explanation: 'Standing up and maintaining a stateful connection for data that changes every 5 minutes is unnecessary operational overhead for no perceptible user benefit.' },
+        { id: 'c', text: 'Long-polling with a 60-second timeout', correct: false, explanation: 'Long-polling is built for lower-latency irregular updates; for something this infrequent it adds server-side complexity over simple polling without a meaningful freshness gain.' },
+      ],
+    },
+  ]}
+/>

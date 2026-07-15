@@ -1,0 +1,255 @@
+---
+title: "Rendering Strategies: CSR, SSR, SSG, and ISR"
+module: "Performance & Optimization"
+moduleOrder: 4
+order: 7
+track: "concept"
+summary: "Compares client- and server-driven rendering strategies and their trade-offs."
+cheatsheet:
+  - "TTFB order (fastest to slowest, roughly): SSG/CDN cache, ISR (cache hit), SSR, CSR — but time-to-interactive can flip this ranking once hydration is counted."
+  - "SSR and SSG both ship HTML first, so content is visible and crawlable before any JS runs; CSR ships an empty shell and depends entirely on JS to paint anything."
+  - "SSG is a build-time snapshot — perfect for content that changes on a deploy cadence (docs, marketing pages, blog posts), not per-request data."
+  - "ISR gets SSG's speed with a revalidation window (time-based or on-demand), trading a small staleness risk for not rebuilding the whole site on every content change."
+  - "Hydration cost scales with the amount of client JS shipped for interactivity, not with page size — islands/partial hydration only ship JS for the interactive widgets, not the whole page."
+  - "Choose by asking two questions: how often does the content change, and does the page need to be interactive on first paint? That combination usually points to one strategy."
+  - "'SEO' isn't binary — modern crawlers execute JS, but render-then-index delays and budget limits still make server-rendered HTML the safer default for content you need indexed reliably."
+tags: ["performance", "rendering", "architecture"]
+estMinutes: 13
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've built a React app. It works great in development, but a teammate
+reports that the marketing homepage takes 3 seconds to show anything, and
+the SEO team is asking why product pages aren't showing up in search
+results. None of this is a bug — it's a consequence of picking client-side
+rendering for content that would have been better served as static HTML.
+Rendering strategy is one of the first architectural decisions you make for
+any frontend, and it quietly determines your time-to-first-byte, your SEO
+posture, how fresh your content can be, and how much JavaScript the browser
+has to chew through before the page responds to a click. Getting this
+wrong shows up as a performance complaint months later, long after the
+choice is baked into the app's structure.
+
+## The four strategies, briefly
+
+**Client-side rendering (CSR)**: the server sends a nearly empty HTML shell
+plus a JS bundle. The browser downloads and executes the JS, which fetches
+data and renders the page entirely in the browser. Nothing meaningful is on
+screen until JS has run.
+
+**Server-side rendering (SSR)**: on every request, the server runs your
+app's render logic (often the same component code as the client) and
+returns fully-formed HTML. The browser can paint content immediately, then
+JS "hydrates" it to attach event handlers and make it interactive.
+
+**Static site generation (SSG)**: HTML is rendered once, at build time, for
+every page the site has. The result is a set of static files served
+directly from a CDN — no per-request server work at all. Content only
+updates when you rebuild and redeploy.
+
+**Incremental static regeneration (ISR)**: a hybrid. Pages are built statically
+like SSG, but a page can be regenerated in the background after a
+time-based interval or an on-demand trigger, without rebuilding the entire
+site. Next.js popularized the name, but the underlying idea — "static, with
+a revalidation policy" — shows up under other names in other frameworks.
+
+## What each one optimizes for
+
+| | TTFB | Interactivity readiness | SEO | Content freshness | Server cost per request |
+|---|---|---|---|---|---|
+| CSR | Fast (empty shell) | Slow — waits on JS + data fetch | Weak by default | Always current | Low |
+| SSR | Medium — server does work per request | Faster paint, hydration still needed | Strong | Always current | High |
+| SSG | Fastest — pure static file | Fast paint, light hydration | Strong | Stale until rebuild | None |
+| ISR | Fast (cache hit) / medium (revalidating) | Fast paint, light hydration | Strong | Bounded staleness | Low — occasional rebuilds |
+
+The table hides an important nuance: TTFB and "ready to interact" are two
+different clocks, and CSR is the one strategy where they're almost the same
+distance apart — because nothing happens until the JS bundle runs. SSR and
+SSG separate those clocks: content paints early, then a second phase
+(hydration) catches the page up to full interactivity. That gap is where
+most of this lesson's complexity lives.
+
+## Hydration: the tax on server-rendered HTML
+
+When the server sends pre-rendered HTML, the browser can paint it
+immediately — but that HTML has no event listeners attached. Buttons look
+clickable but do nothing until the framework's JS runs on the client,
+re-builds its in-memory representation of the DOM, and attaches the real
+handlers. That process is hydration, and it's not free: the browser has to
+download the same component JS that rendered the page on the server,
+execute it, and reconcile it against the DOM that's already there. For a
+large page, this can mean seconds of "looks done, isn't responsive yet" —
+exactly the gap Core Web Vitals' interactivity metrics are designed to
+catch.
+
+Three patterns reduce hydration cost:
+
+- **Partial hydration**: only hydrate the components that are actually
+  interactive (a "like" button, a dropdown) and leave static content — like
+  an article body — as plain HTML with no JS attached at all.
+- **Progressive hydration**: hydrate components in priority order over time
+  — above-the-fold interactive elements first, below-the-fold ones later or
+  on demand (e.g., when they scroll into view or on first interaction).
+- **Islands architecture**: treat the page as static HTML by default, with
+  small, independently-hydrated "islands" of interactivity dropped in
+  (this course's own site is built on Astro, which uses exactly this model
+  — note the `client:visible` directive on the `Mermaid` component in this
+  lesson is an island hydration hint).
+
+All three share the same goal: don't ship and execute JS for parts of the
+page that don't need to respond to user input.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant B as Browser
+    participant S as Server/CDN
+    participant J as JS runtime
+
+    Note over B,S: CSR
+    B->>S: Request page
+    S-->>B: Empty HTML shell + JS bundle
+    B->>J: Execute JS, fetch data
+    J-->>B: Render content (first paint here)
+
+    Note over B,S: SSR
+    B->>S: Request page
+    S-->>B: Full HTML (server rendered per request)
+    B->>B: Paint content immediately
+    B->>J: Hydrate (attach handlers)
+
+    Note over B,S: SSG
+    B->>S: Request page
+    S-->>B: Pre-built static HTML (from CDN)
+    B->>B: Paint content immediately
+    B->>J: Light hydration if needed
+`} />
+
+## Choosing a strategy by content type and update frequency
+
+Think in two dimensions: **how often the content changes**, and **whether
+it needs to be interactive/personalized on first load**.
+
+- **Rarely changes, not personalized** (marketing pages, docs, blog posts):
+  SSG. There's no reason to do render work per request for content that's
+  identical for every visitor and only changes on a deploy.
+- **Changes often but is still mostly the same for every visitor**
+  (a product catalog page, a news homepage): ISR. You get SSG's speed most
+  of the time, with a bounded staleness window instead of a full rebuild
+  per change.
+- **Must be current and/or personalized per request** (a logged-in
+  dashboard, an account page, search results with per-user ranking): SSR.
+  You accept the per-request server cost because the content genuinely
+  can't be precomputed.
+- **Highly interactive, behind a login, SEO doesn't matter**
+  (an admin panel, an internal tool, a SaaS app's authenticated area): CSR
+  is often the pragmatic choice — nobody needs Google to index your
+  internal dashboard, and you'd rather spend the complexity budget on the
+  app's interactivity than on server rendering infrastructure.
+
+Most real products aren't one strategy end to end — a marketing site in
+SSG/ISR, a logged-in app shell in CSR, and a handful of SSR pages for
+personalized-but-crawlable content (a public profile page, say) is a
+completely normal mix.
+
+## Worked example: a mid-size e-commerce site
+
+Say you're designing the frontend for an online store with three page
+types: the homepage, product detail pages, and the shopping cart/checkout
+flow.
+
+- **Homepage**: featured products change a few times a day via a CMS, and
+  it needs to be indexed well for SEO. ISR with a 5-minute revalidation
+  window fits — visitors almost always hit a cached, fast response, and
+  the homepage is never more than 5 minutes stale.
+- **Product detail pages**: there are 200,000 SKUs, prices and stock
+  change frequently, but each individual page doesn't need to be
+  millisecond-fresh. SSG for the base page content (description, images,
+  reviews) with ISR-style revalidation on a per-page basis handles the
+  long tail without rebuilding all 200,000 pages on every price change —
+  and price/stock, which genuinely needs to be current, can be fetched
+  client-side after the static shell paints, or injected via a short-TTL
+  edge cache.
+- **Cart and checkout**: every user sees different content (their own
+  cart, their own address book), it must be current to the second, and it
+  sits behind auth. SSR (or plain CSR once the user is authenticated,
+  since a cart page doesn't need SEO) is the right call — precomputing it
+  statically makes no sense.
+
+Notice the pattern: content freshness requirements and personalization
+needs, not "which framework we're already using," are what's actually
+driving each choice.
+
+<Callout type="warning">
+  A common mistake is treating "SSR" as a single on/off switch for the whole
+  app and then being surprised that time-to-interactive got worse, not
+  better. SSR moves *first paint* earlier, but if you don't also reduce the
+  JS shipped for hydration, you can end up with content that appears fast
+  but stays unclickable for just as long as CSR would have taken — sometimes
+  worse, because now the browser is doing hydration reconciliation work
+  against real DOM nodes instead of building them from scratch. Server
+  rendering and hydration cost are separate problems; fixing one doesn't
+  automatically fix the other. Pair SSR/SSG with partial or islands
+  hydration if the page has more static content than interactive content.
+</Callout>
+
+## Quick gut-check questions for an interview
+
+When asked to justify a rendering choice, it helps to answer these out
+loud, in order: Does this page need to rank in search? Does the content
+differ per user? How often does the underlying data change? Is most of the
+page static with a few interactive widgets, or is the whole thing an app?
+The answers to those four questions almost always narrow you down to one
+of CSR, SSR, SSG, or ISR — and being able to walk through that reasoning is
+more valuable in an interview than reciting definitions.
+
+<Quiz
+  lessonId="rendering-strategies-csr-ssr-ssg-isr"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A public marketing site with content that only changes when the team deploys a new version. Which strategy fits best?',
+      options: [
+        { id: 'a', text: 'CSR', correct: false, explanation: 'CSR ships an empty shell and depends on client JS to render — unnecessary cost and SEO risk for content that never changes per request.' },
+        { id: 'b', text: 'SSR', correct: false, explanation: 'SSR does render work on every single request, which is wasted effort when the output would be identical until the next deploy.' },
+        { id: 'c', text: 'SSG', correct: true, explanation: 'The content only changes on a deploy, so pre-rendering once at build time and serving static files from a CDN gives the fastest possible response with zero per-request server cost.' },
+        { id: 'd', text: 'ISR', correct: false, explanation: 'ISR adds a revalidation mechanism for content that changes between deploys. If content genuinely only changes on deploy, plain SSG is simpler and sufficient.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these reduce the cost of hydration on a server-rendered or statically-generated page? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Only attaching event handlers to components that are actually interactive, leaving static content as plain HTML', correct: true, explanation: 'This is partial hydration — it avoids shipping and executing JS for content that never needs to respond to input.' },
+        { id: 'b', text: 'Hydrating above-the-fold interactive elements first and deferring below-the-fold ones', correct: true, explanation: 'This is progressive hydration — it prioritizes the JS work the user is most likely to need immediately.' },
+        { id: 'c', text: 'Rendering the entire page as independently-hydrated islands instead of one monolithic client app', correct: true, explanation: 'Islands architecture ships JS only for the interactive islands, treating the rest of the page as static HTML by default.' },
+        { id: 'd', text: 'Switching from SSR to CSR so the server does less work', correct: false, explanation: 'Switching to CSR removes server-side rendering, but it does not reduce hydration cost — in fact CSR still has to build the entire DOM from scratch client-side, which is at least as much JS work, plus it delays first paint.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Because SSR sends fully-rendered HTML, a server-rendered page is always fully interactive as soon as it paints.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Painted HTML from SSR has no attached event handlers yet — the page has to hydrate before clicks, inputs, etc. actually work. Paint and interactivity are separate milestones.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. SSR moves first paint earlier, but the page still needs client-side hydration to become interactive, and that hydration can take a noticeable amount of time on a JS-heavy page.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A product catalog page needs to reflect price and inventory changes made throughout the day, but doesn’t need to be current to the second, and should still be fast and crawlable. Which strategy is the best fit?',
+      options: [
+        { id: 'a', text: 'CSR', correct: false, explanation: 'CSR would hurt both initial load speed and SEO crawlability for content that is largely the same across visitors.' },
+        { id: 'b', text: 'Pure SSG with no revalidation', correct: false, explanation: 'Pure SSG would go stale as soon as prices or inventory changed, requiring a full rebuild to update — too coarse for intraday changes.' },
+        { id: 'c', text: 'ISR', correct: true, explanation: 'ISR gives the speed and SEO benefits of static HTML while allowing pages to regenerate on a time-based or on-demand schedule, matching "changes during the day, but staleness of a few minutes is fine."' },
+        { id: 'd', text: 'SSR', correct: false, explanation: 'SSR works but does unnecessary per-request server rendering for content that does not need second-by-second freshness — ISR gets similar freshness with far less server cost.' },
+      ],
+    },
+  ]}
+/>

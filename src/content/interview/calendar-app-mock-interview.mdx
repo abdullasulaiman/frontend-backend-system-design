@@ -1,0 +1,134 @@
+---
+title: "Calendar Application: Mock Interview"
+module: "Case Study: Calendar Application"
+moduleOrder: 5
+order: 4
+track: "interview"
+summary: "A timed mock-interview prompt and rubric for designing a calendar application frontend."
+cheatsheet:
+  - "Ask scope-changing clarifying questions first: single-user vs shared calendars, which views are required (day/week/month), and whether recurring events and multi-timezone display are in scope — each one shifts your data model."
+  - "Name your recurrence storage explicitly: store the rule (e.g. an RRULE-style pattern plus per-instance overrides), not materialized rows for every future occurrence, and expand the rule into instances only for the visible date range."
+  - "State where expansion happens and why: server-side expansion for shared/heavy calendars keeps clients thin and consistent; client-side expansion for a small personal range trades a bit of CPU for fewer round trips — pick one and justify it."
+  - "Timezone correctness has one rule: store every instant in UTC, store the event's authoring timezone alongside it for recurrence math, and convert to the viewer's local timezone only at render time — never store or compare 'local' times directly."
+  - "Call out DST by name: a recurring 9am meeting must stay 9am local time across a DST transition, which means recomputing each instance's UTC offset from the rule, not caching one fixed UTC offset for all future instances."
+  - "For dense month views, name a concrete overlap-layout algorithm (assign events to columns/lanes by interval-overlap, collapse the rest into a '+N more' affordance) instead of just saying 'we'd handle overlapping events.'"
+  - "Budget your time out loud in a 35-40 minute slot: about 5 minutes on requirements, 10 on architecture, 15-20 on the deep dive (recurrence, timezone/DST, performance), and the rest on trade-offs and edge cases."
+tags: ["case-study", "calendar-app", "mock-interview"]
+estMinutes: 20
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+import MockInterview from '../../components/MockInterview';
+
+You've scoped a calendar application, sketched an architecture around a date-range query and an event-expansion layer, and gone deep on recurrence storage, timezone/DST correctness, and dense-view rendering across the previous three lessons. This lesson is where all of that gets tested under interview conditions: one open-ended prompt, a strict time box, and a rubric you'd actually be graded against.
+
+The goal isn't reciting the previous lessons back verbatim. It's practicing the specific skill that separates a strong calendar-app answer from a mediocre one: naming a concrete recurrence data model instead of waving at "recurring events," and having a real answer for what happens to a `9:00 AM` meeting when the clock changes for daylight saving time instead of saying "we'd convert timezones." Set a timer, talk out loud as if an interviewer is sitting across from you, and only look at the rubric after you've committed to a full answer.
+
+## How to run this mock interview
+
+Give yourself 35-40 minutes, uninterrupted. A reasonable time split:
+
+- **Minutes 0-5**: Clarifying questions and stated scope.
+- **Minutes 5-15**: High-level architecture — view/grid rendering layer, event data layer, and how a visible date range turns into rendered event chips.
+- **Minutes 15-30**: Deep dive on two or three of the hardest sub-problems: recurring-event data model and expansion, timezone/DST correctness, and rendering performance for dense views.
+- **Minutes 30-40**: Edge cases, trade-offs, and leaving room for follow-ups.
+
+The most common failure mode on this specific prompt is spending most of the interview drawing a clean grid of days and weeks, then discovering with a few minutes left that you haven't said anything concrete about how "every weekday at 9am, except the one you moved to 10am next Tuesday" actually gets stored and rendered. The grid is necessary but not sufficient — the deep dive on recurrence and timezones is where the signal is.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[0-5 min: Clarify scope] --> B[5-15 min: Architecture - grid layer + event layer]
+  B --> C[15-30 min: Deep dive - pick 2-3]
+  C --> D[Recurrence model and expansion strategy]
+  C --> E[Timezone and DST correctness]
+  C --> F[Dense-view rendering performance]
+  C --> G[30-40 min: Trade-offs and edge cases]
+`} />
+
+## The prompt
+
+Read the prompt in the `<MockInterview>` box below once, then start your timer before looking at anything else on the page. Use the scratchpad the component provides to jot notes as you talk through your answer. Resist revealing the rubric early — the point is to generate structure yourself under time pressure, not to check boxes off a list you've already seen. Once you're done, score yourself against each rubric point honestly and specifically, not against a vague sense of "that went okay."
+
+## What "strong" looks like, briefly
+
+A strong answer opens with two or three questions that actually change the design — not "what browsers do we support" as a throwaway, but things like "is this a single-user calendar, or do I need shared calendars with overlapping events across multiple people's schedules, since that changes both data fetching and rendering" and "do recurring events need to be in scope, since a recurrence engine is a meaningfully different problem from single events." It then restates the answers as constraints before drawing anything.
+
+From there, it presents an architecture with a clear seam between two layers: a grid/view-rendering layer responsible for day, week, and month layouts, and an event data layer responsible for turning a requested date range into concrete event instances the grid can place. A strong candidate is explicit that these are separate concerns — the grid doesn't know or care whether an event chip came from a one-off event or a recurrence rule; it just receives instances with a start and end.
+
+The deep dive is where weak answers fall apart. On recurrence, a strong candidate names the actual storage shape: the recurrence rule (frequency, interval, days of week, end condition) is stored once per series, plus a small table of per-instance overrides for edits like "move just this Tuesday's occurrence to 10am" or "cancel just this one." Expansion — turning the rule into concrete instances with real start/end times — happens only for the date range currently visible, and the candidate states whether that expansion runs on the server (better for shared calendars and consistency across clients) or the client (fine for a small personal range, but doesn't scale to years of history or heavy sharing) and why they picked one.
+
+On timezones, a strong candidate states the one rule that makes everything else consistent: every instant is stored in UTC, the event also stores the timezone it was authored in (needed to correctly recompute recurring instances across a DST boundary), and conversion to the viewer's local time happens only at render time, never baked into storage. They can explain, concretely, why a recurring 9am meeting must be recomputed instance-by-instance against the calendar's timezone rather than storing one fixed UTC offset for the whole series — otherwise the meeting silently drifts to 8am or 10am the moment DST kicks in.
+
+On performance, a strong candidate names a concrete layout algorithm for a dense month view with many overlapping events: bucket events into overlap groups by interval, assign each event a column/lane within its group, and cap the number of visibly rendered chips per day cell with a "+N more" affordance rather than rendering every event and letting the cell grow unbounded.
+
+Weak answers substitute vague verbs for mechanisms: "we'd handle recurring events," "we'd convert timezones," "we'd optimize rendering for busy days" — each true in spirit, none of it demonstrating that the candidate has thought through what actually breaks and how the design handles it.
+
+<Callout type="warning">
+  The single most common gap in this interview is answering "how do you handle a recurring event across a DST transition" with just "we store the UTC time and convert it for display." That breaks the moment the recurrence crosses the DST boundary: a fixed UTC instant for a "daily at 9am local" meeting will render as 9am before the transition and 8am or 10am after it, because the UTC offset for that local time changed. A strong answer recomputes each instance's UTC time from the recurrence rule and the calendar's timezone at expansion time, so the *local* time stays fixed at 9am and the UTC instant shifts instead — that's the correct direction for the invariant to hold.
+</Callout>
+
+<Callout type="interview">
+  If the interviewer pushes on shared calendars ("what if two people's calendars need to render side by side, and one event is time-blocked while another is optional?"), don't freeze — narrate the trade-off out loud: "I'd fetch each calendar's instances for the visible range independently, tag each instance with its source calendar, and let the grid's layout algorithm treat them as one combined set of intervals for overlap purposes, while keeping a per-calendar color or lane so the viewer can still tell whose event is whose. The cost is that the client now needs to merge and re-sort combined results from multiple sources instead of trusting one ordered response, but that's what makes side-by-side comparison actually work." Reasoning about the cost, not just naming the feature, is what interviewers listen for.
+</Callout>
+
+## Worked example: how a strong answer opens
+
+Here's roughly how the first two minutes of a strong answer might sound (paraphrased — not a script to copy):
+
+"Before I design anything, a few questions. First, is this a single-user calendar, or do people need to view and overlay shared or team calendars — that changes both the data-fetching shape and how I lay out overlapping events. Second, are recurring events in scope, since expanding recurrence rules into instances is a meaningfully different problem from just rendering a list of fixed-time events. Third, which views do I need to support — day, week, month, or all three — since month view is where dense-rendering performance actually becomes a concern."
+
+Suppose the interviewer answers: shared calendars are in scope for viewing (not editing others' events), recurring events are in scope with the ability to edit a single instance, and all three views are required. A strong candidate restates that immediately: "Okay — so I'm designing a grid that renders day, week, and month views from a shared pool of possibly-overlapping events, where some events are recurring series that need to expand correctly per visible range and correctly across DST, and viewers can see but not edit calendars that aren't their own." Every architectural decision that follows should visibly trace back to that sentence — the recurrence engine, the timezone handling, and the overlap layout all get justified by it rather than appearing out of nowhere.
+
+## Quick check before you start
+
+<Quiz
+  lessonId="calendar-app-mock-interview"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A candidate answers "how do you handle a recurring event across a daylight saving time transition" with "we store the UTC instant and convert it for display." What is the strongest critique of this answer?',
+      options: [
+        { id: 'a', text: 'A fixed UTC instant per recurring instance is wrong — the instance\'s UTC time must be recomputed from the rule and timezone so the local time (e.g. 9am) stays fixed across the DST boundary', correct: true, explanation: 'If the UTC offset is fixed once and never revisited, the displayed local time silently shifts by an hour across the transition, which breaks the "daily at 9am local" invariant the recurrence rule is supposed to guarantee.' },
+        { id: 'b', text: 'UTC storage is the actual bug and events should be stored in local time instead', correct: false, explanation: 'Storing in local time creates ambiguity (which timezone? what about viewers elsewhere?) and is the wrong direction; UTC storage is correct, the missing piece is recomputing the offset per instance from the rule.' },
+        { id: 'c', text: 'There is no real issue here as long as the client re-renders after fetching', correct: false, explanation: 'Re-rendering does not fix a stale offset baked in at storage or expansion time; the underlying computation has to redo the local-to-UTC conversion per instance.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these demonstrate the concrete, mechanism-level answers this mock interview rubric is looking for? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Storing a recurrence rule plus a small table of per-instance overrides, and expanding only the currently visible date range into concrete instances', correct: true, explanation: 'This names both the storage shape (rule plus overrides) and the expansion boundary (visible range only), which is a specific, testable design rather than a restatement of "recurring events."' },
+        { id: 'b', text: 'Assigning overlapping events to columns/lanes by interval overlap and capping visible chips per day with a "+N more" affordance', correct: true, explanation: 'This is a concrete layout algorithm and a concrete cap mechanism, exactly the specificity a strong answer needs for dense-view performance.' },
+        { id: 'c', text: 'Saying "we would optimize the calendar for performance" without further detail', correct: false, explanation: 'This is exactly the vague, verb-only phrasing the lesson calls out as a weak-answer pattern — it names no actual algorithm or mechanism.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In this mock interview format, you should reveal and read the rubric before attempting a full answer, so you know what to cover.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Reading the rubric first defeats the exercise — the skill being tested is generating structure under time pressure on your own, not recognizing a checklist you were just shown.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — commit to a full timed answer first, then reveal the rubric afterward to self-score honestly.' },
+      ],
+    },
+  ]}
+/>
+
+<MockInterview
+  lessonId="calendar-app-mock-interview"
+  client:visible
+  prompt="Design the frontend for a calendar application — think day, week, and month views, event creation and editing, recurring events, and correct display across timezones, similar in spirit to a Google Calendar-style product. Walk through your requirements, view-rendering and data-layer architecture, recurrence and timezone handling, and rendering performance approach as if this were a 35-40 minute system design interview. Assume a senior frontend engineer is interviewing you and expects you to drive the conversation."
+  rubric={[
+    { point: 'Clarifies requirements before designing', detail: 'Asks whether calendars are single-user or shared/overlapping, whether recurring events are in scope, and which views (day/week/month) are required — then explicitly restates how the answers shape the rest of the design rather than moving on without connecting them back.' },
+    { point: 'Separates the view-rendering layer from the event data layer', detail: 'Describes a grid/view layer that lays out day, week, and month views generically from a list of event instances, and a data layer that resolves a requested date range into those instances, keeping the grid agnostic to whether an instance came from a single event or an expanded recurrence.' },
+    { point: 'Names a concrete recurring-event data model and expansion strategy', detail: 'Describes storing a recurrence rule plus per-instance overrides rather than materializing every future occurrence, states that expansion happens only for the visible date range, and picks (with reasoning) whether expansion runs client-side or server-side.' },
+    { point: 'Gets timezone and DST correctness right, with a mechanism', detail: 'States that instants are stored in UTC with the authoring timezone retained for recurrence math, that conversion to the viewer\'s local timezone happens only at render time, and explains why a recurring event\'s local time (not its UTC offset) must stay fixed across a DST transition.' },
+    { point: 'Addresses rendering performance for dense views', detail: 'Names a concrete overlap-layout approach for many events on the same day (column/lane assignment by interval overlap) and a concrete strategy for capping rendered chips (e.g. a "+N more" affordance) rather than rendering an unbounded number of chips per cell.' },
+    { point: 'Handles shared/overlapping calendars as a real design decision', detail: 'Explains how multiple calendars\' events are fetched and merged for the same visible range, how the layout algorithm treats overlap across calendars (not just within one), and how the UI distinguishes whose event is whose (e.g. per-calendar color or lane) — reasoning about the added complexity, not just naming the feature.' },
+  ]}
+/>

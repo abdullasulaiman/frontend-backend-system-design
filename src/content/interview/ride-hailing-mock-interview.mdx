@@ -1,0 +1,201 @@
+---
+title: "Ride-Hailing App: Mock Interview"
+module: "Case Study: Ride-Hailing App"
+moduleOrder: 4
+order: 4
+track: "interview"
+summary: "A timed mock-interview prompt and rubric for designing a ride-hailing app frontend."
+cheatsheet:
+  - "Open by asking rider app, driver app, or both, and how precise the live ETA needs to be — both answers reshape the state machine and the location pipeline before you draw anything."
+  - "Model the trip as an explicit state machine (requesting, matched, en route, in progress, completed, cancelled) and drive UI and API calls off the current state, not off scattered booleans."
+  - "Say the mechanism, not the term: GPS updates get throttled at the source (2-4s) and the map interpolates/animates the marker between updates for smooth motion — don't just say 'smooth it out.'"
+  - "Every state transition needs a reconnect story: on reconnect, fetch authoritative trip state from the server and reconcile, don't trust whatever state the client woke up in."
+  - "Treat GPS loss and a dropped connection as different failures: GPS loss needs dead-reckoning plus a driver-facing prompt; connection loss needs local buffering plus a rider-facing 'reconnecting' indicator, never a frozen map with no explanation."
+  - "Battery and data cost are first-class constraints on a driver app that runs for hours — justify your update interval and payload size, don't just optimize for accuracy."
+tags: ["case-study","ride-hailing","mock-interview"]
+estMinutes: 20
+---
+
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+import MockInterview from '../../components/MockInterview';
+import Quiz from '../../components/Quiz';
+
+You've now scoped the ride-hailing problem, sketched its high-level
+architecture, and gone deep on location smoothing and edge cases across the
+last three lessons. This lesson is the assembly test: can you deliver all of
+that as one coherent answer inside a 35-45 minute window, in an order that
+makes sense to an interviewer hearing it live, while still leaving room to
+handle follow-ups that push on the parts you glossed over.
+
+Run this as an actual mock interview, not a reading exercise. Set a timer,
+talk out loud, and write down your own answer before you look at the rubric.
+Reading the rubric first and then reverse-engineering an answer to match it
+teaches you nothing about how you perform under real interview pressure.
+
+## Why this prompt is different from a typical CRUD-heavy design
+
+Most frontend system design prompts are dominated by "fetch data, render it,
+keep it in sync" concerns. Ride-hailing shares that, but layers on two things
+that trip up candidates who haven't practiced them: a trip lifecycle that is
+genuinely a state machine (not just a status string you overwrite), and a
+continuous stream of noisy, low-frequency location data that has to look
+smooth and trustworthy on a map despite arriving unevenly and sometimes not
+arriving at all. A rider staring at a driver's car icon that jumps, freezes,
+or contradicts the trip's actual status reads as "this app is broken" far
+faster than a stale list of posts would.
+
+That's exactly why interviewers use this case study: it separates candidates
+who can reason about time-based, asynchronous, partially-unreliable systems
+from those who can only design around clean request/response APIs.
+
+## The prompt
+
+Read it once, then start your timer.
+
+<MockInterview
+  lessonId="ride-hailing-mock-interview"
+  client:visible
+  prompt="Design the frontend for a ride-hailing app, similar in spirit to Uber or Lyft, where a rider requests a trip, gets matched with a nearby driver, and tracks that driver's live location on a map through pickup and drop-off. Cover how you'd model the trip's lifecycle in the UI, how you'd handle live location updates so the driver's position on the map looks smooth and current, and how the experience holds up when the rider or driver's phone loses network or GPS signal mid-trip. Assume a backend team can build whatever APIs you need — focus on the client."
+  rubric={[
+    { point: 'Clarifies requirements before designing', detail: 'Asks whether the scope is the rider app, the driver app, or both; how precise the live ETA/position needs to be; whether multiple ride types or scheduled rides are in scope; and what platform (mobile web vs. native-adjacent) is assumed, before sketching architecture. States assumptions explicitly wherever the interviewer leaves something open.' },
+    { point: 'Designs the trip flow as an explicit state machine', detail: 'Names the concrete states (requesting, matched, driver en route, trip in progress, completed, cancelled) and explains that the current state — not a scattered set of booleans or flags — determines what the UI renders and which actions are valid. Can describe how a transition is triggered (a server push or poll result) and what UI change accompanies each one.' },
+    { point: 'Describes a concrete live-location update strategy', detail: 'Explains how the driver\'s device gets its GPS coordinates onto the rider\'s map: a periodic or streaming update from a moving device, throttled at a sensible interval (a few seconds), sent to the server and relayed to the rider. Does not assume every update instantly repaints the marker.' },
+    { point: 'Explains how the map stays visually smooth between updates', detail: 'Describes interpolating or animating the marker between the last two known points rather than snapping it discretely, and reasons about why raw high-frequency GPS pushed straight to the map would be wasteful and jittery instead of an improvement.' },
+    { point: 'Handles network and GPS resilience explicitly', detail: 'Has distinct, concrete answers for a dropped network connection (buffer or queue locally, reconcile authoritative trip state from the server on reconnect, show an honest "reconnecting" indicator) versus lost or degraded GPS (fall back to dead-reckoning from last known heading/speed for a bounded time, then surface uncertainty rather than silently freezing or guessing forever).' },
+    { point: 'Reasons about mobile performance and trade-offs', detail: 'Discusses battery and data cost of the location strategy (this app runs for the length of a whole trip, often in the background), keeps combined map-plus-list views cheap to render, and can compare alternative approaches under follow-up pressure instead of defending only one design as the sole correct answer.' },
+  ]}
+/>
+
+## How to run your 35-40 minutes
+
+A reasonable allocation, adjustable to however the interviewer steers you:
+
+1. **5-7 min — clarify and scope.** Rider app, driver app, or both? How
+   tight does the ETA need to be? Single ride type for v1, or several?
+2. **10-12 min — architecture.** Sketch the map layer, the trip state
+   machine, and where location updates flow in. Name the states out loud.
+3. **10-12 min — the deep dive the interviewer pushes on.** Usually location
+   smoothing or reconnect/edge-case handling — this is where most of the
+   signal is generated, so don't rush past it to get to a tidy conclusion.
+4. **5-8 min — edge cases and trade-offs.** Backgrounded app mid-trip, GPS
+   loss, mid-match cancellation, and what you'd measure to validate this in
+   production.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Clarify: rider/driver scope, ETA precision, ride types] --> B[Trip state machine drives UI]
+  B --> C[Location updates: throttled GPS -> server -> rider map]
+  C --> D[Client-side interpolation for smooth marker motion]
+  D --> E[Resilience: reconnect reconciliation, GPS dead-reckoning]
+  E --> F[Mobile performance: battery, data, render cost]
+`} />
+
+## Worked example: answering the "phone loses signal mid-trip" follow-up well
+
+A near-guaranteed follow-up is some version of "the driver enters a tunnel
+and loses both GPS and network for 20 seconds — what does the rider see?"
+
+A weak answer says "we retry" and stops there. A strong answer separates the
+two failures and narrates each one specifically. GPS loss on the driver's
+device means the phone itself has no new coordinate to send — the driver
+app should keep the last known position, heading, and speed, and can
+optionally dead-reckon a short extrapolated path from that data for a few
+seconds before it stops trusting its own guess and instead flags "GPS
+signal weak" locally. Network loss means even a valid GPS reading has
+nowhere to go — the driver app should queue recent position samples locally
+(a small ring buffer, not an unbounded one) so it can flush them in order
+once connectivity returns, rather than only sending the single latest point
+and losing the path in between. On the rider's side, the map shouldn't
+freeze silently: once updates go stale past some threshold (say, three
+missed intervals), show a visible "driver's location is delayed" state
+instead of pretending the last position is still current. And whichever
+side of the connection recovers first, the client should not assume its
+locally-held trip state is still correct — it re-fetches authoritative trip
+state from the server and reconciles, because the trip may have advanced
+(or been cancelled) while it was disconnected.
+
+That level of detail — which failure, which device, what the UI actually
+shows, and how state gets reconciled afterward — is what separates "I know
+that networks can fail" from "I could actually ship this."
+
+<Callout type="interview">
+  Don't let this follow-up turn into a monologue about GPS hardware or cell
+  tower handoff. The interviewer is listening for client-side decisions:
+  what state you hold locally, what you show the user, and how you
+  reconcile once connectivity returns — not a lecture on how GPS chipsets
+  work.
+</Callout>
+
+<Callout type="warning">
+  A common mistake in this interview: presenting the trip lifecycle as a
+  single `status` string the client overwrites in place, then improvising
+  when asked "what if the rider cancels while the driver is already en
+  route?" If you haven't named your states and the valid transitions
+  between them up front, edge-case questions like that will expose the gap
+  live. Draw the state machine early, even roughly, so every "what if"
+  question becomes "that's a transition from state X to state Y" instead of
+  a new problem you're solving from scratch.
+</Callout>
+
+## After you finish
+
+Score your own answer against the rubric above, point by point, and be
+honest about which parts you covered fully versus mentioned in passing. If
+you jumped straight into "we poll every few seconds" without naming the
+trip's states first, that's the most common gap in this round — practice
+starting with the state machine before any data-flow detail. If your
+location-smoothing answer stayed at "we interpolate" without saying what
+you interpolate between or why raw GPS alone looks jittery, revisit the
+[deep dives lesson](/interview/ride-hailing-deep-dives) before your next
+attempt.
+
+Before you move on, check your understanding of the concepts this mock
+interview leans on hardest with the quiz below.
+
+<Quiz
+  lessonId="ride-hailing-mock-interview"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Per this lesson, what should primarily determine what the rider\'s UI renders and which actions are available at any given moment?',
+      options: [
+        { id: 'a', text: 'The trip\'s current state in an explicit state machine (requesting, matched, en route, etc.)', correct: true, explanation: 'Driving the UI off a named current state, with defined valid transitions, is exactly what the lesson recommends over scattered flags.' },
+        { id: 'b', text: 'A set of independent boolean flags like isMatched and isCancelled tracked separately', correct: false, explanation: 'The lesson specifically warns against this pattern — independent booleans can drift into impossible or contradictory combinations that a state machine prevents by construction.' },
+        { id: 'c', text: 'Whichever API response arrived most recently, regardless of what it contains', correct: false, explanation: 'Rendering off "whatever arrived last" ignores ordering and reconciliation concerns; the client needs an authoritative current state, not just the last message.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Per the worked example in this lesson, which of these are correct, distinct responses to a driver\'s phone losing GPS and network simultaneously? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The driver app holds its last known position/heading and can briefly dead-reckon before flagging weak GPS', correct: true, explanation: 'This is the correct response to GPS loss specifically — there is no new coordinate, so the app extrapolates briefly rather than freezing or guessing indefinitely.' },
+        { id: 'b', text: 'The driver app queues recent position samples locally so they can be sent once connectivity returns', correct: true, explanation: 'This is the correct response to network loss specifically — a small local buffer preserves the path instead of losing everything but the latest point.' },
+        { id: 'c', text: 'The rider\'s map keeps showing the last received position indefinitely with no visual change', correct: false, explanation: 'The lesson explicitly warns against this — once updates go stale past a threshold, the UI should surface a "delayed" state rather than silently pretending the position is still current.' },
+        { id: 'd', text: 'On reconnect, the client re-fetches authoritative trip state from the server instead of trusting its locally-held state', correct: true, explanation: 'The trip may have advanced or been cancelled while disconnected, so reconciling against the server on reconnect is necessary rather than assuming local state is still accurate.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A strong answer to this prompt should send every raw GPS reading straight to the map so the driver marker updates as frequently as possible.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The lesson recommends throttling GPS updates at the source and interpolating the marker between updates on the client — pushing every raw reading straight through is wasteful of battery/data and tends to look jittery, not smoother.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — throttled updates plus client-side interpolation between the last two known points gives smoother, cheaper motion than forwarding every raw GPS sample.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the rubric, why does clarifying "rider app, driver app, or both" matter enough to ask before sketching architecture?',
+      options: [
+        { id: 'a', text: 'Because it changes what state machine and location-update responsibilities the client under discussion actually owns', correct: true, explanation: 'A rider app mostly consumes trip state and location updates, while a driver app also originates location data and drives more of the state transitions — the scope materially changes the design.' },
+        { id: 'b', text: 'Because rider and driver apps always share one single codebase with no differences', correct: false, explanation: 'Even when code is shared, the responsibilities differ enough (who originates location data, who triggers which transitions) that scope still needs clarifying.' },
+        { id: 'c', text: 'It doesn\'t matter — the answer is identical either way', correct: false, explanation: 'The lesson treats this as a genuine scope-changing question, not a formality; the two apps have different jobs in the same system.' },
+      ],
+    },
+  ]}
+/>

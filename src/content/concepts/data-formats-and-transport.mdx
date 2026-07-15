@@ -1,0 +1,136 @@
+---
+title: "Data Formats & Transport"
+module: "API Architecture Styles, Protocols & Data Formats"
+moduleOrder: 5
+order: 3
+track: "concept"
+summary: "Covers JSON versus binary data formats and when each trade-off matters."
+cheatsheet:
+  - "JSON is the default choice: human-readable, native to the browser via `JSON.parse`, and trivially debuggable in devtools — pick it unless you have a measured reason not to."
+  - "Binary formats (Protocol Buffers, FlatBuffers, MessagePack) win on payload size and parse speed because they skip repeating field names and skip re-parsing text into numbers/strings."
+  - "Protobuf needs a shared `.proto` schema on both ends; JSON is self-describing, which is why JSON is easier to debug and evolve casually but Protobuf is stricter and safer at scale."
+  - "Schema evolution: Protobuf's numbered, optional fields let old and new clients/servers stay compatible; renaming or reusing a field number breaks that contract."
+  - "Reach for a binary format when frequency or volume is the bottleneck — high-frequency real-time streams (prices, game state, telemetry) — not for occasional REST calls where JSON's cost is negligible."
+  - "FlatBuffers/Cap'n Proto skip the decode step entirely (read fields straight from the buffer) — relevant when parsing cost itself, not just wire size, is the bottleneck (e.g. large messages on low-power devices)."
+  - "Compression (gzip/brotli) narrows the size gap between JSON and binary for one-off requests — measure before assuming binary is worth the added complexity."
+tags: ["api", "data-formats"]
+estMinutes: 8
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Once you've picked an API style — REST, GraphQL, gRPC, WebSocket, whatever — you still have to decide what actually goes over the wire. That choice usually defaults to JSON without a second thought, and for most frontend work that default is correct. But when you're pulling down a few hundred KB of chart data every second, or streaming position updates for a multiplayer game at 60 updates per second, the format itself becomes the bottleneck — not the network, not the server logic, just the cost of turning bytes into usable JavaScript objects and back. This lesson covers the data formats you'll actually encounter as a frontend engineer and how to reason about the trade-off between them.
+
+## JSON: the default, and why it earns it
+
+JSON is text. A payload like `{"id": 42, "name": "Ada"}` is exactly as readable in a browser's network tab as it is in the code that produced it. That's not a minor convenience — it's the reason JSON dominates:
+
+- **Native parsing.** `JSON.parse`/`JSON.stringify` are built into every JS runtime, highly optimized, and require zero extra dependencies.
+- **Self-describing.** Field names travel with the data, so a client can read a payload without a separate schema file. Add a new field on the server, and old clients simply ignore it — no coordination step required.
+- **Debuggable everywhere.** curl it, log it, paste it into a REPL, diff it in a PR — no decoder needed.
+
+The cost of all that convenience is size and parse time. Repeating `"name"` as a literal string in every one of ten thousand array entries is wasteful compared to a format that sends the field's position once. And turning a UTF-8 string into numbers, booleans, and nested objects is inherently slower than reading pre-laid-out binary values.
+
+## Binary formats: trade readability for compactness and speed
+
+Binary formats encode data as raw bytes according to a predefined schema, instead of as self-describing text.
+
+### Protocol Buffers (Protobuf)
+
+Protobuf, used heavily by gRPC (see `api-styles-rest-graphql-grpc-websocket-sse`), requires a `.proto` schema shared by both sides:
+
+```
+message User {
+  int32 id = 1;
+  string name = 2;
+}
+```
+
+Each field gets a number instead of repeating its name on the wire, and values are packed with variable-length integer encoding rather than decimal text. The result is typically 3-10x smaller than the equivalent JSON for numeric-heavy payloads, and decoding is a straight binary read rather than a text-parsing pass.
+
+The cost: it's opaque. You can't eyeball a Protobuf payload in a network tab — you need the schema and a decoder to make sense of it. And both client and server must agree on that schema; you can't just add an arbitrary field like you would with JSON.
+
+### Other formats worth knowing
+
+- **MessagePack** — a drop-in binary re-encoding of the same data model as JSON (still self-describing, no schema needed), roughly 20-30% smaller than JSON with faster parsing. A good middle ground when you want some of binary's savings without adopting a schema pipeline.
+- **FlatBuffers / Cap'n Proto** — go further than Protobuf: they skip the decode step entirely. Fields are read directly out of the buffer at fixed offsets, with no "unpack everything into objects first" pass. This matters when the bottleneck is CPU time spent parsing, not just bytes on the wire — think large messages on a low-power device.
+- **CBOR** — a binary format standardized for compactness in constrained environments (IoT, low-bandwidth links); conceptually similar to MessagePack.
+
+## The core trade-off
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Data to send] --> B{How often?}
+  B -->|Occasional API calls| C[JSON]
+  B -->|High-frequency real-time updates| D[Binary: Protobuf / FlatBuffers / MessagePack]
+  C --> E[Debuggable, self-describing, larger + slower to parse]
+  D --> F[Compact, fast to parse, needs a shared schema + tooling]
+`} />
+
+The decision comes down to three questions:
+
+1. **Payload size** — does shaving bytes off each message actually matter at your volume? A 2KB JSON response fetched once per page load is irrelevant; a 2KB message sent 30 times a second is 60KB/s per connected client.
+2. **Parsing cost** — is CPU time spent decoding the bottleneck, separate from wire size? This shows up on lower-powered devices or when a single response contains tens of thousands of records.
+3. **Schema evolution** — how much do you value the flexibility of "just add a field" versus the safety of a shared, versioned contract that catches mismatches at compile time instead of at runtime?
+
+For occasional REST calls — a user loading their profile, a form submission, a dashboard refresh every few minutes — JSON's overhead is noise next to network latency itself. For high-frequency real-time updates — live stock tickers, multiplayer game state, collaborative cursor positions, telemetry dashboards streaming over WebSocket — the format's per-message cost is paid dozens of times a second and compounds fast.
+
+## Worked example: a live pricing feed
+
+Say you're building a trading dashboard that streams price updates over a WebSocket connection for 200 instruments, each updating roughly 5 times per second. That's 1,000 messages/second.
+
+A JSON message per update might look like `{"symbol":"AAPL","price":193.42,"ts":1737012345678}` — around 55 bytes. At 1,000 messages/second that's ~55KB/s of payload, plus the cost of parsing 1,000 JSON strings per second, re-allocating objects each time, and running garbage collection on all of them.
+
+Switch to a Protobuf-encoded message with three fields (an int32 symbol id instead of a string, a fixed-point price, a delta timestamp) and the same update might be 12-15 bytes — a 4x reduction — decoded via a generated function that reads fixed offsets instead of scanning text. At 1,000 messages/second, that's the difference between ~55KB/s and ~14KB/s, and a meaningfully lighter main-thread parsing cost, which matters when you're also trying to keep a chart redrawing at 60fps on the same thread.
+
+Now compare that to the same app's "load my watchlist" REST call, fired once when the dashboard opens: 200 instruments as JSON is maybe 20KB, fetched once. Optimizing that into Protobuf would save a few KB on a request that already isn't the bottleneck — not worth the schema-management overhead for a call that happens once per session.
+
+<Callout type="warning">
+  A common mistake is reaching for a binary format because it "sounds faster" without measuring where the actual cost is. If your bottleneck is network latency or backend query time, switching JSON to Protobuf won't fix it — you'll have added schema coordination and lost debuggability for a saving that never mattered. Profile first: check payload size, parse time, and message frequency before deciding a text format is the problem.
+</Callout>
+
+## Schema evolution in practice
+
+JSON's flexibility (add a field, old clients ignore it) is also its risk — nothing stops a producer from silently renaming a field and breaking every consumer that expected the old name, since there's no contract to violate. Protobuf makes that contract explicit: each field has a permanent number, fields are optional by default, and the rules for a safe change are narrow — you can add a new numbered field or deprecate an old one, but reusing a retired field number for something else corrupts data for any endpoint still running older generated code. That rigidity is a feature once multiple services and client versions are evolving independently, which is exactly why gRPC (built on Protobuf) tends to show up in larger service meshes rather than in a single frontend-to-backend call.
+
+## Recap
+
+JSON stays the right default for the overwhelming majority of frontend API calls — it's debuggable, self-describing, and its overhead is dwarfed by network latency at typical request volumes. Binary formats earn their complexity specifically at high frequency or high volume, where payload size and parse cost start showing up as real, measurable costs: real-time streams, large datasets, or constrained devices. Choose based on measured need, not on binary sounding more sophisticated.
+
+<Quiz
+  lessonId="data-formats-and-transport"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A dashboard fetches a user profile once when a page loads. Which format is the more sensible default, and why?',
+      options: [
+        { id: 'a', text: 'JSON — the payload is small and infrequent, so its overhead is negligible next to network latency', correct: true, explanation: 'For occasional, small requests, JSON\'s debuggability and simplicity outweigh the modest size/parse savings a binary format would offer.' },
+        { id: 'b', text: 'Protobuf — it is always smaller and faster, so it should always be preferred', correct: false, explanation: 'Protobuf\'s savings matter at high frequency or volume; for a one-off small request the schema-coordination overhead isn\'t worth it.' },
+        { id: 'c', text: 'FlatBuffers — because skipping the decode step matters for every request regardless of size', correct: false, explanation: 'FlatBuffers\' zero-copy decode benefit matters when parsing cost is a real bottleneck, which a single small infrequent request is not.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which scenarios are good candidates for a binary format like Protobuf instead of JSON? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A multiplayer game streaming position updates dozens of times per second', correct: true, explanation: 'High message frequency makes per-message parsing and size overhead compound quickly — a strong case for a compact binary format.' },
+        { id: 'b', text: 'A live pricing feed pushing hundreds of ticker updates per second over a WebSocket', correct: true, explanation: 'High-frequency, high-volume real-time data is exactly where binary formats\' size and parse-speed advantages pay off.' },
+        { id: 'c', text: 'A settings page that saves a small form once when the user clicks "Save"', correct: false, explanation: 'A single infrequent small payload gains little from a binary format and loses easy debuggability for no real benefit.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'JSON is self-describing (field names travel with the data), while Protobuf requires both sides to share a schema to interpret the encoded bytes.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — JSON carries field names as text so any consumer can read it unaided, while Protobuf strips names for compactness and relies on a shared .proto schema to decode field numbers back into meaning.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This has it backwards — JSON is the self-describing one; Protobuf is the one that needs a shared schema.' },
+      ],
+    },
+  ]}
+/>

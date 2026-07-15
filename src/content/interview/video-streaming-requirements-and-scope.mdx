@@ -1,0 +1,261 @@
+---
+title: "Video Streaming Platform: Requirements & Scope"
+module: "Case Study: Video Streaming Platform"
+moduleOrder: 2
+order: 1
+track: "interview"
+summary: "Scopes a video streaming platform frontend: playback, adaptive quality, and clarifying questions."
+cheatsheet:
+  - "Say 'video streaming platform' out loud in your head as 'on-demand VOD' vs 'live' — they share a player shell but diverge hard on latency budget, seek behavior, and recommendation logic. Ask which one first."
+  - "Startup latency (time to first frame) and rebuffer ratio are the two metrics that actually predict churn — lead with these over generic 'performance' when you state nonfunctional requirements."
+  - "Adaptive quality switching is a client concern (bitrate ladder + buffer/bandwidth heuristics), not just a backend transcoding concern — call this out early so the interviewer knows you'll design it, not just consume it."
+  - "Scrub/seek needs its own requirement because it's the feature most likely to break with adaptive streaming: seeking into an unbuffered, un-fetched segment range must not hang the whole player."
+  - "DRM and premium content are scope-changing, not detail-changing — DRM forces an encrypted media pipeline (EME/CDM) and rules out plain `<video src>`, so ask about it before you commit to an architecture."
+  - "Offline downloads imply a whole extra subsystem (local storage quota, license renewal, sync) — treat 'do we need downloads' as a top clarifying question, not a stretch goal to mention at the end."
+  - "Comments and the recommendations rail are secondary UI, but they compete with the player for the same network and main-thread budget on a watch page — scope how much they're allowed to affect playback smoothness."
+tags: ["case-study", "video-streaming", "requirements"]
+estMinutes: 12
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design the frontend for a video streaming platform" is one of the most
+common frontend system design prompts, and one of the easiest to answer
+badly by rushing straight into "so we'll use HLS and a video tag." The
+prompt is deliberately broad — it could mean YouTube, Netflix, Twitch, or an
+internal training-video portal — and each of those implies a genuinely
+different architecture. The first five minutes of this interview are about
+narrowing "video streaming platform" down to a specific, buildable product,
+not about picking a manifest format.
+
+This lesson is the scoping pass for the case study. The next lessons
+(architecture, deep dives, mock interview) all assume you've already pinned
+down the scope decisions covered here — so treat this as the foundation, not
+a throwaway warm-up.
+
+## Why scoping this prompt matters more than usual
+
+Video is unusual among system design prompts because the "hard part" moves
+depending on which product you're building:
+
+- A **YouTube-style** platform is dominated by adaptive bitrate playback,
+  a recommendations feed, and comments/engagement UI.
+- A **Netflix-style** platform adds DRM-protected premium content, multi-
+  profile accounts, and cross-device resume.
+- A **Twitch/live** platform is dominated by low end-to-end latency, live
+  chat concurrency, and a fundamentally different buffering strategy (you
+  can't scrub past the live edge).
+
+If you don't ask which of these you're designing, you'll either over-build
+(designing DRM for a prompt that never needed it) or under-build (missing
+live-specific latency requirements entirely). Interviewers use this prompt
+specifically to see whether you scope before you architect.
+
+## Functional requirements
+
+Once you've picked a concrete product shape (see clarifying questions
+below), the core functional requirements for a video streaming frontend
+are:
+
+- **Video playback** — render a video stream with standard transport
+  controls: play/pause, volume, fullscreen, and a progress indicator.
+- **Adaptive quality** — the player selects and switches between multiple
+  encoded quality levels (e.g. 360p to 4K) based on the viewer's network
+  and device, ideally without a visible stutter.
+- **Seek / scrub** — the viewer can drag the scrubber to jump to an
+  arbitrary point (VOD) or within a live/DVR window (live), and playback
+  resumes quickly from the new position even if that segment range wasn't
+  buffered yet.
+- **Recommendations rail** — a list of related or "up next" videos shown
+  alongside or after the current video, driving continued watch time.
+- **Comments** — a paginated, possibly-threaded discussion feed attached to
+  the video, loaded and rendered without blocking the player.
+- **Playback controls beyond the basics** — captions/subtitles toggle,
+  playback speed, and quality override are common enough to mention as
+  "likely in scope" even if the interviewer doesn't ask for them
+  explicitly.
+
+Cross-device resume (starting a video on a phone and continuing on a TV
+from the same position) is functional too, but it's specifically a data-
+sync requirement — worth flagging as a clarifying question rather than
+assuming it's needed.
+
+## Nonfunctional requirements
+
+The nonfunctional requirements are what actually make this prompt hard, and
+they're where most of your design decisions later will be justified from:
+
+- **Startup latency** — time from "user clicks play" to "first frame is
+  rendered." For VOD this is typically budgeted in the low seconds; for
+  live, viewers are even less patient because they expect "instant," and a
+  slow join is often read as broken. A concrete target you can state out
+  loud: "under 2 seconds to first frame on a good connection" is a
+  reasonable bar to defend.
+- **Smooth playback on variable networks** — the player must keep frames
+  coming with minimal rebuffering as available bandwidth fluctuates, which
+  is the entire reason adaptive bitrate streaming exists. Rebuffer ratio
+  (fraction of watch time spent stalled) is the metric to name here.
+- **Cross-device support** — the same watch experience needs to work across
+  phone, tablet, desktop browser, and often TV/set-top apps, each with
+  different input models (touch scrub vs. D-pad) and different hardware
+  decode capabilities.
+- **Resource efficiency** — video decode and rendering are CPU/GPU and
+  battery intensive; a frontend that also runs a heavy recommendations rail
+  and live comment stream needs to budget main-thread work so none of that
+  UI causes the video itself to drop frames.
+- **Accessibility** — captions/subtitles are frequently a legal requirement,
+  not a nice-to-have, and keyboard-operable controls matter for a full-
+  screen player where a mouse may not be in play.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    A[Design a video streaming platform frontend] --> B{Clarify: live or on-demand?}
+    B -->|On-demand| C[VOD: full scrub range,\nlarger buffer window]
+    B -->|Live| D[Live: latency-first,\nseek limited to DVR window]
+    C --> E{DRM / premium content?}
+    D --> E
+    E -->|Yes| F[Encrypted media pipeline,\nlicense server integration]
+    E -->|No| G[Plain adaptive playback]
+    F --> H{Offline downloads?}
+    G --> H
+    H -->|Yes| I[Local storage + license renewal\n+ download manager UI]
+    H -->|No| J[Scope locked: design player,\nABR, and page architecture]
+    I --> J
+`} />
+
+## Clarifying questions and how they shift scope
+
+Ask these early — each one changes the architecture you'd propose, not just
+a small detail.
+
+### Live vs. on-demand?
+
+This is the single biggest fork. On-demand means the whole video's manifest
+and duration are known upfront, so scrubbing anywhere and precise buffer
+health tracking are straightforward. Live means the manifest is a moving
+window (new segments keep appearing), latency to the "live edge" becomes a
+top metric, and scrubbing is usually limited to a bounded DVR window rather
+than the entire broadcast. If the interviewer says "both," treat it as two
+variants of the same player shell and say so explicitly, rather than
+designing one generic system that quietly only fits one case.
+
+### Is DRM or premium/paid content in scope?
+
+If some or all content is protected, the player can't just point a
+`<video>` element at a plain file URL — you need an encrypted media
+pipeline (conceptually: Encrypted Media Extensions and a content decryption
+module talking to a license server) before playback can even start. That's
+a meaningfully larger design than open playback, and it affects your
+startup-latency budget too, since a license request adds a round trip
+before the first frame. If DRM is out of scope, say so and move on — don't
+spend interview time designing key rotation for a prompt that didn't ask
+for it.
+
+### Are offline downloads required?
+
+Downloads mean storing encrypted or plain video segments locally, tracking
+storage quota, renewing time-limited licenses for downloaded DRM content,
+and reconciling "downloaded but stale" content when a video is updated or
+removed. This is a genuinely separate subsystem from the streaming
+architecture core lessons cover — worth a single sentence acknowledging it
+exists, but not worth designing in depth unless the interviewer confirms
+it's in scope.
+
+### What's the recommendations/comments load pattern?
+
+Is the recommendations rail personalized per-viewer (implying a
+server round trip per page load) or largely static per-video? Are comments
+expected to update in near-real-time (implying a subscription or polling
+channel) or just paginated on load? These answers decide whether the watch
+page needs extra live-update infrastructure alongside the player.
+
+### What device/platform surfaces are in scope?
+
+"Cross-device" could mean "responsive web only" or "web plus native TV
+apps sharing a design." If native TV/console apps are explicitly out of
+scope, say that up front — it's fine to focus the whole interview on web
+and mention that a TV app would reuse the same ABR and metadata concepts
+behind a different UI shell.
+
+## Worked example: scoping a concrete answer
+
+Suppose the interviewer opens with: "Design the frontend for a video
+streaming platform, similar to YouTube." A strong opening isn't "okay,
+we'll need a video player and adaptive streaming" — it's a scoping pass:
+
+> "Before I design anything, a few questions. Is this purely on-demand, or
+> is live streaming also in scope? I'll assume on-demand only for now unless
+> you say otherwise. Is any content DRM-protected or paywalled, or is
+> everything freely playable? Do we need offline downloads, or is this
+> online-only? And for cross-device — are we designing responsive web only,
+> or do native TV/mobile apps matter for this exercise?"
+
+Say the interviewer answers: on-demand only, no DRM for this exercise,
+no downloads, web-responsive only (desktop and mobile browser, not native
+apps). That's now a fully scoped, buildable problem: a single-page watch
+experience with an adaptive video player, a scrub bar over a known-duration
+manifest, a recommendations rail, and a comments feed, targeting fast
+startup and smooth playback on typical consumer networks, across desktop
+and mobile browser viewports. Everything in the next three lessons builds
+on exactly this scoped version — see
+`video-streaming-high-level-architecture` for how these requirements map to
+components, and `video-streaming-deep-dives` for how adaptive quality
+switching and network resilience actually work under the hood.
+
+<Callout type="warning">
+  The most common mistake on this prompt is skipping straight to "we'll use
+  HLS/DASH with a video tag" before establishing live vs. on-demand, or
+  before checking whether DRM is in scope. Both of those answers change
+  your architecture enough that designing first and clarifying later means
+  redoing work live, in front of the interviewer. Spend the first two or
+  three minutes narrowing scope out loud — it's the single highest-leverage
+  thing you can do in this case study, and it's exactly what separates a
+  senior answer from a junior one.
+</Callout>
+
+<Callout type="interview">
+  It's fine — expected, even — to explicitly narrow scope and state your
+  assumption ("I'll assume on-demand, no DRM, web only, unless told
+  otherwise") rather than waiting for the interviewer to answer every
+  question. This shows judgment and keeps the interview moving, and the
+  interviewer can always correct you if your assumption is wrong.
+</Callout>
+
+<Quiz
+  lessonId="video-streaming-requirements-and-scope"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does "live vs. on-demand" matter so much for scoping this frontend design prompt?',
+      options: [
+        { id: 'a', text: 'It only changes which video codec is used', correct: false, explanation: 'Codec choice is a minor detail here; the real impact is on manifest structure, latency budget, and how (or whether) scrubbing works.' },
+        { id: 'b', text: 'It changes the manifest model, the latency budget, and the scrub/seek behavior', correct: true, explanation: 'On-demand has a fixed-duration manifest with full scrub range; live has a moving window, a latency-to-live-edge requirement, and scrubbing bounded to a DVR window.' },
+        { id: 'c', text: 'It only affects which analytics events are logged', correct: false, explanation: 'Analytics may differ too, but that is a minor downstream effect, not the reason this fork drives the whole architecture.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuinely scope-changing clarifying questions for this prompt (select all that apply)?',
+      options: [
+        { id: 'a', text: 'Is DRM/premium content in scope?', correct: true, explanation: 'DRM forces an encrypted media pipeline and a license server round trip before playback, which a plain player design does not need.' },
+        { id: 'b', text: 'Are offline downloads required?', correct: true, explanation: 'Downloads add local storage, quota management, and license renewal — a distinct subsystem, not just a UI detail.' },
+        { id: 'c', text: 'Should the play button be a circle or a triangle icon?', correct: false, explanation: 'This is a visual detail with no architectural impact — not the kind of question that changes scope.' },
+        { id: 'd', text: 'Is the recommendations rail personalized per viewer or static per video?', correct: true, explanation: 'Personalized recommendations imply a per-request server call and different caching strategy than a static, cacheable list.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Startup latency (time to first frame) and rebuffer ratio are reasonable concrete nonfunctional metrics to state for a video streaming frontend.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Both are standard, measurable proxies for perceived playback quality: how fast playback starts, and how much of the watch time is spent stalled.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'These are exactly the kind of concrete, measurable nonfunctional requirements this prompt calls for, as opposed to vague terms like "should feel fast."' },
+      ],
+    },
+  ]}
+/>

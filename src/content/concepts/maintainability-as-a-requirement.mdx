@@ -1,0 +1,234 @@
+---
+title: "Maintainability as a Requirement"
+module: "Nonfunctional Requirements"
+moduleOrder: 2
+order: 4
+track: "concept"
+summary: "Frames maintainability as a nonfunctional requirement covering code health, testability, and multi-team ownership."
+cheatsheet:
+  - "Maintainability is a nonfunctional requirement: state it as 'a new engineer ships a safe change to module X within a day' or 'team A can ship without team B in the room' — not as 'write clean code.'"
+  - "Modularity plus clear ownership boundaries let teams change their own slice without a company-wide regression sweep — coupling is the tax that maintainability is trying to avoid."
+  - "A testing strategy names the shape of your test pyramid (unit vs integration vs end-to-end) and which layer catches which class of bug — 'we have tests' is not a strategy."
+  - "Interviewers listen for whether you can name what erodes maintainability (shared mutable state, leaky abstractions, undocumented implicit contracts) as much as what improves it."
+  - "Architecture choices from Design Patterns & Architectures directly gate maintainability: a single shared global store scales poorly across teams, while feature-sliced modules with a stable public interface scale well."
+  - "Trading short-term speed for long-term maintainability is a real trade-off, not a platitude — name the cost (slower this sprint) and the payoff (fewer regressions, faster onboarding) explicitly when you make the call."
+  - "Maintainability degrades quietly — nothing breaks the day you skip the abstraction, it breaks eighteen months later when a fourth team touches the file."
+tags: ["nonfunctional","maintainability"]
+estMinutes: 8
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every other nonfunctional requirement in this module — performance,
+accessibility, i18n — describes how the product behaves for a user on day
+one. Maintainability describes something different: how the codebase
+behaves for *engineers* over the next two years. A checkout flow that
+loads fast and works with a screen reader today can still turn into a
+liability if adding a new payment method requires touching fourteen files
+owned by three teams, none of whom fully understand the other two. In an
+interview, skipping maintainability makes your design look great in a demo
+and terrible in a design review six months later — which is exactly the
+signal senior interviewers are listening for.
+
+Frontend system design interviews increasingly involve more than one team
+working on the same product surface: a checkout team, a search team, a
+navigation/shell team, all shipping into the same app. Maintainability is
+the requirement that asks: can these teams keep shipping independently,
+safely, as the codebase grows? If you don't name it up front, your
+architecture answer will implicitly assume a single small team forever —
+and that assumption rarely survives contact with the actual prompt.
+
+## What "maintainable" actually means
+
+"Write maintainable code" is not a requirement — it's a wish. A real
+maintainability requirement is specific enough to design against. Useful
+phrasings:
+
+- "A new hire should be able to ship a small, safe change to the product
+  catalog module within their first week."
+- "The search team should be able to change their ranking logic without a
+  code review from the checkout team, and without a full-app regression
+  suite blocking their release."
+- "A broken build in one feature module should not block deploys for
+  unrelated modules."
+
+Each of these is testable, unlike "clean code." They also point directly
+at design decisions: module boundaries, ownership, deploy pipelines, and
+test coverage.
+
+### Code health
+
+Code health is the day-to-day texture of the codebase: how easy it is to
+read a file and trust what it does, how consistent naming and patterns are
+across the app, and how much a change in one place requires you to also
+understand five other places. Low code health shows up as "nobody wants to
+touch this file" — which, in a growing frontend, becomes a real cost:
+features get bolted on elsewhere instead of extending the existing
+component, because extending it is scarier than duplicating it.
+
+### Testability
+
+A codebase's testability is a design property, not just "did we write
+tests." Testability depends on:
+
+- **Separation of concerns** — business logic that isn't entangled with
+  DOM rendering can be unit-tested without a browser.
+- **Dependency seams** — a data-fetching layer that can be swapped for a
+  fake in tests, rather than a component that calls `fetch` directly deep
+  inside its render logic.
+- **A test pyramid you can actually name** — mostly fast unit tests for
+  logic, a smaller layer of integration tests for component + data
+  wiring, and a thin layer of end-to-end tests for the critical user
+  journeys (login, checkout). If someone asks "how do you know this
+  change didn't break anything," you should be able to point at which
+  layer would have caught it.
+
+A design that makes testing hard — deeply nested components with implicit
+shared state, side effects buried inside render — makes maintainability
+hard by extension, because every change becomes "ship and hope," not
+"ship and verify."
+
+### Ownership boundaries
+
+At single-team scale, ownership doesn't matter much — one team can hold
+the whole mental model in their heads. Past a certain size, unclear
+ownership is one of the biggest maintainability killers: a shared utility
+file that six teams edit, a global CSS class three components secretly
+depend on, a global store any feature can write to. The fix isn't
+"add more process" — it's designing boundaries so that most changes stay
+inside one team's module, with a small, stable, intentional surface where
+modules talk to each other.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph LowMaintainability["Low maintainability"]
+        A1[Team A code] <--> Shared[Shared mutable state]
+        B1[Team B code] <--> Shared
+        C1[Team C code] <--> Shared
+    end
+    subgraph HighMaintainability["High maintainability"]
+        A2[Team A module] -->|stable public API| Contract[Shared contract]
+        B2[Team B module] -->|stable public API| Contract
+        C2[Team C module] -->|stable public API| Contract
+    end
+`} />
+
+On the left, any team can change shared state and silently break the
+others — nobody can safely reason about their own module in isolation. On
+the right, each team owns their module's internals completely and only
+exposes a narrow, versioned contract; a team can rewrite everything behind
+their own API without touching anyone else's code, as long as the contract
+holds.
+
+## Signals interviewers listen for
+
+When you talk through maintainability in an interview, these are the
+concrete signals that show you're not just reciting the word:
+
+- **Modularity** — can you point at where one feature's code lives and
+  say "this is self-contained," rather than "it's spread across the
+  app"?
+- **Explicit ownership** — for a multi-team prompt, do you assign which
+  team owns which slice, and define how they communicate across the
+  boundary (a typed API, an event contract, a shared design system)?
+- **A named testing strategy** — not "we'll write tests," but which kinds,
+  at which layer, catching which kinds of regressions.
+- **Awareness of coupling costs** — can you name what happens when module
+  A reaches into module B's internals, and how you'd prevent it (linting
+  rules, package boundaries, code review gates, a monorepo's dependency
+  graph)?
+
+This connects directly to the **Design Patterns & Architectures** module
+later in the course: patterns like a layered architecture, a
+feature-sliced folder structure, or a micro-frontend split aren't
+academic exercises — they're maintainability decisions. A layered
+architecture that separates data-fetching, state, and presentation makes
+each layer independently testable and independently replaceable. A
+feature-sliced structure gives each team a folder they fully own. A
+micro-frontend split takes ownership boundaries to the extreme, trading
+deploy independence for extra runtime complexity. Which one is "right"
+depends entirely on the maintainability requirement you stated up front —
+a five-person startup and a 200-engineer org need different answers.
+
+## Worked example: shared form validation logic
+
+Say you're designing a multi-step checkout form. Three fields need
+validation: shipping address, a promo code, and a payment method. The fast
+path is to write the validation inline inside each step's component —
+ship it this afternoon, move on.
+
+Six months later, a fourth team adds a "gift message" step and needs
+similar validation, so they copy-paste the pattern from the payment step
+because it's the closest example they can find. A bug fix to the
+validation logic (say, promo codes with trailing whitespace being rejected
+incorrectly) now needs to be found and fixed in four different places,
+and the team fixing it doesn't know the other three copies exist.
+
+The maintainable alternative costs more upfront: extract a small
+`useFieldValidation` hook (or equivalent) with a documented contract —
+inputs, error shape, when it re-validates — and require every checkout
+step to use it. Writing that hook, documenting it, and migrating the
+first three steps to use it takes real extra time this sprint. The payoff
+shows up later: the whitespace bug gets fixed once, in one file, and the
+fourth team's "gift message" step gets validation for free by importing
+the hook instead of reinventing it.
+
+This is the trade-off maintainability requirements force you to make
+explicitly: slower now, in exchange for a shared, testable, single source
+of truth later. Neither choice is free — the point of naming
+maintainability as a requirement is deciding *on purpose* which cost you're
+willing to pay, rather than defaulting to "fast now" every time and
+discovering the bill later.
+
+<Callout type="warning">
+  A common mistake: treating maintainability as something you'll "clean up
+  later" rather than a requirement to design for now. Duplicated logic,
+  shared mutable state, and untested code paths don't show up as bugs the
+  day you write them — they show up eighteen months later as a
+  three-week refactor that blocks a roadmap feature, or as a bug that
+  takes down an unrelated part of the app because two features secretly
+  shared state. If you don't say out loud "this needs to support N teams
+  changing it independently" before you design, you'll design for one
+  team by default, and the cost lands on whoever inherits the code.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="maintainability-as-a-requirement"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Which of these is the most useful way to state a maintainability requirement in an interview?',
+      options: [
+        { id: 'a', text: '"The code should be clean and easy to read."', correct: false, explanation: 'This is a wish, not a testable requirement — it gives no signal for what design decisions would satisfy it.' },
+        { id: 'b', text: '"A new engineer should be able to ship a small, safe change to the catalog module within their first week."', correct: true, explanation: 'This is concrete and testable — it implies specific things about documentation, module boundaries, and test coverage that a design must satisfy.' },
+        { id: 'c', text: '"We will follow best practices."', correct: false, explanation: 'This names no concrete outcome and gives an interviewer nothing to evaluate your design against.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine signals of testability as a design property (select all that apply)?',
+      options: [
+        { id: 'a', text: 'Business logic is separated from DOM rendering so it can be unit-tested without a browser.', correct: true, explanation: 'Separation of concerns is a core enabler of fast, reliable unit tests.' },
+        { id: 'b', text: 'A data-fetching layer can be swapped for a fake/mock in tests.', correct: true, explanation: 'Dependency seams let you isolate the code under test from network flakiness and external state.' },
+        { id: 'c', text: 'The team has a large end-to-end test suite covering every possible user flow, with no unit tests.', correct: false, explanation: 'An end-to-end-only suite is usually a maintainability problem, not a strength — it is slow, flaky, and gives poor signal on where a regression actually is. A healthy pyramid leans on fast unit tests for most coverage.' },
+        { id: 'd', text: 'You can name which test layer would catch a given class of regression before it ships.', correct: true, explanation: 'Being able to map "this kind of bug" to "this layer of the test pyramid" shows the testing strategy is intentional, not incidental.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Choosing to extract shared, documented validation logic instead of copy-pasting it into each form step is purely a code-quality nicety with no real short-term cost.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'There is a real short-term cost: writing and documenting the shared hook, then migrating existing steps to use it, takes more time upfront than copy-pasting inline validation.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'It is a genuine trade-off — slower to build now, in exchange for one place to fix bugs and reuse logic later. Naming that trade-off explicitly is the point of treating maintainability as a requirement.' },
+      ],
+    },
+  ]}
+/>

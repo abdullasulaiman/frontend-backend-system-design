@@ -1,0 +1,184 @@
+---
+title: "A Framework for Frontend System Design Interviews"
+module: "Design Framework"
+moduleOrder: 8
+order: 1
+track: "concept"
+summary: "Introduces an original six-step framework for structuring any frontend system design interview answer."
+cheatsheet:
+  - "Budget roughly: clarify 5-7 min, scale 3-5 min, components 6-8 min, API/data flow 8-10 min, rendering/state 8-10 min, trade-offs 5-7 min, in a 35-45 minute slot."
+  - "Never start designing before you've said out loud what you're building, for whom, and on what devices — an interviewer marks you down for solving the wrong problem well."
+  - "Turn scale numbers into concrete decisions: 'updates every 2s for 10k rows' means virtualization and batching, not a vague 'it should be fast.'"
+  - "Draw components as boxes with one-line responsibilities before naming a single library — the shape of the system matters more than the tool."
+  - "State locality beats state centralization: keep state as close to where it's used as possible, and only lift it when two components genuinely need to share it."
+  - "Always end with trade-offs, not a single 'correct' answer — naming what you gave up is what separates a senior answer from a junior one."
+  - "The six steps are a checklist, not a script: revisit earlier steps out loud when new constraints surface instead of pretending your first pass was final."
+tags: ["framework", "interview-prep"]
+estMinutes: 14
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Frontend system design interviews fail for a boring reason more often than a technical one: the candidate starts talking about components and code before anyone has agreed on what's being built. Thirty-five minutes disappears fast, and without a plan for spending it, you either freeze on a blank whiteboard or dive into implementation detail on a problem you haven't actually scoped.
+
+What you need isn't a memorized answer to "design a news feed" or "design a chat app" — it's a repeatable sequence of moves that works on a problem you've never seen before. This lesson lays out a six-step framework built for that purpose. It isn't tied to any single case study; it's the scaffolding you'll reuse across every one of the five case studies later in the Interview Prep track.
+
+## The six steps, and why they're in this order
+
+Each step produces an input the next step needs. Skip one and the later steps get vague or contradictory.
+
+1. **Clarify requirements and scope** — pin down what you're actually building.
+2. **Estimate scale and data** — turn "how big" into numbers that drive later decisions.
+3. **Break the problem into components** — sketch the shape of the system.
+4. **Design the API and data flow** — decide what data moves where, and how.
+5. **Choose the rendering and state architecture** — decide how the UI stays in sync with that data.
+6. **Evaluate performance and trade-offs** — stress-test your own design out loud.
+
+The order matters because each step constrains the next: you can't reasonably choose between client-side rendering and server-side rendering (step 5) until you know the data flow (step 4), and you can't design a sane API (step 4) until you know roughly how much data you're moving (step 2). Treat the list as a checklist you can revisit, not a rigid script — if step 4 reveals a requirement you missed, say so and go back to step 1 briefly. Interviewers want to see you notice that, not pretend your first pass was complete.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  A["1. Clarify requirements and scope"] --> B["2. Estimate scale and data"]
+  B --> C["3. Break into components"]
+  C --> D["4. Design API and data flow"]
+  D --> E["5. Rendering and state architecture"]
+  E --> F["6. Performance and trade-offs"]
+  F -.revisit earlier steps if needed.-> A
+`} />
+
+## Step 1: Clarify requirements and scope (about 5-7 minutes)
+
+Most prompts are deliberately underspecified — "design a live comments feed" could mean a lightweight widget on a blog or a Twitch-scale chat wall. Your first job is to make the interviewer narrow it with you, out loud.
+
+Ask about, and write down:
+
+- **Core use case**: what's the one thing this feature must do well? A like button's core use case is "show an accurate, responsive count," not "support every possible reaction type."
+- **Users and devices**: logged-in only or anonymous too? Mobile web, native wrapper, desktop, all three?
+- **Real-time expectations**: does data need to update live for other viewers, or is a page refresh acceptable?
+- **Explicit non-goals**: what's out of scope? Saying "I'm assuming we don't need offline support, tell me if that's wrong" shows judgment, not just asking questions.
+
+Leave this step with a one-sentence problem statement you both agree on. If you skip it, you'll spend the rest of the interview solving a problem the interviewer didn't ask for.
+
+## Step 2: Estimate scale and data (about 3-5 minutes)
+
+This step is short but not optional — the numbers you get here shape steps 3 through 6. You're not doing capacity planning for a data center; you're extracting the two or three numbers that change your frontend decisions.
+
+Ask things like:
+
+- Roughly how many concurrent users touch this screen at once?
+- How often does the data change — every few seconds, every few minutes, rarely?
+- How big is a single unit of data (one row, one message, one comment)?
+
+Translate the answer into a decision, don't just repeat it back. "10,000 rows visible with updates every 2 seconds" should immediately make you think "I can't re-render every row on every tick — I need virtualization and I need to batch or diff updates," and you should say that out loud.
+
+## Step 3: Break the problem into components (about 6-8 minutes)
+
+Now sketch the system as boxes with one-line responsibilities — not code, not a specific framework's file structure. For a UI-heavy feature this usually splits into: a data-fetching/subscription layer, a small number of presentational components, and any cross-cutting concerns (auth, error boundaries, offline queueing).
+
+Keep each box's job to one sentence. If you can't state a component's responsibility in one sentence, it's doing two jobs and should probably be two components. This step is also where you decide what's a reusable primitive (a `Button`, a `Avatar`) versus a feature-specific composition (a `CommentThread` built from those primitives) — naming that distinction shows you think about a codebase, not just a screen.
+
+## Step 4: Design the API and data flow (about 8-10 minutes)
+
+With rough component boundaries in hand, decide what data crosses the network, in which shape, and how often. Cover:
+
+- **The shape of the request/response**: what fields does the client actually need? Resist the urge to design a generic, everything-included payload — a frontend interview rewards trimming payloads to what the UI renders.
+- **Read vs. write paths**: how does the client fetch initial state, and how does it send changes back?
+- **Push vs. pull**: does the client poll, hold a WebSocket/SSE connection, or just refetch on user action? Justify the choice using the scale numbers from step 2 — polling every 5 seconds for 10,000 users is a very different cost than a single shared WebSocket broadcast.
+- **Optimistic vs. confirmed updates**: does the UI update immediately and reconcile later, or wait for a server response?
+
+This is usually the meatiest step and the one most tied to the specific problem, so budget the most time here.
+
+## Step 5: Choose the rendering and state architecture (about 8-10 minutes)
+
+Now decide how the UI actually renders and stays in sync with the data from step 4:
+
+- **Rendering strategy**: does this screen benefit from server-side rendering or static generation for first paint, or is it fine as a client-rendered app shell? Tie this back to step 1's requirements — an SEO-sensitive public page leans SSR/SSG; an authenticated dashboard usually doesn't need it.
+- **State location**: for each piece of state, ask "who else needs this?" State only one component needs stays local to that component. State two siblings need gets lifted to their common parent or a small shared store — don't reach for a global store by default.
+- **Sync strategy**: how does server state (fetched data) get kept fresh against client state (in-progress edits, optimistic updates)? This is where you name a real mechanism — cache invalidation on write, a subscription pushing deltas, or a simple polling refetch — rather than waving your hands at "state management."
+
+<Callout type="warning">
+  A common failure mode here is naming a specific library ("I'd use Redux" or "I'd use React Query") as if that's the answer. The library isn't the point — the interviewer wants to hear the reasoning: what state exists, where it lives, and how it stays consistent. Name the tool only after you've explained the shape of the problem it solves; if you lead with the tool, it sounds like you're pattern-matching a buzzword rather than designing.
+</Callout>
+
+## Step 6: Evaluate performance and trade-offs (about 5-7 minutes)
+
+Close by stress-testing your own design instead of waiting for the interviewer to poke holes in it. Cover:
+
+- **Where this design could break under load**: what happens at 10x the scale number from step 2? Does the API shape or update mechanism still hold?
+- **What you'd cut under a tighter deadline**: naming a deliberately simpler version ("ship polling first, upgrade to WebSockets once we see real usage") shows pragmatism.
+- **Failure and edge cases**: slow network, a dropped connection, a write that fails after an optimistic update was already shown.
+- **What you consciously didn't optimize for**: every design favors something over something else. Say what you traded away and why that's an acceptable bet given step 1's scope.
+
+Ending here — rather than fading out after step 5 — is what makes an answer feel complete rather than abandoned partway through.
+
+## Worked example: a like button with a live count
+
+Applying all six steps briefly, end to end, to something small:
+
+**1. Clarify.** One button per post, toggles liked/unliked for the current user, shows a count that also reflects other users' likes arriving in near real time. Logged-in users only. Not in scope: reaction picker with multiple emoji types.
+
+**2. Estimate.** A single post might get a burst of likes right after posting (say, up to 50 likes/second briefly on a popular post) then trickle to a few per minute. Thousands of users could be viewing the same post simultaneously.
+
+**3. Components.** A `LikeButton` (icon + toggle state), a `LikeCount` (formatted number), and a small hook/service that owns the fetch-and-subscribe logic feeding both.
+
+**4. API and data flow.** `POST /posts/:id/like` and `DELETE /posts/:id/like` for the write; initial count comes from the post's own GET response. For live updates, a lightweight server-sent-events stream per post pushes incremented/decremented deltas rather than the client polling every post on screen — cheaper at the scale numbers from step 2 than per-client polling.
+
+**5. Rendering and state.** The liked/unliked boolean is local to `LikeButton` and updated optimistically the instant the user clicks, before the network call resolves. The count is shared between the button and the count display, so it lives one level up in the parent post component, and it's patched by both the optimistic local delta and incoming SSE deltas from other users.
+
+**6. Trade-offs.** Optimistic updates mean a rare failed request has to roll the UI back and show an error toast — worth it for the snappy feel. A single shared SSE stream per visible post scales better than per-user polling but adds server-side fan-out complexity, which is an acceptable trade for a feature this central to engagement.
+
+Notice the whole exercise took a few sentences per step. On a real case study you'll go deeper in each one, but the sequence is identical — that's the point of having a framework at all.
+
+<Callout type="warning">
+  The most common way candidates sabotage themselves with this framework: spending 20 of their 40 minutes on step 1 or step 4 because the conversation is interesting, and then rushing rendering, state, and trade-offs into the last two minutes. Keep a rough mental clock — if you're deep into an interesting tangent past a step's budget, say "let's park that and come back if we have time" and move on. A complete, slightly shallow answer beats a brilliant, unfinished one.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="a-framework-for-frontend-system-design-interviews"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does this framework put "estimate scale and data" before "design the API and data flow"?',
+      options: [
+        { id: 'a', text: 'Because scale numbers are required by the interview rubric regardless of relevance', correct: false, explanation: 'The numbers matter because of what they drive, not because a rubric demands them for their own sake.' },
+        { id: 'b', text: 'Because scale numbers (update frequency, data size, concurrent users) directly shape decisions like polling vs. push and payload shape', correct: true, explanation: 'Knowing roughly how often data changes and how many users are watching determines whether polling, WebSockets, or plain refetch makes sense in the API step that follows.' },
+        { id: 'c', text: 'Because interviewers always ask about scale first, so candidates should match that order', correct: false, explanation: 'The ordering is justified by what each step needs from the previous one, not by mirroring interviewer habits.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are recommended moves during step 5 (rendering and state architecture), per this lesson?',
+      options: [
+        { id: 'a', text: 'Deciding where each piece of state lives by asking "who else needs this?"', correct: true, explanation: 'The lesson frames state locality as the default: keep state local unless a sibling genuinely needs it, then lift it.' },
+        { id: 'b', text: 'Leading with a specific state-management library name before explaining the state shape', correct: false, explanation: 'The lesson\'s warning callout specifically flags naming a library first as a failure mode — explain the reasoning, then optionally name a tool.' },
+        { id: 'c', text: 'Tying the rendering strategy choice back to requirements from step 1, like SEO needs vs. an authenticated dashboard', correct: true, explanation: 'The lesson explicitly connects rendering strategy (SSR/SSG vs. client-rendered) back to the requirements gathered in step 1.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'The six steps in this framework should always be executed once, strictly in order, with no revisiting earlier steps.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The lesson explicitly says to treat the steps as a checklist you can revisit — if a later step reveals a missed requirement, go back briefly to an earlier step and say so.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. The steps establish a default sequence and time budget, but noticing a gap and looping back is presented as a sign of good judgment, not a failure to follow the framework.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the worked "like button" example, why is the liked/unliked boolean kept local to the LikeButton component while the count is lifted to the parent?',
+      options: [
+        { id: 'a', text: 'Because booleans must always be local state and numbers must always be shared state', correct: false, explanation: 'That\'s not a general rule — the lesson\'s actual test is "who else needs this," not the data type.' },
+        { id: 'b', text: 'Because the count is needed by both the button and a separate count display, while the liked/unliked toggle is only used by the button itself', correct: true, explanation: 'This matches the "who else needs this?" test from step 5: state used by only one component stays local, state needed by multiple components gets lifted to their shared parent.' },
+        { id: 'c', text: 'Because optimistic updates only work on state that lives in a parent component', correct: false, explanation: 'Optimistic updates can be applied to local or lifted state; that isn\'t what determines where the boolean lives in this example.' },
+      ],
+    },
+  ]}
+/>

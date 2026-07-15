@@ -1,0 +1,148 @@
+---
+title: "Chat Application: High-Level Architecture"
+module: "Case Study: Chat Application"
+moduleOrder: 3
+order: 2
+track: "interview"
+summary: "Presents an architecture centered on a persistent connection with a local message store."
+cheatsheet:
+  - "A chat client needs two network paths, not one: a persistent WebSocket for live message push, and a REST/GraphQL API for history, search, and anything request/response shaped (pagination doesn't belong on the socket)."
+  - "The message store is the single source of truth the UI reads from — both the socket handler and the history API write into the same per-conversation store, so a message never has to be reconciled in two places."
+  - "Reconnection needs backoff (exponential, capped, with jitter) plus a resync step on reconnect — re-opening the socket without asking 'what did I miss since my last known message' silently drops messages sent during the gap."
+  - "Surface connection state in the UI explicitly (connected / reconnecting / offline) — a chat app that looks connected while the socket is dead is worse than one that visibly tells the user to expect delay."
+  - "Split the component tree by responsibility: ConversationList (which threads, unread counts), MessageThread (rendering + scroll position for one conversation), Composer (draft state, send, typing signal) — each can be optimized and tested independently."
+  - "The composer's typing indicator and the thread's read receipts are just more socket messages, not a separate system — model them as events flowing through the same connection as chat messages."
+tags: ["case-study", "chat-app", "architecture"]
+estMinutes: 13
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Once you've scoped the chat app interview question (see `chat-app-requirements-and-scope`), the interviewer wants to see you draw a picture: where does a message actually go the instant someone hits send, and where does it live once it's on screen? Get this wrong and you end up describing a chat app that behaves like a page that happens to refresh a lot — polling for updates, re-fetching whole conversations, no real notion of "connected." Get it right and the rest of the interview (ordering, dedup, offline handling, performance) has somewhere to attach.
+
+This lesson lays out that architecture: a persistent connection for real-time delivery, a local message store that both the socket and the history API feed into, a component tree built around that store, and the reconnection behavior that keeps the whole thing trustworthy when the network misbehaves.
+
+## Two network paths, one job split
+
+A chat client needs two very different kinds of network access, and conflating them is the single most common design mistake in this case study.
+
+- **A persistent connection (WebSocket, or a fallback like SSE for server-to-client-only push)** carries anything that's inherently event-driven and needs to reach the client with minimal latency: new messages, typing indicators, delivery and read receipts, presence changes. This connection stays open for the life of the session.
+- **A REST or GraphQL API** handles anything shaped like a request with a response: loading the last 50 messages of a conversation, paginating further back in history, searching across conversations, fetching a user's profile. These are one-shot operations where a normal HTTP request/response (with caching, retries, and standard status codes) is simpler and more robust than trying to force it through the socket.
+
+The temptation is to push everything through the socket since it's already open. Resist it. Search queries and deep pagination don't need push semantics, they need request/response semantics — matching a response to its request, standard retry/backoff, and the ability to cancel an in-flight request (a user who edits a search query mid-typing). A socket message protocol can support request/response too, but you'd be reinventing HTTP semantics on top of a transport that wasn't built for it, for zero benefit. Use the tool that matches the interaction pattern.
+
+## The local message store
+
+Both network paths ultimately feed the same place: a local message store, keyed by conversation ID and, within each conversation, by message ID. This store is the one thing every UI component reads from — nothing renders directly off a raw socket event or a raw API response.
+
+Two things make this store worth calling out explicitly in an interview:
+
+- **It's the reconciliation point.** When the history API returns the last 50 messages for a conversation, and the socket simultaneously delivers a new message, both write into the same store. Because messages are keyed by ID, an incoming socket message that duplicates one already fetched via history just overwrites the same entry — no duplicate render. (The deep-dives lesson covers this in more depth, including client-generated IDs and server sequence numbers.)
+- **It's the cache.** Switching from conversation A to conversation B and back shouldn't re-fetch A's history if it's still in the store — just re-render from cache and let a background refresh (or the socket) fill in anything new. This is what makes conversation switching feel instant rather than another loading spinner.
+
+A reasonable shape: a map from `conversationId` to an ordered list of message IDs, plus a flat map from `messageId` to the message object itself — the same normalized pattern you'd use for any list-of-entities client cache, applied here per conversation.
+
+## The component tree
+
+With the store in place, the UI splits cleanly along responsibility lines:
+
+- **`ConversationList`** — renders the list of conversations, each with a preview of the last message, unread count, and online/typing indicator for the other participant. Reads conversation metadata from the store; doesn't touch individual message bodies.
+- **`MessageThread`** — renders one conversation's messages in order, owns scroll position (including "stick to bottom on new message unless the user has scrolled up to read history"), and triggers "load older messages" against the history API when the user scrolls near the top.
+- **`Composer`** — owns the draft text, attachment state, and the send action. Sending writes an optimistic message into the store immediately (so it shows up before any server round trip) and emits both the actual send over the socket and a typing-stopped signal.
+
+Each piece can be built and tested against a fake store independently — `MessageThread` doesn't need a real socket connection to be unit-tested with a fixed array of messages, and `Composer` doesn't need to know whether the thread it's attached to has 3 messages or 30,000.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    WS["WebSocket connection<br/>(live push)"] --> STORE["Local message store<br/>by conversation, by message ID"]
+    API["REST / GraphQL API<br/>(history, search)"] --> STORE
+    STORE --> CL[ConversationList]
+    STORE --> MT[MessageThread]
+    CMP[Composer] -->|optimistic write| STORE
+    CMP -->|send over socket| WS
+    MT -->|load older messages| API
+`} />
+
+Notice the composer writes to the store directly (optimistic update) and also pushes the send onto the socket — the socket's own acknowledgment of that message, when it arrives, reconciles with the optimistic entry rather than creating a second one.
+
+## Reconnection strategy
+
+A WebSocket will drop — laptop sleeps, phone switches from WiFi to cellular, a load balancer recycles the connection. The architecture has to treat disconnection as a normal, expected state, not an edge case.
+
+The standard approach:
+
+1. **Detect the drop** via the socket's close/error event (don't rely solely on a missing heartbeat — implement an actual ping/pong heartbeat with a timeout, since some drops are silent at the TCP level).
+2. **Back off exponentially, with a cap and jitter**: retry after roughly 1s, 2s, 4s, 8s... up to some ceiling (say 30s), with a small random jitter added so a server restart doesn't get hit by every client's identical retry schedule at once (a thundering herd).
+3. **Resync on reconnect, don't just reopen.** The moment the new socket connection is established, the client needs to ask "what have I missed since the last message I know about for each open conversation?" — typically a lightweight API call with a `lastMessageId` or timestamp per conversation, or a single "sync since cursor X" endpoint. Simply reopening the socket and waiting for new pushes silently drops anything sent during the gap.
+4. **Replay queued outgoing messages.** Anything the user sent while disconnected (composer optimistic-sent, not yet acknowledged) needs to be retried once the connection is back, using the same client-generated ID so the server can dedupe if it actually did receive the original send moments before the drop.
+
+## Connection-state UI
+
+Because reconnection can take anywhere from under a second to tens of seconds, the UI needs to represent connection state honestly rather than pretending everything's fine:
+
+- **Connected** — normal state, no indicator needed beyond maybe a subtle presence dot.
+- **Reconnecting** — a small, non-blocking banner ("Reconnecting…") so the user understands why new messages might be delayed, without blocking them from reading history or composing a draft.
+- **Offline / failed** — a clearer state after retries are exhausted or the device reports no network, distinct from "reconnecting," since the user's expectation (and the retry behavior) is different — this is where you'd rely on `navigator.onLine` and a `online` event listener to resume retrying promptly once connectivity returns, instead of waiting out a long backoff timer.
+
+The composer should stay usable in every one of these states — a message typed while reconnecting still gets queued and optimistically shown, just marked "sending" instead of "sent," rather than the whole UI locking up.
+
+## Worked example: reconnecting mid-conversation
+
+A user is in a conversation, phone screen off for two minutes, WiFi drops during that time. On wake, the app fires a socket close event. The client shows "Reconnecting…" in the thread header and starts the backoff sequence: retry at 1s (fails, no network yet), 2s (fails), 4s (succeeds — WiFi is back).
+
+On successful reconnect, before showing "Connected," the client calls `syncConversation(conversationId, lastMessageId)` against the REST API. That call returns 3 messages the other participant sent during the gap. Those merge into the store by ID (no duplicates, since none of them were in the store yet), `MessageThread` re-renders with them appended, and only then does the header flip to "Connected." Meanwhile, if the user had typed a reply right as the screen went dark, that message was sitting in the store as `status: 'sending'` — the reconnect flow retries its send over the fresh socket, and once the server acknowledges it, its status flips to `'sent'`.
+
+<Callout type="warning">
+  A common mistake: treating "socket reconnected" as equivalent to "fully caught up." A raw reconnect only restores the pipe for *future* pushes — it says nothing about messages sent by others during the outage window. Skipping the resync-since-last-known-message step means those messages simply never arrive unless the sender happens to still be online and the server re-pushes them, which most servers won't do by default. Always pair reconnect with an explicit "sync since X" call before you consider the client caught up.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="chat-app-high-level-architecture"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why use a REST/GraphQL API for conversation history and search instead of pushing those requests through the same WebSocket used for live messages?',
+      options: [
+        { id: 'a', text: 'History and search are request/response shaped, and HTTP already gives matching, retries, caching, and cancellation for that pattern for free', correct: true, explanation: 'Correct — the socket is optimized for server-initiated push; forcing request/response interactions onto it means reinventing HTTP semantics for no benefit.' },
+        { id: 'b', text: 'WebSockets cannot carry more than one message type', correct: false, explanation: 'WebSockets can carry any message shape you define in your protocol; the limitation is about matching the transport to the interaction pattern, not a technical restriction on message types.' },
+        { id: 'c', text: 'REST APIs are always faster than WebSocket messages', correct: false, explanation: 'Neither is inherently faster; a live push over an already-open socket is typically lower latency than opening a new HTTP request. The reason to split them is interaction pattern, not raw speed.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these should happen as part of a WebSocket reconnection strategy? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Back off with an increasing delay between retries, capped at some maximum', correct: true, explanation: 'Exponential backoff with a cap prevents hammering a server that is still recovering, while still retrying promptly under normal conditions.' },
+        { id: 'b', text: 'Fetch anything missed since the last known message once the socket reconnects', correct: true, explanation: 'A reopened socket only restores future push delivery; a resync call is required to close the gap created by the outage.' },
+        { id: 'c', text: 'Discard any messages the user tried to send while disconnected, since they failed once', correct: false, explanation: 'Those messages should be retried (using their client-generated ID for dedup) once the connection is restored, not silently dropped.' },
+        { id: 'd', text: 'Add jitter to retry timing so many clients reconnecting after a shared outage do not all retry at the exact same moment', correct: true, explanation: 'Jitter spreads out simultaneous reconnect attempts, avoiding a thundering-herd spike on the server right as it comes back up.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'The local message store should be written to only by the WebSocket handler, with the history API populating a separate cache that the UI reconciles manually.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Splitting them into separate caches reintroduces exactly the reconciliation problem a shared, ID-keyed store avoids. Both the socket and the history API should write into the same store.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — one store, keyed by message ID, written to by both the socket and the history/search API, is what makes deduplication automatic and keeps the UI reading from a single source of truth.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A user is mid-reconnect ("Reconnecting…" shown) and types a message in the Composer. What should happen?',
+      options: [
+        { id: 'a', text: 'The message is accepted, shown optimistically with a "sending" status, and queued to send once the connection is restored', correct: true, explanation: 'The composer should stay usable through reconnect states; queuing the optimistic send keeps the UI responsive and the message gets flushed once the socket is back.' },
+        { id: 'b', text: 'The composer should be disabled until the connection is fully restored', correct: false, explanation: 'This blocks a core interaction for a transient, often sub-second condition, and is worse UX than accepting the draft and queuing the send.' },
+        { id: 'c', text: 'The message should be sent via the REST API instead, since the socket is down', correct: false, explanation: 'The REST API is for request/response operations like history and search, not for delivering chat messages, which belong on the real-time delivery path once it is available.' },
+      ],
+    },
+  ]}
+/>

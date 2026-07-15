@@ -1,0 +1,160 @@
+---
+title: "Caching Strategies"
+module: "Performance & Optimization"
+moduleOrder: 4
+order: 5
+track: "concept"
+summary: "Surveys the layers of frontend caching and how to reason about invalidation."
+cheatsheet:
+  - "Cache-Control max-age says how long a response can be reused; ETag/If-None-Match lets a stale copy be revalidated cheaply with a 304 instead of a full re-download."
+  - "Hashed filenames (app.a3f1c2.js) let you set immutable, max-age=31536000 on assets while cache-busting for free — a new build gets a new URL."
+  - "HTML (or an unhashed entry file) should stay short-lived or no-store, since it's what points at the hashed asset URLs."
+  - "Stale-while-revalidate serves the cached response immediately and refreshes it in the background — good for content where a few seconds of staleness is invisible to the user."
+  - "CDN caching and browser caching are separate layers with separate lifetimes (s-maxage vs max-age) — a CDN purge doesn't clear a visitor's browser cache and vice versa."
+  - "A service worker cache is a strategy you write in code (cache-first, network-first, SWR), not a header — pick per request type, not one policy for the whole app."
+  - "When you present a caching strategy in an interview, name the staleness window you're accepting for each layer and why the product can tolerate it."
+tags: ["performance", "caching"]
+estMinutes: 11
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every millisecond you don't spend fetching something over the network is a millisecond you get back for rendering. Caching is how you avoid re-fetching (or re-computing) things that haven't changed — and in frontend system design interviews, "what's your caching strategy" is really asking "how do you decide what's safe to reuse, for how long, and how do you know when it's gone stale?" There isn't one cache — there are several layers, each with its own lifetime and invalidation model, and a good answer names which layer handles which kind of data.
+
+This lesson walks through the four layers you'll typically reason about — HTTP caching, CDN caching, service-worker caching, and in-app data caching — and the invalidation techniques that tie them together.
+
+## Layer 1: HTTP caching
+
+The browser's built-in HTTP cache is controlled by response headers, and it's the cheapest cache you get — no code required.
+
+**`Cache-Control`** is the primary header:
+
+- `max-age=<seconds>` — how long the response is considered fresh, no network round trip needed at all.
+- `no-cache` — the response can be cached, but must be revalidated with the server on every use (despite the confusing name, this isn't "don't cache").
+- `no-store` — don't cache this at all; always fetch fresh (used for sensitive or highly volatile data).
+- `immutable` — tells the browser this exact URL will never change, so don't even revalidate it on a refresh.
+
+**`ETag`** (and `Last-Modified`) enable revalidation once `max-age` expires. The server returns an opaque `ETag` value with the response; on the next request, the browser sends `If-None-Match: <etag>`. If the content hasn't changed, the server replies `304 Not Modified` with no body, saving the download even though the freshness window has passed.
+
+The practical pattern: hashed static assets get a long `max-age` plus `immutable` (they never need revalidation — a change produces a new URL, covered below), while HTML documents and API responses that change more often use a short `max-age` or `no-cache` with an `ETag`, so a still-valid response can skip a full re-download.
+
+## Layer 2: CDN caching
+
+A CDN is a cache that sits between the origin server and every user, at edge locations distributed geographically. It caches responses (mostly static assets, but increasingly HTML too) so most requests never reach the origin at all.
+
+CDNs use their own header, **`s-maxage`** (or `Surrogate-Control`), which can differ from the browser's `max-age`. A common pattern: `Cache-Control: max-age=60, s-maxage=3600` — the browser treats the response as fresh for 60 seconds, while the CDN holds onto it for an hour, serving it to *every other visitor* during that hour without touching the origin.
+
+This matters for how you reason about freshness: a CDN cache is shared across users, so one origin fetch amortizes across thousands of requests — but it also means a content update needs an explicit CDN purge (or a cache key change) to take effect early, independent of what any single browser has cached.
+
+## Layer 3: Service-worker and offline caching
+
+A service worker runs in the background between your app and the network, and it gives you a programmable cache (the `Cache` API) instead of a headers-only one. This is what powers offline support and app-shell architectures.
+
+You choose the caching strategy per request type in code:
+
+- **Cache-first**: check the cache, serve it if present, only hit the network on a cache miss. Good for versioned static assets you control (app shell HTML, CSS, JS, icons).
+- **Network-first**: try the network, fall back to cache on failure. Good for content you want fresh whenever possible, but that should still work offline.
+- **Stale-while-revalidate**: serve the cached copy immediately, then fetch a fresh copy in the background and update the cache for *next* time. Good for content where showing something a few seconds old beats showing a spinner.
+
+Because this is code you write (typically in an install/activate/fetch event lifecycle), the service worker also owns its own invalidation: a new deploy ships a new service-worker script, which triggers a cache-name bump and a cleanup of old cache entries during the `activate` event.
+
+## Layer 4: In-app data caching
+
+Above all of that sits application-level caching — keeping already-fetched data in memory (or IndexedDB for persistence across reloads) so a component doesn't refetch what another part of the app already has.
+
+- **In-memory cache** (a `Map`, a query-library cache like React Query/SWR, or a normalized store): fastest, but gone on refresh. Good for data reused within a single session — e.g., a user's profile fetched once and read by five different components.
+- **IndexedDB**: persists across page loads and works well for larger or structured data — offline-capable feeds, drafts, or a local search index. Slower than memory but far faster than a network round trip.
+
+Data-fetching libraries generally combine a `staleTime` (how long data is considered fresh enough to serve without refetching) with a `cacheTime`/garbage-collection window (how long unused data is kept around at all, in case it's needed again soon). That two-number model — freshness window versus retention window — is worth naming explicitly when you describe an in-app cache design, since the two failure modes are different: too-short `staleTime` causes redundant refetching; too-short retention causes cache misses on tab switches.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  A[Browser request] --> B{In HTTP cache and fresh?}
+  B -- yes --> Z[Use cached response, no network]
+  B -- no / expired --> C{CDN edge has it?}
+  C -- yes, fresh --> D[CDN serves response]
+  C -- no / expired --> E[Origin server]
+  E --> F[Response with Cache-Control, ETag]
+  F --> C
+  D --> B
+  E -.-> G[Service worker cache, offline]
+  E -.-> H[In-app memory / IndexedDB cache]
+`} />
+
+## Invalidation: cache-busting and staleness trade-offs
+
+Long cache lifetimes are only safe if you have a reliable way to invalidate them the instant content changes. Two techniques dominate:
+
+### Cache-busting via hashed filenames
+
+Instead of serving `app.js` and worrying about how to tell caches it changed, bundlers emit `app.a3f1c2.js` — a filename derived from the file's content hash. A code change produces a different hash, which produces a different URL. Old cached copies at every layer (browser, CDN, service worker) simply become irrelevant; nothing was ever invalidated, a *new* resource was requested. This is why hashed assets can safely get `Cache-Control: max-age=31536000, immutable` — a year is fine, because "this exact URL's content changing" is not a scenario that occurs.
+
+The one file that can't be hashed this way is the entry point (`index.html`, or a manifest/import-map file) — something has to point at the current hash, and that file needs a short cache lifetime or `no-cache` so clients pick up new hashes promptly.
+
+### Stale-while-revalidate
+
+Where hashing doesn't apply — API responses, personalized data, content that changes on its own schedule — stale-while-revalidate is the standard middle ground between "always fresh, always slow" and "fast, but sometimes wrong." Serve what you have, trigger a background refresh, update silently for the next read. The user never waits on a network round trip, but also never sees data that's more than one refresh cycle stale.
+
+### Reasoning about the trade-off
+
+When you present a caching layer in an interview, name the staleness window you're accepting and justify it against the data's actual change frequency: a product catalog price might tolerate a 5-minute CDN cache; a live inventory count might need `no-store` or a very short `max-age` with revalidation; a user's own draft content might live safely in IndexedDB indefinitely, since only that user's actions change it. "Cache everything as long as possible" isn't a strategy — a strategy assigns a deliberate freshness budget per data type and picks the layer that hits that budget cheaply.
+
+## Worked example: a news app's dashboard
+
+Say you're designing the frontend for a news app. Static assets (JS/CSS bundles, logo, icon sprite) are hashed and served with `immutable, max-age=31536000` — a deploy changes the hash, so there's nothing to invalidate. The HTML shell is served with `Cache-Control: no-cache` plus an `ETag`, so a repeat visit gets a `304` instead of a full re-download when nothing changed.
+
+Headline lists are fetched from an API and cached at the CDN with `s-maxage=60` — a minute of staleness across all readers is an acceptable trade for cutting origin load by orders of magnitude, since headlines don't need to be instant. On the client, those same headline responses are held with a stale-while-revalidate policy: the UI paints instantly from whatever's cached, then quietly refreshes in the background so the next navigation is current.
+
+A logged-in user's saved-articles list is different: it's personalized and small, so it lives in an in-memory cache with a short `staleTime` (refetch on focus) plus a service-worker network-first policy, so it's fresh when online but still viewable — read from IndexedDB — when the user opens the app on a plane.
+
+<Callout type="warning">
+  A common mistake: setting a long `max-age` on the HTML entry file (or any file whose URL doesn't change on deploy) "for speed." Since the browser now considers that HTML fresh for hours or days, users can get stuck on an old page that references asset URLs from a previous build — assets that may no longer exist post-deploy, breaking the page entirely. Keep the entry file's cache lifetime short (or `no-cache` with an `ETag`); push long lifetimes only onto URLs that change whenever their content does.
+</Callout>
+
+<Quiz
+  lessonId="caching-strategies"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why can a hashed filename like `app.a3f1c2.js` safely be served with a one-year `max-age` and `immutable`?',
+      options: [
+        { id: 'a', text: 'Because the browser automatically re-validates immutable assets in the background', correct: false, explanation: '`immutable` tells the browser the opposite: skip revalidation entirely, even on a manual refresh.' },
+        { id: 'b', text: 'Because a content change produces a different hash and therefore a different URL, so the old cached URL never needs to reflect new content', correct: true, explanation: 'Cache-busting via hashing sidesteps invalidation: instead of updating what a URL points to, a change creates a brand-new URL, leaving old cached copies harmlessly unreferenced.' },
+        { id: 'c', text: 'Because CDNs treat hashed filenames as a special reserved pattern', correct: false, explanation: 'CDNs just cache by URL like any other resource; there is nothing special about the hash pattern itself beyond it changing per build.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are true about stale-while-revalidate?',
+      options: [
+        { id: 'a', text: 'It serves the cached response immediately and refreshes the cache in the background', correct: true, explanation: 'That is the core behavior: no network wait on the current request, with a background fetch updating the cache for next time.' },
+        { id: 'b', text: 'It guarantees the response returned is always fully up to date', correct: false, explanation: 'The opposite — the whole point is accepting some staleness (the current cached copy) in exchange for an instant response.' },
+        { id: 'c', text: 'It is a reasonable choice for content where a short staleness window is invisible or harmless to the user', correct: true, explanation: 'That is exactly the trade-off it targets: fine for headline lists or non-critical feeds, less fine for a live stock ticker or inventory count.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A CDN cache (controlled by `s-maxage`) and a browser\'s HTTP cache (controlled by `max-age`) are the same cache, so purging one clears the other.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'They are separate layers with independent lifetimes. Purging the CDN edge cache has no effect on what individual browsers have already stored locally, and vice versa.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — `s-maxage` governs the shared CDN cache, `max-age` governs each browser\'s own cache, and each needs its own invalidation path.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'An ETag lets a client avoid re-downloading a resource that has not changed. How does this work?',
+      options: [
+        { id: 'a', text: 'The client sends the ETag back via `If-None-Match`; if it matches server-side, the server replies `304 Not Modified` with no body', correct: true, explanation: 'That is exactly the revalidation flow — the client pays a round trip for the 304, but skips downloading the (potentially large) response body.' },
+        { id: 'b', text: 'The ETag is a timestamp that the browser compares against the system clock to decide freshness locally', correct: false, explanation: 'That describes `Last-Modified`-only comparisons; an ETag is an opaque content fingerprint, not a timestamp, and freshness/`max-age` is a separate, earlier check.' },
+        { id: 'c', text: 'The ETag tells the browser to skip caching this response entirely', correct: false, explanation: 'That is the role of `Cache-Control: no-store`; an ETag exists specifically to make caching plus revalidation possible.' },
+      ],
+    },
+  ]}
+/>

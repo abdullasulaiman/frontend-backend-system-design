@@ -1,0 +1,150 @@
+---
+title: "State Architecture Patterns"
+module: "Design Patterns & Architectures"
+moduleOrder: 6
+order: 6
+track: "concept"
+summary: "Covers architectural patterns for state at scale, building on the earlier fundamentals lesson."
+cheatsheet:
+  - "Normalize entity data (store by id in a flat map) once the same record shows up in more than one list or view — it turns 'update this everywhere' into a single write."
+  - "Unidirectional data flow (action to update to view to action) trades a little boilerplate for the ability to answer 'why did this change?' by reading one path instead of tracing arbitrary mutations."
+  - "Optimistic updates make mutations feel instant, but every optimistic update needs an explicit rollback path for the failure case — an optimistic update with no rollback is just an update that lies to the user under errors."
+  - "Cache invalidation on mutation should target the smallest set of queries the mutation actually affects, not a global refetch-everything reflex."
+  - "Pick architecture by asking two questions about the data: how many places need to read it (sharing), and how often it changes and from where (volatility) — those two answers point at the mechanism, not team convention."
+  - "Highly shared + low volatility (config, user profile) tolerates simple broadcast mechanisms; highly shared + high volatility (a live cart, a chat feed) is where normalized caches and event-driven updates earn their cost."
+tags: ["patterns", "state", "architecture"]
+estMinutes: 11
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The state-management-fundamentals lesson gave you four categories of state and a mechanism for each. That's enough for a single feature. It's not enough for an app where the same product appears in a search results grid, a "recently viewed" rail, and a cart drawer — and updating its price needs to update all three without you writing three update paths by hand. At that scale, the question stops being "where does this value live" and becomes "what's the architecture that keeps a hundred components in sync without a hundred bespoke wires between them."
+
+This lesson covers three patterns that answer that question: normalizing client-side caches so an entity has exactly one copy, structuring updates as a unidirectional event flow so changes are traceable, and synchronizing server state with optimistic updates plus targeted cache invalidation. It closes with a way to decide which of these you actually need for a given piece of data.
+
+## Normalized client caches
+
+A naive cache stores server responses shaped exactly like the API returned them: a `feedPosts` array, a `profilePosts` array, a `searchResults` array — each one holding its own full copy of any post that happens to appear in it. Like one post gets liked, and now three arrays each hold a stale `likeCount`, and you need to know about all three arrays to fix it.
+
+Normalization stores each entity once, keyed by id, in a flat table — `posts: { '123': { id: '123', likeCount: 41, ... } }` — and every list becomes just an array of ids that reference into that table (`feedPostIds: ['123', '87', ...]`). Update `posts['123']`, and every view that renders post 123 sees the new value automatically, because they're all reading the same object.
+
+This is the same idea as normalizing a SQL schema, applied to the client. The cost is indirection: rendering a list now means "look up each id, then read the entity," and relationships between entities (a post's comments, a comment's author) need their own id references rather than nested copies. That cost is worth paying once the same entity legitimately appears in more than one place in the UI — for a screen where every entity only ever appears once, normalizing is pure overhead.
+
+Most server-state libraries (React Query, Apollo's cache, RTK Query) do this normalization for you under the hood, keyed by query key or by a `__typename` + id pair — which is a large part of why reaching for one beats hand-rolling `useState` + `useEffect` per fetch, as the fundamentals lesson noted.
+
+## Event-driven, unidirectional data flow
+
+The second pattern is about *how* updates happen, not where data lives. In an unstructured app, any component can mutate any shared state directly — a click handler in component A sets a value that component B also mutates from a different handler, and tracing "why is this wrong" means checking every place that touches it.
+
+The flux-style alternative: a change is described as a plain data object (an "action") describing *what happened*, that object is the only way to reach a central update function, and that update function is the only thing allowed to produce a new state. Views never mutate state directly — they dispatch actions and re-render off whatever state the update function produced. That's the "unidirectional" part: data flows action to update to view, and the view's own reaction to what it renders is to dispatch new actions, not to reach back and mutate.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    V[View] -->|dispatches| A[Action]
+    A -->|the only input to| U[Update function<br/>reducer/store]
+    U -->|produces new| S[State]
+    S -->|re-renders| V
+`} />
+
+The payoff isn't philosophical purity — it's that every state change has exactly one entry point, so you can log every action, replay them for a bug report, or add a single piece of middleware (analytics, undo/redo, persistence) that sees every change without touching the components that triggered them. The cost is real: an action + update function for a two-line state change is more ceremony than `setState` needs. This pattern earns its cost for shared state with many writers and readers — a shopping cart, a multi-step form wizard, a collaborative editor's document state — and is overkill for one component's local toggle.
+
+## Server-state synchronization: optimistic updates and invalidation
+
+Server state (per the fundamentals lesson's third category) has a synchronization problem local and shared UI state don't: the source of truth lives on another machine, and a mutation you send might succeed, fail, or land out of order relative to other requests.
+
+**Optimistic updates** address the *feel* of that latency: instead of waiting for the mutation's response before updating the UI, you apply the expected result immediately (mark the item liked, show the new comment in the list) and reconcile once the real response arrives. If the request fails, you roll the change back and surface the error. Done well, this is the difference between a like button that feels instant and one that visibly waits 200ms every time.
+
+**Cache invalidation on mutation** addresses *correctness* after the mutation resolves: once you `POST` a new comment, every cached view that shows that post's comment count or comment list is now stale and needs to either be updated directly (if the response tells you the new state) or marked stale so the next read refetches it. Most server-state libraries key cached data by a "query key" (e.g. `['post', 123, 'comments']`) specifically so a mutation can say "anything under this key is now stale" without the caller needing to know every component that happens to be reading it.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant U as User clicks "Like"
+    participant C as Client cache
+    participant S as Server
+    U->>C: apply optimistic update (likeCount + 1)
+    C->>S: send like mutation
+    alt success
+        S-->>C: confirm, real data
+        C->>C: reconcile (usually a no-op)
+    else failure
+        S-->>C: error
+        C->>C: roll back to prior likeCount
+    end
+    C->>C: invalidate cached "post" query
+`} />
+
+## Choosing an architecture: sharing versus volatility
+
+Not every piece of state needs normalization, a flux dispatcher, and optimistic sync. Two questions about the *data itself* — not team preference — point at the right mechanism:
+
+- **How shared is it?** Does one component read it, or does the same entity/value need to stay consistent across many, possibly distant, parts of the tree?
+- **How volatile is it?** Does it change rarely (a user's display name, feature flags loaded once) or constantly, from multiple sources (a live cart total, a chat message list, stock ticker prices)?
+
+Low sharing, any volatility: keep it local. A component's own draft input doesn't need any of these patterns regardless of how often it changes.
+
+High sharing, low volatility: a plain shared store or context read from multiple places is enough — you don't need normalization because there's nothing to keep in sync frequently, and you don't need an event-driven system because writes are rare enough that a direct update is easy to trace by hand.
+
+High sharing, high volatility, but the data is *server-owned*: this is where a normalized server-state cache with optimistic updates and mutation-scoped invalidation earns its keep — a product catalog shown in five places, a cart that changes from the product page, the cart drawer, and a "buy again" button all at once.
+
+High sharing, high volatility, *client-owned*: this is the unidirectional-flow case — a collaborative document, a multi-panel dashboard where filters in one panel affect three others, a real-time chat UI. The volatility means many writers; the sharing means many readers; you want one traceable path for both.
+
+## Worked example: an order-tracking dashboard
+
+Picture a logistics dashboard: a shipment list, a map showing shipment pins, and a detail panel — all showing overlapping views of the same shipments, which update via both user actions (marking one delivered) and a WebSocket feed pushing carrier status changes.
+
+- Shipments are normalized by id in the client cache. The list, the map, and the detail panel all read the same `shipments['SHP-4471']` object, so a status change from *either* the WebSocket feed or a user's "mark delivered" click updates all three views from one write.
+- Marking a shipment delivered is an optimistic update: the UI flips to "Delivered" immediately, the `PATCH` request goes out, and a failure rolls the status back and shows a toast — the dispatcher/warehouse worker doesn't sit and wait for a spinner on every click.
+- The WebSocket feed and the "mark delivered" mutation both funnel through the same update path (dispatch a `shipmentStatusChanged` action) rather than each independently patching the cache their own way — so a bug in how status changes are applied only has one place to look.
+- The dashboard's currently-selected shipment id lives in the URL, not in the shipment cache — refreshing the page or sharing a link should reopen the same detail panel, which is a URL-state concern layered on top of, not mixed into, the server cache.
+
+<Callout type="warning">
+  A frequent mistake with optimistic updates: implementing the "apply immediately" half and skipping the rollback half, because the happy path is what gets tested. In production, a percentage of mutations always fail — a flaky network, a validation error the client didn't check, a conflict with another user's concurrent edit. Without an explicit rollback (revert the optimistic change and show the real error), users end up staring at UI that confidently shows a state the server never actually accepted, and they lose trust in the app the first time they discover it. Always write the failure branch of an optimistic update before shipping the success branch.
+</Callout>
+
+<Quiz
+  lessonId="state-architecture-patterns"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A "product" object shows up in a search results grid, a wishlist, and a cart drawer, each currently holding its own copy fetched separately. What does normalizing the client cache fix?',
+      options: [
+        { id: 'a', text: 'Updating one property (like price) requires writing to only one place, and every view reflects it automatically', correct: true, explanation: 'Normalization stores each entity once by id; every view reads the same object, so a single write propagates everywhere the entity is rendered.' },
+        { id: 'b', text: 'It removes the need to ever refetch data from the server', correct: false, explanation: 'Normalization is about avoiding duplicate copies on the client — it does not eliminate the need for network requests or staleness handling.' },
+        { id: 'c', text: 'It guarantees the UI updates instantly before a mutation response arrives', correct: false, explanation: 'That instant-update behavior is what optimistic updates provide, which is a separate pattern from normalization.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine benefits of routing all state changes through a single unidirectional action-to-update path (flux-style), rather than letting any component mutate shared state directly? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Every change has one traceable entry point, making bugs easier to reproduce and log', correct: true, explanation: 'Because all writes funnel through actions and one update function, you can log or replay every action to see exactly what produced a given state.' },
+        { id: 'b', text: 'It eliminates the need to think about which state is shared versus local', correct: false, explanation: 'Unidirectional flow is about how shared state changes, not about which state should be shared in the first place — local state still stays local.' },
+        { id: 'c', text: 'Cross-cutting concerns like analytics or undo/redo can be added once, at the update function, without touching every component that dispatches actions', correct: true, explanation: 'Since every action passes through one funnel, middleware there sees every change without each dispatching component needing to know about it.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'An optimistic update is complete once the UI is changed immediately on user action, without needing any additional handling for the mutation request failing.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'An optimistic update without a rollback path shows the user a state the server never confirmed, and possibly never will, whenever the mutation fails.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'A correct optimistic update always pairs the immediate UI change with an explicit rollback (and usually an error toast) for the case where the request fails.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A dashboard shows a "last synced at" timestamp that is fetched once on load and almost never changes, read by a single header component. Which architecture fits best?',
+      options: [
+        { id: 'a', text: 'A plain fetch into local or lightly shared state — no normalization, no unidirectional dispatcher, no optimistic sync needed', correct: true, explanation: 'Low sharing (one consumer) and low volatility (fetched once, rarely changes) means none of the heavier patterns pay for themselves here.' },
+        { id: 'b', text: 'A normalized cache with mutation-scoped invalidation', correct: false, explanation: 'Normalization solves duplicate copies of entities shown in multiple places; a single value read by one component has nothing to normalize.' },
+        { id: 'c', text: 'A flux-style unidirectional dispatcher shared across the app', correct: false, explanation: 'That pattern earns its overhead for state with many writers and readers; a rarely-changing value read by one component does not need it.' },
+      ],
+    },
+  ]}
+/>

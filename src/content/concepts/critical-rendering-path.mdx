@@ -1,0 +1,155 @@
+---
+title: "The Critical Rendering Path"
+module: "Performance & Optimization"
+moduleOrder: 4
+order: 1
+track: "concept"
+summary: "Defines the critical rendering path and the techniques used to shorten it."
+cheatsheet:
+  - "The critical rendering path is everything the browser must finish before the first meaningful pixels appear — not the whole page load."
+  - "CSS is render-blocking by default: the browser withholds first paint until it has a full CSSOM, because it refuses to paint unstyled content."
+  - "A synchronous `<script>` in `<head>` blocks HTML parsing too — the parser stops, fetches, and executes before it can build the rest of the DOM."
+  - "`defer` runs scripts in order after parsing finishes; `async` runs them as soon as they arrive, in arbitrary order — neither blocks the parser while fetching."
+  - "Split your CSS into 'critical' (above-the-fold) and 'the rest'; inline the critical slice and load the rest without blocking paint."
+  - "`<link rel=\"preload\">` tells the browser to fetch something urgently without changing when it's applied — use it for the hero image, key font, or a CSS file discovered late (e.g. via JS)."
+  - "`font-display: swap` (or `optional`) trades a flash of fallback-styled text for not blocking text from appearing at all — usually the right trade for body copy."
+tags: ["performance", "rendering"]
+estMinutes: 11
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A user taps a link, the network spinner clears, and then... nothing, for another second and a half, before anything shows up. Somewhere in that gap the browser had everything it needed to paint something — HTML had arrived, the layout was knowable — but a handful of resources stood between "bytes received" and "pixels drawn." That gap is the **critical rendering path**, and shrinking it is one of the highest-leverage things you can do for perceived performance, because it directly controls when a user sees *anything* at all.
+
+This lesson is about the page-load version of rendering: what the browser must fetch and process before first paint, and how to get there faster. If you want the mechanics of DOM/CSSOM/layout/paint themselves, see `the-browser-rendering-pipeline` — this lesson assumes that model and focuses on what delays it on a cold load.
+
+## What "critical" actually means
+
+The critical rendering path is the minimum sequence of steps the browser must complete to render the first meaningful pixels of a page:
+
+1. Receive and parse enough HTML to know the DOM structure.
+2. Receive and parse all CSS needed to compute styles for what's above the fold (building the CSSOM).
+3. Run any JavaScript that blocks parsing or that the initial render depends on.
+4. Combine DOM + CSSOM into a render tree, run layout, and paint.
+
+"Critical" doesn't mean "important" in some vague sense — it means "on the path to first paint." A below-the-fold image, an analytics script, or a comment widget might matter to the product, but none of them are on the critical path: the browser can paint the initial view without them. The goal of every technique in this lesson is the same: get more things off that path, or make the things still on it smaller and faster to obtain.
+
+## Render-blocking resources
+
+Two resource types are render-blocking by default, for different reasons.
+
+### CSS blocks paint
+
+The browser will not paint anything until it has the full CSSOM for the current document, because painting unstyled content and then re-painting once styles arrive would cause a visible flash (this is exactly the "flash of unstyled content" you're avoiding). Practically: every `<link rel="stylesheet">` in `<head>` delays first paint until it's fetched and parsed, no matter how small. A single 200KB CSS bundle on a slow connection can hold back paint for seconds, even if the HTML and JS were both ready instantly.
+
+### Synchronous JS blocks parsing (and therefore paint)
+
+A plain `<script src="...">` (no `async`, no `defer`) is worse than render-blocking CSS in one specific way: it also blocks HTML parsing. When the parser hits that tag, it stops building the DOM, fetches the script (if external), executes it, and only then resumes parsing. If that script is large, or sits behind a slow third-party host, the DOM itself stalls — and since the DOM feeds the render tree, paint stalls with it.
+
+<Mermaid client:visible chart={`
+gantt
+    title Page load timeline (critical path highlighted)
+    dateFormat  X
+    axisFormat %s
+    section Network
+    HTML request/response      :done, html, 0, 300
+    section Parsing
+    Parse HTML (blocks at script) :active, parse, 300, 350
+    Fetch + exec blocking JS    :crit, js, 350, 700
+    Resume HTML parsing        :active, parse2, 700, 750
+    section Styles
+    Fetch + parse CSS          :crit, css, 300, 900
+    section Render
+    Render tree + Layout + Paint :crit, paint, 900, 950
+    section Off critical path
+    Fetch below-fold image     :done, img, 300, 1200
+    Analytics script (async)   :done, async1, 750, 1000
+`} />
+
+In this timeline, CSS is the long pole: even though the blocking script finishes around 700ms, first paint can't happen until the CSSOM is ready at 900ms. The image and the async analytics script are running the whole time but never delay paint — they're simply not on the critical path.
+
+## Shortening the critical path
+
+### Minimize and inline critical CSS
+
+Split your styles into "critical" (whatever's needed to render the above-the-fold view correctly) and "everything else." Inline the critical slice directly in `<head>` as a `<style>` block so it needs zero extra round trips, and load the remaining CSS in a way that doesn't block paint — commonly `<link rel="stylesheet" media="print" onload="this.media='all'">` or an equivalent async-CSS loader pattern. The trade-off is real: you now maintain two CSS artifacts (or a build step that extracts one from the other), and if your "critical" slice guesses wrong, you get a visible re-flow when the rest of the CSS lands. For most content pages, a few KB of inlined critical CSS covering the hero/header is worth that cost; for a small app-wide stylesheet already under ~15KB, it often isn't worth the complexity.
+
+### Defer or async non-critical JS
+
+Nothing your initial paint depends on should be a blocking `<script>` tag. Use `defer` for anything that needs to run in document order and interact with the DOM once it exists (most app bootstrap code); use `async` for independent scripts that don't care when they run relative to others (most analytics and third-party tags). Both let the parser keep building the DOM while the script downloads in the background — the difference is only about *when* they execute relative to parsing finishing and to each other.
+
+### Preload the resources you already know you need
+
+`<link rel="preload">` tells the browser "fetch this now, at high priority" without changing how or when it's applied. It's most useful for resources the browser wouldn't otherwise discover early: a hero image referenced only inside CSS `background-image`, a web font, or a CSS/JS chunk that's normally only discovered after another script runs. Preloading doesn't shorten the work itself — it shortens the delay before the browser *starts* that work, which matters most for resources deep in a dependency chain.
+
+### Font-loading strategy
+
+Fonts are their own critical-path trap: by default, a browser using `@font-face` will hold text invisible until the font file arrives (a "flash of invisible text"), which can add hundreds of milliseconds even after CSS and JS are done. Two common fixes:
+
+- `font-display: swap` — paint text immediately in a fallback font, then swap to the web font once it loads. Trades a visible font swap for never blocking text.
+- `font-display: optional` — use the web font only if it's already cached or arrives within a very short window; otherwise stick with the fallback for this page view. No swap, but the custom font may not show up on a cold load.
+
+Preloading the font file itself (`<link rel="preload" as="font">`) combines well with either: it starts the fetch earlier so the swap (if any) happens sooner.
+
+## Worked example: a blog post page
+
+Say a blog post page ships: 40KB of app-wide CSS, a 90KB JS bundle for the site's interactive header/search widget, a web font for body text, and a hero image. Unoptimized, the load order is CSS link, JS `<script>` (blocking), font `@font-face`, all discovered in that order from the HTML `<head>`.
+
+Applying the techniques above: inline roughly 4KB of critical CSS (header + article typography) directly in `<head>`, load the remaining 36KB of CSS asynchronously since it only affects the search widget and footer. Change the JS tag to `defer` — it manipulates the DOM but doesn't need to block parsing to do it. Add `<link rel="preload" as="font" href="...">` for the body-text font and set `font-display: swap` in the `@font-face` rule. The hero image, if it's above the fold, gets its own `<link rel="preload" as="image">` since otherwise the browser wouldn't discover it until CSS parsing reaches the rule referencing it.
+
+Net effect: first paint now depends only on HTML parsing plus 4KB of inlined CSS — no JS execution, no font fetch, no 36KB CSS fetch. The rest of the resources still load, just off the critical path, and the page becomes interactive shortly after paint instead of visibly blocked on it.
+
+<Callout type="warning">
+  A common mistake: treating "add `async` to every script" as a universal fix. `async` scripts run as soon as they arrive, in whatever order that happens to be — if script B depends on script A having already run (e.g. a plugin depending on a framework being loaded first), `async` on both introduces a race condition that "works in dev" and intermittently breaks in production depending on cache state and network timing. Use `defer` (which preserves document order) for anything with ordering dependencies, and reserve `async` for truly independent scripts.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="critical-rendering-path"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does the browser block first paint on CSS by default, even for a page that already has its full DOM?',
+      options: [
+        { id: 'a', text: 'CSS files are always larger than HTML, so the browser waits for the bigger download first', correct: false, explanation: 'File size isn\'t the reason — a tiny CSS file still blocks paint. It\'s about correctness of what gets painted, not download size.' },
+        { id: 'b', text: 'Painting unstyled content and then repainting once styles arrive would cause a visible flash, so the browser waits for a complete CSSOM first', correct: true, explanation: 'Correct. The browser withholds first paint until it can compute final styles for the visible content, avoiding a flash of unstyled content.' },
+        { id: 'c', text: 'The DOM cannot be constructed until CSS is parsed', correct: false, explanation: 'DOM construction from HTML and CSSOM construction from CSS are independent parsing processes; CSS doesn\'t block DOM construction, only the subsequent render tree/paint step.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are on the critical rendering path for a typical page\'s first paint? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A stylesheet linked in <head> with no media query restricting it', correct: true, explanation: 'An unrestricted <link rel="stylesheet"> in <head> is render-blocking by default — it\'s on the critical path.' },
+        { id: 'b', text: 'A blocking <script src="..."> placed before the visible content in <head>, with no async/defer', correct: true, explanation: 'A plain synchronous script blocks HTML parsing itself, which delays DOM construction and therefore first paint.' },
+        { id: 'c', text: 'An analytics script loaded with the async attribute', correct: false, explanation: 'async scripts don\'t block parsing and aren\'t required for the initial render — they\'re explicitly off the critical path by design.' },
+        { id: 'd', text: 'A below-the-fold image with loading="lazy"', correct: false, explanation: 'A lazy-loaded, below-the-fold image isn\'t needed for the initial visible paint and is deliberately deferred — not on the critical path.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A script tag with the `defer` attribute can execute before the HTML parser has finished building the DOM.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'defer scripts specifically wait for parsing to complete, and run in document order, before the DOMContentLoaded event fires.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the whole point of defer is that the script executes only after HTML parsing has finished, unlike async which can execute as soon as it arrives, mid-parse.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A web font is causing a "flash of invisible text" that adds noticeable delay before body copy appears, even though the font file is only 30KB. What is the most direct fix?',
+      options: [
+        { id: 'a', text: 'Remove the font entirely and use only system fonts', correct: false, explanation: 'That works but throws away the design intent entirely; it\'s a valid fallback but not the "most direct fix" for the described problem — font-display solves it while keeping the custom font.' },
+        { id: 'b', text: 'Set font-display: swap (or optional) on the @font-face rule so text renders in a fallback font immediately instead of staying invisible', correct: true, explanation: 'This is exactly what font-display controls: it changes the browser\'s behavior from "hide text until the font loads" to "show fallback text now, swap later (or never, with optional)."' },
+        { id: 'c', text: 'Move the @font-face declaration to the bottom of the CSS file', correct: false, explanation: 'CSS rule order within a stylesheet doesn\'t affect when the browser decides to hide text waiting for a font — that behavior is controlled by font-display, not rule position.' },
+      ],
+    },
+  ]}
+/>
