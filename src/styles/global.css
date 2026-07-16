@@ -306,3 +306,23 @@ hr {
   letter-spacing: 0.04em;
   margin-bottom: 0.375rem;
 }
+
+/* Sidebar lesson links. Active state is keyed off `aria-current="page"` so it
+   can be reconciled in JS after view-transition navigations (the sidebar is
+   persisted, so its server-rendered highlight would otherwise go stale). */
+.nav-lesson {
+  color: var(--muted);
+}
+.nav-lesson:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.nav-lesson[aria-current='page'] {
+  background: var(--brand);
+  color: #fff;
+  font-weight: 600;
+}
+.nav-lesson[aria-current='page']:hover {
+  background: var(--brand);
+  color: #fff;
+}

@@ -40,6 +40,7 @@ for (const track of tracks) {
 <aside
   class="w-full shrink-0 border-[var(--border)] p-4 lg:sticky lg:top-16 lg:h-[calc(100vh-4rem)] lg:w-72 lg:overflow-y-auto lg:border-r"
   aria-label="Lesson navigation"
+  transition:persist="sidebar"
 >
   {tracks.map(track => (
     <div class="mb-6 last:mb-0">
@@ -67,12 +68,7 @@ for (const track of tracks) {
                     <a
                       href={`${track.base}/${lesson.id}`}
                       aria-current={isActive ? 'page' : undefined}
-                      class={
-                        'block rounded-sm px-2 py-1.5 text-sm transition-colors duration-[var(--transition-fast)] ' +
-                        (isActive
-                          ? 'bg-[var(--brand)] font-semibold text-white'
-                          : 'text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]')
-                      }
+                      class="nav-lesson block rounded-sm px-2 py-1.5 text-sm transition-colors duration-[var(--transition-fast)]"
                     >
                       {lesson.title}
                     </a>
@@ -86,3 +82,26 @@ for (const track of tracks) {
     </div>
   ))}
 </aside>
+
+<script is:inline>
+  // The sidebar is `transition:persist`ed across view-transition navigations,
+  // so its server-rendered active highlight would go stale. Reconcile the
+  // `aria-current="page"` marker against the current URL on every page load
+  // (fires on first load AND after each view transition). CSS keys the active
+  // styling off `[aria-current="page"]`, so toggling the attribute is enough.
+  (function () {
+    function syncActiveLesson() {
+      var here = location.pathname.replace(/\/+$/, '');
+      document.querySelectorAll('a.nav-lesson').forEach(function (a) {
+        var href = a.getAttribute('href') || '';
+        if (href.replace(/\/+$/, '') === here) {
+          a.setAttribute('aria-current', 'page');
+        } else {
+          a.removeAttribute('aria-current');
+        }
+      });
+    }
+    syncActiveLesson();
+    document.addEventListener('astro:page-load', syncActiveLesson);
+  })();
+</script>

@@ -1,7 +1,7 @@
 @import 'tailwindcss';
 
 /*
- * Design tokens for "Grokking Frontend System Design".
+ * Design tokens for "The System Design Handbook".
  *
  * Two layers:
  * 1. `@theme` — static values Tailwind compiles into utility classes
