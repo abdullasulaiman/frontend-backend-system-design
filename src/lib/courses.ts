@@ -74,18 +74,3 @@ export function trackForCollection(collection: CollectionName): CourseTrack {
   }
   throw new Error(`No track registered for collection "${collection}"`);
 }
-
-/** Find the track whose basePath is a prefix of the given pathname. */
-export function trackForBasePath(pathname: string): CourseTrack | undefined {
-  const here = pathname.replace(/\/+$/, '') || '/';
-  let best: CourseTrack | undefined;
-  for (const course of COURSES) {
-    for (const track of course.tracks) {
-      const base = track.basePath.replace(/\/+$/, '');
-      if (here === base || here.startsWith(`${base}/`)) {
-        if (!best || track.basePath.length > best.basePath.length) best = track;
-      }
-    }
-  }
-  return best;
-}
