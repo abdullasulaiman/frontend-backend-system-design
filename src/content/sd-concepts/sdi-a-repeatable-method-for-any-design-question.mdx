@@ -1,0 +1,140 @@
+---
+title: "A Repeatable Method for Any Design Question"
+module: "System Design Interviews"
+moduleOrder: 2
+order: 6
+track: "concept"
+summary: "Gives a repeatable, six-step method for structuring any system design interview so you never freeze on an unfamiliar prompt."
+tags: ["system-design-interview", "framework", "interview-strategy", "communication"]
+estMinutes: 12
+cheatsheet:
+  - "Use the six-step loop: Scope -> Numbers -> Contract -> Blueprint -> Deep Dive -> Wrap-up. It works on any prompt because it doesn't depend on knowing the 'right' architecture in advance."
+  - "Scope kills more interviews than any technical gap — spend real minutes on functional/non-functional requirements before drawing anything."
+  - "Turn scale numbers into QPS and storage-per-year; those two figures alone tell you whether you need sharding, caching, or neither."
+  - "Write the API contract (or a plain-English equivalent) before the boxes — it forces you to agree on what the system actually does before deciding how."
+  - "The first architecture diagram should be the dumbest thing that could plausibly work; layer in caches, queues, and replicas only in response to a stated pressure."
+  - "Pick your own deep dive if the interviewer doesn't hand you one — steering toward a topic you can go deep on beats waiting to be steered somewhere you can't."
+  - "Reserve two minutes at the end for a wrap-up: bottlenecks, what you'd change with more time, and known trade-offs you accepted."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The hardest part of a system design interview isn't usually the technology — it's the first ninety seconds after the prompt lands. "Design a ride-hailing dispatch system" or "design a notification service" can trigger a blank stare even from engineers who know caching, sharding, and queues cold, because those tools don't tell you where to start or in what order to bring them up. Without a method, candidates either freeze, or they lurch straight to a whiteboard architecture that's answering a question the interviewer never asked.
+
+A repeatable method fixes this by giving you the same starting move for every prompt, regardless of domain. You're not memorizing "how Uber's dispatch system works" — you're applying one loop that turns any vague prompt into a structured, defensible design in about 35-40 minutes. This lesson lays out that loop step by step; the next lessons in this course apply it to specific systems.
+
+## The six-step loop
+
+Call it **Scope -> Numbers -> Contract -> Blueprint -> Deep Dive -> Wrap-up**. Each step produces an artifact (a list, a number, an API signature, a diagram) that the next step consumes, so the conversation has visible forward motion instead of circling.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[1. Scope] --> B[2. Numbers]
+  B --> C[3. Contract]
+  C --> D[4. Blueprint]
+  D --> E[5. Deep Dive]
+  E --> F[6. Wrap-up]
+`} />
+
+### 1. Scope: decide what you're actually building
+
+Most prompts are deliberately underspecified — "design a notification service" could mean push notifications for a mobile app, email digests, or both, fanned out to millions of users or a few thousand. Spend the first 3-5 minutes pinning down:
+
+- **Functional requirements**: the 3-5 core actions the system must support. Not every feature real systems have — the ones that matter for this conversation. For a notification service: send a notification, let a user set channel preferences, and prevent duplicate sends.
+- **Non-functional requirements**: what quality attributes matter most — availability over strict consistency, low latency over throughput, durability of writes, and so on. State them as explicit trade-offs, not a wish list ("we want everything").
+- **Explicit non-goals**: say out loud what you're *not* designing (e.g., "I'll assume push tokens are already registered via an existing device-registration flow, and I won't design that flow"). This prevents scope creep from swallowing your remaining time.
+
+This step alone prevents the single most common interview failure: building a detailed, correct architecture for a system nobody asked for.
+
+### 2. Numbers: turn scale into two figures
+
+Ask for (or estimate) enough inputs to compute two things: **requests per second** and **storage growth per year**. These two numbers, more than any other input, determine whether you need a single database or a sharded cluster, whether an in-memory cache is enough, and whether a queue is load-bearing or optional.
+
+A rough approach: estimate daily active users, then daily actions per user, then convert to average and peak QPS (peak is usually 2-5x average for consumer traffic with daily cycles). For storage, estimate bytes per record times records per day times 365, then multiply by a retention period.
+
+You don't need precision — you need order of magnitude. The difference between "5,000 requests/sec" and "50,000 requests/sec" changes your design; the difference between 5,000 and 5,200 doesn't.
+
+### 3. Contract: define the API before the boxes
+
+Write down the core API calls (or a plain-English equivalent if the interviewer prefers prose) before touching architecture: `sendNotification(userId, template, channel)`, `getPreferences(userId)`, and so on. This step forces agreement on *what* the system does before you argue about *how*, and it surfaces hidden requirements — deciding the return value of `sendNotification` often surfaces the question of whether sends are synchronous or fire-and-forget, which materially changes the architecture.
+
+### 4. Blueprint: draw the simplest thing that could work
+
+Start with the most boring architecture that satisfies the requirements from step 1 at the scale from step 2 — a client, a service, a database. Resist the urge to open with a heavily-optimized design; it signals you're pattern-matching to a memorized diagram rather than reasoning from the requirements in front of you.
+
+Then layer in complexity one justified piece at a time: "at this write volume, a single database becomes the bottleneck, so I'd shard by user ID" or "sends need to survive a downstream provider outage, so I'll put a queue between the API and the delivery workers." Each addition should trace back to a number or requirement from steps 1-2. An architecture where every box has a stated reason is far stronger than one that's technically more sophisticated but unexplained.
+
+### 5. Deep dive: go deep on one or two hard parts
+
+No interview has time to fully design every component at the same depth, and a good candidate doesn't try. Pick (or accept the interviewer's steer toward) the one or two hardest problems in this specific system — deduplicating notification sends, handling delivery-provider retries without double-sending, or keeping a dispatch queue fair under load — and spend real time there: failure modes, edge cases, and at least one alternative you considered and rejected.
+
+If the interviewer doesn't hand you a deep-dive topic, propose one yourself: "I think the interesting problem here is preventing duplicate sends when a retry races with a slow acknowledgment — can I dig into that?" Steering toward strength beats waiting passively and hoping you're steered somewhere you can't answer well.
+
+### 6. Wrap-up: name what you'd do with more time
+
+In the last two minutes, summarize the design's known bottlenecks, the trade-offs you accepted on purpose (and why), and what you'd tackle next with more time — multi-region failover, a smarter rate limiter, better observability. This isn't padding; it demonstrates you know the design's limits rather than believing you built something flawless.
+
+## Worked example: applying the loop live
+
+Prompt: "Design a service that lets users upvote posts, with a running vote count shown next to each post."
+
+- **Scope**: functional — cast an upvote, remove an upvote, show current count. Non-functional — availability matters more than millisecond-fresh counts; a count that's a few seconds stale under load is acceptable. Non-goal: not designing post creation or the feed itself.
+- **Numbers**: assume 20 million daily active users, each casting on average 5 votes/day -> ~100M votes/day -> roughly 1,150 votes/sec average, call it 4,000/sec at peak. Storage: a vote record at ~50 bytes times 100M/day times 365 is roughly 1.8 TB/year if every vote is retained indefinitely.
+- **Contract**: `castVote(userId, postId)`, `getVoteCount(postId)`.
+- **Blueprint**: start with a votes table and a synchronous count query — clearly too slow to recompute per read at this volume, so add a counter cache (incremented asynchronously via a queue consuming vote events) that the read path hits instead of the raw table.
+- **Deep dive**: preventing double-counting when a user's client retries `castVote` after a timeout — solved with an idempotency key per (user, post) pair and a unique constraint, so a retried request is a no-op rather than a double vote.
+- **Wrap-up**: note that this design tolerates a few seconds of count staleness under load, and that a next iteration would add sharding the votes table by post ID once a single post's vote volume (a viral post) threatens to bottleneck one partition.
+
+Notice the numbers from step 2 directly justified the counter cache in step 4 — that traceability is what makes a design defensible instead of decorative.
+
+<Callout type="warning">
+  A common failure mode is running this loop once, silently, in your head, then presenting only the final architecture. The interviewer is evaluating your *reasoning process*, not just the end diagram — narrate each step out loud as you do it ("given that write volume, I'd add a queue here because...") so the interviewer can follow, correct, and steer you before you've sunk ten minutes into the wrong branch.
+</Callout>
+
+<Quiz
+  lessonId="sdi-a-repeatable-method-for-any-design-question"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does the method described in this lesson start with "Scope" before any numbers or architecture?',
+      options: [
+        { id: 'a', text: 'Because interviewers expect exactly five minutes of small talk before the technical portion begins', correct: false, explanation: 'Scope is a requirements-gathering step, not small talk — its purpose is to pin down what is actually being built, not to fill time.' },
+        { id: 'b', text: 'Because building a detailed architecture for the wrong problem is one of the most common ways candidates fail, and scoping prevents it', correct: true, explanation: 'Prompts are deliberately underspecified; without agreeing on functional/non-functional requirements and non-goals first, a candidate can spend the whole interview solving a problem the interviewer never intended.' },
+        { id: 'c', text: 'Because numbers and architecture are not actually necessary if scope is defined well enough', correct: false, explanation: 'Scope is a prerequisite step, not a replacement for the numbers and architecture steps that follow it in the loop.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'According to the lesson, which of these should directly influence architecture decisions made in the "Blueprint" step? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Estimated requests per second and storage growth per year from the Numbers step', correct: true, explanation: 'These two figures are called out as the main drivers of whether sharding, caching, or queues are actually needed.' },
+        { id: 'b', text: 'The non-functional requirements agreed on during Scope (e.g., availability over strict freshness)', correct: true, explanation: 'A stated trade-off like "a few seconds of staleness is fine" directly justifies design choices like an asynchronous counter cache.' },
+        { id: 'c', text: 'Whichever architecture diagram is fastest to draw on a whiteboard', correct: false, explanation: 'The lesson argues every added component should trace back to a stated requirement or number, not to drawing convenience.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'If an interviewer does not explicitly tell you which part of the design to go deeper on, the best move is to keep the design shallow everywhere and wait to be told.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The lesson recommends proactively proposing a deep-dive topic yourself when none is given, rather than waiting passively.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the lesson explicitly advises steering toward a topic you can go deep on if the interviewer does not provide one, since no interview has time to go deep everywhere.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the worked upvote-counting example, what specific number from the "Numbers" step directly motivated adding an asynchronous counter cache in the "Blueprint" step?',
+      options: [
+        { id: 'a', text: 'The 1.8 TB/year storage estimate for vote records', correct: false, explanation: 'That figure speaks to long-term storage capacity planning, not to why reads needed a cache in front of the votes table.' },
+        { id: 'b', text: 'The roughly 4,000 votes/sec peak rate, which made recomputing counts per read too slow', correct: true, explanation: 'The peak QPS estimate is what made a synchronous per-read count query infeasible, directly justifying the counter cache.' },
+        { id: 'c', text: 'The number of core API calls defined in the Contract step', correct: false, explanation: 'The API contract shapes what operations exist, but it was the QPS estimate, not the number of API calls, that justified the caching decision.' },
+      ],
+    },
+  ]}
+/>

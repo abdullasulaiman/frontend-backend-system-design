@@ -1,0 +1,241 @@
+---
+title: "Real-Time Location Updates"
+module: "Design Uber"
+moduleOrder: 5
+order: 4
+track: "interview"
+summary: "Covers how millions of driver GPS pings get ingested, indexed, and fanned back out to rider apps as smoothly moving markers, without either side melting under load."
+tags: ["uber", "real-time", "location", "scaling", "mobile"]
+estMinutes: 12
+cheatsheet:
+  - "The location stream has two very different consumers: the matching service needs a fresh index for a one-shot query, the rider app needs a smooth stream of updates for animation — don't design one pipeline as if it only serves one of them."
+  - "A raw GPS ping and a rendered marker position are not the same thing — interpolate/animate on the client between the last two known points instead of snapping to each new server update."
+  - "Buffer ingestion through a queue and keep the position store in-memory/ephemeral — writing every ping straight into a durable, transactional store is the single most common way to over-build this path."
+  - "Adapt ping frequency to trip state and device conditions (faster while en route to pickup or in-trip, slower or paused when idle or backgrounded) — a fixed interval either wastes battery or starves accuracy."
+  - "Broadcast rate to riders does not need to match ingestion rate — down-sample on fan-out (e.g. every 2-3 seconds) even if pings arrive every second; the eye can't tell the difference once you interpolate."
+  - "Treat late or out-of-order pings as expected, not exceptional — drop any ping older than the last accepted timestamp for that driver instead of trying to reconcile order server-side."
+  - "Shard the location index geographically (by geohash prefix) and expect hot shards in dense downtown cores at rush hour — plan for that imbalance explicitly rather than assuming uniform load per shard."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The high-level design named a "location service" as one box among many. This
+lesson is about what that box actually has to do, because it's carrying more
+load than every other service in the system combined. With a few million
+drivers online and each one pinging every few seconds, you're looking at
+roughly a million writes a second at steady state, before a single ride
+request has even been made. Get this pipeline wrong and two very different
+things break: the matching service starts dispatching against stale
+positions, and the rider's app shows a driver marker that jumps and stutters
+instead of gliding down the street. Neither failure crashes the system, which
+is exactly why it's easy to under-design — the bug is "it feels laggy and
+janky," not "it's down."
+
+## Two consumers, two different needs
+
+Before touching the pipeline, separate who actually reads this data:
+
+- **The matching service** (covered in the previous lesson) needs a
+  reasonably fresh index to answer "which drivers are near this pickup
+  point right now" — a one-shot read, tolerant of a position being a few
+  seconds stale, but it needs the *index* itself to be queryable fast.
+- **The rider's app** needs a stream of updates it can render as a smoothly
+  moving marker on a map, over the whole duration a driver is en route.
+  This consumer cares about visual smoothness far more than about the exact
+  freshness of any single point.
+
+These two consumers want the same underlying data but shaped differently:
+one wants a queryable snapshot, the other wants a display-ready stream. Build
+one pipeline that serves both without conflating "how often does this update
+internally" with "how often should a rider's phone redraw a marker" and the
+design holds up; conflate them and you either starve the index or flood the
+rider's phone.
+
+## The ingestion path
+
+A driver's app doesn't call the trip service or the matching service
+directly with its GPS coordinates — it streams to the location service alone,
+on its own path:
+
+1. The driver app sends a location update (lat, lng, timestamp, driver ID)
+   over a lightweight, persistent connection (a long-lived WebSocket or
+   gRPC stream is typical) rather than opening a fresh HTTP request per
+   ping — at this volume, connection setup overhead alone would be a real
+   cost.
+2. Updates land on an ingestion tier, which does the minimum necessary
+   validation (is this driver online, is the timestamp newer than the last
+   one accepted for them) and pushes the update onto a queue.
+3. A consumer reads off the queue and writes the position into a fast,
+   ephemeral geo-indexed store — a geohash-keyed in-memory store or a
+   purpose-built geospatial database, not the durable trip ledger. Only the
+   *latest* position per driver needs to be kept; there's no product reason
+   to retain a full location history in this store.
+
+The queue in step 2 matters for one specific reason: it decouples "a burst
+of pings just arrived" from "the geo-index can absorb them at whatever rate
+it can sustain," so a momentary spike (everyone's app reconnecting after a
+network blip) doesn't take down the index itself.
+
+### Adaptive ping frequency
+
+A fixed ping interval is wrong in both directions. Consider tuning it to
+trip state and device signals instead:
+
+- **Idle, online, no trip**: ping every 10-15 seconds — riders aren't
+  watching this driver yet, so freshness matters less than battery life.
+- **En route to pickup or in-trip**: ping every 2-4 seconds — a rider is
+  actively watching this marker, and the matching service may still need
+  fresh positions for nearby re-dispatch decisions.
+- **Backgrounded or low battery**: fall back to OS-level low-power location
+  updates rather than the app's own high-frequency timer.
+
+## Fanning updates back out to riders
+
+Once a position lands in the index, getting it onto a rider's screen is a
+separate design decision from ingestion. Two broad options:
+
+- **Push** (WebSocket/SSE to the rider's app): the location service (or a
+  thin fan-out layer subscribed to it) sends each driver's position to any
+  rider currently tracking that driver's trip.
+- **Poll**: the rider's app requests the driver's current position every
+  `n` seconds.
+
+Push feels more "real-time," but the fan-out rate to the rider does not need
+to match the ingestion rate from the driver. If a driver pings every 2
+seconds, sending every single one of those straight to the rider's phone is
+wasted bandwidth and — worse — makes the marker visually jerk from point to
+point. Down-sample on the way out (send every 2nd or 3rd update, or batch on
+a fixed 2-3 second broadcast tick) and have the rider's app **interpolate**:
+animate smoothly between the last two known points over the interval between
+updates, rather than snapping the marker to each new coordinate the instant
+it arrives. This single client-side trick is responsible for most of the
+"the map feels smooth" experience riders associate with these apps — it has
+nothing to do with server-side update frequency.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant D as Driver app
+    participant Ing as Ingestion tier
+    participant Q as Queue
+    participant Idx as Geo index (in-memory)
+    participant M as Matching service
+    participant R as Rider app
+    D->>Ing: GPS ping (lat, lng, ts)
+    Ing->>Q: enqueue update
+    Q->>Idx: write latest position
+    M->>Idx: query nearby drivers
+    Idx-->>M: candidate list
+    Idx-->>R: down-sampled position (every ~2-3s)
+    Note over R: interpolate/animate between points
+`} />
+
+## Scaling the hot path
+
+Sharding the geo index by geohash prefix (the same technique covered in
+proximity-service designs) lets you distribute drivers across shards by
+location. The catch specific to ride-hailing: driver density is wildly
+uneven and shifts by time of day. A downtown core at rush hour can have
+10-20x the driver density of the same area at 3am, and far more than a
+suburban shard ever sees. Plan for hot shards explicitly — either by using
+finer-grained geohash prefixes in historically dense areas, or by
+autoscaling shard capacity based on observed load rather than a static
+partition scheme decided once at launch.
+
+## Handling flaky mobile networks
+
+Mobile connections drop, queue, and reorder. Two defensive rules keep this
+from corrupting the index:
+
+- **Reject stale updates by timestamp.** If a driver's app briefly loses
+  connectivity and then flushes three queued pings at once, only the
+  newest one (by client timestamp, not arrival order) should update the
+  index — discard the rest rather than trying to replay history into a
+  store that only holds current position.
+- **Expire drivers who go silent.** If no update arrives for a driver
+  within a short window (say, 30-60 seconds), mark them offline/unavailable
+  in the index rather than letting the matching service dispatch against a
+  position that's minutes old.
+
+## Worked example: sizing the pipeline
+
+Say the platform has 5 million drivers online at peak, each pinging every 4
+seconds on average while idle and every 3 seconds while in-trip, with roughly
+20% in-trip at any moment. That's about `4,000,000 / 4 + 1,000,000 / 3`,
+call it 1.3 million pings per second at peak. The queue and ingestion tier
+need to sustain that comfortably; the geo-index only needs to hold one
+current position per driver — 5 million small records, easily fitting
+in-memory across a sharded fleet. On fan-out, if 500,000 riders are actively
+tracking a driver right now and each gets an update every 2.5 seconds, that's
+200,000 outbound updates per second — an order of magnitude below the
+inbound rate, which is exactly the point of down-sampling on the way out.
+
+<Callout type="warning">
+  A common mistake is treating the location pipeline like the trip ledger:
+  writing every ping straight into a durable, transactional, replicated
+  store "to be safe." At a million-plus writes per second, that store either
+  falls over or becomes the most expensive part of the whole system, for
+  data that's obsolete within seconds anyway. Keep this path ephemeral and
+  in-memory, and reserve durable, transactional storage for the trip plane
+  (request created, matched, completed) described in the high-level design
+  lesson — the two planes have opposite durability requirements for a
+  reason.
+</Callout>
+
+## Where this leaves you
+
+The location service now has real shape: an ingestion path built for
+sustained high write volume with a queue absorbing bursts, an ephemeral
+geo-index sized for "one current position per active driver," and a fan-out
+path deliberately decoupled from ingestion rate so rider apps animate
+smoothly instead of replaying every raw ping. The next lesson turns to
+pricing and ETA, which lean on this same position data (and the matching
+service's dispatch decisions) to quote a fare and an arrival time before the
+rider even confirms a trip.
+
+<Quiz
+  lessonId="uber-real-time-location-updates"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should the rider app interpolate a driver\'s marker position between updates instead of snapping the marker to each new coordinate as it arrives?',
+      options: [
+        { id: 'a', text: 'Because raw pings arrive too infrequently for the map to render at all without interpolation.', correct: false, explanation: 'Pings arrive frequently enough to render directly; the issue is visual smoothness, not a lack of enough data points to draw something.' },
+        { id: 'b', text: 'Because animating smoothly between the last two known points looks like continuous motion, while snapping to each raw update looks jerky even if the update rate is reasonable.', correct: true, explanation: 'Correct — client-side interpolation is what makes the marker feel like it is gliding rather than teleporting between points, independent of how often the server actually sends updates.' },
+        { id: 'c', text: 'Because the matching service requires the rider app to smooth positions before it can query for nearby drivers.', correct: false, explanation: 'The matching service reads from the server-side geo index directly and has nothing to do with how the rider app renders its map.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are good reasons to keep the location index ephemeral and in-memory rather than writing every ping into the same durable store used for trip records? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'At millions of pings per second, a durable transactional store becomes a severe bottleneck or the most expensive part of the system.', correct: true, explanation: 'Correct — sustained write volume at this scale is exactly what durable, transactional stores are poorly suited for.' },
+        { id: 'b', text: 'A location ping is obsolete within seconds, so there is no product reason to retain a full history of every point in a durable store.', correct: true, explanation: 'Correct — only the latest position per driver matters operationally; retaining every historical ping durably serves no purpose this design needs.' },
+        { id: 'c', text: 'The matching service cannot query an in-memory store, so location data must be durable to be queryable at all.', correct: false, explanation: 'This is backwards — in-memory geo-indexed stores are specifically designed to be queried fast; durability and queryability are separate concerns.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'The rate at which the location service broadcasts position updates to a rider\'s app should match the rate at which the driver\'s app sends pings to the server.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'It shouldn\'t — down-sampling on fan-out (e.g. broadcasting every 2-3 seconds even if pings arrive every 1-2 seconds) reduces bandwidth and, combined with client-side interpolation, looks just as smooth to the rider.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — ingestion rate and fan-out (broadcast) rate are independent design choices; down-sampling on the way out is expected and doesn\'t hurt perceived smoothness once the client interpolates.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A driver\'s app briefly loses connectivity, then reconnects and flushes three queued location pings with timestamps t1, t2, and t3 (in that order) almost simultaneously. What should the location service do?',
+      options: [
+        { id: 'a', text: 'Apply all three updates in order to reconstruct the driver\'s recent path.', correct: false, explanation: 'The index only needs to hold one current position per driver — there is no product need to replay a path through a store that isn\'t designed to retain history.' },
+        { id: 'b', text: 'Keep only the update with the newest timestamp (t3) and discard the rest.', correct: true, explanation: 'Correct — since the index only tracks current position, accepting the newest timestamped update and discarding older, now-stale ones is the simplest correct behavior, regardless of arrival order.' },
+        { id: 'c', text: 'Reject all three updates since they arrived out of the expected real-time cadence.', correct: false, explanation: 'Rejecting all of them would leave the driver marked stale or offline unnecessarily; the newest of the three is still a valid, useful position update.' },
+      ],
+    },
+  ]}
+/>

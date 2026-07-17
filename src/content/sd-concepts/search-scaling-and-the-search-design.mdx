@@ -1,0 +1,136 @@
+---
+title: "Scaling and the Search Design"
+module: "Distributed Search"
+moduleOrder: 21
+order: 4
+track: "concept"
+summary: "Assembles sharding, replication, and query fan-out into one end-to-end architecture for a search engine that serves billions of documents from thousands of machines."
+tags: ["distributed-search", "sharding", "scalability", "system-design", "architecture"]
+estMinutes: 13
+cheatsheet:
+  - "Document partitioning (each shard holds a full mini-index for a slice of documents) is the default choice — scatter-gather is simple, shards are independent, and adding shards is a routine capacity operation."
+  - "Term partitioning (each shard owns a slice of the vocabulary) touches fewer machines per query but concentrates load on shards holding popular terms and makes rebalancing expensive — reach for it only when query fan-out itself is the bottleneck."
+  - "Every query becomes scatter-gather: a coordinator fans out to one shard per replica set, collects each shard's top-K with its own scores, and merges into one globally ranked list — merging needs comparable scores, not just comparable ranks."
+  - "Replicas exist for two reasons at once: surviving a node failure, and absorbing read QPS that a single copy of a shard could never serve alone."
+  - "Tail latency dominates scatter-gather — total query latency is set by the slowest replica that responds, so a fixed per-shard timeout with partial results beats waiting indefinitely for a straggler."
+  - "Index updates flow through a separate near-real-time path (recent, small, frequently-merged segments) layered on top of a large, rarely-rebuilt base index — never re-run a full index build to make one new document searchable."
+  - "Shard count is a capacity decision, not a knob you tune per query — resharding a document-partitioned index means redistributing whole documents, so size for growth, not just today's corpus."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The earlier lessons in this module built an inverted index and a ranking pipeline that both quietly assumed everything fits on one machine: one postings list per term, one process scoring and sorting results. That assumption holds for a corpus of a few million documents. It falls apart at the scale search actually gets designed for in interviews — a web-scale crawl, a product catalog with hundreds of millions of SKUs, a logging platform ingesting billions of events a day. No single machine holds that index in memory, and no single machine could score every candidate document for a busy query load fast enough anyway. Scaling a search system means answering two questions the single-node design ducked: how do you split the index across many machines, and how do you turn "search my index" into "search across a fleet of machines and still return one ranked, correct-looking list in under 200ms"?
+
+## Splitting the index: document partitioning vs. term partitioning
+
+There are exactly two ways to cut an inverted index into shards, and the choice shapes everything downstream.
+
+**Document partitioning** assigns each document to exactly one shard (usually by hashing a document ID), and each shard builds a complete, self-contained inverted index over just its slice of documents. A query for "distributed systems" gets sent to every shard, and each shard independently finds its own best-matching documents from the postings lists it happens to hold.
+
+**Term partitioning** instead splits the vocabulary itself: shard 1 might own postings lists for terms starting a-h, shard 2 for i-p, and so on, with each shard holding postings for every document that contains one of its assigned terms. A query only needs to visit the shards owning its query terms — potentially far fewer than "all of them."
+
+In practice, document partitioning wins the majority of real designs, for reasons that matter more than the query-fan-out savings term partitioning promises:
+
+- **Independence.** Each document-partitioned shard is a fully self-sufficient search engine. You can add shards, move a shard to new hardware, or rebuild one shard's index without touching any other shard's data or code path.
+- **Balanced load in practice.** Hashing document IDs spreads documents (and therefore index size and query load) evenly across shards almost for free. Term partitioning's load balance depends on query term frequency, which is wildly skewed — a shard holding common terms like "the" or "app" gets hammered while a shard holding rare terms sits idle.
+- **Multi-term queries are cheap either way.** A real query like "best noise cancelling headphones" needs postings for four terms. Document partitioning sends that whole query to every shard once; term partitioning has to fetch postings for four different terms from up to four different shards and then intersect them per-shard anyway, which erodes the "fewer machines touched" advantage as queries get longer.
+
+Term partitioning still shows up where the win is real: extremely selective, single-term-dominant lookups (log search on a fixed set of tags, for example), or when the corpus is too large to reasonably replicate across every shard for every query. For a general-purpose search interview answer, default to document partitioning and be ready to explain the trade-off if asked.
+
+## Query fan-out: scatter-gather
+
+However you shard, a query almost never resolves on one machine. The standard pattern is scatter-gather, coordinated by a broker (sometimes called a query aggregator or root node):
+
+1. The broker receives the query and sends it to one replica of every shard in parallel.
+2. Each shard runs its own retrieval and ranking (the work from the Querying and Ranking lesson), scoped to only the documents it holds, and returns its local top-K candidates with scores.
+3. The broker merges all shards' top-K lists into one globally ranked top-N, using each candidate's score, and returns that to the client.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  C[Client query] --> B[Broker / aggregator]
+  B --> S1[Shard 1 replica]
+  B --> S2[Shard 2 replica]
+  B --> S3[Shard 3 replica]
+  B --> S4[Shard 4 replica]
+  S1 --> M[Merge top-K per shard]
+  S2 --> M
+  S3 --> M
+  S4 --> M
+  M --> R[Globally ranked top-N]
+  R --> C
+`} />
+
+The subtlety interviewers probe for: merging only works cleanly if scores are **comparable across shards**. If one shard's scoring depends on corpus-wide statistics — inverse document frequency, for instance, which needs to know how rare a term is across the *entire* collection, not just one shard's slice of it — then each shard computing IDF locally against only its own documents produces scores that aren't directly comparable to another shard's. Real systems either approximate (accept the slight skew, since it washes out at scale) or maintain small periodically-refreshed global term statistics that every shard shares when scoring.
+
+## Replication: availability and read capacity
+
+Every shard is replicated, and the reason is two-fold, not one. Replicas obviously provide failover — if a shard's only copy dies, the whole document range it holds becomes unsearchable. But replicas are just as important for absorbing query volume: a document-partitioned shard under high read QPS needs multiple replicas serving reads in parallel the same way any read-heavy service does, entirely independent of failure tolerance. The broker load-balances each fan-out request across whichever replica of a shard is healthiest and least loaded, the same way a load balancer picks among backend instances for any service.
+
+This is also where a coordination layer (something like a cluster metadata service tracking which nodes hold which shard replicas, and their health) earns its keep — the broker needs a live, accurate map of shard-to-replica-to-node to route each fan-out correctly and to route around a dead node without stalling the whole query.
+
+## Keeping a sharded index fresh
+
+Rebuilding a shard's entire index every time a document changes doesn't scale once the corpus is large — the earlier indexing lesson's batch-build process is fine for the initial corpus but far too slow to make a single new or edited document searchable within seconds. The standard fix layers two paths:
+
+- A large, mostly-static **base index**, built in batch (or incrementally merged) and optimized for compact size and fast lookups.
+- A small, frequently-updated **near-real-time segment** holding just-arrived documents, which gets searched alongside the base index and periodically merged into it once it grows large enough.
+
+Each shard runs this two-tier structure independently. A document's write goes to its shard's near-real-time segment first (fast, but a less-optimized data structure), and becomes part of the compact base index later during a background merge — the same segment-merging idea as an LSM-tree, applied to postings lists instead of key-value pairs.
+
+## Worked example: sizing shards for a large corpus
+
+Say you're indexing 4 billion documents, and a single shard performs well up to roughly 20 million documents before query latency degrades past your budget (postings lists get too long to intersect and score quickly). That's `4,000,000,000 / 20,000,000 = 200` shards as a floor.
+
+Add replication for availability and read throughput — say 3 replicas per shard for reasonable read parallelism and to survive a node loss without dropping a shard entirely. That's `200 x 3 = 600` total index-serving processes, before accounting for the broker tier, the indexing pipeline, or any caching layer in front of it. Sizing this way — starting from "how much can one shard handle" and dividing into the total corpus — is the concrete number an interviewer wants to see instead of "we'll just add more shards."
+
+<Callout type="warning">
+  A common mistake: designing scatter-gather without a per-shard timeout, then having the whole query's latency held hostage by a single slow or overloaded replica. If a broker waits unconditionally for every shard to respond, one straggler shard turns a 50ms query into a multi-second one for every user, no matter how fast the other shards were. The fix is a strict per-shard timeout with partial results — return the best answer from whichever shards responded in time, and treat late shards as empty for that request, accepting a small, rare hit to recall in exchange for a latency ceiling that actually holds.
+</Callout>
+
+<Quiz
+  lessonId="search-scaling-and-the-search-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does document partitioning tend to balance load across shards more evenly than term partitioning?',
+      options: [
+        { id: 'a', text: 'Hashing document IDs spreads documents (and their queries) roughly uniformly, while query term frequency is highly skewed and concentrates load on shards holding popular terms', correct: true, explanation: 'Document IDs hash close to uniformly, but real query vocabularies are Zipfian — a handful of terms dominate traffic, so whichever shard owns those terms in a term-partitioned design gets disproportionately hammered.' },
+        { id: 'b', text: 'Term partitioning cannot be replicated, so it always has less total capacity', correct: false, explanation: 'Term-partitioned shards can be replicated just like document-partitioned ones — replication is orthogonal to which partitioning scheme you pick.' },
+        { id: 'c', text: 'Document partitioning uses fewer shards overall', correct: false, explanation: 'Shard count depends on corpus size and per-shard capacity, not on which partitioning scheme is chosen — either approach can use any number of shards.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'In a document-partitioned scatter-gather query, which of these are genuine concerns the broker/merge step has to handle? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Scores from different shards may not be directly comparable if scoring depends on corpus-wide statistics computed only locally per shard', correct: true, explanation: 'A statistic like inverse document frequency, computed against only one shard\'s documents, differs from the true corpus-wide value, which can skew ranking when merging shards\' results.' },
+        { id: 'b', text: 'A slow or unresponsive shard replica can dominate total query latency if there is no timeout', correct: true, explanation: 'This is the tail-latency problem: scatter-gather latency is bounded by the slowest responder, so an unbounded wait lets one straggler set the latency for the whole query.' },
+        { id: 'c', text: 'Every shard must hold an identical copy of the entire corpus for merging to work', correct: false, explanation: 'The opposite is true for document partitioning — each shard deliberately holds only its own slice of documents; merging combines each shard\'s partial top-K into one global list, it does not require full corpus duplication per shard.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Replicas of a shard exist purely for failover, so a shard under heavy read load with no risk of node failure would not benefit from additional replicas.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Replicas serve two independent purposes: failover and absorbing read throughput. A shard under heavy read QPS benefits from more replicas purely to spread query load across more machines, regardless of failure risk.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — replication scales read capacity as well as availability; the broker load-balances fan-out requests across a shard\'s replicas the same way any read-heavy service spreads load across instances.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why do sharded search systems typically maintain a small near-real-time segment alongside a large base index, rather than rebuilding the base index on every write?',
+      options: [
+        { id: 'a', text: 'Rebuilding a large, optimized base index is too slow to make a single new document searchable within seconds, so recent writes go to a small, fast structure first and get merged in later', correct: true, explanation: 'This mirrors an LSM-tree pattern: small, fast, frequently-updated segments absorb writes immediately, while a large, compact structure is rebuilt or merged in the background on its own schedule, not per write.' },
+        { id: 'b', text: 'Base indexes cannot be sharded, only near-real-time segments can', correct: false, explanation: 'Both the base index and the near-real-time segment live within each shard — sharding applies to the whole two-tier structure, not just one tier of it.' },
+        { id: 'c', text: 'Near-real-time segments replace replication as the availability mechanism', correct: false, explanation: 'Near-real-time segments solve freshness (how quickly a write becomes searchable), an entirely different problem from replication, which solves availability and read scaling.' },
+      ],
+    },
+  ]}
+/>

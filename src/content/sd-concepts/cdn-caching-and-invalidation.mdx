@@ -1,0 +1,136 @@
+---
+title: "Caching and Invalidation"
+module: "Content Delivery Network"
+moduleOrder: 11
+order: 3
+track: "concept"
+summary: "Explains how CDN edge caches decide what to store and for how long, and the invalidation techniques (TTLs, cache-busting, purges, tagging) that keep cached content from going stale."
+tags: ["cdn", "caching", "invalidation", "ttl", "cache-control"]
+estMinutes: 12
+cheatsheet:
+  - "Cache-Control max-age sets a hard expiry the edge trusts without asking the origin again — the single biggest lever for hit rate."
+  - "Cache-busting via a hashed or versioned URL (app.a3f9c1.js) is the most reliable invalidation strategy: a new version is a new cache key, so there's nothing to invalidate."
+  - "stale-while-revalidate serves the old cached copy immediately while refreshing it in the background — use it when 'slightly stale but fast' beats 'blocking on a fresh fetch.'"
+  - "A purge API deletes cached content by URL or tag across every edge node before its TTL expires — reserve it for corrections and emergencies, since it's slower and more expensive than letting a TTL do the work."
+  - "Cache-busting handles planned deploys; purges handle unplanned ones. If you're purging on every deploy, you probably want versioned filenames instead."
+  - "Vary tells caches that a response differs per header (e.g. Accept-Encoding, Accept-Language) — get it wrong and users get someone else's cached response, or you fragment your cache into useless slivers."
+  - "ETag/If-None-Match lets an edge revalidate cheaply (a 304 with no body) instead of either trusting a stale copy blindly or re-downloading the full response."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A CDN's whole value proposition is "don't make the origin do this work again." But an edge node that caches forever is a liability, not a feature — it'll happily serve a logo you replaced last week, a price you corrected an hour ago, or a JS bundle with a bug you just shipped a fix for. The previous lessons covered what a CDN is and how content gets to the edge (push vs. pull); this lesson is about the two decisions that actually determine whether a CDN helps or hurts: **how long something stays cached**, and **how you get rid of a cached copy before its time is up**.
+
+Get this wrong in an interview and it shows immediately — "just add a CDN" without a caching/invalidation story is a incomplete answer for any design involving static assets, API responses, or media.
+
+## How the edge decides what to cache and for how long
+
+Every cached response needs an answer to three questions: is this cacheable at all, for how long, and under what key?
+
+### Cache-Control and TTL
+
+The origin sets this via the `Cache-Control` response header, and it's the primary contract between origin and edge:
+
+- `max-age=<seconds>` — how long the response is considered fresh, from the client/edge's perspective.
+- `s-maxage=<seconds>` — the same idea, but specifically for shared caches (CDNs, proxies), overriding `max-age` for them. Useful when you want the edge to hold something longer than a browser should.
+- `no-store` — never cache this, anywhere.
+- `no-cache` — a confusing name: it *can* be cached, but must be revalidated with the origin before every use.
+- `private` — cacheable only in the end-user's browser, not in a shared CDN cache (used for per-user data).
+
+A response with `Cache-Control: public, max-age=31536000` tells every edge node: hold this for a year, no questions asked. That's exactly right for a hashed static asset (see below) and exactly wrong for a personalized API response.
+
+### Cache keys
+
+The edge doesn't cache "a response" — it caches a response under a **key**, typically derived from the URL plus whatever the `Vary` header names. If `Vary: Accept-Encoding` is set, the edge stores a separate cached copy per encoding (gzip vs. br vs. identity), because those response bodies genuinely differ. Get `Vary` wrong in either direction and you either serve a Portuguese page to an English-language visitor (cache key too coarse) or blow your hit rate into the ground by fragmenting the cache per irrelevant header value (cache key too fine — `Vary: User-Agent` is a classic offender, since it's nearly unique per client).
+
+### Revalidation instead of blind trust
+
+For content that changes but not predictably, `ETag` (a version fingerprint of the response) lets an edge or browser send `If-None-Match: <etag>` on the next request. If the origin's content hasn't changed, it replies `304 Not Modified` with no body — cheap for the origin, and the edge keeps serving its cached copy with a refreshed freshness clock. This is the middle ground between "trust the cache blindly for max-age" and "always re-fetch the full response."
+
+## Invalidation: getting rid of a cached copy early
+
+TTLs handle the common case — content expires on schedule. Invalidation is what you need when content needs to *stop* being served before its TTL says so.
+
+### Cache-busting (the default for anything you deploy)
+
+The most robust invalidation strategy is to never need one: bake a content hash or version into the URL, e.g. `/static/app.3f9a1c.js` instead of `/static/app.js`. When you ship a new build, it's a *new* cache key — the old cached file just ages out naturally (or gets evicted for space), and every client immediately gets the new file on next deploy because the HTML referencing it points at the new hash. There's no "wait for the CDN to notice" step, because nothing needs to be told anything — it's a new object, not an update to an old one.
+
+This is why frontend build tooling emits hashed filenames, and why this pattern generalizes past JS/CSS to any versioned asset (images, API-served config blobs, even API response bodies keyed by a resource version).
+
+### Purging
+
+Sometimes you can't rename the URL — a wrongly-priced product page, a legal takedown, a leaked API key baked into a cached response. For that, CDNs expose a **purge API**: tell every edge node (or a subset) to drop a specific URL, a wildcard prefix, or everything tagged with a given cache tag, immediately.
+
+Purging is powerful but has real costs: it's a fan-out operation across potentially hundreds of edge locations, it isn't instantaneous (propagation typically takes seconds, sometimes longer under load), and providers rate-limit it because it's expensive to run at scale. A design that relies on purging *every deploy* is usually a sign you should be cache-busting instead — reserve purges for the unplanned case.
+
+**Cache tagging** is the scalable version of purging: tag every response derived from a given underlying resource (e.g. all pages that render `product_id=42`) with a tag, and purge by tag instead of enumerating every URL yourself. This matters once one origin object fans out into many cached URLs (a product appears on its own page, a category listing, and a search results page — one purge-by-tag call invalidates all three).
+
+### Stale-while-revalidate
+
+`Cache-Control: max-age=60, stale-while-revalidate=300` tells the edge: serve the cached copy immediately even after it's gone stale (up to 5 extra minutes past the 60s max-age), while kicking off a background refresh from the origin. The *next* request after that gets the fresh copy. This trades a small, bounded window of staleness for consistently fast responses — no request ever blocks on an origin round-trip, even right at the expiry boundary. It's a good default for content where "occasionally a few seconds stale" is harmless (a homepage feed, a stock ticker refresh) but a bad fit for anything where staleness is a correctness bug (an account balance, an inventory count at checkout).
+
+<Mermaid client:visible chart={`
+flowchart TD
+    A["Origin sets Cache-Control on response"] --> B{"Edge cache decision"}
+    B -->|"max-age not expired"| C["Serve from edge, no origin hit"]
+    B -->|"expired, has ETag"| D["Edge sends If-None-Match to origin"]
+    D -->|"304 Not Modified"| C
+    D -->|"200 with new body"| E["Edge stores new copy, serves it"]
+    B -->|"expired, stale-while-revalidate window"| F["Serve stale copy now, refresh in background"]
+    G["Deploy: new hashed URL"] --> H["Old URL just ages out, no invalidation needed"]
+    I["Emergency: wrong content live"] --> J["Purge API: drop by URL / prefix / tag"]
+`} />
+
+## Worked example: a product page after a price correction
+
+Say a product page is cached at the edge with `Cache-Control: public, max-age=300, stale-while-revalidate=600`, and it's tagged `product:42`. Three scenarios:
+
+1. **Normal traffic, no changes.** For 5 minutes, every edge node in every region serves the cached page with zero origin hits. At minute 6, the next request finds it stale-but-within-the-swr-window, so the edge serves that (now 1-minute-stale) copy instantly and fires a background refresh. The request after that gets a page that's fully fresh again. Users never wait on the origin; worst case, they see a page up to ~6 minutes old.
+
+2. **A scheduled re-deploy of the page template.** If the template's static assets (CSS/JS) are hash-versioned, this needs no invalidation at all — new hashes, new cache keys, done. The HTML itself (the product page) still rides its normal 300s TTL.
+
+3. **The price was wrong and legal wants it fixed now.** Waiting up to 5 (or 6, with swr) minutes isn't acceptable. This is exactly the purge case: call the purge API for tag `product:42`. Every edge node drops that page immediately; the next request anywhere in the world is a guaranteed origin fetch with the corrected price. Cost: one purge call, some origin load for the first request per region afterward — much cheaper than dropping the TTL to zero for every request, every day, just to cover the rare emergency.
+
+<Callout type="warning">
+  A common mistake: setting `Cache-Control: no-cache` (or dropping caching entirely) on an endpoint "just to be safe" because invalidation feels complicated, then wondering why the CDN isn't helping. This throws away the CDN's entire benefit for that endpoint and pushes 100% of traffic back to the origin. Almost everything can be cached for *some* non-zero duration — even a 5-10 second TTL on a "live" API response cuts origin load dramatically under high fan-out (many edge users sharing one cached answer) with staleness most users will never notice. Default to a short TTL plus stale-while-revalidate, and reserve `no-store` for genuinely per-request, per-user, or security-sensitive data.
+</Callout>
+
+The next lesson picks up where this one leaves off: once you have caching and invalidation working, how do you reason about the consistency guarantees this gives you across regions, and where security fits into the CDN's design.
+
+<Quiz
+  lessonId="cdn-caching-and-invalidation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A team ships a new JS bundle on every deploy at a fixed URL, `/static/app.js`, and calls the CDN purge API for that URL on every release. What is the more robust alternative?',
+      options: [
+        { id: 'a', text: 'Serve the file with Cache-Control: no-store instead', correct: false, explanation: 'That disables edge caching for the file entirely, which trades the purge problem for permanently losing the CDN benefit on every request.' },
+        { id: 'b', text: 'Use a content-hashed filename (e.g. app.3f9a1c.js) referenced from the HTML', correct: true, explanation: 'A new build produces a new URL, which is automatically a new cache key. There is nothing to purge because the old file simply ages out; every client picks up the new version as soon as it loads the updated HTML.' },
+        { id: 'c', text: 'Lower the max-age to 0 so the edge always revalidates', correct: false, explanation: 'This forces a round trip to the origin on every single request for that file, which defeats the purpose of caching it at the edge at all.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine costs or limitations of using a CDN purge API, compared to letting content expire via TTL? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Purges fan out across many edge locations and are not instantaneous', correct: true, explanation: 'A purge has to propagate to every relevant edge node, which takes real (if usually short) time — it is not an atomic, instant operation everywhere at once.' },
+        { id: 'b', text: 'Providers commonly rate-limit purge calls because they are expensive to run at scale', correct: true, explanation: 'Purging is a more costly operation for the CDN provider than a normal TTL expiry, so most providers cap how often you can call it.' },
+        { id: 'c', text: 'Purged content can never be re-cached afterward', correct: false, explanation: 'A purge just removes the current cached copy. The very next matching request is simply treated as a cache miss and gets cached again normally.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'stale-while-revalidate guarantees that every client always receives a fully fresh response, never a stale one.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The opposite is the point of the mechanism: it deliberately serves a stale cached copy immediately (within a bounded window) while refreshing in the background, trading a small amount of staleness for consistently fast responses.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. stale-while-revalidate intentionally serves stale content for a bounded extra window past max-age, refreshing asynchronously so the next request gets the updated copy — it optimizes for speed and availability, not for always-fresh responses.' },
+      ],
+    },
+  ]}
+/>

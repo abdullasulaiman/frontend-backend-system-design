@@ -1,0 +1,152 @@
+---
+title: "Data Model and Architecture"
+module: "Blob Store"
+moduleOrder: 20
+order: 2
+track: "concept"
+summary: "Covers how a blob store's data model splits an object into immutable content and mutable metadata, and how that split shapes the store's core services and write/read paths."
+tags: ["blob-store", "object-storage", "data-model", "architecture", "metadata"]
+estMinutes: 12
+cheatsheet:
+  - "A blob store never diffs or partially rewrites an object — every write replaces the whole object, which is why blobs are treated as immutable once committed."
+  - "Split the data model in two: object data (the bytes, content-addressed or opaque) and metadata (bucket/key, size, content-type, version, ACLs) — they have different size, mutation, and consistency needs."
+  - "Metadata lives in a fast key-value or relational index; object data lives on a separate storage layer built for large sequential writes (chunked/erasure-coded storage nodes), not the same system."
+  - "Large objects are split into fixed-size chunks so upload, replication, and repair operate on manageable pieces instead of one giant blob."
+  - "The key/path namespace is usually a flat map (bucket + key -> metadata pointer), not a real directory tree — 'folders' in the UI are just a naming convention over flat keys."
+  - "A separate metadata service means a write can partially fail (metadata committed, chunks not all durable yet, or vice versa) — the architecture needs an explicit two-phase or reconciliation step to avoid orphaned chunks or dangling metadata."
+  - "Content-addressing (hashing the object to derive its storage ID) gives you free deduplication and integrity checks, but breaks if you need mutable objects at the same key."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson pinned down what a blob store needs to do: accept objects from a few KB to many TB, serve them back with high durability, and do it at a cost per GB that a key-value store or relational database can't touch. None of that is achievable if you store a blob the same way you'd store a database row.
+
+A 5 GB video file and a 200-byte thumbnail can't share the same read/write path, the same replication unit, or the same index structure without one of them paying a huge penalty. The data model is where that gets resolved — and getting it right is what lets the rest of the system (partitioning, replication, the API) fall into place cleanly, which is why it comes right after requirements and before anything else.
+
+## The core split: metadata vs. object data
+
+Every blob store separates two things that look like one "object" from the outside:
+
+- **Metadata** — the bucket name, key/path, size, content-type, checksum, version ID, creation time, ACL/permissions, and a pointer to where the actual bytes live. Small (well under a KB per object typically), frequently queried, and needs to be strongly consistent — you don't want two clients seeing different metadata for the same key at the same time.
+- **Object data** — the actual bytes: the photo, the log file, the video. Can be enormous, is written once and read many times, and doesn't need a rich query interface — you fetch it by key, you don't filter it by content.
+
+These two have almost nothing in common operationally, so real systems store them in genuinely different subsystems:
+
+- A **metadata store** — often a strongly-consistent key-value store or small relational database, indexed by `(bucket, key)`, optimized for fast point lookups and small updates.
+- An **object storage layer** — a fleet of storage nodes built for large sequential writes and reads, chunked and replicated (or erasure-coded) for durability, with no need for rich indexing at all.
+
+A request for an object is really two requests glued together: look up the metadata to find out where the data lives (and confirm the caller is allowed to read it), then fetch the actual bytes from the object storage layer using the pointer the metadata gave you.
+
+## Chunking large objects
+
+Blobs aren't stored as one indivisible unit once they cross a size threshold (commonly tens of MB). Instead, the object is split into fixed-size chunks — say 8-64 MB each — and each chunk is stored, replicated, and repaired independently.
+
+This matters for a few concrete reasons:
+
+- **Upload/download resumability.** If a client uploading a 10 GB file loses its connection at chunk 47 of 200, it re-sends chunk 47, not the whole file.
+- **Parallelism.** Multiple chunks of the same object can be uploaded to (or fetched from) different storage nodes concurrently, so retrieval latency doesn't scale linearly with object size.
+- **Even placement.** Chunking turns one giant, awkward-to-place object into many uniformly-sized units that a partitioning scheme (covered in the next lesson) can spread evenly across nodes — a single 500 GB blob would otherwise dominate whichever node was unlucky enough to hold it.
+- **Cheaper repair.** If a storage node dies, the system only needs to re-replicate the chunks that lived on it, not re-copy every full object that happened to touch that node.
+
+The metadata record for an object then stores an ordered list of chunk IDs/locations instead of one single pointer, and reads reassemble the object by fetching chunks in order (or in parallel and reassembling).
+
+<Mermaid client:visible chart={`
+flowchart TB
+  Client["Client PUT /bucket/key"]
+  API["Blob Store API / gateway"]
+  Meta["Metadata store\\n(bucket, key) -> chunk list, size, version, ACL"]
+  Chunker["Chunker (splits object into fixed-size chunks)"]
+  S1["Storage node A (chunk 1, 2)"]
+  S2["Storage node B (chunk 3)"]
+  S3["Storage node C (replicas)"]
+
+  Client --> API
+  API --> Chunker
+  Chunker --> S1
+  Chunker --> S2
+  Chunker --> S3
+  API --> Meta
+  Meta -. commits pointer after chunks durable .-> API
+`} />
+
+## The namespace: flat keys, not a real filesystem
+
+A common misconception: a bucket with "folders" like `photos/2024/trip/img1.jpg` is stored as a nested directory tree the way a local filesystem would. It almost never is. The metadata store maps a single flat key — the whole string `photos/2024/trip/img1.jpg` — directly to its metadata record. "Folders" are a client-side and UI convention: listing "everything under `photos/2024/`" is implemented as a prefix scan over the flat, sorted key index, not a directory traversal.
+
+This is why blob stores are fast at listing large prefixes but bad at true directory operations like "rename this folder" — renaming a prefix means rewriting metadata (and sometimes re-keying) for every object under it, because there was never a real folder object to rename, just a shared string prefix across many independent flat keys.
+
+## Immutability and versioning
+
+Because object data can be huge, blob stores don't support partial in-place edits — there's no "patch bytes 500-600 of this file" operation the way a database supports `UPDATE ... SET col = ...`. A write replaces the entire object. This makes blobs effectively immutable once a write completes: the object you read is exactly the object that was last written, in full, never partially patched.
+
+That immutability is a feature, not a limitation, for the architecture:
+
+- It makes **caching trivial** — an immutable object at a given version can be cached anywhere (CDN, local disk) with no invalidation logic beyond "did the version change."
+- It makes **replication simpler** — replicating an immutable chunk is just copying bytes; there's no concurrent-write conflict to resolve on the chunk itself, only on which version of the metadata pointer is current.
+- It enables straightforward **versioning**: instead of overwriting a key's data, some systems keep the old chunks around under a version ID and only flip the metadata pointer to the new version, which is what makes "restore previous version" cheap to support.
+
+Some designs go further and content-address chunks — deriving the storage ID from a hash of the chunk's bytes. Two objects (or two versions of the same object) that happen to contain an identical chunk then share the same stored copy automatically, which is a natural deduplication win, at the cost of needing a separate mutable pointer layer (the metadata) to let a key's "current version" move even though content-addressed chunks themselves never do.
+
+## Worked example: storing a 2 GB video upload
+
+A user uploads a 2 GB video to `videos/user42/clip.mp4`.
+
+1. The API layer accepts the upload and hands it to the chunker, which splits it into 32 chunks of 64 MB each.
+2. Each chunk is written to storage nodes with 3x replication (or erasure-coded, per the next lesson), across nodes chosen so no single node or rack holds more than one replica of the same chunk.
+3. Once all 32 chunks report durable, the API writes a single metadata record: `{ bucket: "videos", key: "user42/clip.mp4", size: 2_147_483_648, chunks: [id1, id2, ..., id32], version: "v1", contentType: "video/mp4" }`.
+4. Only after that metadata write commits does the object become visible to a `GET` — before that point, a reader asking for `videos/user42/clip.mp4` gets a "not found," even if some chunks already landed on disk. This ordering (data durable, then metadata visible) is what stops a reader from ever seeing a half-uploaded object.
+
+If the same user later re-uploads the same key with a smaller edited version, the store doesn't patch the old chunks — it writes a fresh set of chunks and a new metadata record with `version: "v2"`, then flips the key's current-version pointer. The old chunks either get garbage-collected or kept around if versioning is enabled.
+
+<Callout type="warning">
+  A common design mistake is treating "store the blob" as a single atomic operation and glossing over the two-system split. In an interview, if you say "we write the object to storage" without distinguishing the metadata commit from the chunk writes, you'll get pressed on: what does a reader see if the process crashes after chunks are written but before metadata commits? (Answer: nothing — the object isn't visible until metadata says so, and the orphaned chunks get cleaned up by a background garbage collector.) Always call out that data durability must be confirmed *before* the metadata pointer is committed, and that reads only ever go through metadata first.
+</Callout>
+
+<Quiz
+  lessonId="blob-data-model-and-architecture"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why do blob stores keep metadata (bucket, key, size, chunk list) in a separate system from the object data itself?',
+      options: [
+        { id: 'a', text: 'Metadata and object data have very different size, mutation, and consistency needs, so one storage system can\'t serve both well', correct: true, explanation: 'Metadata is small, frequently updated, and needs strong consistency; object data is large, write-once, and just needs efficient sequential storage — different systems suit each.' },
+        { id: 'b', text: 'Object data is always encrypted and metadata never is, so they must be isolated for security', correct: false, explanation: 'Encryption policy is independent of this split; the real reason is the mismatch in size, access pattern, and consistency requirements.' },
+        { id: 'c', text: 'It is required by most cloud provider billing models', correct: false, explanation: 'Billing has nothing to do with the internal architecture decision — this is a systems-design choice, not a pricing constraint.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine benefits of splitting a large object into fixed-size chunks? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A failed upload can resume from the last incomplete chunk instead of restarting the whole object', correct: true, explanation: 'Chunking makes uploads resumable at chunk granularity, avoiding a full re-transfer after a partial failure.' },
+        { id: 'b', text: 'Chunks can be placed evenly across storage nodes instead of one giant object overloading a single node', correct: true, explanation: 'Uniformly-sized chunks are easier for a partitioning scheme to spread evenly than one huge, awkwardly-sized object.' },
+        { id: 'c', text: 'Node failure only requires re-replicating the chunks that lived on that node, not every full object touching it', correct: true, explanation: 'Chunk-level repair is far cheaper than re-copying entire objects whenever a single storage node is lost.' },
+        { id: 'd', text: 'It removes the need for the metadata store to track anything about the object\'s chunks', correct: false, explanation: 'The opposite is true — the metadata record has to store the ordered list of chunk IDs/locations so a read knows how to reassemble the object.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In most blob stores, a key like "photos/2024/trip/img1.jpg" is stored as a nested directory tree, the same way a local filesystem stores nested folders.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'It\'s the opposite: the metadata store maps the entire string as one flat key to its record. "Folders" are a UI/client convention over prefix scans, not real directory nodes.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the namespace is a flat key-to-metadata map. Listing a "folder" is a prefix scan over sorted flat keys, which is also why renaming a folder is expensive (it touches every key under the prefix).' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A process crashes after all of an object\'s chunks are durably written but before the metadata record is committed. What should a client GET-ing that key see?',
+      options: [
+        { id: 'a', text: 'A "not found" response, since the object never became visible', correct: true, explanation: 'Reads go through metadata first; until the metadata pointer commits, the object was never officially written, regardless of whether chunks happen to exist on disk. The orphaned chunks get cleaned up later by garbage collection.' },
+        { id: 'b', text: 'A partially-reassembled object built from whatever chunks are available', correct: false, explanation: 'Blob stores don\'t serve partially-committed objects — visibility is gated entirely on the metadata commit, not on how many chunks physically exist.' },
+        { id: 'c', text: 'The previous version of the object, silently rolled back', correct: false, explanation: 'If a previous version existed and its metadata pointer was untouched, that previous version would still be readable, but that\'s because it was never overwritten — not because of any rollback mechanism triggered by this crash.' },
+      ],
+    },
+  ]}
+/>

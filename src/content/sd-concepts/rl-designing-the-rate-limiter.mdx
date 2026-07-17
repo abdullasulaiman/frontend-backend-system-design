@@ -1,0 +1,135 @@
+---
+title: "Designing the Rate Limiter"
+module: "Rate Limiter"
+moduleOrder: 19
+order: 4
+track: "concept"
+summary: "Assembles a production rate limiter end to end — request path, rule storage, the client-facing contract, and where the limiter physically sits in your stack."
+tags: ["rate-limiting", "system-design", "api-gateway", "distributed-systems"]
+estMinutes: 12
+cheatsheet:
+  - "Put the limiter in front of the app tier (gateway/sidecar/middleware), not inside each service — otherwise every service reinvents rule storage and counting."
+  - "A rule is a tuple: which key (user, IP, API key, endpoint), which algorithm, and the limit/window — store rules in a small config service or cache, not hardcoded in application code."
+  - "Always return 429 with a `Retry-After` header and the standard `X-RateLimit-Limit` / `-Remaining` / `-Reset` headers so clients can back off correctly instead of hammering you harder."
+  - "Decide fail-open vs fail-closed for when the counter store is unreachable — fail-open protects availability, fail-closed protects the backend; most public APIs fail-open with a conservative fallback limit."
+  - "Count and reject as close to the edge as possible — a rejected request should never reach a database connection pool or an expensive handler."
+  - "Log and expose rate-limit rejections as metrics per key/rule; a spike in 429s is often the first signal of an abusive client, a misconfigured retry loop, or a limit set too low."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+By now you know what a rate limiter needs to do ([Requirements for Rate Limiting](/system-design/rl-requirements-for-rate-limiting)), which counting algorithm to reach for ([Algorithms: Token Bucket, Leaky Bucket, and Windows](/system-design/rl-algorithms-token-bucket-leaky-bucket-and-windows)), and how to keep counters correct across many nodes ([Distributed Rate Limiting](/system-design/rl-distributed-rate-limiting)). None of that answers the question an interviewer asks next: where does this thing actually live, what talks to what, and what does a client see when it gets throttled? This lesson puts the pieces together into a single system you could describe on a whiteboard end to end.
+
+## Where the limiter sits
+
+The limiter needs to run *before* a request does any real work — before it opens a database connection, calls a downstream service, or renders a response. That pushes it toward the edge of your architecture, in one of three common spots:
+
+- **API gateway / reverse proxy** — the limiter is a plugin or built-in feature of something like an API gateway or load balancer, sitting in front of every backend service. Centralized, easy to operate, and it protects every service behind it without each one implementing its own logic.
+- **Sidecar** — each service instance runs a small proxy process alongside it that intercepts inbound traffic. Common in a service-mesh setup, and useful when different services need very different rules but you still want a shared implementation.
+- **In-process middleware** — a library embedded directly in the application, running as the first thing in the request-handling chain. Simplest to add to an existing service with no infrastructure change, but every service now owns its own counting logic and its own bugs.
+
+Most production systems default to the gateway option for anything facing external clients (mobile apps, partner APIs, public REST endpoints), and reserve sidecars or middleware for internal service-to-service limits where a shared gateway doesn't exist in the request path. Whichever you pick, the counting logic itself — the algorithm and the shared counter store from the distributed lesson — is the same component; only its deployment location changes.
+
+## The building blocks
+
+A working rate limiter is four cooperating pieces:
+
+1. **Rule store** — maps a key (user ID, API key, IP, or a combination) plus an endpoint/route pattern to a limit: algorithm, threshold, and window. Rules change more often than code deploys (a customer negotiates a higher quota, an endpoint gets a tighter limit after an incident), so they belong in a small config service or a cache-backed table, not hardcoded constants.
+2. **Counter store** — the shared state tracking how much of each key's quota is used, typically Redis or an equivalent in-memory store, as covered in the distributed lesson. This is the component under the most write load, since every single request touches it.
+3. **Decision logic** — the algorithm (token bucket, sliding window, etc.) that reads the counter, decides allow or reject, and updates the counter — ideally as one atomic operation (a Lua script in Redis, or an atomic increment-and-compare) to avoid the race conditions the distributed lesson covered.
+4. **Enforcement point** — the code that actually rejects or forwards a request based on the decision: the gateway plugin, sidecar, or middleware from the previous section.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Client request] --> B[Enforcement point<br/>gateway/sidecar]
+  B --> C{Look up rule<br/>for this key+route}
+  C --> D[Rule store]
+  B --> E[Decision logic:<br/>check + update counter]
+  E --> F[Counter store<br/>Redis]
+  E -- allowed --> G[Forward to backend service]
+  E -- rejected --> H[Return 429 + headers]
+`} />
+
+## The client-facing contract
+
+A rate limiter isn't just an internal accounting mechanism — it's an API contract with every caller. Two things make that contract usable rather than mysterious:
+
+**The rejection response.** When a request exceeds its limit, return HTTP `429 Too Many Requests`, not a generic `503` or a silently dropped connection — the status code itself tells the client's HTTP stack "this is a rate limit, not an outage." Attach a `Retry-After` header telling the client how many seconds to wait before trying again; a well-behaved client uses this instead of guessing a backoff interval.
+
+**Visibility into remaining quota.** Even on successful requests, return headers so clients can self-regulate before they ever get rejected:
+
+- `X-RateLimit-Limit` — the total quota for the current window.
+- `X-RateLimit-Remaining` — how much is left in the current window.
+- `X-RateLimit-Reset` — when the window resets (as a Unix timestamp or seconds-from-now).
+
+These header names aren't standardized across every provider (some use `RateLimit-*` per the newer IETF draft, some keep vendor-prefixed names), but the three pieces of information — limit, remaining, reset — are what every serious API exposes. A client library that reads these can throttle itself proactively instead of learning its limit by getting 429s.
+
+## Deciding what happens when the limiter itself fails
+
+The counter store is now a dependency on the hot path of every request, which means you must decide up front what happens when it's unreachable:
+
+- **Fail-open**: if the counter store times out or errors, let the request through. This protects overall availability — a Redis blip shouldn't take down your entire API — but temporarily removes protection exactly when your infrastructure might already be stressed. Most public-facing APIs choose this, sometimes falling back to a cheap, conservative local-only limit (e.g., a per-instance in-memory cap) rather than fully unlimited traffic.
+- **Fail-closed**: if the counter store is unreachable, reject the request. This guarantees the limit is never silently bypassed, at the cost of turning a counter-store outage into a full outage of the protected service. Reasonable for a limiter guarding something that would be badly damaged by an unthrottled burst (a fragile downstream write path, a paid third-party API you're billed per call for).
+
+Whichever you choose, make it an explicit, monitored decision — "we didn't think about it" defaults to whatever your client library or Lua script happens to do on a connection error, which is rarely the behavior you'd have picked deliberately.
+
+## Worked example: designing limits for a public API
+
+Say you're adding rate limiting to a public API with three tiers: free (60 requests/min), pro (600 requests/min), and enterprise (custom, negotiated). Here's how the pieces fit:
+
+The rule store holds one row per API key: `key_id -> { tier, limit, window }`. On login/key-issuance, a key's tier is looked up once and cached at the gateway for a few minutes (rules change rarely enough that a short TTL cache avoids hitting the rule store on every request). The gateway terminates every request, extracts the API key from the `Authorization` header, and asks the decision logic: "does `key_id` have quota against a sliding-window counter with this key's limit?" The decision logic runs an atomic Redis Lua script (from the distributed lesson) against a counter keyed by `key_id` plus the current window bucket. If allowed, the request proceeds and the response carries `X-RateLimit-Remaining: 41` alongside the actual API response; if rejected, the gateway short-circuits with `429` and `Retry-After: 12`, never touching the backend at all. Because the gateway also fails open with a conservative 10 requests/min fallback if Redis itself is down, a Redis blip degrades everyone briefly to "free-tier-ish" behavior instead of taking the API down entirely.
+
+<Callout type="warning">
+  A common mistake is rate-limiting only at the outermost edge and assuming that's sufficient. A single misbehaving internal service (a batch job with a bug, a retry storm from another team) can still overwhelm a downstream dependency without ever passing through the public gateway. Defense in depth means applying limits at more than one layer — the public gateway for external clients, and a second, separate limiter (often with different keys and limits) in front of anything internal that's expensive or fragile enough to need its own protection, like a payments service or a third-party API you pay per call.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="rl-designing-the-rate-limiter"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Where should the primary rate-limiting decision logic run to be most effective at protecting backend services?',
+      options: [
+        { id: 'a', text: 'As close to the edge as possible (gateway, sidecar, or middleware), before a request reaches expensive backend work', correct: true, explanation: 'Rejecting early means a throttled request never consumes a database connection, a downstream call, or handler CPU time.' },
+        { id: 'b', text: 'Inside the database layer, so every query is checked against quota', correct: false, explanation: 'By the time a request reaches the database it has already consumed connection-pool and handler resources — the whole point of the limit is to reject before that happens.' },
+        { id: 'c', text: 'In an asynchronous batch job that periodically bans over-quota keys', correct: false, explanation: 'Asynchronous, after-the-fact enforcement lets bursts through in real time; rate limiting needs to act on each request as it arrives.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'A client gets rejected by the rate limiter. Which response elements make the rejection actionable for a well-behaved client? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'HTTP 429 status code', correct: true, explanation: '429 specifically signals "rate limited," letting the client\'s HTTP stack and retry logic distinguish this from a generic server error.' },
+        { id: 'b', text: 'A Retry-After header', correct: true, explanation: 'Retry-After tells the client how long to wait before retrying, avoiding a guessed backoff that might be too short or unnecessarily long.' },
+        { id: 'c', text: 'A generic HTTP 500 with no body', correct: false, explanation: 'A 500 signals a server error, not a rate limit — a client cannot distinguish "back off and retry later" from "something is broken," and has no timing information to act on.' },
+        { id: 'd', text: 'X-RateLimit-Remaining and X-RateLimit-Reset headers', correct: true, explanation: 'These let clients see how much quota is left and when it resets, enabling proactive throttling on future requests rather than repeated trial and error.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Fail-open behavior (letting requests through when the counter store is unreachable) guarantees the rate limit is never bypassed.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Fail-open explicitly does the opposite: it lets requests through unchecked during an outage, trading strict limit enforcement for availability.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — fail-open prioritizes availability over strict enforcement; fail-closed is the choice that guarantees the limit is never silently bypassed, at the cost of turning a counter-store outage into a service outage.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why is rate limiting only at a single public-facing gateway considered insufficient defense in depth?',
+      options: [
+        { id: 'a', text: 'Because internal services or batch jobs can overwhelm a downstream dependency without ever passing through the public gateway', correct: true, explanation: 'A gateway only sees external traffic; misbehaving internal callers need their own, separately-keyed limits in front of fragile or expensive dependencies.' },
+        { id: 'b', text: 'Because a single gateway cannot physically handle enough throughput for any real API', correct: false, explanation: 'Throughput scaling is a separate concern (horizontal scaling of the gateway/counter store) from the defense-in-depth argument about which traffic paths a single layer can see.' },
+        { id: 'c', text: 'Because gateways cannot return 429 responses', correct: false, explanation: 'Gateways are exactly where 429 responses are typically generated — this is unrelated to why a single layer of limiting is insufficient.' },
+      ],
+    },
+  ]}
+/>

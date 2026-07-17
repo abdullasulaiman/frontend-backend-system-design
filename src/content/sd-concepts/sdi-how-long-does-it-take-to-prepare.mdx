@@ -1,0 +1,137 @@
+---
+title: "How Long Does It Take to Prepare?"
+module: "System Design Interviews"
+moduleOrder: 2
+order: 4
+track: "concept"
+summary: "Gives a realistic, scenario-based estimate of system design interview prep time based on your current experience level and how many hours a week you can actually commit."
+tags: ["interview-prep", "planning", "system-design", "career"]
+estMinutes: 10
+cheatsheet:
+  - "Prep time depends far more on your current experience than on any fixed number of weeks — a senior backend engineer with production distributed-systems scars needs far less than someone whose background is mostly single-service CRUD apps."
+  - "Budget roughly three buckets of time: building the vocabulary/building-blocks foundation, deliberately practicing full design problems, and mock-interview reps with feedback — most people under-invest in the third bucket."
+  - "A rough planning range: 3-4 weeks of focused work (10+ hrs/week) for engineers with real distributed-systems exposure; 8-12 weeks for engineers who need to build that foundation first."
+  - "Practicing more problems without feedback plateaus fast — 20 mock interviews with a critique loop beat 60 problems read passively."
+  - "Set a prep plan around a fixed interview date, not an open-ended 'I'll know when I'm ready' feeling — readiness is a moving target that never resolves on its own."
+  - "Cramming system design in under two weeks before a loop is possible only as a refresh for someone who already has the underlying experience — it is not enough time to build the reasoning skill from scratch."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"How many weeks until I'm ready?" is one of the first questions anyone preparing for system design interviews asks, and it's also one of the worst-answered questions online — most answers give a single number ("6 weeks!") that has no connection to who's asking. A backend engineer who has spent three years operating a sharded database in production and a recent grad who has only ever built monolithic CRUD apps are not the same distance from interview-ready, even if they read the exact same list of topics. This lesson gives you a way to estimate your own timeline instead of borrowing someone else's.
+
+The goal isn't to hit an arbitrary date — it's to avoid the two failure modes that waste the most candidate time: under-preparing because a generic number said "a few weeks is plenty," and over-preparing by drifting for six months without ever converging on being ready, because there was no plan telling you when to stop reading and start practicing.
+
+## Why a single number doesn't work
+
+System design interviews test a mix of three things, and each person walks in with a different starting point on each:
+
+- **Distributed-systems fundamentals** — replication, partitioning, consistency models, caching, queuing. Someone who has debugged a production replication lag issue already has intuition here; someone who hasn't has to build it from scratch.
+- **Breadth of building blocks** — knowing what a message queue, a CDN, a consistent-hashing ring, or a rate limiter is actually for, not just its name.
+- **The reasoning process itself** — turning an ambiguous prompt into requirements, then into an architecture, out loud, under time pressure. This is a skill independent of raw knowledge, and it's the one people most consistently underestimate.
+
+Two candidates can know the same facts and still need wildly different prep time, because the third skill — performing the reasoning live, in front of someone judging you — only comes from repeated, structured practice, not from reading.
+
+## Three buckets of prep time
+
+Whatever your starting point, prep time breaks into three buckets, and most candidates get the ratio between them wrong.
+
+### 1. Foundation building
+
+Learning (or refreshing) the vocabulary and building blocks: what a load balancer actually load-balances on, how a leader-based replication scheme handles a leader failure, what problem consistent hashing solves, when a queue helps and when it just moves the bottleneck. If you already work with these daily, this bucket might be a light refresher. If your day job has never touched more than one service and one database, this is real, non-skippable learning.
+
+### 2. Deliberate practice on full problems
+
+Working end-to-end problems — "design a URL shortener," "design a ride-hailing dispatch system" — by yourself, with a timer, producing an actual design: requirements, scale estimate, high-level architecture, and a couple of deep dives. This bucket is where foundation knowledge turns into the ability to assemble a coherent design instead of a disconnected list of facts about caching and queues.
+
+### 3. Mock interviews with feedback
+
+Doing the above out loud, live, in front of another person (or a structured format that forces you to talk instead of think silently), and getting told specifically what you skipped, rushed, or over-explained. This is the bucket almost everyone under-invests in, because it's the most uncomfortable one — and it's the bucket that most closely simulates the actual interview, including the part where you have to manage time and a listener's questions simultaneously.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Foundation: building blocks and vocabulary] --> B[Deliberate practice: solo full-problem reps]
+  B --> C[Mock interviews: live, timed, with feedback]
+  C --> D[Interview-ready]
+  C -.gaps found here.-> A
+`} />
+
+Notice the feedback loop in that diagram: mock interviews don't just test readiness, they reveal exactly which foundation gaps to go patch. Treating the three buckets as one-way instead of a loop is a common planning mistake — see the module's earlier lesson on why engineers fail for more on how gaps like this show up under pressure.
+
+## Rough planning ranges
+
+Treat these as planning anchors, not guarantees — they assume 8-12 focused hours a week, not passive reading in spare moments.
+
+- **Strong distributed-systems background already** (you operate services with replication, caching, or partitioning in production today): **3-4 weeks**. Most of the time goes to buckets 2 and 3 — you're mainly practicing the reasoning and communication skill, not learning new concepts.
+- **Solid general backend engineer, limited distributed-systems exposure** (comfortable with APIs and a single database, but caching/queuing/sharding are mostly theoretical to you): **6-8 weeks**. You need real time in bucket 1 before bucket 2 has much to work with.
+- **Early-career or coming from a narrow domain** (little production exposure to systems at any real scale): **8-12 weeks**. Foundation building takes longer, and it's worth resisting the urge to rush to mock interviews before you have enough vocabulary to reason with, not just repeat.
+
+These ranges assume you're preparing for one specific interview loop, not building expertise for its own sake — once you're consistently getting solid feedback on mock interviews across 3-4 different problem types, more calendar time mostly buys diminishing returns, not new readiness.
+
+## Worked example: budgeting six weeks
+
+Say you're a backend engineer with two years of experience on a single monolithic service, an interview loop in six weeks, and roughly 10 hours a week available. A reasonable split:
+
+- **Weeks 1-2 (foundation, ~10 hrs/week = 20 hrs)**: build solid mental models for replication, partitioning, caching, load balancing, and queuing — the building blocks, not yet full designs.
+- **Weeks 3-4 (deliberate practice, ~10 hrs/week = 20 hrs)**: work 6-8 full problems solo, timed, covering a mix of read-heavy (e.g., a content feed), write-heavy (e.g., a metrics ingestion pipeline), and real-time (e.g., a chat system) shapes, so you're not just pattern-matching one archetype.
+- **Weeks 5-6 (mock interviews, ~10 hrs/week = 20 hrs)**: 6-10 mock interviews with feedback, revisiting whichever specific gaps show up repeatedly (say, always forgetting to state a scale estimate, or rushing the API design step).
+
+That's roughly 60 hours total — a useful gut-check number when someone claims they got ready in "a weekend." It's not that more hours always help linearly, but a plan that totals under 15-20 hours for someone starting from limited distributed-systems exposure is very unlikely to have covered enough ground, no matter how the weeks are arranged.
+
+<Callout type="warning">
+  The most common prep-time mistake is spending nearly all available time in bucket 1 (reading, watching explainer videos, collecting notes) and treating that as "preparing," while bucket 3 (live mock interviews) gets pushed to "later" and then skipped or squeezed into the final two days. Reading about consistent hashing does not test whether you can explain it coherently, under time pressure, to a skeptical listener who asks a follow-up question you didn't anticipate — only practicing that specific skill does. If your plan doesn't have mock interviews scheduled with actual dates by week 2 or 3, that's a sign the plan is unbalanced, not that you need more reading first.
+</Callout>
+
+## Quick self-check for your own timeline
+
+A fast way to place yourself: can you currently explain, without notes, why a system might choose eventual consistency over strong consistency for a specific feature, and give a concrete example of each in a system you've worked on? If yes, you likely lean toward the shorter end of these ranges — your gap is mostly reps and communication, not concepts. If that question is genuinely hard to answer, budget real time for foundation building before scheduling mock interviews, or the mocks will mostly surface "I don't know this term yet" rather than useful feedback on your reasoning process.
+
+<Quiz
+  lessonId="sdi-how-long-does-it-take-to-prepare"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does this lesson avoid giving a single fixed number of weeks for system design interview prep?',
+      options: [
+        { id: 'a', text: 'Because system design interviews vary too much between companies to prepare for in advance', correct: false, explanation: 'The lesson is about prep time depending on the candidate\'s starting point, not about company-to-company interview variance.' },
+        { id: 'b', text: 'Because candidates start with very different levels of distributed-systems experience, and that gap drives most of the timeline difference', correct: true, explanation: 'The lesson explicitly frames prep time as a function of your current experience with fundamentals, breadth of building blocks, and live reasoning practice, not a fixed constant.' },
+        { id: 'c', text: 'Because mock interviews are optional for most candidates', correct: false, explanation: 'The lesson argues mock interviews are the most commonly under-invested bucket, not optional.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are among the three prep-time buckets described in this lesson? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Foundation building (vocabulary and building blocks)', correct: true, explanation: 'This is bucket 1 — learning or refreshing what the core components actually do.' },
+        { id: 'b', text: 'Deliberate practice on full, timed design problems done solo', correct: true, explanation: 'This is bucket 2 — turning foundation knowledge into the ability to assemble a coherent end-to-end design.' },
+        { id: 'c', text: 'Mock interviews with live feedback', correct: true, explanation: 'This is bucket 3 — practicing the reasoning and communication skill under realistic pressure, with critique.' },
+        { id: 'd', text: 'Memorizing solutions to a fixed list of named systems', correct: false, explanation: 'The lesson never recommends memorizing fixed solutions; it explicitly favors building transferable reasoning skill over memorized answers.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'According to this lesson, spending most of your available prep time on reading and watching explainer content, while pushing mock interviews to the final days, is a well-balanced plan.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The warning callout identifies exactly this pattern as the most common prep-time mistake, since reading does not test whether you can explain concepts live under pressure.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the lesson calls this the most common mistake and recommends having mock interviews scheduled with real dates by week 2 or 3 of a plan.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the worked six-week example, what is the main reason the plan allocates the first two weeks to foundation building before full practice problems?',
+      options: [
+        { id: 'a', text: 'Full practice problems have less value than foundation reading, regardless of background', correct: false, explanation: 'The lesson treats deliberate practice and mock interviews as the higher-value buckets overall — foundation time is front-loaded here specifically because this candidate has limited distributed-systems exposure.' },
+        { id: 'b', text: 'The candidate in the example has limited distributed-systems exposure, so practice problems would have little to work with until the vocabulary is in place', correct: true, explanation: 'The example candidate comes from a single monolithic service, so building blocks like replication and partitioning need real foundation time before full design problems become productive.' },
+        { id: 'c', text: 'Interviewers require candidates to define every term before starting a design', correct: false, explanation: 'This is about the candidate\'s own readiness to reason with the concepts, not a rule interviewers enforce during the interview itself.' },
+      ],
+    },
+  ]}
+/>
+

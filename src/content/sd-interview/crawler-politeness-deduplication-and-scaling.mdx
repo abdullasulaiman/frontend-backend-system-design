@@ -1,0 +1,240 @@
+---
+title: "Politeness, Deduplication, and Scaling"
+module: "Design a Web Crawler"
+moduleOrder: 10
+order: 2
+track: "interview"
+summary: "Covers the three concerns that turn a basic crawl loop into a production web crawler: not overloading the sites you crawl, not wasting work on pages you've already seen, and partitioning the pipeline so it scales horizontally."
+tags: ["web-crawler", "politeness", "deduplication", "bloom-filter", "distributed-systems"]
+estMinutes: 13
+cheatsheet:
+  - "Politeness is enforced per host, not globally — a single crawl-delay setting applied across the whole crawler either starves fast hosts or hammers slow ones."
+  - "Partition the URL frontier by a hash of the hostname so every URL for a given host lands in one queue; that's what makes per-host rate limiting enforceable across many worker machines."
+  - "URL-level dedup (a seen-URL set, usually a Bloom filter at scale) stops you from re-fetching a page; content-level dedup (fingerprinting, e.g. SimHash) stops you from storing near-identical pages reached via different URLs."
+  - "Always normalize URLs before checking or inserting into the seen-set — dropping default ports, sorting query params, and stripping session IDs and fragments collapses huge numbers of URLs that are really the same page."
+  - "A Bloom filter trades a small, tunable false-positive rate for massive space savings — sizing example: about 12 GB covers 10 billion URLs at a 1% false-positive rate, versus far more for an exact hash set."
+  - "Overall crawl throughput is capped by how many distinct hosts you can be actively fetching from at once, not by how many fetcher threads you run — respect per-host limits and add host parallelism to go faster."
+  - "Watch for crawler traps (auto-generated infinite URL spaces like calendar 'next day' links) and cap crawl depth or URL count per host so one badly behaved site can't consume your entire budget."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson scoped the crawler's requirements and sketched the
+high-level pipeline: seed URLs feed a frontier queue, fetcher workers pull
+URLs and download pages, a parser extracts links and content, and both
+feed back into the system. That pipeline works fine for a demo that
+crawls a few thousand pages from a handful of sites. It falls apart the
+moment you point it at the real web, for three reasons: you'll get your
+IP banned for hammering someone's server, you'll waste enormous compute
+re-crawling and re-storing pages you've already seen, and a design that
+only runs on one machine can't touch anything close to web scale. This
+lesson covers all three: politeness, deduplication, and horizontal
+scaling — the concerns that separate a toy crawler from one that could
+actually ship.
+
+## Politeness: crawling without becoming a denial-of-service attack
+
+A crawler that fetches as fast as its network allows will, for any
+individual site, look indistinguishable from an attack. Politeness is
+the set of rules that keep a crawler a welcome (or at least tolerated)
+visitor instead of an incident in someone else's on-call rotation.
+
+### Respecting robots.txt
+
+Before fetching anything from a host, a crawler should fetch and cache
+that host's `/robots.txt`, which lists paths the site owner disallows
+crawling and, often, a `Crawl-delay` directive suggesting a minimum gap
+between requests. Treat this as a hard rule, not a suggestion: ignoring
+robots.txt is the single fastest way to get an entire IP range
+blocklisted, which can take down crawling for every other host sharing
+that egress IP too.
+
+### Enforcing rate limits at the host level, not globally
+
+The mistake that's easy to make in a first design is a single global
+rate limiter — "no more than 1,000 requests per second, crawler-wide."
+That number does nothing to protect any individual site: at 1,000
+QPS spread unevenly, a single popular host with many extracted links can
+still receive hundreds of requests per second, while a small host gets
+none. The correct unit of enforcement is **per host**: track a last-fetch
+timestamp and a minimum delay (from `Crawl-delay`, or a conservative
+default like one request every 1-2 seconds) per hostname, and only allow
+a worker to fetch from that host once its delay window has elapsed.
+Because a crawl of the whole web touches millions of distinct hosts, this
+still adds up to very high aggregate throughput — it just requires
+spreading load across hosts instead of concentrating it.
+
+## Deduplication: don't fetch or store the same page twice
+
+The web is full of the same content reachable through different URLs:
+`example.com/page`, `example.com/page/`, `example.com/page?utm_source=x`,
+and `www.example.com/page` are frequently the exact same document.
+Without dedup, a crawler burns fetch budget, storage, and index space on
+copies of pages it has effectively already processed.
+
+### URL normalization and the seen-URL set
+
+Before a URL ever reaches the frontier, normalize it: lowercase the
+scheme and host, drop default ports (`:80` for `http`, `:443` for
+`https`), remove the fragment (everything after `#`, since it's
+client-side only), strip known tracking parameters, and sort remaining
+query parameters into a canonical order. Then check the normalized URL
+against a **seen-URL set** before enqueuing it. At small scale that set
+can be an actual hash set in memory or Redis; at billions of URLs, an
+exact set becomes too large to hold cheaply, so crawlers typically use a
+**Bloom filter** instead — a probabilistic structure that answers
+"definitely not seen" or "probably seen" using a fraction of the memory
+of an exact set, at the cost of an occasional false positive (a new URL
+incorrectly treated as already-seen and skipped).
+
+### Content fingerprinting for near-duplicates
+
+URL dedup alone still lets duplicate *content* through: mirrors,
+syndicated articles, and printer-friendly or AMP versions of a page often
+live at genuinely different URLs but carry nearly identical content.
+For this, fingerprint the page content itself — a fast approach is
+**SimHash** or **MinHash**, which produce a fixed-size fingerprint such
+that near-identical documents produce fingerprints that differ in only a
+few bits, unlike a cryptographic hash where a one-character change
+scrambles the whole output. Comparing a new page's fingerprint against
+recently stored fingerprints (using bit-distance rather than exact
+match) catches near-duplicates that URL-level dedup can never see.
+
+## Scaling the crawler horizontally
+
+### Partitioning the frontier by host
+
+To run on more than one machine, the frontier queue itself has to be
+partitioned. The natural partition key is a hash of the hostname: every
+URL for `example.com` is routed to the same partition (and, within it,
+into a per-host sub-queue), regardless of which worker discovered the
+URL. This single design choice is what makes politeness enforceable in a
+distributed system — the worker or queue owning a host's partition is
+the only place tracking that host's last-fetch time, so the rate limit
+can't be silently bypassed by two different machines fetching the same
+host in parallel.
+
+### Keeping the seen-set and storage consistent
+
+The Bloom filter (or sharded exact set) for URL dedup, and the page
+store itself, need to be shared or sharded consistently across workers —
+otherwise two workers can both decide a URL is new and fetch it twice.
+Shard the seen-set the same way as the frontier (by host hash) so
+membership checks stay local to the worker that owns that host, avoiding
+a cross-network round trip on every single URL discovered.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    F["URL Frontier\n(partitioned by host hash)"] --> PM["Politeness Manager\n(per-host delay timer)"]
+    PM --> W["Fetcher Workers"]
+    W --> SU{"Seen URL?\n(Bloom filter)"}
+    SU -- "yes, drop" --> X["Discarded"]
+    SU -- "no, new" --> DL["Download page"]
+    DL --> CD{"Duplicate content?\n(SimHash)"}
+    CD -- "near-duplicate" --> X
+    CD -- "unique" --> PS[("Page Store")]
+    PS --> PE["Parser: extract links"]
+    PE --> F
+`} />
+
+### Crawler traps and other scale hazards
+
+Some sites generate effectively infinite URL spaces on purpose or by
+accident: a calendar with a "next month" link that never terminates, or
+a session ID embedded in every URL that makes each page look unique.
+Guard against these with hard caps — a maximum crawl depth per host,
+a maximum number of URLs enqueued per host per day, and normalization
+rules that strip session-style parameters before they ever multiply the
+frontier.
+
+## Worked example: sizing the politeness budget and the dedup filter
+
+Say the target is 1 billion pages crawled per month, and you've settled
+on a conservative default politeness delay of one request every 2
+seconds per host (0.5 requests/sec) for hosts that don't specify their
+own `Crawl-delay`.
+
+**Required throughput:** 1 billion pages over a 30-day month is about
+2,592,000 seconds, giving a target average of roughly 386 pages/sec.
+
+**Host parallelism needed:** since no single host can be fetched faster
+than 0.5 requests/sec, hitting 386 pages/sec requires at least
+`386 / 0.5 = 772` distinct hosts being actively fetched from at any given
+instant. This is the number that matters for capacity planning — not
+"how many fetcher threads do we run," but "how many hosts can we keep in
+flight simultaneously while respecting each one's delay." In practice
+you'd run several thousand hosts in flight to leave headroom for slow
+responses and retries.
+
+**Bloom filter size for URL dedup:** at web scale, assume 10 billion
+distinct URLs need to be tracked over the crawler's lifetime. A Bloom
+filter tuned for a 1% false-positive rate needs roughly 9.6 bits per
+element, so `10,000,000,000 x 9.6 bits ≈ 96 billion bits`, or about
+12 GB. That's a strikingly small footprint for 10 billion URLs — an exact
+hash set storing even short URL hashes at that scale would run into
+hundreds of gigabytes. The 1% false-positive cost is a small number of
+new pages incorrectly skipped as "already seen," which is an acceptable
+trade for the memory savings at this scale.
+
+<Callout type="warning">
+  A common mistake is treating deduplication as a single problem solved
+  by one hash check. Relying only on an exact URL string match misses
+  the huge volume of URLs that differ trivially (trailing slash, query
+  parameter order, tracking parameters) but resolve to the same page —
+  fix this with normalization before the seen-check, not after. And
+  relying only on URL-level dedup misses content duplicates reached
+  through genuinely different URLs (mirrors, AMP pages, syndicated
+  copies) — that requires a separate content-fingerprinting step. Treat
+  URL dedup and content dedup as two distinct layers, not one.
+</Callout>
+
+<Quiz
+  lessonId="crawler-politeness-deduplication-and-scaling"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should crawl politeness (rate limiting) be enforced per host rather than as a single global request-per-second cap across the whole crawler?',
+      options: [
+        { id: 'a', text: 'A global cap does not stop the crawler from overloading any individual site, since load can concentrate unevenly on popular hosts within that global budget', correct: true, explanation: 'A global QPS number says nothing about how requests are distributed across hosts; a popular host can still receive far more than a polite rate even while the crawler stays under its global cap.' },
+        { id: 'b', text: 'Per-host limits are required by the HTTP specification', correct: false, explanation: 'There is no such HTTP requirement; per-host rate limiting is a crawler design practice driven by robots.txt conventions and courtesy, not a protocol rule.' },
+        { id: 'c', text: 'Global rate limits are technically impossible to implement in a distributed system', correct: false, explanation: 'A global limit is implementable (e.g. via a shared counter); the problem is that it does not protect individual sites, not that it cannot be built.' },
+        { id: 'd', text: 'Per-host limits make the frontier queue smaller', correct: false, explanation: 'Rate limiting affects fetch timing, not the number of URLs stored in the frontier.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuinely different deduplication mechanisms a web crawler needs, each catching cases the other misses? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'URL normalization plus a seen-URL set (e.g. a Bloom filter)', correct: true, explanation: 'This catches the case where the same page is reachable via superficially different URLs (trailing slash, query param order, tracking params) by canonicalizing before checking or inserting.' },
+        { id: 'b', text: 'Content fingerprinting (e.g. SimHash) compared across stored pages', correct: true, explanation: 'This catches near-duplicate content reached through genuinely different URLs, such as mirrors or AMP versions, which URL-level dedup cannot detect.' },
+        { id: 'c', text: 'Increasing the per-host crawl delay', correct: false, explanation: 'Crawl delay controls request pacing to be polite to a host; it has no effect on whether duplicate URLs or duplicate content get detected.' },
+        { id: 'd', text: 'Raising the number of fetcher worker machines', correct: false, explanation: 'Adding workers increases fetch throughput and parallelism; it does not, by itself, detect or prevent duplicate URLs or content.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A Bloom filter used for the seen-URL set can occasionally cause a genuinely new URL to be incorrectly treated as already seen and skipped.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — this is exactly what a false positive means for a Bloom filter: it can say "probably seen" for an element it has never actually stored, at a rate that is tunable but never zero (short of using far more memory).' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Bloom filters trade a small, non-zero false-positive rate for large memory savings compared to an exact set; that possibility is inherent to the structure, not a bug in a particular implementation.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Targeting 1 billion pages/month (about 386 pages/sec average) with a politeness rule of one request every 2 seconds per host, roughly how many distinct hosts must be actively fetched from at once to hit that throughput?',
+      options: [
+        { id: 'a', text: 'About 772 hosts', correct: true, explanation: 'Each host allows at most 0.5 requests/sec under this delay; 386 divided by 0.5 is about 772 hosts needing to be in flight simultaneously to reach the target average throughput.' },
+        { id: 'b', text: 'About 386 hosts', correct: false, explanation: '386 is the target pages-per-second rate itself, not the number of hosts needed — each host only contributes 0.5 requests/sec, so more than 386 hosts are required.' },
+        { id: 'c', text: 'About 2 hosts', correct: false, explanation: 'That would only produce about 1 request/sec total (2 hosts x 0.5 req/sec each), nowhere near the 386/sec target.' },
+        { id: 'd', text: 'It does not depend on the number of hosts, only on the number of fetcher threads', correct: false, explanation: 'Per-host politeness caps how fast any single host can be fetched regardless of thread count; more threads hitting the same small set of hosts would violate the delay, not increase throughput.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,256 @@
+---
+title: "Rollouts, Rollbacks, and Safety"
+module: "Design a Deployment System"
+moduleOrder: 14
+order: 2
+track: "interview"
+summary: "Covers the rollout strategies (canary, blue-green, rolling) and automated rollback mechanisms a deployment system needs to ship code safely at scale."
+tags: ["deployment", "rollouts", "rollbacks", "canary-release", "reliability"]
+estMinutes: 12
+cheatsheet:
+  - "Rolling deploy is the default: cheap, uses existing capacity, but a bad build is visible to some fraction of traffic for the whole duration and there's no automatic \"stop and undo.\""
+  - "Canary trades a slower rollout for a blast-radius cap: 1% -> 5% -> 25% -> 100%, with a health gate between each step, so a bad build only ever hurts a small slice of traffic."
+  - "Blue-green gives instant, clean rollback (flip the router back) at the cost of running 2x capacity during the cutover window — best when rollback speed matters more than compute cost."
+  - "Automated rollback needs a signal (error rate, latency p99, saturation), a comparison baseline (the previous version, not a fixed threshold, catches regressions a static SLO misses), and a trigger that pauses or reverts without waiting for a human to notice."
+  - "Bad deploys and bad config changes look identical to users — a rollout system has to gate config pushes and feature-flag flips through the same canary/health-check pipeline as binary deploys, not just code."
+  - "Rollback is not free: undoing a schema migration, a message format change, or a stateful cache write can be much harder than undoing a binary swap, so design migrations to be backward-compatible before you need to roll back through them."
+  - "Feature flags decouple deploy from release: you can deploy new code dark (flag off) and flip it on gradually per-user or per-cohort, independent of the binary rollout curve."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Getting a build from a merged pull request into a running fleet is only
+half the problem — the other half is not breaking production while you do
+it. A pipeline that's fast but ships every build to 100% of instances at
+once is a pipeline that turns every bad commit into a full outage. This
+lesson covers the part of a deployment system that limits the damage a bad
+build can do: how you roll a new version out gradually, how you detect
+that something's wrong, and how you get back to a known-good state fast
+and automatically, without paging a human at 3am to eyeball a dashboard.
+
+If you designed the pipeline itself in the previous lesson, think of this
+as the "what happens after the artifact is built and ready to ship"
+half — the actual act of exposing new code to traffic, safely.
+
+## Rollout strategies
+
+There are three rollout shapes you should be able to describe, compare,
+and pick between in an interview.
+
+### Rolling deploy
+
+Replace instances (or pods) a batch at a time — say 10% of the fleet every
+few minutes — until all of them run the new version. It reuses existing
+capacity (no extra machines needed) and is the default strategy in most
+orchestrators (Kubernetes' `Deployment` object does this natively).
+
+The catch: during the rollout window, both versions serve live traffic
+simultaneously, and there's no built-in "notice a problem and undo"
+behavior beyond a readiness-probe failure blocking further progress. If
+version N+1 has a subtle bug, some fraction of requests hit it for the
+entire rollout duration unless something outside the mechanism is watching
+and intervenes.
+
+### Canary release
+
+Route a small, deliberate slice of traffic — often 1% — to the new
+version first, watch health signals, and only then widen the slice: 1% ->
+5% -> 25% -> 100%, pausing at each step for a health gate to pass. This
+caps blast radius by construction: if the new version is broken, at most
+1% of users ever see it before the pipeline halts and rolls back
+automatically.
+
+The cost is time and complexity — canarying safely means running two
+versions side by side, splitting traffic precisely (often by user ID hash
+so the same users consistently land on the same version), and having a
+comparison mechanism sensitive enough to catch a regression at 1% of
+traffic, where noise is higher.
+
+### Blue-green deployment
+
+Run two complete, identical-capacity environments ("blue" = live,
+"green" = idle). Deploy the new version fully into green, run smoke tests
+against it directly, then flip a router or load balancer to send all
+traffic to green in one atomic switch. Blue stays warm and unused for a
+rollback window; if anything goes wrong, flip the router back — no
+redeploy, no waiting for containers to reschedule.
+
+Rollback is close to instant, which is the whole appeal. The cost is
+running 2x the compute during the cutover window, and it doesn't limit
+blast radius the way canary does — once you flip, 100% of traffic hits the
+new version immediately, so you're betting entirely on your pre-flip smoke
+tests.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  A[New build artifact] --> B{Rollout strategy}
+  B -->|Rolling| C[Replace 10% of instances at a time]
+  B -->|Canary| D[Route 1% traffic, then 5%, 25%, 100%]
+  B -->|Blue-green| E[Deploy fully to idle environment, flip router]
+  C --> F[Health gate at each step]
+  D --> F
+  E --> F
+  F -->|Healthy| G[Continue to next step / done]
+  F -->|Unhealthy| H[Automated rollback]
+`} />
+
+## Automated rollback: the part that actually needs designing
+
+Picking a rollout shape is the easy half. The interview signal comes from
+how you detect "unhealthy" and act on it without a human in the loop,
+because a human noticing a dashboard is not a design — it's a hope.
+
+An automated rollback needs three pieces:
+
+1. **A signal.** Error rate, latency percentiles (p99 matters more than
+   average — a regression that only hurts the slowest 1% of requests is
+   invisible in an average), saturation (CPU, memory, queue depth), and
+   business-level signals where you have them (checkout failure rate, for
+   example).
+2. **A baseline to compare against.** Comparing the canary's error rate to
+   a fixed threshold like "less than 1%" misses regressions in a system
+   whose normal error rate is already 0.02%. Compare the canary's metrics
+   to the *currently-running previous version's* metrics over the same
+   time window — a relative regression (canary error rate is 5x the
+   baseline's) is a far more sensitive and portable signal than any
+   absolute number you hardcode.
+3. **A trigger that acts, not just alerts.** On a bad comparison, the
+   pipeline should pause the rollout (stop widening the traffic slice) and
+   then roll back — shift traffic back to the last known-good version,
+   or scale it back up and redirect. This needs to happen automatically,
+   within the health-check window (often 2-10 minutes), not after someone
+   reads a page.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+  participant P as Pipeline
+  participant C as Canary (5% traffic)
+  participant M as Metrics/monitoring
+  participant B as Baseline (95% traffic, old version)
+  P->>C: Shift 5% of traffic to new version
+  loop every health-check interval
+    M->>C: Collect error rate, p99 latency
+    M->>B: Collect same metrics
+    M->>P: Compare canary vs baseline
+  end
+  alt Canary within tolerance
+    P->>C: Widen to next traffic step
+  else Canary regressed
+    P->>C: Halt rollout
+    P->>B: Shift all traffic back to baseline
+  end
+`} />
+
+## Config and feature flags need the same discipline
+
+A rollout system that only gates *binary* deploys but lets config changes
+or feature-flag flips push straight to 100% of traffic has a hole in it —
+from a user's perspective, a bad config push and a bad code push look
+identical: both change behavior for everyone at once. Route config changes
+and flag flips through the same canary-and-health-gate pipeline as code
+deploys, ideally the same mechanism, so a typo in a rate-limit config gets
+caught at 1% of traffic instead of 100%.
+
+Feature flags are also worth separating conceptually from rollout: a
+rollout controls how much of the fleet runs new *code*; a flag controls
+how much of the fleet's *behavior* is turned on. Deploying code with a
+flag off ("dark launch") lets you decouple the two — ship the binary
+broadly, then ramp the feature itself independently, by user cohort or
+percentage, without re-running the binary rollout.
+
+## The one thing rollback can't undo cleanly: state
+
+Rolling back a stateless binary is straightforward — swap the version,
+traffic follows. Rolling back a database migration, a changed message
+schema, or a write that already landed in a cache is not. If version N+1
+adds a new required column and starts writing it, rolling back to version
+N doesn't undo the writes N+1 already made, and N might not even tolerate
+reading rows that have the new column.
+
+The fix is designing migrations to be rollback-safe *before* you need to
+roll back: additive schema changes (new nullable columns, not renames or
+drops), a deploy-then-migrate-then-cleanup sequence so two versions of
+the binary can both run against the same schema during the transition,
+and message formats that tolerate unknown fields (so an old consumer
+reading a new producer's message doesn't crash). This is worth stating
+explicitly in an interview — "I'd make this migration additive so both
+versions coexist" is a strong, concrete signal.
+
+## Worked example: rolling out a payment-service change safely
+
+Say you're shipping a change to a payment service that processes 5,000
+requests per second. A rolling deploy across 50 instances (100 req/s
+each) at 10% per batch means 5 instances flip at once — if the new
+version has a bug that fails 1-in-10 payments, that's roughly 50 failed
+payments per second concentrated on those 5 instances for however long
+the batch takes to complete, maybe 2-3 minutes. That's 6,000-9,000 failed
+payments before the rollout even reaches the next batch, let alone finishes.
+
+A canary strategy on the same service starts at 1% (50 req/s). The same
+1-in-10 failure rate now produces 5 failed payments per second, and if
+your health gate compares canary error rate to baseline every 60 seconds,
+you catch a 10x error-rate spike within one interval — roughly 300 failed
+payments total before the pipeline auto-halts and shifts back to the old
+version. That's a two-order-of-magnitude difference in blast radius for
+the same bug, purely from the rollout shape, before any code fix is even
+written.
+
+<Callout type="warning">
+  A common mistake: building a canary or health-gate mechanism, then
+  setting the traffic-shift steps and health-check window loosely enough
+  that a slow-burning regression sails through. A canary held at 1% for 60
+  seconds only sees a few hundred requests — enough to catch a total
+  crash, not enough to catch a memory leak that degrades p99 latency after
+  five minutes of sustained load. Size your canary duration and traffic
+  percentage to your traffic volume and to the kind of regression you're
+  trying to catch, not just to "make the rollout finish fast."
+</Callout>
+
+<Quiz
+  lessonId="deploy-rollouts-rollbacks-and-safety"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Which rollout strategy gives the fastest rollback, at the cost of running roughly double the compute capacity during the cutover window?',
+      options: [
+        { id: 'a', text: 'Rolling deploy', correct: false, explanation: 'Rolling deploy reuses existing capacity (no doubling), but rollback means re-rolling backward through the same batches, which is not instant.' },
+        { id: 'b', text: 'Blue-green deployment', correct: true, explanation: 'Blue-green keeps a full second environment warm and idle; rollback is flipping the router back, which is close to instant, at the cost of 2x capacity during the window.' },
+        { id: 'c', text: 'Canary release', correct: false, explanation: 'Canary limits blast radius via gradual traffic shifting, but it does not require doubling total capacity, and its rollback is a traffic-shift-back rather than an instant router flip.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these should feed into an automated rollback decision during a canary rollout? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Comparing the canary error rate to the currently-running baseline version, not a fixed threshold', correct: true, explanation: 'A relative comparison against the live baseline catches regressions that a hardcoded absolute threshold would miss in a system whose normal error rate is already low.' },
+        { id: 'b', text: 'p99 latency, not just average latency', correct: true, explanation: 'Averages can hide a regression that only hurts a slow tail of requests; p99 (or higher percentiles) surfaces it.' },
+        { id: 'c', text: 'Waiting for an on-call engineer to notice a dashboard and manually trigger the rollback', correct: false, explanation: 'That is a monitoring practice, not an automated rollback mechanism — the whole point of automation is acting on the signal without waiting for a human to notice.' },
+        { id: 'd', text: 'Saturation signals like CPU, memory, or queue depth on the canary instances', correct: true, explanation: 'Saturation metrics catch resource-exhaustion regressions (like a memory leak) that error rate alone might not show yet.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Rolling back a binary deploy also automatically undoes any database schema migration or message-format change that shipped alongside it.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False — flipping traffic back to an old binary does not undo writes, schema changes, or already-consumed messages. Migrations need to be designed additively/backward-compatible so a rollback of the code does not leave the system in a broken state.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. State changes (schema migrations, message formats, cache writes) are not undone by a binary rollback — they require their own rollback-safe design, such as additive-only schema changes and a deploy-then-migrate-then-cleanup sequence.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A rollout system gates code deploys through a canary pipeline but pushes config changes and feature-flag flips straight to 100% of traffic. What is the main risk this creates?',
+      options: [
+        { id: 'a', text: 'Config changes are inherently safer than code changes, so this is fine', correct: false, explanation: 'A bad config value or flag flip can change behavior for every user just as badly as a bad binary — from a user\'s perspective the two are indistinguishable.' },
+        { id: 'b', text: 'A bad config push or flag flip affects all traffic at once with no gradual health-checked rollout to catch it early', correct: true, explanation: 'Skipping the canary/health-gate pipeline for config and flags removes the blast-radius cap and early detection that the same pipeline gives binary deploys, so a bad config push hits 100% of traffic immediately.' },
+        { id: 'c', text: 'It has no risk, since config changes do not require rebuilding the binary', correct: false, explanation: 'Not rebuilding the binary is irrelevant to the risk — the risk is about how broadly and how carefully a behavioral change is exposed to traffic, regardless of whether it required a rebuild.' },
+      ],
+    },
+  ]}
+/>

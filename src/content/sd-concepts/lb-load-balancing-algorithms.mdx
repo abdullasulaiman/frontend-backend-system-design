@@ -1,0 +1,147 @@
+---
+title: "Load Balancing Algorithms"
+module: "Load Balancers"
+moduleOrder: 8
+order: 2
+track: "concept"
+summary: "Compares the core algorithms load balancers use to pick a backend — round robin, least connections, weighted variants, and consistent hashing — and when each one is the right call."
+tags: ["load-balancing", "algorithms", "consistent-hashing", "scalability"]
+estMinutes: 12
+cheatsheet:
+  - "Round robin assumes requests and servers are roughly uniform in cost — it breaks down fast with long-lived connections or wildly varying request cost."
+  - "Least connections adapts to real-time load and is the safer default for anything with variable request duration (uploads, streaming, long queries)."
+  - "Weighted variants (weighted round robin, weighted least connections) let you run mixed-capacity fleets without wasting the bigger boxes."
+  - "Consistent hashing keeps client-to-server (or key-to-shard) mappings stable across scale-up/down — use it whenever cache locality or session affinity matters."
+  - "Plain hashing (hash mod N) reshuffles almost every key when N changes; consistent hashing only remaps ~1/N of keys."
+  - "Power-of-two-choices gets most of least-connections' benefit with far less coordination overhead — worth knowing for high-QPS layer-4 balancers."
+  - "The 'best' algorithm is a function of your traffic shape, not a universal ranking — pick based on request cost variance, statefulness, and fleet homogeneity."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson established *why* you put a load balancer in front of a fleet of servers. This one answers the question that comes right after: given a request and a pool of healthy backends, which one actually gets it? That decision is made by an algorithm, and the algorithm you pick has real consequences — one backend silently overloaded while its neighbors idle, a cache that never gets a hit because requests bounce between machines, or a session that breaks because request 2 lands on a different server than request 1.
+
+Interviewers probe this because it's where "I'd add a load balancer" turns into an actual design decision. You need to be able to say *which* algorithm and *why*, tied to the traffic pattern of the system you're designing.
+
+## Static algorithms: decide without looking at server state
+
+These algorithms pick a backend using only fixed configuration — they never check how busy a server currently is.
+
+### Round robin
+
+Requests are handed out in a fixed rotation: server 1, then 2, then 3, then back to 1. It's simple, requires no shared state between load balancer instances, and works well when every request costs roughly the same amount of work and every server has roughly the same capacity.
+
+It falls apart when either assumption breaks. A batch of expensive requests (say, large file uploads) can land on the same server back-to-back purely by rotation timing, or a server that's slower or smaller than its peers gets the exact same share of traffic as the fastest box in the fleet.
+
+### Weighted round robin
+
+Same rotation, but each server gets a weight proportional to its capacity — a server twice as powerful gets roughly twice the requests. This fixes the "identical shares for non-identical servers" problem, but it's still blind to real-time load: a weight is a static guess about capacity, not a measurement of current busy-ness.
+
+## Dynamic algorithms: decide using live server state
+
+These algorithms track something about each server in real time and route based on it.
+
+### Least connections
+
+The load balancer tracks how many active connections (or in-flight requests) each server currently has, and sends the next request to whichever server has the fewest. This adapts automatically to uneven request cost — a server stuck processing a few slow requests naturally gets fewer new ones until it catches up.
+
+Least connections is usually the better default over round robin for anything where request duration varies meaningfully: file uploads/downloads, streaming connections, long-running queries, or WebSocket connections that stay open for minutes. The cost is that the load balancer has to track connection counts per backend, which is trivial for a single load balancer instance but requires coordination (or approximation) across a fleet of load balancers.
+
+### Weighted least connections
+
+Combines both ideas: route to the server with the lowest ratio of active connections to its assigned weight, so a bigger server can carry proportionally more concurrent connections before it's considered "busier" than a smaller one.
+
+### Least response time
+
+A variant that factors in observed latency, not just connection count — route to the server with the best combination of low connection count and low recent response time. This catches a failure mode least-connections alone misses: a server can have few connections but still be slow (say, it's mid-garbage-collection-pause), and least-connections would happily send it more work.
+
+### Power of two choices
+
+At very high request rates, tracking exact global connection counts across many load balancer instances gets expensive to keep consistent. Power-of-two-choices is a cheap approximation: pick two servers at random, check their load, and send the request to the less-loaded of the two. It sounds like it should perform much worse than checking all servers, but it gets remarkably close to full least-connections behavior with far less coordination — a detail worth citing if an interviewer pushes on how this works at extreme scale (envoy and several modern layer-4/7 balancers use this).
+
+## Hash-based algorithms: same key, same server
+
+Sometimes the goal isn't spreading load evenly — it's routing the *same* client, session, or key to the *same* backend every time, for cache locality or session affinity.
+
+### IP hash / consistent hashing on a key
+
+Hash some property of the request (client IP, session ID, a cache key) to deterministically pick a server. The naive version — `hash(key) mod N` — has a serious problem: if `N` (the number of servers) changes because you scale up or a server dies, nearly every key's `mod N` result changes too, meaning nearly every client gets remapped to a different server at once. For a cache-fronting load balancer, that's a full cache-cold event on every scaling operation.
+
+**Consistent hashing** fixes this. Servers and keys are hashed onto the same conceptual ring (a circular hash space); a request is routed to the first server found walking clockwise from its key's position. Adding or removing one server only remaps the keys that fall in the small arc it owned — roughly `1/N` of all keys — instead of nearly all of them. This is the standard technique behind CDN edge routing, cache-aware load balancing (so a cache-heavy request keeps hitting the same warmed cache), and sharded backends where you want stable key ownership.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    LB["Load Balancer"]
+    subgraph Static
+        RR["Round Robin"]
+        WRR["Weighted Round Robin"]
+    end
+    subgraph Dynamic
+        LC["Least Connections"]
+        LRT["Least Response Time"]
+        P2["Power of Two Choices"]
+    end
+    subgraph Hash-based
+        CH["Consistent Hashing"]
+    end
+    LB --> RR
+    LB --> LC
+    LB --> CH
+    RR -->|"uniform cost, uniform servers"| S1["Good fit"]
+    LC -->|"variable request duration"| S2["Good fit"]
+    CH -->|"cache locality, sessions, sharding"| S3["Good fit"]
+`} />
+
+## Worked example: picking an algorithm for two different services
+
+Say you're designing two services behind the same load balancer tier:
+
+**Service A — a URL shortener redirect endpoint.** Every request is nearly identical work: look up a key, return a 301. Requests are stateless and cheap, and the fleet is homogeneous. Round robin (or weighted round robin, if the fleet has mixed instance sizes) is a fine choice — there's little variance for a smarter algorithm to exploit, and the operational simplicity is worth it.
+
+**Service B — an image-processing service** where requests range from resizing a 50 KB thumbnail to transcoding a 200 MB video. Round robin would regularly stack multiple expensive video jobs on one server while a neighbor sits idle with easy thumbnail work. Least connections (or least response time, if you can measure it) adapts to that variance directly. If you also want repeated requests for the same source image to hit a server that already has it decoded in memory, you'd add consistent hashing on the source-image ID on top — routing by "least loaded among the 2-3 servers that already own this key" rather than globally least loaded.
+
+This is the pattern interviewers want to see: name the algorithm, then justify it from the actual shape of the traffic, not from memorized rankings.
+
+<Callout type="warning">
+  A common mistake: treating "least connections" as if it always measures real load. Connection *count* is a proxy for load, not load itself. A server can hold many idle keep-alive connections while a peer holds fewer but much heavier ones, and pure least-connections will keep routing to the "less busy by count" server that's actually more saturated on CPU. If request cost varies a lot, pair connection count with an actual load signal (CPU, queue depth, or response time) rather than trusting raw connection counts alone.
+</Callout>
+
+Placement of the load balancer itself, health checks that keep these algorithms from routing to dead servers, and the global-vs-local balancing question are covered in the next lesson — this one is purely about the selection logic once you already have a pool of healthy candidates.
+
+<Quiz
+  lessonId="lb-load-balancing-algorithms"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A service handles requests whose processing time varies enormously (some finish in milliseconds, others take minutes). Which algorithm adapts best to this?',
+      options: [
+        { id: 'a', text: 'Round robin', correct: false, explanation: 'Round robin ignores request cost entirely and can stack several slow requests on one server purely by rotation timing.' },
+        { id: 'b', text: 'Least connections', correct: true, explanation: 'Least connections reacts to real-time load: a server tied up with slow requests naturally receives fewer new ones until it frees up.' },
+        { id: 'c', text: 'Weighted round robin', correct: false, explanation: 'Weighted round robin only accounts for static server capacity differences, not per-request cost variance, so it has the same blind spot as plain round robin here.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'boolean',
+      prompt: 'With plain hash(key) mod N routing, adding one new server to the pool typically remaps only a small fraction of keys to a different server.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The opposite is true for plain mod-N hashing — changing N changes the mod result for nearly every key, remapping almost everything at once.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Plain hash mod N reshuffles nearly all keys when N changes; consistent hashing is the technique that limits remapping to roughly 1/N of keys.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'multi',
+      prompt: 'Which scenarios are good reasons to reach for consistent hashing instead of least connections? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'You want repeated requests for the same cache key to keep hitting a server that already has it warmed in memory', correct: true, explanation: 'This is the classic consistent hashing use case: routing by key to preserve cache locality, not just by instantaneous load.' },
+        { id: 'b', text: 'You need session affinity so a user\'s follow-up requests land on the server holding their in-memory session state', correct: true, explanation: 'Consistent hashing on a session/user ID gives stable routing across scaling events, which is exactly what session affinity needs.' },
+        { id: 'c', text: 'You want the load balancer to automatically account for one server currently having far more in-flight requests than others', correct: false, explanation: 'That is precisely what least connections (a dynamic, load-aware algorithm) is for. Consistent hashing routes by key identity, not current load, so it does not solve this on its own.' },
+      ],
+    },
+  ]}
+/>

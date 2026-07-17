@@ -1,0 +1,261 @@
+---
+title: "Requirements and the Lambda/Kappa Choice"
+module: "Design a Data Infrastructure System"
+moduleOrder: 17
+order: 1
+track: "interview"
+summary: "Scopes a batch-plus-streaming data infrastructure system into concrete requirements, then works through the Lambda vs. Kappa architectural choice that those requirements force."
+tags: ["data-infrastructure", "lambda-architecture", "kappa-architecture", "requirements", "stream-processing"]
+estMinutes: 12
+cheatsheet:
+  - "Separate two axes of 'fast' up front: event latency (how soon after an event does it get ingested) and freshness/staleness (how stale can a query result be) — they drive different parts of the design."
+  - "State a correctness requirement explicitly: does a metric need to be exactly right eventually (reprocessable from raw data), or is an approximate, real-time number acceptable forever?"
+  - "Lambda architecture runs a batch layer (correct, replayable, slow) and a speed layer (fast, approximate) in parallel, merging both at serving time — it buys correctness-plus-speed at the cost of maintaining two codepaths for the same logic."
+  - "Kappa architecture treats everything as a stream over a replayable log (e.g. Kafka with long retention or tiered storage) and reprocesses by replaying the log through a new version of the same job — one codepath, but it depends on the log being replayable far enough back."
+  - "Pick Lambda when batch jobs need capabilities streaming can't easily replicate (large joins, ML training, ad-hoc historical queries) or when full history can't live in the log economically; pick Kappa when the log can hold or reload full history and all logic can be expressed as stream transformations."
+  - "Idempotency and exactly-once semantics are a requirements question, not an implementation detail — decide upfront whether double-counting a retried event is a business problem (billing, ad spend) or a rounding error (a dashboard view count)."
+  - "Capacity-estimate ingestion volume, retention needs, and query fan-out before picking an architecture — the Lambda/Kappa decision should follow from the numbers, not from which one sounds more modern."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design a data pipeline" or "design an analytics platform" questions feel
+different from designing Twitter or Uber, and candidates who treat them the
+same way struggle. There's no single user-facing request/response to
+optimize. Instead you're designing infrastructure that ingests a firehose of
+events (clicks, sensor readings, transactions, logs) from dozens of
+producers, and serves that data to consumers who want wildly different
+things from it: a real-time dashboard that needs a number from the last 10
+seconds, a nightly report that needs perfect historical accuracy, and a data
+scientist who wants to replay six months of raw events through a new model.
+
+The first job in this kind of interview is pinning down what "fast" and
+"correct" actually mean for the system you're building, because those two
+requirements are in tension, and the tension is exactly what the
+Lambda/Kappa architectural choice exists to resolve. Get the requirements
+vague and you'll either over-engineer a dual-pipeline system nobody asked
+for, or under-engineer a single streaming path that can't answer "what was
+the exact number three weeks ago."
+
+## Step 1: Scope the functional requirements
+
+A workable core for an interview-sized data infrastructure system:
+
+- **Ingest events from multiple producers** — application logs, clickstream
+  events, IoT/sensor data, or transaction records, arriving continuously.
+- **Support both real-time and historical queries.** A live "requests per
+  second right now" dashboard and a "total revenue for Q2" report are both
+  in scope, and they read from the same underlying events.
+- **Allow reprocessing.** When someone finds a bug in a metric's
+  calculation, or a new metric is invented, the system should be able to
+  recompute it correctly from raw historical data, not just from today
+  forward.
+- **Serve multiple downstream consumers** — dashboards, alerting, ML feature
+  stores, ad-hoc analytics queries — each with different latency and
+  accuracy expectations against the same data.
+
+Explicitly defer: the specifics of the query language / OLAP engine, a
+full data-governance/PII layer, and multi-region replication are each their
+own design problem. Naming them and moving on keeps the conversation focused
+on the ingestion/processing/serving core.
+
+### Non-functional requirements — the ones that actually decide the architecture
+
+- **Event latency vs. freshness are two different numbers.** Event latency
+  is how long between an event happening and it landing in the system
+  at all. Freshness (or staleness) is how old the data behind a query
+  result is allowed to be. A system can ingest events within milliseconds
+  but still serve dashboards that are five minutes stale by design — that's
+  a deliberate trade, not a bug.
+- **Correctness requirement: exact-eventually vs. approximate-forever.**
+  Decide out loud whether a number (say, daily active users) must be
+  100% correct once the day closes and reprocessing happens, or whether an
+  approximate real-time estimate is acceptable as the permanent answer.
+  Billing and financial reporting usually need the former; a live "viewers
+  right now" counter is fine with the latter.
+- **Volume and retention.** How many events per second at peak, and how far
+  back does the system need to be able to recompute from raw data — days,
+  months, or years? This single number often decides whether "keep
+  everything in the log" (Kappa) is economically realistic.
+- **Idempotency / exactly-once semantics.** Producers and consumers will
+  retry after failures. Decide whether a duplicated event double-counted
+  downstream is a real business problem (ad spend, billing) or a rounding
+  error nobody will notice (a page-view counter).
+- **Fault tolerance and backfill.** If a processing job crashes or a bug
+  ships, the system needs a way to recompute affected results without
+  re-ingesting from producers, who may not retain data that long.
+
+<Callout type="tip">
+  Say this out loud early: "Let's separate how fast data needs to arrive
+  from how fresh query results need to be, and how exact they need to be
+  once the day settles — those three numbers are what decide the
+  architecture, not a preference for batch or streaming." It reframes the
+  rest of the conversation around requirements instead of buzzwords.
+</Callout>
+
+## Step 2: The tension that forces an architectural choice
+
+Batch processing (recompute over a large stored dataset on a schedule) is
+easy to reason about and gets correctness essentially for free — rerun the
+same job over the same immutable input and you get the same answer. But it's
+slow: an hourly or nightly batch job means results are stale by definition
+for that whole window.
+
+Stream processing (react to each event as it arrives) gets you low latency,
+but correctness is harder: out-of-order events, late-arriving data, and
+node failures all threaten the "did I count this exactly once" guarantee
+that batch gets for free.
+
+Two named architectural patterns resolve this tension in opposite ways.
+
+### Lambda architecture: run both, merge at serving time
+
+Lambda architecture keeps a **batch layer** and a **speed layer** running in
+parallel against the same raw event log, and merges their outputs at query
+time.
+
+- The batch layer periodically recomputes complete, correct views from all
+  historical raw data — slow, but authoritative.
+- The speed layer processes only recent events with a stream processor, to
+  fill the gap between "now" and the last completed batch run — fast, but
+  approximate, and its output is discarded/superseded once the batch layer
+  catches up to that time range.
+- A serving layer merges both: batch results for anything the batch layer
+  has already covered, speed-layer results for the recent gap.
+
+The upside is you get both correctness and low latency. The cost is real:
+you're maintaining the same business logic twice, once as a batch job and
+once as a streaming job, in what are often two different frameworks — and
+keeping their outputs from silently diverging is an ongoing maintenance
+burden, not a one-time cost.
+
+### Kappa architecture: one pipeline, replay the log to reprocess
+
+Kappa architecture drops the batch layer entirely and treats **everything**
+as a stream, including reprocessing. All events land in a durable,
+replayable log (the canonical example is Kafka with long retention or a
+tiered-storage backend). When logic changes or a bug is found, you don't
+run a separate batch job — you spin up a new version of the stream
+processing job and replay the log from the relevant point in history
+through it, then cut consumers over to the new output once it catches up.
+
+This collapses two codepaths into one, which is the big win — no more
+batch/speed logic drift. The cost is that it depends entirely on the log
+being replayable far enough back economically. If you need to reprocess two
+years of data and the log can't cheaply retain or reload that much, Kappa
+either isn't viable as pure streaming or needs a "replay from cold storage"
+escape hatch that starts to look like a batch layer again.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph Lambda["Lambda architecture"]
+      direction TB
+      L1["Raw event log"] --> L2["Batch layer\n(recompute all history, slow, exact)"]
+      L1 --> L3["Speed layer\n(recent events only, fast, approximate)"]
+      L2 --> L4["Serving layer\nmerges batch + speed views"]
+      L3 --> L4
+    end
+    subgraph Kappa["Kappa architecture"]
+      direction TB
+      K1["Replayable log\n(long retention)"] --> K2["Stream processing job"]
+      K2 --> K3["Serving layer"]
+      K1 -. "replay from offset\non reprocessing" .-> K2b["New job version"]
+      K2b --> K3
+    end
+`} />
+
+## Worked example: choosing for a ride-metrics platform
+
+Say the system ingests ride-completion events from a ride-hailing app: 20
+million rides/day, each producing an event with fare, distance, and
+timestamps. Requirements: a live "rides completed in the last minute"
+dashboard for ops, plus an exact daily revenue report used for finance and
+driver payouts, plus the ability to recompute historical revenue if a fare
+calculation bug is found up to a year back.
+
+Do the estimation: 20,000,000 rides/day is about 230 events/sec on average,
+maybe 1,000/sec at peak — a modest volume any modern stream processor or log
+handles comfortably. The deciding factor isn't volume, it's the finance
+requirement: revenue numbers feeding driver payouts must be exactly right,
+with a clean way to recompute a full year if the fare formula changes. If
+the event log can affordably retain (or reload from cold storage) a full
+year of ride events, Kappa works: reprocess by replaying that year through a
+corrected job version, and the ops dashboard reads the same stream's recent
+output for real-time freshness. If retaining a year in the log is too
+costly and the finance reports are better served by a proper batch job over
+a data warehouse anyway, Lambda's split — nightly exact batch recompute
+for finance, a lightweight streaming layer just for the live ops dashboard
+— is the more defensible choice. Either way, the decision traces back to
+one number: how far back, and how cheaply, can raw history be replayed.
+
+<Callout type="warning">
+  A common mistake is picking Kappa because it sounds simpler and more
+  modern, without checking whether the event log can actually retain or
+  reload the full history the reprocessing requirement demands. If a bug
+  fix needs to recompute two years of data and the log only economically
+  holds 30 days before events age out to cold storage, you've quietly
+  reintroduced a batch layer to read that cold storage — just without
+  calling it one, and without having designed it. State the retention/replay
+  requirement first; let it decide the architecture, not the other way
+  around.
+</Callout>
+
+## Where this leads
+
+The requirements pinned down here — ingestion volume, the freshness vs.
+exactness split, and how far back reprocessing needs to reach — are exactly
+what the next lesson's batch and stream processing mechanics build on, and
+what the lesson after that assembles into a full data platform: ingestion
+layer, processing layer (batch, streaming, or both), storage tiers, and the
+serving layer that downstream consumers actually query.
+
+<Quiz
+  lessonId="data-infra-requirements-and-the-lambda-kappa-choice"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A dashboard is allowed to show data that is up to 5 minutes old, even though events are ingested within milliseconds of occurring. Which requirement does the "5 minutes" number describe?',
+      options: [
+        { id: 'a', text: 'Event latency', correct: false, explanation: 'Event latency is how long it takes an event to be ingested after it happens — here that is milliseconds, not 5 minutes.' },
+        { id: 'b', text: 'Freshness / staleness of query results', correct: true, explanation: 'This describes how old the data behind a served query result is allowed to be, which is a separate requirement from how fast events are ingested.' },
+        { id: 'c', text: 'Retention period', correct: false, explanation: 'Retention describes how far back historical data is kept for reprocessing, not how stale a live query result may be.' },
+        { id: 'd', text: 'Idempotency window', correct: false, explanation: 'Idempotency concerns duplicate event handling on retries, not the staleness of a dashboard value.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine costs of a Lambda architecture compared to Kappa? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The same business logic often has to be implemented twice, once for the batch layer and once for the speed layer', correct: true, explanation: 'Maintaining equivalent logic in two frameworks/codepaths is the central ongoing cost of Lambda, since batch and speed layer outputs must stay consistent as logic evolves.' },
+        { id: 'b', text: 'Batch and speed layer outputs can drift apart if the two implementations are not kept in sync', correct: true, explanation: 'Because the logic is duplicated, a change applied to one layer but not the other silently produces inconsistent merged results.' },
+        { id: 'c', text: 'It cannot produce a low-latency view of recent data at all', correct: false, explanation: 'The opposite is true — the speed layer exists specifically to provide a fast, low-latency view of recent events while the batch layer catches up.' },
+        { id: 'd', text: 'It requires the raw event log to retain history forever with no cold storage tier', correct: false, explanation: 'That constraint is more central to a pure Kappa reprocessing story; Lambda\'s batch layer commonly reads from a data warehouse or object storage rather than depending on unlimited log retention.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In a Kappa architecture, reprocessing after a bug fix is done by replaying the event log through a new version of the stream processing job, rather than running a separate batch job.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — Kappa\'s defining trait is collapsing reprocessing into the same streaming paradigm: replay the durable log from the needed offset through an updated job version.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Incorrect — this replay-based reprocessing is exactly what distinguishes Kappa from Lambda, which instead runs a dedicated batch layer for correctness.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A team needs to recompute two years of historical revenue after a fare-calculation bug is found, but their event log economically retains only 30 days before data ages out to cold storage. What does this imply?',
+      options: [
+        { id: 'a', text: 'Pure Kappa as described works fine with no changes needed', correct: false, explanation: 'Pure Kappa reprocessing assumes the log can replay the needed history; 30 days of retention cannot satisfy a two-year reprocessing requirement without an additional mechanism.' },
+        { id: 'b', text: 'The team needs either a way to replay from cold storage (effectively reintroducing a batch layer) or should adopt a Lambda-style batch layer for correctness-critical recomputation', correct: true, explanation: 'When the log cannot economically hold the full reprocessing window, some batch-style mechanism over colder, cheaper storage is required — whether or not it is explicitly labeled "Lambda."' },
+        { id: 'c', text: 'This is only a storage cost issue and has no bearing on the architectural choice', correct: false, explanation: 'It directly bears on the choice: it is precisely the retention/replay limitation that determines whether pure Kappa is viable for this reprocessing requirement.' },
+        { id: 'd', text: 'Idempotency settings should be adjusted to solve the reprocessing gap', correct: false, explanation: 'Idempotency addresses duplicate-event handling, not the separate problem of how far back historical data can be replayed for reprocessing.' },
+      ],
+    },
+  ]}
+/>

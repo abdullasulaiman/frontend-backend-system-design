@@ -1,0 +1,244 @@
+---
+title: "Batch and Stream Processing"
+module: "Design a Data Infrastructure System"
+moduleOrder: 17
+order: 2
+track: "interview"
+summary: "Compares batch and stream processing as the two execution models underneath any data platform, and shows how their windowing, state, and failure-handling choices differ in practice."
+tags: ["data-infrastructure", "batch-processing", "stream-processing", "windowing", "data-pipelines"]
+estMinutes: 13
+cheatsheet:
+  - "Batch trades latency for simplicity and cost: process everything that landed since the last run, recompute from scratch if needed, and let a scheduler retry the whole job on failure."
+  - "Streaming trades simplicity for latency: results are seconds old instead of hours old, but you now own out-of-order events, watermarks, and long-lived per-key state."
+  - "Event time (when it happened) and processing time (when you saw it) diverge under network delay and retries — window by event time or your aggregates will be wrong on late data."
+  - "A watermark is a bet, not a guarantee: 'I believe no more events older than T will arrive.' Set it too tight and you drop real data; too loose and every window waits too long to close."
+  - "Exactly-once in a streaming system almost always means at-least-once delivery plus idempotent or transactional writes on the output side — not a magic delivery guarantee from the broker alone."
+  - "Don't reach for streaming by default: if the business need is 'a report by 8am,' a nightly batch job is cheaper to build, cheaper to run, and easier to debug than an always-on stream job."
+  - "Micro-batching (small, frequent batch jobs) is a legitimate middle ground when you need minutes-fresh data without owning full streaming state management."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson framed the Lambda-vs-Kappa decision at the architecture
+level: do you run two pipelines or one? This lesson goes one level down, into
+the two execution models that decision is actually choosing between. Batch
+and stream processing aren't just "slow" and "fast" versions of the same
+thing — they make different assumptions about what data you have, how
+complete it is, and what "done" even means. An interviewer who hears you say
+"we'll just stream everything" without understanding those assumptions will
+immediately ask what happens to a message that arrives four minutes late, and
+that's exactly the kind of question this lesson prepares you to answer.
+
+## Batch processing: bounded input, recompute freely
+
+A batch job operates on a bounded dataset: a day's worth of log files, an
+hour's partition in a data lake, a full table snapshot. Because the input is
+finite and known ahead of time, batch systems get to make simplifying
+assumptions that streaming systems can't:
+
+- **Completeness is assumed.** By the time the job runs, the data for that
+  window is considered final. There's no "what if more arrives later" — if
+  it does arrive later, it belongs to the *next* run.
+- **Failure recovery is coarse-grained.** If a batch job fails halfway
+  through, you typically just re-run the whole job (or the failed
+  partition). There's no per-record checkpoint to resume from because the
+  whole computation is one atomic unit of work.
+- **Throughput over latency.** A batch job optimizes for processing the most
+  data per unit of compute, not for getting any single record through
+  quickly. A nightly job that takes 3 hours to process 500GB is a success if
+  it finishes before the 8am report deadline.
+
+This is the model behind tools like Spark batch jobs, Hadoop MapReduce, and
+scheduled SQL transforms in a warehouse. It's also the right default when the
+business requirement doesn't actually need freshness — most financial
+reconciliation, billing runs, and daily analytics dashboards fall into this
+bucket, and building a streaming pipeline for them is over-engineering.
+
+## Stream processing: unbounded input, decide as you go
+
+A stream processor operates on data that never stops arriving. There's no
+"end of the dataset" to wait for, which forces a different set of decisions:
+
+- **You have to decide when a window is "done" without ever being sure.**
+  Since events can be delayed by network partitions, retries, or a mobile
+  client that was offline, the system has to make an explicit, revisable
+  guess about completeness — this is what watermarks are for (more below).
+- **State lives across the life of the job, not one run.** A streaming
+  aggregation (e.g. "clicks per user per 5-minute window") keeps that
+  partial count in memory or in a local state store for as long as the
+  window is open, potentially across process restarts.
+- **Failure recovery is fine-grained.** Instead of re-running everything,
+  streaming engines checkpoint offsets and operator state periodically (Flink
+  does this with distributed snapshots; Kafka Streams with changelog
+  topics) so a crashed worker resumes near where it left off, not from zero.
+
+This is the model behind Flink, Kafka Streams, Spark Structured Streaming,
+and managed services like Kinesis Data Analytics. It's the right choice when
+the business need is genuinely "seconds to low-minutes fresh": fraud
+scoring on a payment, a live dashboard for an ops team, triggering an alert
+when error rates spike.
+
+## Event time vs. processing time
+
+This is the single most important distinction to get right, and the one
+interviewers probe hardest.
+
+- **Event time** is when the thing actually happened — a click, a sensor
+  reading, a payment — timestamped at the source.
+- **Processing time** is when your pipeline actually observes that event.
+
+Under perfect conditions these are the same. In practice, mobile clients
+batch and flush later, retries happen, network queues back up, and clock
+skew exists between producers. If you window by processing time, a burst of
+delayed events all lands in whichever window happens to be open when they
+finally arrive — corrupting your aggregate for that window and silently
+fixing nothing about the window they actually belonged to. Windowing by
+event time is almost always the correct choice for anything resembling an
+analytical aggregate; processing time is only appropriate when you
+explicitly care about system throughput or arrival rate itself.
+
+### Watermarks: a bet about lateness
+
+A watermark is the stream processor's running estimate of "how far behind
+could the slowest-in-flight event still be." When the watermark for a window
+passes the window's end, the engine closes it and emits a result — even
+though, technically, a later event could still show up. That's the trade-off:
+a tight watermark (assume little lateness) closes windows fast but drops or
+misroutes genuinely late data; a loose watermark waits longer, catches more
+stragglers, but delays every result. Most engines let you configure a
+"grace period" — accept late data up to N minutes past the watermark and
+update the result, then truly close it.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph Batch["Batch job"]
+        B1[Bounded input:<br/>yesterday's partition] --> B2[Process entire dataset]
+        B2 --> B3[Emit one result set]
+        B3 --> B4{Failed?}
+        B4 -->|yes| B2
+    end
+    subgraph Stream["Stream job"]
+        S1[Unbounded input:<br/>continuous events] --> S2[Assign event-time + track watermark]
+        S2 --> S3[Update per-window state incrementally]
+        S3 --> S4{Watermark passed<br/>window end?}
+        S4 -->|no| S3
+        S4 -->|yes| S5[Emit window result]
+        S3 --> S6[Periodic checkpoint of state]
+    end
+`} />
+
+## Delivery guarantees and idempotency
+
+"Exactly-once" is the phrase every candidate reaches for and few explain
+correctly. Almost no real system delivers a message exactly once end to end
+at the network layer — brokers like Kafka give you **at-least-once**
+delivery (a consumer that crashes after processing but before committing its
+offset will re-read the same message). Exactly-once *processing* is
+achieved on top of that by combining at-least-once delivery with:
+
+- **Idempotent writes** — the output operation can be applied twice with the
+  same effect as once (e.g. `UPSERT` keyed by event ID, or a counter keyed
+  by a dedup ID rather than a blind increment).
+- **Transactional output** — some engines (Kafka's transactional producer,
+  Flink's two-phase-commit sinks) atomically commit the processed offset and
+  the output write together, so a crash can't leave you with output written
+  but the offset uncommitted (a duplicate) or the reverse (data loss).
+
+Whichever you use, design the sink to tolerate replay. This matters just as
+much for batch jobs that get re-run after a failure — the same idempotency
+discipline applies there too.
+
+## Worked example: sizing a clickstream aggregation
+
+Say the requirement is "unique visitors per product page, updated within 30
+seconds, for a site doing 50,000 clicks/second at peak." Two engineering
+choices follow directly from that 30-second number:
+
+1. **This rules out batch.** Even a very fast micro-batch job scheduled
+   every 30 seconds spends most of its budget on job startup, shuffle, and
+   scheduling overhead at this volume — you need a long-running streaming
+   job with incremental state, not repeated short jobs.
+2. **Window size and watermark follow the freshness target.** A 1-minute
+   tumbling window with a 10-second watermark grace period gives you a
+   result at most ~70 seconds after a window closes in the worst case
+   (60s window + 10s grace) — too slow. Dropping to a 30-second tumbling
+   window with a 5-second grace period gets you inside the 30-second-ish
+   budget for typical traffic, accepting that pages with unusually delayed
+   mobile clients occasionally get a slightly stale correction.
+3. **State size is bounded by cardinality, not event volume.** Unique
+   visitors per page needs a HyperLogLog sketch (or exact set, if the
+   product catalog is small) keyed per page per window — at, say, 10,000
+   active product pages, that's 10,000 small sketches in memory per open
+   window, not 50,000 events/second of raw state. This is what makes the
+   streaming approach tractable rather than a memory nightmare.
+
+<Callout type="warning">
+  A common mistake: treating stream processing as strictly "the fast
+  version" of batch and reaching for it by default. Streaming systems carry
+  real, ongoing operational cost — watermark tuning, state store sizing,
+  exactly-once plumbing, and 24/7 on-call for a job that never finishes. If
+  the actual requirement is "data ready by the time someone opens the
+  dashboard in the morning," a batch job is simpler to write, cheaper to
+  run, and dramatically easier to debug (you can just re-run it). Reach for
+  streaming when the requirement genuinely needs sub-minute freshness, not
+  because it sounds more impressive in an interview.
+</Callout>
+
+## Where this leaves you
+
+Batch and stream aren't rival technologies to pick once — most real data
+platforms run both, for different pipelines, chosen per use case. What
+matters for the interview is being able to say, for any given requirement,
+which model it actually needs and why: is "freshness" a real product
+requirement measured in seconds, or a nice-to-have that a scheduled job
+satisfies at a fraction of the operational cost? The next lesson takes this
+further and puts both models together into one coherent platform design.
+
+<Quiz
+  lessonId="data-infra-batch-and-stream-processing"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why do stream processors need watermarks but batch jobs do not?',
+      options: [
+        { id: 'a', text: 'Because streaming input is unbounded, so the system must explicitly estimate when a window is "complete enough" to emit; a batch job\'s input is already bounded and considered final.', correct: true, explanation: 'Correct. Batch input is finite and assumed complete at run time; streaming input never stops, so completeness has to be estimated, which is exactly what a watermark does.' },
+        { id: 'b', text: 'Because batch jobs run on a fixed schedule and streaming jobs do not run on any schedule at all.', correct: false, explanation: 'Scheduling isn\'t the reason watermarks exist — the real issue is bounded vs. unbounded input and whether completeness can be assumed.' },
+        { id: 'c', text: 'Because streaming systems use Kafka and batch systems never use a message broker.', correct: false, explanation: 'Both models can use a broker as a source; the distinction between batch and stream is about the execution and completeness model, not whether a broker is involved.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of the following are true about windowing by event time instead of processing time? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It correctly attributes a delayed event to the window it actually happened in, not the window it happened to arrive in.', correct: true, explanation: 'Correct — event-time windowing groups data by when it occurred, which is what most aggregations actually want.' },
+        { id: 'b', text: 'It requires the system to make a lateness assumption (a watermark) about how long to wait before closing a window.', correct: true, explanation: 'Correct — since late events can still arrive, the engine needs an explicit, tunable estimate of "how late is too late" before it emits a result.' },
+        { id: 'c', text: 'It guarantees every window is emitted exactly at its nominal end time with no delay.', correct: false, explanation: 'The opposite is closer to true — event-time windows are typically emitted after some watermark/grace delay past the window end, precisely to tolerate late data.' },
+        { id: 'd', text: 'It eliminates the need for any kind of checkpointing in the stream processor.', correct: false, explanation: 'Event-time windowing and checkpointing solve different problems — checkpointing is about recovering state after a failure, independent of which time domain you window by.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A Kafka-based pipeline that guarantees at-least-once message delivery automatically gives you exactly-once processing results.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'At-least-once delivery on its own can produce duplicate processing after a crash-and-retry. Exactly-once results require pairing at-least-once delivery with idempotent or transactional writes on the output side.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — exactly-once processing is an outcome built on top of at-least-once delivery plus idempotent or transactional sinks, not a guarantee the broker provides by itself.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A team needs a report ready every morning by 8am summarizing the previous day\'s sales, with no requirement for intra-day updates. What is the most appropriate processing model?',
+      options: [
+        { id: 'a', text: 'Batch processing over the previous day\'s bounded data', correct: true, explanation: 'Correct — the freshness requirement (once a day, by a fixed deadline) is exactly what batch jobs are optimized for, and it avoids the ongoing operational cost of a streaming job.' },
+        { id: 'b', text: 'Stream processing with 1-second tumbling windows', correct: false, explanation: 'This massively over-builds the requirement, adding watermark tuning, state management, and on-call burden for a freshness need the business never asked for.' },
+        { id: 'c', text: 'Stream processing with no windowing at all', correct: false, explanation: 'Aggregating "sales per day" still needs some notion of a window (a day); more importantly, streaming\'s low-latency strength is wasted when the requirement is a once-daily deadline.' },
+      ],
+    },
+  ]}
+/>

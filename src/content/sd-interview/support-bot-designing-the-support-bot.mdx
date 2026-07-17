@@ -1,0 +1,137 @@
+---
+title: "Designing the Support Bot"
+module: "LLM-Powered Customer Support Bot"
+moduleOrder: 18
+order: 2
+track: "interview"
+summary: "Walks through the concrete design of a RAG-based support bot's ingestion, retrieval, generation, and escalation pipeline, with a worked capacity estimate."
+tags: ["rag", "retrieval", "llm-systems", "vector-search", "customer-support"]
+estMinutes: 13
+cheatsheet:
+  - "Split ingestion (offline, batch) from serving (online, low-latency) — re-indexing a knowledge base should never sit on the request path."
+  - "Chunk by semantic unit (a help-article section, not a fixed token window) and store metadata (product, locale, doc version) alongside the vector for filtering."
+  - "Retrieve broad with a fast method, then re-rank narrow with a slower, more accurate one — don't ask a single stage to be both fast and precise."
+  - "A grounding/confidence check before the answer ships is what keeps a RAG bot from confidently hallucinating a policy that doesn't exist."
+  - "Escalation to a human agent is a first-class design output, not an error path — carry the full retrieved context and conversation history into the handoff."
+  - "Cache aggressively at the embedding and retrieval layers (query -> chunks is highly repetitive in support traffic); cache generation only for identical, high-frequency queries."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson established *why* a support bot needs retrieval-augmented generation and sketched the architecture at a high level: a knowledge base, a retriever, and a generator sitting behind a chat interface. That's the right shape, but "add a vector database and call an LLM" is not a design — it's a diagram with three boxes. The interview (and the real system) lives in the details: how documents get chunked and indexed, how a query turns into the right context, how the model is stopped from making things up, and what happens when it can't help.
+
+This lesson designs each of those stages concretely, then works through a capacity estimate so the numbers behind "low latency, low hallucination rate" are grounded rather than assumed.
+
+## Ingestion: turning documents into searchable chunks
+
+The knowledge base — help-center articles, internal runbooks, past resolved tickets, product docs — arrives as long-form text. It has to be broken into chunks small enough to retrieve precisely and to fit inside the model's context window alongside several other chunks and the conversation itself.
+
+Two decisions matter most:
+
+- **Chunk by semantic boundary, not a fixed token count.** Splitting a "how to reset your password" article at an arbitrary 512-token cutoff can sever a step from its prerequisite. Chunking along headings, list items, or Q&A pairs keeps each chunk a coherent, self-contained unit — which also makes each chunk more useful as a standalone citation.
+- **Attach metadata to every chunk.** Product line, locale, plan tier, document version, and last-updated timestamp all travel with the vector, not just the text. Retrieval later filters on this metadata before or alongside the similarity search — a French-speaking customer on the free tier shouldn't get an English enterprise-only runbook back just because it's semantically close.
+
+Ingestion runs as an offline batch/streaming pipeline, decoupled from user requests: a document changes, a worker re-chunks and re-embeds it, and the vector store is updated asynchronously. Re-indexing must never block or slow down live chat traffic — that's a common design smell interviewers probe for.
+
+## Retrieval: broad recall, then a narrow, accurate re-rank
+
+A single similarity search against a vector store is a good first filter but a mediocre final answer. Two problems show up in practice: pure dense-vector search can miss exact-match terms (an error code, a SKU) that a keyword search would nail instantly, and top-k from a single fast index isn't always the k most *relevant* results, just the k most similar by one metric.
+
+The fix is a two-stage retrieval design:
+
+1. **Broad recall** — run a dense vector search (embeddings) and a lexical search (BM25/keyword) in parallel, each returning a wider set (say, 50 candidates) than you'll ultimately use.
+2. **Re-rank narrow** — merge the candidate sets and pass them through a smaller, more accurate cross-encoder re-ranker that scores query-chunk relevance directly, then keep only the top handful (3-6 chunks) that actually go into the prompt.
+
+This "retrieve wide, re-rank narrow" pattern trades a bit of extra latency in stage two for materially better precision, and it's the detail that separates a bot that finds the right paragraph from one that finds *a* paragraph.
+
+Before retrieval even runs, it's often worth a lightweight query-rewrite step: expanding "it's not working" using the last two turns of conversation into something like "user cannot complete checkout, error 402, mobile app" — vague chat messages retrieve poorly on their own.
+
+## Generation: grounding the answer in what was retrieved
+
+The retrieved chunks, the rewritten query, recent conversation turns, and a system prompt instructing the model to answer *only* from the provided context all get assembled into the final prompt. Two things need explicit design attention here:
+
+- **Context budget.** With a fixed context window, you're trading off how much conversation history versus how many retrieved chunks you keep. A common pattern: summarize older turns, keep the last one or two turns verbatim, and reserve the majority of the budget for retrieved context.
+- **Forced citation.** Instructing the model to tag which chunk supports each claim (even informally, like a bracketed source ID) gives you two things for free: a citation to show the user ("Source: Refund Policy, updated June 2026") and a cheap downstream check — if a sentence in the answer can't be traced to any retrieved chunk, that's a hallucination signal.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    U[User message] --> QR[Query rewrite<br/>+ conversation context]
+    QR --> V[Vector search]
+    QR --> K[Keyword search]
+    V --> M[Merge candidates]
+    K --> M
+    M --> RR[Re-ranker<br/>top 3-6 chunks]
+    RR --> P[Prompt assembly<br/>system + history + chunks]
+    P --> G[LLM generation]
+    G --> C[Grounding / confidence check]
+    C -->|grounded| R[Return answer + citations]
+    C -->|low confidence| H[Escalate to human agent<br/>with full context]
+`} />
+
+## Guardrails and escalation as a designed path, not a failure mode
+
+A support bot that occasionally can't answer is expected; a support bot that confidently invents a refund policy is a liability. The design needs an explicit gate between generation and the user:
+
+- **Grounding check** — verify the answer's claims trace back to retrieved chunks (via the citation tags above, or a second, cheaper LLM call that scores "is this answer supported by this context").
+- **Confidence/coverage threshold** — if retrieval returned low-similarity chunks across the board, that's a signal the knowledge base doesn't cover this question at all; don't let generation paper over a retrieval gap.
+- **Scope guard** — refuse (gracefully) on anything outside the support domain, and on anything requiring an account action the bot isn't authorized to take (refunds over a limit, account deletion).
+
+When any gate trips, escalation is the answer — and it should carry everything the human agent needs: the conversation transcript, the chunks that were retrieved, and a short bot-generated summary of what the customer is asking. Treat this handoff as a real API contract with your ticketing system (create a ticket, attach the context, route by category), not an afterthought.
+
+## Worked example: sizing a knowledge base and a latency budget
+
+Say the knowledge base has 8,000 help-center articles, averaging 1,200 words each. Chunking by semantic section produces roughly 4 chunks per article on average — about 32,000 chunks. At a typical 768-dimension embedding stored as 4-byte floats, each vector is about 3 KB; with index overhead and metadata, budget roughly 5 KB per chunk, putting the vector store around 160 MB — small enough to fit comfortably in memory on a single well-provisioned index node, with room to grow 10x before you need to think about sharding.
+
+For latency, a reasonable per-turn budget for a chat-style bot is around 2-3 seconds to first token. A rough split: query rewrite (~100ms), parallel vector + keyword search (~150ms), re-ranking 50 candidates down to 5 (~150ms), prompt assembly (negligible), and LLM generation, which dominates the budget at 1.5-2 seconds for a first token with streaming for the rest. That leaves the retrieval pipeline needing to land well under 500ms combined — which is exactly why the two-stage "wide recall, narrow re-rank" design matters: doing a full cross-encoder pass over all 32,000 chunks per query would blow that budget by orders of magnitude, while doing it over 50 pre-filtered candidates does not.
+
+<Callout type="warning">
+  A frequent interview-answer mistake: describing retrieval as "embed the query, cosine-similarity search the vector DB, done" with no re-ranking, no metadata filtering, and no grounding check before the answer reaches the user. That design retrieves *something* fast but has no mechanism to catch a wrong document, an access-control leak (returning enterprise-only content to a free-tier user), or a hallucinated claim the model added on top of a legitimate chunk. Naming these explicit stages — recall, re-rank, filter, ground, escalate — is what shows an interviewer you've thought about failure modes, not just the happy path.
+</Callout>
+
+<Quiz
+  lessonId="support-bot-designing-the-support-bot"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why do many production RAG retrieval pipelines run a fast broad search followed by a separate re-ranking stage, instead of one single-pass search?',
+      options: [
+        { id: 'a', text: 'A single fast method (vector or keyword) is good at recall but not reliably the most precise ranking, so a slower, more accurate re-ranker narrows a wide candidate set down to the best few', correct: true, explanation: 'This is the core reason: broad recall casts a wide net cheaply, and the re-ranker spends its precision budget on a small candidate set instead of the whole corpus.' },
+        { id: 'b', text: 'Vector databases cannot return more than one result per query', correct: false, explanation: 'Vector databases happily return top-k results for any k; that is not the constraint driving the two-stage design.' },
+        { id: 'c', text: 'Re-ranking is required to generate the embeddings in the first place', correct: false, explanation: 'Embeddings are generated during ingestion and query time independently of re-ranking; re-ranking is a separate scoring step applied after initial retrieval.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these belong on the chunk\'s stored metadata (alongside its embedding), rather than being decided at query time from scratch?',
+      options: [
+        { id: 'a', text: 'The product line or locale the source document applies to', correct: true, explanation: 'Attaching this at ingestion time lets retrieval filter candidates before or during the similarity search, avoiding cross-tenant or cross-locale leakage.' },
+        { id: 'b', text: 'The document\'s last-updated timestamp', correct: true, explanation: 'Freshness metadata lets retrieval prefer current chunks over stale ones and supports showing the user a citation date.' },
+        { id: 'c', text: 'The exact wording of the user\'s current chat message', correct: false, explanation: 'The live user message is query-time input, not something precomputed and stored on a knowledge-base chunk.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In a well-designed support bot, escalating to a human agent should be treated as an unhandled error case, so the bot only needs to pass along a generic "could not answer" message.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Escalation is an expected, first-class path in the design, and skimping on context handed to the agent defeats the point of the handoff.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — escalation should carry the full conversation transcript, the retrieved chunks, and a summary, so the human agent isn\'t starting from zero.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A knowledge base is re-chunked and re-embedded after an article is edited. Where should this re-indexing work run?',
+      options: [
+        { id: 'a', text: 'Synchronously on the request path, right before answering the user who happened to trigger it', correct: false, explanation: 'This would add unpredictable latency to a random user\'s chat turn and couple an editorial change to live traffic — exactly what the offline/online split avoids.' },
+        { id: 'b', text: 'As an offline/asynchronous ingestion job, decoupled from live query serving', correct: true, explanation: 'Re-indexing is a batch/streaming background process; the vector store is updated asynchronously so live chat latency is unaffected.' },
+        { id: 'c', text: 'It should not run again — embeddings only need to be computed once per document, ever', correct: false, explanation: 'Documents change (policies update, products ship); stale embeddings mean stale or wrong answers, so re-indexing on edits is necessary.' },
+      ],
+    },
+  ]}
+/>

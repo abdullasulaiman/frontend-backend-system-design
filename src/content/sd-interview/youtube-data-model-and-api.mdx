@@ -1,0 +1,174 @@
+---
+title: "Data Model and API"
+module: "Design YouTube"
+moduleOrder: 1
+order: 3
+track: "interview"
+summary: "Defines the core entities, storage choices, and API surface behind a YouTube-style platform, and shows how each schema decision maps to a read or write pattern established in the high-level design."
+tags: ["data-modeling", "api-design", "database-schema", "sql-vs-nosql", "video-platform"]
+estMinutes: 13
+cheatsheet:
+  - "Split metadata (relational, small rows, needs joins/transactions) from watch-time counters (write-heavy, needs a wide-column or KV store, not a hot row in Postgres)."
+  - "Never increment view/like counts synchronously on the request path — batch counters in a stream processor and flush aggregates every few seconds."
+  - "Store multiple renditions per video as rows in a child table (video_id, resolution, codec, cdn_url), not as columns — new resolutions or codecs shouldn't require a migration."
+  - "Comments are naturally a tree; model them as a flat table with (parent_comment_id, video_id) and paginate top-level plus one reply page at a time, not a full recursive fetch."
+  - "The upload API is two calls, not one: initiate (get an upload URL and video_id) then a separate ingestion step the transcoding pipeline picks up — never proxy a multi-GB file through your own API server."
+  - "Use a composite/sharded key for watch history and view events (user_id or video_id as partition key) so a single hot video doesn't concentrate all writes on one shard."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The high-level design from the previous lesson drew boxes for upload, transcoding, and streaming — but none of that works without deciding, concretely, what a "video" *is* in your database and what shape the API calls take to create and read one. This is the lesson where the whiteboard sketch turns into schemas an interviewer can poke holes in. Get the data model wrong here and every later lesson inherits the problem: a view-count column that can't take the write load, a comment table that can't paginate, an API that makes the client re-fetch the whole video object just to check like counts.
+
+The goal isn't to design a perfect schema — it's to show you know which entities exist, which need strong consistency versus which can be eventually consistent, and why those are different stores.
+
+## The core entities
+
+A YouTube-style platform has five entities that matter for the interview:
+
+- **User** — account, channel profile, subscription list.
+- **Video** — the metadata record: title, description, owner, upload timestamp, duration, status (processing/live/removed).
+- **Rendition** — one transcoded output of a video (a specific resolution + codec + container), each with its own storage/CDN URL.
+- **Engagement** — views, likes/dislikes, watch-time — high-volume, append-mostly events.
+- **Comment** — threaded discussion attached to a video.
+
+Treat these as candidates for *different* storage systems, not five tables in one database. That separation is the single most important decision in this lesson.
+
+### Video metadata: relational, and that's fine
+
+```
+videos
+  id             bigint PK
+  owner_id       bigint FK -> users.id
+  title          varchar(200)
+  description    text
+  status         enum('processing','ready','failed','removed')
+  duration_ms    int
+  visibility     enum('public','unlisted','private')
+  created_at     timestamp
+  updated_at     timestamp
+```
+
+This table is a great fit for a relational store (Postgres/MySQL, sharded by `owner_id` or `video_id` once volume demands it). Rows are small, writes are infrequent relative to reads, and you genuinely need transactional guarantees — e.g., "don't show a video as public until transcoding finishes" is a status transition you want to be atomic and immediately consistent for the owner's own dashboard.
+
+### Renditions: a child table, not columns
+
+```
+video_renditions
+  video_id     bigint FK -> videos.id
+  resolution   varchar(10)   -- '1080p', '480p', '360p'
+  codec        varchar(10)   -- 'h264', 'av1'
+  bitrate_kbps int
+  cdn_url      varchar(500)
+  ready_at     timestamp
+```
+
+New resolutions or a new codec (say, adding AV1 next to H.264) just become new rows — no schema migration, no `NULL`-filled columns for videos uploaded before the format existed. The streaming lesson later in this module reads from this table to build the adaptive bitrate manifest.
+
+### Engagement: write-heavy, so it's not the same store
+
+View counts and watch-time are a different beast: a popular video can take thousands of view events per second, and nobody needs the count to be exactly right at millisecond granularity — "1.2M views" updating a few seconds late is completely acceptable. Writing every view synchronously to a row in your metadata database creates a hot-row bottleneck (every viewer of a trending video contends for the same row lock).
+
+The standard fix: emit a lightweight event (`video_id`, `user_id`, `watched_ms`, `timestamp`) to a stream (Kafka or similar), and have a separate aggregation job roll those up into per-video counters every few seconds, writing the aggregate into a fast key-value or wide-column store (Redis for the hot counter, Cassandra/DynamoDB-style store for durable per-video/per-day rollups used in analytics).
+
+<Mermaid client:visible chart={`
+flowchart LR
+  P[Player reports watch event] --> S[Event stream]
+  S --> AGG[Aggregator job]
+  AGG --> CTR[(Counter store: Redis)]
+  AGG --> HIST[(Durable rollups: wide-column store)]
+  CTR --> API[Read API serves view count]
+`} />
+
+### Comments: a flat table modeling a tree
+
+Comments look hierarchical (replies to replies), but you don't want a recursive query on every page load. Model it flat:
+
+```
+comments
+  id                bigint PK
+  video_id          bigint FK
+  parent_comment_id bigint NULL   -- NULL = top-level
+  author_id         bigint FK
+  body              text
+  created_at        timestamp
+```
+
+Fetch top-level comments for a video with `WHERE video_id = ? AND parent_comment_id IS NULL`, paginated by `created_at` or a ranking score. Fetch replies to one comment on demand, one page at a time, only when the user expands that thread — never eagerly load the whole tree.
+
+## The API surface
+
+Three groups of endpoints cover the core flows; each maps to a different consistency and latency profile.
+
+**Upload (write-heavy, async)**
+
+- `POST /videos/initiate` — client sends title/description, server creates a `videos` row with `status='processing'`, returns a `video_id` and a pre-signed upload URL (direct to object storage, not through your API tier).
+- The client uploads bytes straight to storage; a completion event triggers transcoding (covered in the next lesson).
+- `GET /videos/{id}/status` — client polls (or gets pushed via websocket/webhook) until `status='ready'`.
+
+**Playback (read-heavy, latency-sensitive)**
+
+- `GET /videos/{id}` — metadata + rendition list, served from a cache in front of the metadata store; this is read orders of magnitude more than it's written, so cache aggressively and invalidate on the rare update.
+- `GET /videos/{id}/manifest` — the adaptive bitrate manifest built from `video_renditions`, handed to the player.
+- `POST /videos/{id}/events` — fire-and-forget watch/view events, accepted quickly and queued; the client should never block playback waiting on this call to complete.
+
+**Engagement (mixed)**
+
+- `GET /videos/{id}/comments?cursor=...` — cursor-based pagination, not offset — offset pagination degrades badly on a table with continuous inserts, because page 50 shifts under you as new comments arrive.
+- `POST /videos/{id}/like` — idempotent (same user liking twice is a no-op, not a double-count); a good candidate for a simple `(user_id, video_id)` uniqueness constraint in a fast KV store rather than the primary metadata database.
+
+<Callout type="warning">
+A common mistake in this lesson is putting `view_count` as a plain column on the `videos` row and issuing `UPDATE videos SET view_count = view_count + 1` on every playback. On a trending video, that's thousands of row-level writes per second against your primary metadata store — the same store handling title edits, ownership checks, and status transitions. It doesn't scale, and it couples a "nice to have eventually consistent" number to a store that needs to stay fast for transactional work. Separate the hot counter path from metadata from day one; retrofitting it under load is much more painful than designing it in.
+</Callout>
+
+## Worked example: answering "how would you paginate comments on a 50,000-comment video?"
+
+Say an interviewer pushes on this specifically. Offset pagination (`LIMIT 20 OFFSET 40000`) forces the database to scan and discard 40,000 rows before returning the page you want — that cost grows linearly with page depth and gets worse under concurrent inserts, since newly added comments can shift every later page.
+
+Cursor pagination fixes both problems: the client passes the `id` (or `created_at`) of the last comment it saw, and the query becomes `WHERE video_id = ? AND parent_comment_id IS NULL AND id < :cursor ORDER BY id DESC LIMIT 20`. That's an index range scan, not a full scan-and-discard, and its cost doesn't grow with page depth. It does give up random access to "page 500" — you can only walk forward from a cursor — which is a completely acceptable trade-off for a comment feed nobody jumps to page 500 of anyway.
+
+## Quiz
+
+<Quiz lessonId="youtube-data-model-and-api" client:visible questions={[
+  {
+    id: 'q1',
+    kind: 'mcq',
+    prompt: 'Why should view counts be stored in a separate system from video metadata rather than as a column updated on every playback?',
+    options: [
+      { id: 'a', text: 'Because relational databases cannot store integer counters', correct: false, explanation: 'Relational databases store integers fine — the problem is write contention on a single hot row under high concurrent update volume, not a type limitation.' },
+      { id: 'b', text: 'Because a hot video would generate thousands of concurrent writes to one row, contending with transactional metadata updates', correct: true, explanation: 'Correct. High-frequency increments on a single row create lock contention and slow down the same store handling metadata writes like status transitions or ownership changes.' },
+      { id: 'c', text: 'Because view counts must never be shown to users in real time', correct: false, explanation: 'View counts can and do update near-real-time via an aggregator; the point is decoupling the write path, not hiding the number.' },
+    ],
+  },
+  {
+    id: 'q2',
+    kind: 'multi',
+    prompt: 'Which design choices correctly reduce coupling and improve scalability in a YouTube-style data model? (Select all that apply.)',
+    options: [
+      { id: 'a', text: 'Storing each transcoded rendition as a row in a child table rather than as columns on the video row', correct: true, explanation: 'A child table lets new resolutions/codecs be added as rows, avoiding schema migrations and NULL-filled columns for older videos.' },
+      { id: 'b', text: 'Uploading video bytes directly from the client to object storage via a pre-signed URL, instead of proxying through the API server', correct: true, explanation: 'Proxying multi-GB uploads through the API tier wastes bandwidth and ties up API server resources for no benefit; a pre-signed direct upload avoids that entirely.' },
+      { id: 'c', text: 'Using offset-based pagination (LIMIT/OFFSET) for comments so pages are simple to reason about', correct: false, explanation: 'Offset pagination degrades on large, frequently-inserted tables — it scans and discards rows and pages shift under concurrent inserts. Cursor-based pagination is the better fit here.' },
+    ],
+  },
+  {
+    id: 'q3',
+    kind: 'boolean',
+    prompt: 'Comments should be modeled with a self-referencing parent_comment_id column and fetched top-level-first, loading replies only when a thread is expanded.',
+    options: [
+      { id: 'true', text: 'True', correct: true, explanation: 'Correct — a flat table with a nullable parent_comment_id models the tree without recursive queries, and lazy-loading replies avoids fetching an entire comment tree on every page view.' },
+      { id: 'false', text: 'False', correct: false, explanation: 'This is in fact the recommended approach: it keeps queries simple range scans instead of recursive tree traversals on every video-page load.' },
+    ],
+  },
+  {
+    id: 'q4',
+    kind: 'mcq',
+    prompt: 'A client just finished uploading a video file. What should the API flow look like to get it ready for transcoding?',
+    options: [
+      { id: 'a', text: 'The client uploads bytes in one call directly to the API server, which stores them in the metadata database', correct: false, explanation: 'Storing multi-GB binary blobs in the same database that holds metadata rows is a scalability and cost mistake — video bytes belong in object storage, not a relational database.' },
+      { id: 'b', text: 'An initiate call creates a metadata row and returns a video_id plus a pre-signed direct-upload URL; the completion event then triggers transcoding', correct: true, explanation: 'This is the standard two-step flow: metadata creation is cheap and immediate, the byte upload goes straight to storage, and a completion signal (not the API server) kicks off the transcoding pipeline.' },
+      { id: 'c', text: 'The client polls the transcoding service directly before any metadata row exists', correct: false, explanation: 'There is nothing to poll without a video_id and a status field first — the metadata row and its status column are what the client polls against.' },
+    ],
+  },
+]} />

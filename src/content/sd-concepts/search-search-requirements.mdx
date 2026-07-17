@@ -1,0 +1,262 @@
+---
+title: "Search Requirements"
+module: "Distributed Search"
+moduleOrder: 21
+order: 1
+track: "concept"
+summary: "Frames what a full-text search system actually has to deliver — relevance, latency, freshness, and scale — before any design decision about indexing or ranking makes sense."
+tags: ["search", "requirements", "full-text-search", "relevance", "distributed-systems"]
+estMinutes: 11
+cheatsheet:
+  - "Search is not a lookup — the input is fuzzy text, the output is a ranked list, and 'correct' means 'useful,' not 'exact.'"
+  - "Separate the write path (crawl/ingest -> analyze -> index) from the read path (parse query -> retrieve candidates -> rank -> return) early; they scale differently and fail differently."
+  - "Nail down freshness (how fast a new/edited document must become searchable) and index size (documents x average size) before picking a design — they drive the sharding and update strategy."
+  - "Recall (did we find everything relevant) and precision (is what we found actually relevant) trade off against each other; state which one the product cares about more."
+  - "Query latency budgets are usually tighter than write latency budgets — a search box is a live UI, indexing can tolerate seconds of lag."
+  - "Typos, synonyms, and multi-word queries are core requirements, not edge cases — decide upfront how much of that the system owns versus the client."
+  - "Write down 2-3 concrete example queries and what a 'good' result looks like for each — it disambiguates relevance arguments for the rest of the design faster than any abstract spec."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Ask "design a search engine" in an interview and most candidates jump
+straight to inverted indexes and B-trees. That's premature. Before you can
+justify any indexing or ranking choice, you need to know what the search
+system is actually promising: how fresh does a result need to be, how
+forgiving of typos, how fast, and over how much data. Get those wrong and
+you'll optimize the wrong thing — a beautifully sharded index that returns
+results in 20ms but doesn't find the document the user was obviously
+looking for is a failed design, not a fast one.
+
+This lesson is the first stop in the Distributed Search module. It doesn't
+build anything yet — it establishes the vocabulary and the checklist the
+rest of the module (inverted indexes, ranking, and the final scaled
+design) builds on.
+
+## Why search is a different problem than a database lookup
+
+A database query like `WHERE user_id = 42` has one correct answer set: the
+rows where that predicate is true. A search query like `wireless noise
+canceling headphones` has no single correct answer — it has a *best*
+answer, and reasonable people can disagree on what that is. That shift —
+from exact match to ranked relevance — is the defining property of search
+and the reason it needs its own architecture:
+
+- **The input is fuzzy.** Users misspell words, use synonyms, and phrase
+  the same intent ten different ways ("cheap flights NYC to LA" vs. "LA to
+  New York budget flight").
+- **The output is a ranked list, not a set.** Returning the right ten
+  documents in the wrong order is still a worse product experience than
+  returning nine of them in the right order.
+- **"Correct" is fuzzy too.** Two documents can both legitimately match a
+  query; the system has to decide which one a user is more likely to want,
+  which means scoring, not filtering.
+
+Because of this, a search system needs a step a plain database doesn't:
+turning free text into a structure that supports fast, ranked, fuzzy
+lookup. That structure is the inverted index — covered in the next lesson
+— but you can't design it well until you know what's being asked of it.
+
+## The core functional requirements
+
+Every search design should answer these before touching architecture:
+
+### 1. What's being searched
+
+Documents, product listings, log lines, chat messages, source code — the
+content type shapes almost everything downstream. A product catalog has
+structured fields (price, brand, category) alongside free text; log search
+is mostly free text at huge volume with a strong recency bias; code search
+needs token boundaries that differ from natural language (`getUserById`
+should be findable by `user` and `by id`, not just as one opaque token).
+
+### 2. Query capability
+
+Decide upfront what kinds of queries you support:
+
+- **Keyword / free text** — the baseline: match documents containing the
+  query terms.
+- **Phrase and boolean queries** — `"noise canceling"` as an exact phrase,
+  or `headphones AND wireless NOT refurbished`.
+- **Fuzzy matching** — tolerate typos and near-misses (`recieve` should
+  still find `receive`).
+- **Faceted / filtered search** — combine free text with structured filters
+  like price range or category, common in e-commerce.
+- **Autocomplete / prefix search** — a related but distinct feature with
+  its own latency and data-structure needs (covered briefly in the
+  scaling lesson).
+
+### 3. Freshness
+
+How quickly must a new or edited document become searchable? A product
+catalog can tolerate a few minutes of lag; a chat or social-post search
+feature usually needs near-real-time (seconds); a nightly-batch document
+archive can tolerate hours. Freshness directly determines whether you can
+get away with periodic bulk re-indexing or need incremental index updates
+— a much harder engineering problem, since most classic index structures
+are easy to build once and expensive to mutate.
+
+### 4. Scale
+
+Two numbers matter most: **corpus size** (document count x average
+document size, which determines index size and shard count) and **query
+volume** (queries per second, which determines how much replication and
+caching you need on the read path). A 10-million-document product catalog
+serving 500 QPS is a very different system than a 50-billion-page web
+index serving 100K QPS, even though both are "search."
+
+### 5. Relevance requirements: precision vs. recall
+
+**Precision** asks: of the results returned, how many are actually
+relevant? **Recall** asks: of all the relevant documents that exist, how
+many did we return? These trade off. A search that only returns exact
+phrase matches has high precision but misses documents that use different
+wording (low recall). A search that fuzzy-matches aggressively catches
+more relevant documents but also drags in noise (higher recall, lower
+precision). Different products sit at different points on this curve — a
+legal-document search cares enormously about recall (missing a relevant
+case is a real cost); a consumer product search cares more about precision
+on the first page (users rarely scroll past result 10).
+
+## Non-functional requirements that shape the architecture
+
+- **Query latency** — search sits behind a live UI, so the read path
+  usually has a tight budget, often under 100-200ms end to end including
+  ranking. This is tighter than most write-path freshness budgets, which
+  is why search systems architecturally separate the two paths.
+- **Availability** — a search box returning "service unavailable" is a
+  visible, embarrassing failure; most designs favor eventual consistency
+  on the index (a document might take a few seconds to appear) over
+  taking search down for consistency's sake.
+- **Ranking consistency** — repeated identical queries should return
+  stable results (modulo intentional randomization like A/B tests);
+  flapping order across requests looks broken even if each individual
+  ranking is defensible.
+- **Cost** — inverted indexes and ranking signals both consume significant
+  memory for low-latency serving; corpus size and query volume together
+  drive real infrastructure cost, so back-of-envelope index size estimates
+  matter early, not as an afterthought.
+
+## The write path and read path are different problems
+
+A useful mental model before any component diagram: search splits cleanly
+into an **ingestion (write) path** that turns raw content into a queryable
+index, and a **query (read) path** that turns a user's text into a ranked
+result list. They have different latency budgets, different scaling
+knobs, and different failure modes — conflating them is the most common
+early design mistake.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  subgraph Write Path
+    A[Raw documents] --> B[Analyze: tokenize, normalize]
+    B --> C[Build/update index]
+  end
+  subgraph Read Path
+    D[User query] --> E[Parse and analyze query]
+    E --> F[Retrieve candidate docs]
+    F --> G[Rank and score]
+    G --> H[Return top-N results]
+  end
+  C -.serves.-> F
+`} />
+
+The write path can absorb latency (seconds, sometimes minutes) as long as
+it keeps up with ingestion volume. The read path can't — every millisecond
+there is user-facing. That asymmetry is why search systems pre-compute as
+much as possible during ingestion (the index, and often partial ranking
+signals) so the read path does the minimum work necessary at request time.
+
+## Worked example: scoping a job-listing search
+
+Say the assignment is "design search for a job-listings site" with 20
+million active listings, each averaging 2KB of text and metadata (title,
+description, company, salary range, location), and 5,000 search queries
+per second at peak.
+
+Working through the requirements checklist:
+
+- **Corpus size**: 20M x 2KB is roughly 40GB of raw text — small enough
+  that the whole index plausibly fits across a modest cluster's memory
+  once compressed, which matters a lot for the indexing lesson's
+  design choices.
+- **Freshness**: a new listing should be searchable within a minute or two
+  of posting — good enough to not need true streaming updates, but too
+  slow for a nightly batch rebuild.
+- **Query capability**: keyword search on title/description, plus
+  structured filters (location radius, salary range, seniority) combined
+  with the free-text query — this is faceted search, not pure keyword
+  match.
+- **Relevance**: precision matters more than recall here. A job seeker
+  scanning page one wants the ten best matches, not every technically
+  matching listing across 40 pages.
+- **Latency**: sub-200ms end to end at 5,000 QPS peak, since this sits
+  directly behind a search box on page load.
+
+That scoping alone — before any index structure is chosen — already tells
+you this needs: an incremental (not full-rebuild) indexing pipeline, a
+ranking function that can combine text relevance with structured filters,
+and enough replicated read capacity to serve 5K QPS with headroom. The
+next lesson picks up from here and builds the inverted index that makes
+the read path fast.
+
+<Callout type="warning">
+  The most common mistake in search system design interviews is treating
+  "search" as a synonym for "look up documents containing these words" and
+  skipping relevance entirely. A candidate who designs a perfectly sharded
+  inverted index but never discusses precision/recall trade-offs, or what
+  a "good result" looks like for a sample query, has designed half a
+  system. Ranking is not a nice-to-have layered on top — it's the reason
+  search is a hard problem in the first place. Always state a couple of
+  concrete example queries and what you'd expect back before moving to
+  architecture.
+</Callout>
+
+<Quiz
+  lessonId="search-search-requirements"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why is a full-text search query fundamentally different from a database lookup like `WHERE user_id = 42`?',
+      options: [
+        { id: 'a', text: 'Search queries always run slower, so they need caching', correct: false, explanation: 'Speed is a consequence, not the defining difference — plenty of database lookups are also slow without indexes.' },
+        { id: 'b', text: 'Search has no single correct answer set; it produces a ranked list based on relevance, not an exact-match filter', correct: true, explanation: 'That is the core distinction: search deals with fuzzy input and a best-effort ranked output, not a deterministic predicate match.' },
+        { id: 'c', text: 'Search only works on text columns, never on structured data', correct: false, explanation: 'Real search systems (e.g. faceted product search) routinely combine free text with structured filters like price or category.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are core functional requirements you should pin down before designing a search system? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'How fresh a new or edited document must be before it is searchable', correct: true, explanation: 'Freshness determines whether you can batch-rebuild the index or need incremental updates — a major architectural fork.' },
+        { id: 'b', text: 'Whether the system needs to support fuzzy matching and typo tolerance', correct: true, explanation: 'This changes what the query-analysis step and candidate retrieval need to do, and affects precision/recall trade-offs.' },
+        { id: 'c', text: 'Which specific programming language the index will be implemented in', correct: false, explanation: 'Implementation language is an execution detail, not a requirement that shapes the system\'s architecture or trade-offs.' },
+        { id: 'd', text: 'Corpus size (document count x average size) and expected query volume', correct: true, explanation: 'These two numbers drive index size, sharding, and how much read-path replication and caching you need.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'The write (ingestion) path and read (query) path of a search system typically share the same latency budget, so they should be designed as one unified pipeline.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The read path is user-facing and usually needs sub-second latency; the write path can tolerate seconds or minutes of lag. Treating them identically wastes design effort.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the read and write paths have different latency budgets and scaling needs, which is why search systems separate ingestion/indexing from query serving.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A legal-document search product decides that missing a relevant case is far more costly than surfacing a few marginally relevant ones. Which relevance property should it optimize for first?',
+      options: [
+        { id: 'a', text: 'Precision', correct: false, explanation: 'Optimizing purely for precision would favor stricter matching, which risks excluding relevant documents that use different wording — the opposite of what this product needs.' },
+        { id: 'b', text: 'Recall', correct: true, explanation: 'Recall measures how many of the truly relevant documents were found; a product that cannot tolerate missing relevant results should prioritize recall over precision.' },
+        { id: 'c', text: 'Query latency', correct: false, explanation: 'Latency is a non-functional requirement about response speed, not about whether results are relevant or complete.' },
+      ],
+    },
+  ]}
+/>

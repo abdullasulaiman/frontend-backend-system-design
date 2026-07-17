@@ -1,0 +1,159 @@
+---
+title: "Availability"
+module: "Non-Functional Characteristics"
+moduleOrder: 4
+order: 1
+track: "concept"
+summary: "Explains what availability actually measures, how the 'nines' translate into real downtime budgets, and the architectural patterns you reach for to raise it."
+tags: ["availability", "uptime", "sla", "redundancy", "failover"]
+estMinutes: 12
+cheatsheet:
+  - "Availability = uptime / total time, usually expressed in 'nines' — 99.9% ('three nines') allows about 8.7 hours of downtime a year; 99.99% allows about 52 minutes."
+  - "Availability is not the same as reliability: a system can be 'up' and returning wrong or corrupted answers, or 'down' in a way that's perfectly correct (a clean maintenance window)."
+  - "Redundancy without automatic failover doesn't raise availability by much — someone has to notice the failure and route around it before the clock stops counting as downtime."
+  - "Every dependency you add multiplies availability (if calls are synchronous and required): three 99.9% services chained together cap you well under 99.9% unless you isolate failures."
+  - "Active-active raises availability and utilizes both regions, but forces you to handle write conflicts; active-passive is simpler but wastes standby capacity and has slower failover."
+  - "SLA (promised), SLO (internal target), and SLI (measured indicator) are three different things — know which one a number in an interview refers to before you use it."
+  - "Health checks, timeouts, retries with backoff, and circuit breakers are the mechanics that turn 'we have redundant servers' into measured availability gains."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+When an interviewer asks "how available does this need to be?", they're asking you to put a number on how much downtime is acceptable — and then to design an architecture that hits that number under real failure conditions, not just under happy-path load. Availability is usually the first non-functional requirement pinned down in a system design interview, right after functional scope, because it drives concrete decisions: how many replicas you need, whether you can tolerate a single region, and how much complexity (and cost) you're willing to pay to shave downtime from minutes to seconds.
+
+This lesson covers what availability actually measures, how to reason about the "nines," and the core architectural levers — redundancy, failover, and load balancing — that raise it. Later lessons in this module cover related-but-distinct properties: Reliability and Durability (is the data/behavior *correct*, not just present), and Fault Tolerance and Redundancy (the deeper mechanics of surviving component failure).
+
+## What availability actually measures
+
+Availability is the fraction of time a system is capable of servicing requests, over some total period:
+
+`availability = uptime / (uptime + downtime)`
+
+It says nothing about correctness. A service that's reachable but returns stale data, 500s on 10% of requests, or silently drops writes can still count as "available" if it's technically responding. That's why availability and reliability are tracked as separate concerns — a system can be highly available and unreliable at the same time (always up, frequently wrong), or the reverse (rock-solid correctness, but a single instance with no redundancy that goes dark during every deploy).
+
+Availability is almost always expressed as a percentage of "nines," because the raw percentages look deceptively similar until you convert them to actual time:
+
+| Availability | Downtime / year | Downtime / month |
+|---|---|---|
+| 99% ("two nines") | ~3.65 days | ~7.3 hours |
+| 99.9% ("three nines") | ~8.76 hours | ~43.8 minutes |
+| 99.99% ("four nines") | ~52.6 minutes | ~4.4 minutes |
+| 99.999% ("five nines") | ~5.26 minutes | ~26 seconds |
+
+The jump from three nines to four nines isn't a 0.09% improvement in difficulty — it's roughly a 10x reduction in tolerated downtime, and each additional nine typically costs far more than 10x in engineering effort (multi-region active-active, automated failover, chaos testing, on-call rigor). Part of the interview skill is recognizing when four or five nines is actually justified (payments, emergency services) versus when three nines is the pragmatic, defensible choice (an internal analytics dashboard).
+
+## SLA, SLO, and SLI — three different numbers
+
+These terms get used interchangeably in casual conversation, but they mean different things and mixing them up in an interview reads as imprecise:
+
+- **SLI (Service Level Indicator)** — the actual measured metric, e.g. "99.95% of requests over the last 30 days succeeded."
+- **SLO (Service Level Objective)** — the internal target you're designing and alerting against, e.g. "we aim for 99.9% monthly availability."
+- **SLA (Service Level Agreement)** — the external, often contractual promise to customers, usually set looser than the SLO so you have margin before breaching it (with financial penalties or credits attached to a breach).
+
+A healthy pattern: SLA (promised to customers) is looser than SLO (internal target) which is looser than what you're actually hitting (SLI), so you have buffer at every layer before a bad week turns into a broken contract.
+
+## The core levers: redundancy, failover, and load balancing
+
+Raising availability almost always comes down to removing single points of failure and making sure the system can route around a failed component fast enough that users don't notice.
+
+**Redundancy** means running more than one instance of anything that can fail — servers, database replicas, availability zones, even entire regions. Redundancy alone doesn't buy you availability, though; it buys you the *option* to survive a failure. You still need something to detect the failure and reroute traffic.
+
+**Health checks and failover** are what turn redundancy into measured uptime. A load balancer or orchestrator pings each instance on an interval; instances that fail a threshold of checks get pulled out of rotation, and traffic shifts to the survivors. The speed of this detection loop directly sets your floor on downtime during a single-instance failure — a 30-second health-check interval with a 3-strike threshold means up to roughly 90 seconds of degraded service every time an instance dies ungracefully.
+
+**Active-passive vs. active-active** is the key architectural choice at the region or replica level:
+
+- *Active-passive*: one primary handles all traffic; a standby stays synced (or nearly synced) and takes over on failure. Simpler to reason about — no concurrent writes to reconcile — but the standby's capacity sits idle, and failover (promoting the standby, updating DNS/routing) takes real time, often tens of seconds to minutes.
+- *Active-active*: multiple instances/regions serve traffic simultaneously. Failure of one just means the others absorb its share — often sub-second, since there's no promotion step. The cost is that you now have concurrent writes to the same logical data from multiple places, which reintroduces conflict resolution and consistency questions (this is exactly where the Consistency: CAP and PACELC lesson picks up).
+
+**Timeouts, retries, and circuit breakers** matter because a slow dependency is often worse for availability than a dead one — a hung connection ties up a caller's threads/connections waiting for a response that never comes, which can cascade into the caller itself becoming unavailable. Bounded timeouts, retries with backoff and jitter (not tight retry loops that amplify load on an already-struggling dependency), and circuit breakers that stop calling a dependency once it's clearly failing are what keep one component's bad day from becoming everyone's bad day.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  C[Client] --> LB[Load Balancer]
+  LB -->|healthy| S1[Server A]
+  LB -.->|failed health check| S2[Server B - down]
+  LB -->|healthy| S3[Server C]
+  S1 --> DB1[(Primary DB)]
+  S3 --> DB1
+  DB1 -.->|replication| DB2[(Standby DB)]
+`} />
+
+## Availability math across a request path
+
+Availability compounds across a call chain the same way probabilities do. If a request must succeed through three independent, synchronous, required dependencies each running at 99.9%, the end-to-end availability isn't 99.9% — it's the product:
+
+`0.999 x 0.999 x 0.999 ≈ 0.997`, or about 99.7% — nearly a full nine worse than any single service.
+
+This is why "just call three microservices" quietly erodes availability if none of the calls are optional, cached, or run in parallel with a fallback. Two ways architects push back against this decay:
+
+1. **Redundancy at each hop** — if each of those three services is itself deployed with N+1 (or N+2) redundant instances behind a load balancer, an individual instance failing doesn't take the whole service down, so each hop's *effective* availability stays close to its target instead of degrading further.
+2. **Reducing required synchronous hops** — making dependencies optional (serve a slightly stale cached result instead of failing), asynchronous (a write that can be queued and retried instead of blocking the response), or parallel (fan out and take the fastest N of M) all avoid the strict multiplication above, because a single failed hop no longer fails the whole request.
+
+## Worked example: sizing a checkout service
+
+Say you're designing checkout for an e-commerce site and the business tells you: "checkout must be available 99.95% of the time, measured monthly." That's about 21.6 minutes of allowed downtime a month.
+
+Checkout calls three internal services synchronously: inventory, pricing, and payment, each independently deployed at 99.9%. Multiplied together, naive end-to-end availability is about 99.7% — roughly 2.2 hours of monthly downtime, nearly 6x over budget.
+
+The fix isn't "make each service better" (expensive, slow to achieve) — it's shrinking what's actually on the synchronous critical path:
+
+- Inventory check can tolerate a short cache TTL (a few seconds of staleness is fine for "is this roughly in stock") — read from a cache with a fast fallback instead of a hard synchronous call, so a slow/down inventory service degrades gracefully instead of failing checkout.
+- Pricing can be pre-computed and attached to the cart earlier in the flow rather than queried at the checkout instant.
+- Payment is the one hop that genuinely must be synchronous and correct (you can't guess whether a charge succeeded), so that's where the redundancy budget goes: multiple payment-provider connections, aggressive but bounded timeouts, and a circuit breaker so a slow provider doesn't hang every checkout.
+
+The result: only one hard synchronous dependency remains on the critical path, each backed by redundant instances and a load balancer, which is how you get back within the 99.95% budget without needing every single service in the company to independently hit five nines.
+
+<Callout type="warning">
+  A common interview mistake: proposing "add more servers" as the entire availability answer without addressing detection and failover. Redundant instances that a load balancer doesn't know how to health-check and route around don't help — if a server dies and nothing notices for five minutes, you've taken the outage anyway. Always pair "we have N replicas" with "and here's how failure gets detected and traffic gets rerouted" (health checks, a load balancer, and a failover/promotion mechanism for stateful components like databases).
+</Callout>
+
+<Quiz
+  lessonId="nfr-availability"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A service runs at 99.99% availability. Roughly how much downtime does that allow per year?',
+      options: [
+        { id: 'a', text: 'About 8.7 hours', correct: false, explanation: 'That is the downtime budget for 99.9% ("three nines"), one order of magnitude looser than 99.99%.' },
+        { id: 'b', text: 'About 52 minutes', correct: true, explanation: 'Correct — 99.99% ("four nines") allows roughly 52.6 minutes of downtime across a year.' },
+        { id: 'c', text: 'About 5 minutes', correct: false, explanation: 'That is closer to the budget for 99.999% ("five nines"), one order of magnitude tighter than 99.99%.' },
+        { id: 'd', text: 'About 3.5 days', correct: false, explanation: 'That is the downtime budget for 99% ("two nines"), far looser than 99.99%.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these actually raise measured availability, rather than just adding redundant capacity that sits unused during a failure? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Adding a second server with no health checks or load balancer in front', correct: false, explanation: 'Without a mechanism to detect the failed instance and route traffic away from it, the extra server does not shorten the outage a client experiences.' },
+        { id: 'b', text: 'Automated health checks feeding a load balancer that removes failed instances from rotation', correct: true, explanation: 'This is the detection-and-reroute loop that turns spare capacity into an actual reduction in observed downtime.' },
+        { id: 'c', text: 'An active-active multi-region deployment where surviving regions absorb failed-region traffic automatically', correct: true, explanation: 'Automatic traffic absorption on failure, with no manual promotion step, is a direct availability improvement over a single region.' },
+        { id: 'd', text: 'A circuit breaker that stops calling a dependency once it is clearly failing, instead of queuing every caller behind a timeout', correct: true, explanation: 'This prevents a slow/failing dependency from exhausting the caller’s own resources, protecting the caller’s own availability.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'If a checkout flow makes three required, synchronous calls to services each running at 99.9% availability, the checkout flow’s own availability is also about 99.9%.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Availability multiplies across required synchronous hops, so three services at 99.9% chained together yield about 99.7% end-to-end — noticeably worse than any single hop.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Roughly 0.999 x 0.999 x 0.999 is about 0.997 (99.7%), which is why reducing required synchronous hops (caching, async writes, fallbacks) matters as much as improving any individual service.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A team advertises "99.9% uptime" to customers in their contract, while their internal dashboards alert engineers if the measured rate drops below 99.95%. What are these two numbers called, respectively?',
+      options: [
+        { id: 'a', text: 'SLI, then SLO', correct: false, explanation: 'The contractual promise is an SLA, not an SLI — an SLI is the measured indicator itself, not a promise.' },
+        { id: 'b', text: 'SLA, then SLO', correct: true, explanation: 'Correct — the contractual customer-facing promise is the SLA; the tighter internal alerting target is the SLO, deliberately set stricter so engineers get warned before an SLA breach.' },
+        { id: 'c', text: 'SLO, then SLA', correct: false, explanation: 'This has it backwards — SLAs are the external contractual promises, and SLOs are the internal engineering targets, usually set tighter than the SLA.' },
+        { id: 'd', text: 'SLA, then SLI', correct: false, explanation: 'The internal alerting threshold described here is a target (SLO), not the raw measured metric itself (which would be the SLI).' },
+      ],
+    },
+  ]}
+/>

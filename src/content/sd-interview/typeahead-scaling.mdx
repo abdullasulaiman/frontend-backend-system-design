@@ -1,0 +1,215 @@
+---
+title: "Scaling"
+module: "Design Typeahead Suggestion"
+moduleOrder: 12
+order: 5
+track: "interview"
+summary: "Covers how a typeahead service scales past a single in-memory trie — precomputing suggestions offline, sharding and replicating the prefix index, layering caches for the zipfian query distribution, and folding in trending terms without a full rebuild."
+tags: ["scalability", "caching", "sharding", "data-pipelines", "typeahead"]
+estMinutes: 12
+cheatsheet:
+  - "Never compute top-k suggestions live off a shared trie under load — precompute them offline (batch or streaming) and serve a read-only lookup structure; the trie stays a build-time tool, not the request-time path."
+  - "Query prefixes are brutally zipfian — a tiny number of short, common prefixes absorb most traffic. Cache aggressively at the edge/CDN and in a server-side hot-prefix cache before ever touching a shard."
+  - "Shard the prefix index by prefix range (e.g. first 1-2 characters), but rebalance hot shards by splitting ranges further, not by scaling every shard for worst-case load."
+  - "Rebuild the offline index on a fixed cadence (e.g. hourly) from aggregated query logs, and swap it in atomically — never mutate the structure serving live reads in place."
+  - "Blend a lightweight streaming layer (recent-window counts) on top of the batch index so trending queries surface within minutes, not on the next full rebuild cycle."
+  - "Typeahead only needs eventual consistency — a suggestion list that's 10 minutes stale is invisible to users, so don't spend engineering effort making it strongly consistent."
+  - "Replicate the read-only index per region so every request round-trips to the nearest data center; keep index rebuilds centralized (or regionally aggregated and merged) rather than fighting cross-region write consistency."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've built the trie, ranked its suggestions, and wired it into a service in
+the last three lessons. That design is correct and it will demo beautifully
+on your laptop with a few thousand terms loaded in memory. It will not
+survive contact with a real product: hundreds of millions of users, each
+firing a request on every keystroke, hitting a query distribution so skewed
+that a handful of prefixes account for a huge share of all traffic. Getting
+typeahead to scale isn't about a smarter trie — it's about get­ting almost
+all of that traffic to never touch the trie at all, and handling the rest
+without ever blocking a live request on a rebuild.
+
+## Stop computing suggestions live
+
+The biggest structural mistake is treating the trie as the thing that
+answers requests. Walking a shared, mutable trie under load runs into two
+problems at once: computing (and re-ranking) the top-k completions for a
+popular prefix on every single request is wasted, repeated work, and any
+lock or copy-on-write you add to keep it safe under concurrent reads and
+writes slows down every request that touches it.
+
+The fix is to split the pipeline into two clearly separate stages:
+
+1. **Offline build** — periodically aggregate query logs, build (or rebuild)
+   the trie, and for every prefix worth serving, precompute and cache its
+   top-k suggestion list. This is a batch job; it can take minutes and run
+   on dedicated hardware.
+2. **Online serve** — the request path never touches the trie or does any
+   ranking. It looks up a prefix in a read-only, precomputed
+   prefix-to-top-k-list structure (a hash map or a flattened trie with the
+   list stored at each node) and returns it. That lookup is O(1)-ish and
+   trivially parallelizable.
+
+Swap the online structure in atomically when a new build finishes (new
+version stood up alongside the old one, traffic cut over, old one dropped)
+rather than mutating the live structure in place. A rebuild that's still in
+progress should never be visible to a request.
+
+## Sharding the prefix index
+
+Once the suggestion lookup is a flat, read-only structure, sharding it is
+straightforward: partition by prefix range. Shard 0 owns prefixes starting
+`a`-`e`, shard 1 owns `f`-`j`, and so on — or, for finer control, shard by
+the first one or two characters and let a routing layer own the
+prefix-range-to-shard mapping.
+
+That mapping needs to be adjustable, because character frequency isn't
+uniform. Prefixes starting with common letters ("s", "c", "p" in English)
+carry far more distinct queries and far more traffic than prefixes starting
+with "q" or "x." Fixed, equal-width ranges create a hot shard the same way
+fixed-length geohash ranges create hot shards in a geospatial index: equal
+address space, unequal load. Split a hot range into finer sub-ranges across
+more shards, and merge cold ranges together, tracked through a small routing
+table rather than a static formula.
+
+Each shard is stateless from the serving perspective — it just holds a slice
+of the precomputed lookup structure — so scaling a shard's read capacity is
+just adding read replicas behind it.
+
+## Caching the zipfian read path
+
+Typeahead query volume is one of the most skewed traffic patterns you'll see
+in an interview: a small number of one- and two-character prefixes ("a",
+"th", "ho") are requested constantly, while the long tail of specific
+prefixes is requested rarely. That skew is a gift if you cache correctly:
+
+- **CDN / edge cache** for the most common short prefixes, keyed on the
+  prefix string, with a modest TTL (say, a few minutes). This absorbs a huge
+  fraction of requests before they ever reach your data center.
+- **Server-side hot-prefix cache** (an LRU or similar) in front of the
+  sharded lookup structure, catching whatever the edge cache missed.
+- **Client-side cache** in the app/browser for the current session — once a
+  user has seen suggestions for "san fra", re-showing them while they type
+  "san franc" needs no round trip if the client also does local prefix
+  matching over what it already fetched.
+
+Because the underlying data changes slowly (suggestion lists shift over
+hours, not seconds), moderately stale cache entries are a non-issue. Don't
+over-engineer cache invalidation here — a short TTL plus the next scheduled
+rebuild keeps everything close enough to fresh.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    Logs[Query Logs] --> Agg[Log Aggregator]
+    Agg --> Builder[Offline Trie + Top-k Builder]
+    Builder --> Idx[(Versioned Prefix Index)]
+    Idx --> ShardA[Shard: prefixes a-e]
+    Idx --> ShardB[Shard: prefixes f-j]
+    Idx --> ShardC[Shard: prefixes k-z]
+    Client[Client keystroke] --> Edge[CDN / Edge Cache]
+    Edge --> Hot[Server Hot-Prefix Cache]
+    Hot --> ShardA
+    Hot --> ShardB
+    Hot --> ShardC
+    Stream[Streaming Recent-Query Counts] --> Hot
+`} />
+
+## Folding in trending queries
+
+A pure batch rebuild has a lag problem: if you rebuild hourly, a term that
+suddenly spikes (breaking news, a viral product) won't show up in
+suggestions for up to an hour, which is a visibly bad user experience for
+exactly the queries people care about most. Rather than shortening the
+batch cycle for everything (expensive, and most terms don't need it), run a
+thin streaming layer alongside it: a real-time counter (a sliding-window
+count-min sketch or similar) tracks query frequency over the last few
+minutes per prefix.
+
+At serve time, blend the streaming layer's recent counts with the batch
+index's stable, historical top-k — for instance, boost a term's rank if its
+recent-window count is disproportionately high relative to its historical
+baseline, capped so a handful of bot-driven queries can't hijack the list.
+This gives you "trending shows up in minutes" without making the whole
+system real-time, which would cost far more for far less benefit on the 99%
+of prefixes that never trend.
+
+## Going multi-region
+
+Because the serving structure is read-only and derived, not a live database,
+multi-region scaling is simpler than it looks: replicate the built index (or
+each shard of it) to every region, and route each user to the nearest
+replica. The build pipeline stays centralized — logs from all regions feed
+one aggregation and build process, and the resulting versioned index ships
+out to every region's replicas. You're replicating an artifact, not
+running a distributed write path, so you sidestep cross-region write
+consistency entirely.
+
+## Worked example: sizing shards and replicas
+
+Say the service handles 200 million daily active users, each triggering
+roughly 20 keystroke-level requests per session and averaging 3 sessions a
+day — about 12 billion requests/day, or ~140,000 requests/sec at average
+load (call it 400,000/sec at peak). If the edge and hot-prefix caches
+together absorb 95% of that traffic (reasonable given the zipfian
+distribution), only about 20,000/sec at peak actually reaches the sharded
+index.
+
+Split the alphabet into 20 shard ranges rather than 26 raw letters, sized so
+each shard targets roughly 2,000-3,000 requests/sec — comfortably within
+what a few read replicas per shard can serve. Monitoring then reveals, say,
+that the "s" and "c" ranges are running 5x hotter than the rest; you split
+those two ranges into finer sub-ranges across additional shards, exactly
+like splitting a hot geospatial cell, and update the routing table. No
+client change, no downtime, no need to over-provision the "q"/"x" shard to
+match.
+
+<Callout type="warning">
+  A common mistake in this design is treating the trie itself as the
+  production serving structure — walking it live, per request, to compute
+  top-k suggestions with locking to handle concurrent updates. That couples
+  read latency to write contention and to ranking cost on every request. The
+  fix is the offline/online split: precompute top-k lists in a batch (or
+  streaming) job, and make the request path a dumb, fast lookup against a
+  read-only, versioned, cacheable structure. If you find yourself explaining
+  how reads and writes coordinate on the same trie, that's the sign to
+  separate the pipeline.
+</Callout>
+
+<Quiz
+  lessonId="typeahead-scaling"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should the request path avoid walking a live, shared trie to compute top-k suggestions on every request?',
+      options: [
+        { id: 'a', text: 'Tries cannot store suggestion rankings alongside prefixes', correct: false, explanation: 'A trie node can absolutely store a precomputed ranked list — that is exactly the recommended design. The problem is doing the ranking computation live per request, not the data structure itself.' },
+        { id: 'b', text: 'It couples every read to write contention and repeats identical ranking work for popular prefixes on every single request', correct: true, explanation: 'Computing and locking against a shared mutable structure on the hot path adds latency and wastes work, since the same popular prefixes get requested constantly with the same answer.' },
+        { id: 'c', text: 'Tries use more memory than hash maps, so they are too large to serve from', correct: false, explanation: 'Memory footprint is a separate, secondary concern; the core scaling issue is doing live computation and coordination on the request path, not the structure\'s memory size.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which techniques directly address the zipfian (heavily skewed) nature of typeahead query traffic? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'CDN/edge caching of the most common short prefixes', correct: true, explanation: 'A small number of short, common prefixes account for a huge share of traffic — caching them at the edge absorbs most requests before they reach your infrastructure.' },
+        { id: 'b', text: 'A server-side hot-prefix cache in front of the sharded lookup structure', correct: true, explanation: 'This catches whatever the edge cache missed, again exploiting the fact that a small set of prefixes dominates request volume.' },
+        { id: 'c', text: 'Provisioning every shard identically so each can handle worst-case load for any prefix range', correct: false, explanation: 'This wastes capacity on cold ranges instead of exploiting the skew — the better move is caching hot prefixes and splitting hot shard ranges, not uniformly over-provisioning.' },
+        { id: 'd', text: 'Client-side caching of suggestions already fetched during the current typing session', correct: true, explanation: 'As a user keeps typing a prefix they already queried, the client can serve from what it already has instead of round-tripping again.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A typeahead service should shorten its full offline rebuild cycle to seconds so that trending queries appear immediately, rather than adding a separate streaming layer.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Rebuilding the full index every few seconds is expensive and unnecessary — the vast majority of prefixes do not need that freshness. A thin streaming layer that tracks recent counts and blends them with the stable batch index gets trending terms visible in minutes at a fraction of the cost.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. The standard approach is a slower batch rebuild (e.g. hourly) for the stable long tail, plus a lightweight real-time counter layer blended in at serve time for trending terms — not shrinking the whole rebuild cycle to real-time.' },
+      ],
+    },
+  ]}
+/>

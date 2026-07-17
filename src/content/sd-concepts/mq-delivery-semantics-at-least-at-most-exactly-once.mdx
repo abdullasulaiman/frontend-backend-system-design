@@ -1,0 +1,117 @@
+---
+title: "Delivery Semantics (At-Least/At-Most/Exactly-Once)"
+module: "Distributed Messaging Queue"
+moduleOrder: 17
+order: 2
+track: "concept"
+summary: "Explains the three delivery guarantees a messaging queue can offer, where each one is enforced (producer ack vs. consumer ack), and why exactly-once is really at-least-once plus deduplication."
+tags: ["messaging-queue", "delivery-semantics", "reliability", "distributed-systems", "consumer-ack"]
+estMinutes: 11
+cheatsheet:
+  - "At-most-once: send/deliver and move on, no retry — messages can be silently lost, never duplicated. Only acceptable when losing a message is cheaper than handling a duplicate."
+  - "At-least-once: retry until acknowledged — messages are never silently lost, but crashes and timeouts can cause the same message to be delivered more than once."
+  - "Exactly-once is not a delivery guarantee the network can provide on its own; it is at-least-once delivery plus idempotent processing or dedup on the consumer side."
+  - "The guarantee is decided by *when* you ack, not by a config flag: ack-before-process risks loss, ack-after-process risks duplication, and there is no third option that risks neither for free."
+  - "Producer-side acks (broker persisted the write) and consumer-side acks (consumer finished processing) are two independent knobs — a queue can be at-least-once on one side and at-most-once on the other."
+  - "Default to at-least-once plus idempotent consumers for anything that matters (payments, inventory, notifications with a dedup key) — it is the only combination that is both safe and practical at scale."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Picture a payments service that publishes a `ChargeCard` message to a queue every time a customer checks out. If a consumer crashes right after charging the card but before it acknowledges the message, what happens next depends entirely on a decision the queue's design made ahead of time: does the broker redeliver that message to another consumer, or does it consider the job done and move on? Redeliver, and you might double-charge the customer. Don't redeliver, and you might silently drop a charge that never gets retried. Neither outcome is acceptable on its own — and no queue can dodge this choice. This lesson is about the three named guarantees that come out of that choice, what actually produces each one under the hood, and why "exactly-once" is more marketing term than mechanism.
+
+## The three semantics
+
+**At-most-once**: each message is delivered zero or one times. The producer or consumer never retries on doubt — if an ack is lost, a network blip drops a send, or a consumer crashes mid-processing, the message is simply gone. Nothing duplicates, but things can vanish. This is the semantics you get "for free" from a fire-and-forget send with no acknowledgment and no retry logic.
+
+**At-least-once**: each message is delivered one or more times. The system retries whenever it isn't sure a message was handled — an unacknowledged send gets resent, an unacknowledged consumer read gets redelivered. Nothing is silently lost, but the same message can arrive twice (or more) if an ack is delayed, dropped, or the consumer dies after doing the work but before confirming it.
+
+**Exactly-once**: each message is processed as if delivered precisely once — no loss, no duplicates, no matter what crashes or retries happen underneath. This is the semantics everyone wants and the one that's genuinely hard to deliver, because "exactly once" over an unreliable network with independently crashing machines runs into a fundamental problem: you cannot atomically do "process the message" and "confirm I processed it" as a single indivisible step across two different machines. Something can always fail between those two actions. What real systems build is **effectively-once**: at-least-once delivery at the transport layer, combined with deduplication or idempotent processing at the consumer, so duplicates arrive but never take effect twice. The next lesson in this module covers exactly how that dedup works.
+
+## Where the guarantee actually comes from
+
+Delivery semantics aren't a mode you flip in a config file — they fall out of *when* an acknowledgment happens relative to the work being acknowledged, and that decision exists twice: once between producer and broker, and again between broker and consumer.
+
+### Producer-to-broker
+
+- **Fire-and-forget** (producer sends, doesn't wait for a response): fastest, but a dropped packet or a broker that crashes before persisting the write loses the message with no way to know it happened. At-most-once.
+- **Ack-after-persist, producer retries on timeout/failure** (producer waits for the broker to confirm durable storage, and resends if it doesn't hear back in time): the message can't be silently lost, but if the ack itself is lost after the broker already wrote it, the producer retries and the broker ends up storing it twice. At-least-once.
+
+### Broker-to-consumer
+
+- **Ack-before-process** (consumer tells the broker "got it, you can delete/advance past this one" as soon as it reads the message, before doing the actual work): if the consumer then crashes while processing, the broker has already forgotten the message — it's gone, and the work never completes. At-most-once.
+- **Ack-after-process** (consumer only acknowledges once it has fully finished the work): if the consumer crashes after finishing the work but before the ack reaches the broker, the broker assumes it was never handled and redelivers it to another consumer — which now redoes work that already happened. At-least-once.
+
+Notice the symmetry: whichever side you're on, acking early risks loss and acking late risks duplication. There is no ack timing that avoids both — the tradeoff is structural, not a bug to engineer around.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant P as Producer
+    participant B as Broker
+    participant C as Consumer
+    P->>B: publish ChargeCard(order=42)
+    B-->>P: ack (persisted)
+    B->>C: deliver ChargeCard(order=42)
+    C->>C: charge the card (succeeds)
+    Note over C,B: consumer crashes before ack reaches broker
+    Note over B: broker sees no ack, timeout expires
+    B->>C: redeliver ChargeCard(order=42)
+    Note over C: without dedup, card is charged twice
+`} />
+
+## Worked example: sizing the risk for a notification service
+
+Say you're running a push-notification service sending roughly 5,000 messages/sec, where a consumer crash-loop happens on average once every 10 minutes and a crash typically kills 200 in-flight messages before they're re-picked-up.
+
+With **at-most-once** delivery, each of those 200 in-flight notifications is simply lost on a crash — over a day with ~144 crash events, that's up to ~28,800 notifications a user never receives, with no record anything was even attempted. For a "your package shipped" alert, that's a bad but survivable outcome; users don't usually notice one missing push.
+
+With **at-least-once** delivery, none of those 200 are lost — they get redelivered once a healthy consumer picks the partition back up. But if the crash happened after a consumer sent the actual push (through APNs/FCM) and before it acked the broker, some fraction of those 200 get sent twice. At 5,000 msg/sec, even a generous crash-to-recovery window can double-send a few hundred notifications a day. For push notifications, a duplicate is mildly annoying, not dangerous — so most teams pick at-least-once here and accept the occasional double-send rather than build full dedup for a low-stakes message type.
+
+Now swap the payload for `ChargeCard` instead of a push notification, and the math flips: losing 28,800 charges a day is a business-ending outcome, and double-charging a few hundred customers a day is also unacceptable — this is exactly the case where at-least-once delivery *must* be paired with idempotent processing (e.g., a unique `orderId` the payment processor de-duplicates on) rather than shipped bare.
+
+<Callout type="warning">
+  A common design mistake is asking for "exactly-once" as if it's a checkbox the message broker can provide by itself, then stopping there. No broker can atomically deliver a message and guarantee a downstream side effect (charging a card, sending an email, writing a row) happens exactly once — those are two separate systems that can fail independently between each other. If you hear "exactly-once" in an interview or a vendor's marketing, always ask "at-least-once plus what deduplication mechanism?" The honest answer is always some combination of at-least-once delivery, an idempotency key, and consumer-side dedup state — never delivery-layer magic alone.
+</Callout>
+
+## Choosing in practice
+
+As a default: pick **at-least-once** delivery for anything where losing a message is worse than occasionally reprocessing one — which is most production systems — and push the "avoid duplicate side effects" problem down to idempotent consumers. Reach for **at-most-once** only for genuinely disposable data where a retry storm would be worse than a gap: high-frequency metrics samples, best-effort telemetry, or live cursor positions where the next update supersedes the last anyway. True end-to-end exactly-once (as opposed to effectively-once) is realistic only inside a single system that controls both the message log and the state it's updating in one atomic transaction — Kafka's transactional producer/consumer APIs are the canonical example, and even those only hold the guarantee within that one Kafka cluster, not across an arbitrary external side effect like an HTTP call to a third party.
+
+<Quiz
+  lessonId="mq-delivery-semantics-at-least-at-most-exactly-once"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A consumer acknowledges a message to the broker immediately after reading it, before doing any processing work. If the consumer then crashes mid-processing, what delivery semantics does this produce?',
+      options: [
+        { id: 'a', text: 'At-most-once', correct: true, explanation: 'The broker already considers the message delivered and will not redeliver it, so a crash mid-processing means the work is silently never completed — the message is delivered (and processed) at most once.' },
+        { id: 'b', text: 'At-least-once', correct: false, explanation: 'At-least-once requires the broker to redeliver when it is not sure the work completed. Acking before processing tells the broker the work is done regardless of what actually happens next, so no redelivery occurs.' },
+        { id: 'c', text: 'Exactly-once', correct: false, explanation: 'Exactly-once requires no loss and no duplication. Acking before processing can lose work entirely on a crash, which violates the "no loss" half.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these statements about exactly-once delivery are accurate? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It generally requires at-least-once delivery combined with idempotent processing or deduplication.', correct: true, explanation: 'Since a broker cannot atomically deliver a message and guarantee a downstream effect happens once, real systems achieve "effectively-once" by retrying (at-least-once) and making duplicates harmless.' },
+        { id: 'b', text: 'A message broker can guarantee it purely through its wire protocol, with no consumer-side logic required.', correct: false, explanation: 'No protocol can atomically span "deliver the message" and "the consumer finished its side effect" across two independently-failing machines — some consumer-side dedup or idempotency is always required.' },
+        { id: 'c', text: 'It is fundamentally hard because acknowledgment and the work being acknowledged happen as two separate steps that can fail independently.', correct: true, explanation: 'This is the structural reason exactly-once is hard: there is always a gap between finishing work and confirming it, and a crash in that gap forces a choice between losing the confirmation or losing the work.' },
+        { id: 'd', text: 'It is only relevant for consumer-side acknowledgment, never for producer-to-broker communication.', correct: false, explanation: 'The same ack-timing problem exists on the producer side too — a producer can lose track of whether the broker persisted its write, causing loss or duplication there as well.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'At-least-once delivery guarantees that a consumer will never see the same logical message processed more than once.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'At-least-once only guarantees a message is not silently lost; it explicitly allows redelivery (and therefore reprocessing) when an ack is delayed, dropped, or never sent because the consumer crashed after finishing the work.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — at-least-once trades away the "never duplicated" property in exchange for "never silently lost." Preventing reprocessing on duplicates is a separate job, handled by idempotent consumers or dedup, covered in the next lesson.' },
+      ],
+    },
+  ]}
+/>

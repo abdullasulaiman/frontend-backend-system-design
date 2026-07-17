@@ -1,0 +1,146 @@
+---
+title: "Putting the Key-Value Store Together"
+module: "Key-Value Store"
+moduleOrder: 10
+order: 5
+track: "concept"
+summary: "Assembles consistent hashing, quorum replication, and versioning into one coherent read/write path for a distributed key-value store, and shows how the pieces cover each other's failure modes."
+tags: ["key-value-store", "system-design", "distributed-systems", "replication", "architecture"]
+estMinutes: 13
+cheatsheet:
+  - "A write touches three layers in order: hash the key onto the ring to find the coordinator node, fan out to N replicas, wait for W acks (or R acks on a read) before responding to the client."
+  - "Sloppy quorum plus hinted handoff keeps writes accepted during a node outage; anti-entropy (Merkle trees) repairs replicas that missed writes once the node returns."
+  - "Vector clocks (or last-write-wins if the product can tolerate lost updates) resolve the concurrent versions that quorum reads can surface — decide this before you decide on W and R."
+  - "Gossip-based membership plus consistent hashing is what lets the cluster add or remove a node by moving roughly 1/N of the keys, not a full reshuffle."
+  - "Every knob trades off against another: W=1 is fast but risks stale reads; R+W > N buys strong-ish consistency at the cost of latency; picking N, W, R is a single decision, not three independent ones."
+  - "When you present this in an interview, narrate the request path end to end (client to coordinator to replicas to response) — that's the artifact that shows you actually understand how the pieces fit."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've now covered the four building blocks of a distributed key-value store one at a time: how to partition keys across nodes, how to replicate them for durability, how to reconcile conflicting versions, and how quorum reads and writes tune the consistency/availability trade-off. Individually, each piece is a well-scoped idea you can explain in two minutes. The part that actually separates a strong system design answer from a mediocre one is showing how they interlock — because none of them work in isolation.
+
+Consistent hashing tells you *where* a key lives, but "where" is meaningless without replication deciding *how many places* it lives. Replication needs quorum rules to define what "successful" means for a write that's fanned out to multiple nodes. And quorum reads, once you allow partial failures, will occasionally return replicas that disagree — which is exactly the problem versioning solves. Pull any one of these out and the design breaks: no partitioning means no scaling, no replication means no durability, no quorum means no availability during failures, no versioning means clients see silently wrong data. This lesson walks the full request path end to end and shows where each earlier lesson's mechanism actually gets invoked.
+
+## The write path, start to finish
+
+Follow a single `PUT(key, value)` through the system:
+
+1. **Routing.** The client (or a coordinator node it talks to) hashes `key` with consistent hashing to find its position on the ring, then walks clockwise to the first node — the *coordinator* for that key.
+2. **Replica selection.** The coordinator is also replica 1. It identifies the next `N - 1` distinct physical nodes clockwise on the ring as the rest of the replica set (this is the mechanism from the consistent-hashing lesson — virtual nodes are what make "next distinct physical node" evenly distributed instead of clumped).
+3. **Fan-out.** The coordinator sends the write, tagged with a version (a vector clock entry or a timestamp, depending on your conflict strategy), to all `N` replicas in parallel.
+4. **Quorum wait.** The coordinator waits for `W` acknowledgments — not all `N` — before telling the client the write succeeded. The remaining replicas apply the write asynchronously.
+5. **Degraded case.** If a replica is down, sloppy quorum lets the coordinator write to a healthy stand-in node instead, with a hint attached ("this belongs to node X, deliver it when X comes back"). This is hinted handoff — it's what keeps `W` reachable during a single-node outage instead of the write failing outright.
+
+## The read path, and where conflicts surface
+
+A `GET(key)` follows the same routing step, then:
+
+1. The coordinator requests the value from `R` replicas (not necessarily the same `R` nodes every time — whichever are reachable and hold the key).
+2. If all `R` responses carry the same version, return it — done.
+3. If they disagree, this is a genuine concurrent-write conflict, not a bug. The coordinator applies the strategy chosen in the conflict-resolution lesson: return all conflicting versions to the client for merge (Dynamo's approach), or pick the one with the highest timestamp (last-write-wins), and — separately, on a background schedule — run anti-entropy repair (Merkle-tree comparison between replicas) so replicas that silently drifted apart get resynced even for keys nobody happens to read for a while.
+
+This is the crux most candidates gloss over: **quorum overlap (R + W > N) does not eliminate conflicts, it only guarantees a read will see at least one up-to-date replica.** You still need a real conflict-resolution mechanism, because "see the latest version among several" and "know which one is latest" are different problems when writes happen concurrently on different coordinators.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant C as Client
+    participant Co as Coordinator
+    participant R1 as Replica 1
+    participant R2 as Replica 2
+    participant R3 as Replica 3
+    C->>Co: PUT(key, value)
+    Co->>Co: hash(key) -> ring position -> replica set
+    Co->>R1: write(key, value, version)
+    Co->>R2: write(key, value, version)
+    Co->>R3: write(key, value, version)
+    R1-->>Co: ack
+    R2-->>Co: ack
+    Note over Co: W=2 reached, don't wait for R3
+    Co-->>C: write OK
+    R3-->>Co: ack (arrives late, discarded)
+`} />
+
+## How membership changes ripple through the stack
+
+The other place the pieces interact is cluster topology changes — a node joining, leaving, or dying:
+
+- **Failure detection** runs on gossip: nodes periodically exchange "who's alive" state with a few random peers, so failure information spreads in `O(log N)` rounds without a central health-check service that would itself be a bottleneck.
+- **Ring update.** Once a node is confirmed down (or a new node joins), the consistent-hashing ring updates — the joining/leaving node's virtual nodes move, and only the keys mapped to those specific ring segments need to relocate. This is the entire point of consistent hashing: without it, adding a node would remap most keys and require a mass data shuffle.
+- **Replica set shift.** Because replica sets are derived live from the ring ("next `N - 1` distinct nodes clockwise"), a topology change can silently shift who's in a key's replica set. Anti-entropy is what catches a replica that's now newly responsible for a key but doesn't have the latest version yet.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    A[Client request] --> B[Hash key onto ring]
+    B --> C[Coordinator + N-1 replicas]
+    C --> D{Write or read?}
+    D -->|Write| E["Fan out, wait for W acks<br/>(hinted handoff if a replica is down)"]
+    D -->|Read| F["Query R replicas<br/>compare versions"]
+    F --> G{Versions agree?}
+    G -->|Yes| H[Return value]
+    G -->|No| I["Resolve conflict<br/>(vector clock merge or LWW)"]
+    E --> J[Background anti-entropy sync]
+    I --> J
+`} />
+
+## Worked example: sizing N, W, R for a session store
+
+Say you're storing user session tokens: 50 million active sessions, each read on nearly every request and written on login/refresh. Availability matters more than perfect consistency — a session read that's a few hundred milliseconds stale is harmless, but a login that fails because of a quorum timeout is a real user-facing outage.
+
+- **N = 3.** Enough to survive a single node failure with two copies still live, without tripling storage cost the way `N = 5` would.
+- **W = 1.** Login writes should almost never block or fail on replica coordination — accept the write as soon as one node has it, and let it replicate asynchronously. This is the "sloppy" end of the trade-off: fast, highly available, and it's fine if a read races ahead of full replication for a token that's only checked, not computed from.
+- **R = 1.** For the same reason — read latency matters far more here than catching a rare stale replica, and a stale-by-milliseconds session check just means an extra token refresh at worst.
+
+Notice `W + R = 2`, which is less than `N = 3`: this design deliberately does **not** guarantee every read sees the latest write. That's the right call for session data. Contrast with an inventory-count key where overselling is expensive — there you'd push toward `W = 2, R = 2` (so `R + W > N`) and accept the added latency, because correctness now outweighs raw speed. The same three building blocks, tuned differently, produce a very different system — that's the whole exercise of this module.
+
+<Callout type="warning">
+  A common mistake in interviews: describing consistent hashing, replication, quorum, and conflict resolution as four separate slides with no connective tissue, then going quiet when asked "walk me through what happens when a write comes in." If you can't narrate the full path — hash the key, find the replica set, fan out, wait for W, handle a down replica with hinted handoff, resolve a later read conflict with vector clocks — you haven't actually assembled a system, you've memorized four topics. Practice the end-to-end narration, not just each piece in isolation.
+</Callout>
+
+<Quiz
+  lessonId="kv-putting-the-key-value-store-together"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'With W = 2, a coordinator does not need an ack from all 3 replicas before responding to the client. What happens to the third replica\'s acknowledgment when it eventually arrives?',
+      options: [
+        { id: 'a', text: 'It is discarded once quorum is reached; the write to that replica still completed and its data is intact', correct: true, explanation: 'The coordinator only waits for W acks before responding to the client — the write still went out to all N replicas, and the late ack just arrives after the response was already sent.' },
+        { id: 'b', text: 'The write is rolled back on that replica to keep all replicas in sync', correct: false, explanation: 'There is no rollback in this model — the replica already has the correct value, it just acknowledged slightly later than the two the coordinator waited for.' },
+        { id: 'c', text: 'The client is asked to retry the write against that replica directly', correct: false, explanation: 'Clients talk to the coordinator, not individual replicas, and no retry is needed since the write already succeeded there.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements correctly describe why R + W > N is not, by itself, a complete consistency solution?',
+      options: [
+        { id: 'a', text: 'It guarantees a read overlaps with at least one up-to-date replica, but not which one in the response set that is', correct: true, explanation: 'Overlap only guarantees the freshest version is somewhere in the R responses — the coordinator still needs a way to identify it, which is what versioning provides.' },
+        { id: 'b', text: 'Concurrent writes to different coordinators can still produce genuinely conflicting versions that quorum math alone cannot order', correct: true, explanation: 'Quorum overlap is about read/write set intersection, not about ordering concurrent writes — that requires vector clocks or last-write-wins.' },
+        { id: 'c', text: 'It eliminates the need for anti-entropy repair between replicas', correct: false, explanation: 'The opposite is true — anti-entropy is still needed to fix replicas that silently drifted, especially for keys that are not read again for a long time.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'When a node joins the cluster, consistent hashing means only the keys mapped to that node\'s new ring segments need to move, not the entire keyspace.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'That locality of movement is the core benefit of consistent hashing over naive mod-N hashing, which would remap nearly every key on a membership change.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This is actually the main reason consistent hashing is used for partitioning in the first place — a naive hash-mod-N scheme is what causes a full remap, not consistent hashing.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'For an inventory-count key where overselling a product is costly, which N/W/R configuration best reflects prioritizing correctness over latency, and why?',
+      options: [
+        { id: 'a', text: 'N = 3, W = 2, R = 2, since R + W > N forces read/write set overlap', correct: true, explanation: 'With N = 3 and R + W = 4 > N, every read is guaranteed to intersect at least one replica from the most recent write, reducing (though not eliminating without versioning) the chance of reading stale stock counts.' },
+        { id: 'b', text: 'N = 3, W = 1, R = 1, since this minimizes latency for high-traffic reads', correct: false, explanation: 'W = 1, R = 1 is the availability-optimized end of the spectrum, appropriate for something like session tokens, not a value where staleness directly causes financial loss.' },
+        { id: 'c', text: 'N = 1, W = 1, R = 1, to avoid any replication overhead', correct: false, explanation: 'N = 1 means no replication at all — a single node failure loses the data outright, which is unacceptable for inventory correctness or durability.' },
+      ],
+    },
+  ]}
+/>

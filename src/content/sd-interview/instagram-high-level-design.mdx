@@ -1,0 +1,246 @@
+---
+title: "High-Level Design"
+module: "Design Instagram"
+moduleOrder: 8
+order: 2
+track: "interview"
+summary: "Breaks Instagram into its core services and traces how an upload becomes a post while a feed read stays fast, separating the write-heavy media path from the read-heavy timeline path."
+tags: ["photo-sharing", "system-design", "architecture", "media-storage", "fan-out"]
+estMinutes: 13
+cheatsheet:
+  - "Split media bytes from metadata from the start: object storage (plus a CDN) holds pixels; a database holds post rows, captions, and pointers. Never store binary blobs in your relational database."
+  - "The upload path is asynchronous and CPU-heavy (resize, transcode, moderate); the read path is synchronous and must return in well under 200ms — design them as two pipelines with different scaling knobs, not one 'posts service.'"
+  - "The feed is the hardest read in the system. Precompute it (fan-out-on-write into a per-user timeline cache) for most users; fall back to fan-out-on-read (merge-on-demand) for celebrity accounts with huge follower counts to avoid a 'thundering herd' write on every post."
+  - "Likes and comment counts are approximate, high-write counters — aggregate them through a queue or in-memory counter service, not with a synchronous UPDATE on every tap."
+  - "The graph service (who-follows-whom) is a distinct concern from the post/feed services and is usually backed by a store optimized for adjacency lookups, not the same database as posts."
+  - "Draw a clear boundary: client-facing API layer (stateless, horizontally scaled) talks to a set of independent services (upload, post metadata, graph, feed, notification) each with its own datastore and scaling profile."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've already nailed down requirements and rough scale numbers in the
+previous lesson — say, hundreds of millions of daily active users, a
+read-to-write ratio north of 100:1, and a hard requirement that opening the
+app feels instant. Now comes the part of the interview where you actually
+draw boxes. The trap most candidates fall into is treating Instagram as one
+big "posts and feeds" service. It isn't. It's a handful of services with
+wildly different traffic shapes bolted together, and naming that split
+explicitly is what separates a strong answer from a vague one.
+
+## Two traffic shapes, not one
+
+Before drawing components, say out loud what's actually happening
+volume-wise:
+
+- **Posting a photo/video** is rare per user (a handful of times a day at
+  most), tolerant of a second or two of processing latency, and involves
+  real CPU work — resizing images into multiple resolutions, generating
+  thumbnails, sometimes transcoding video.
+- **Viewing a feed** happens constantly — every app open, every pull-to-refresh
+  — and has to feel instant. It's a read against data that was mostly
+  written by *other* people, often minutes or hours ago.
+- **Social actions** (like, comment, follow) are high-frequency, low-latency
+  writes, but the data they touch (counts) doesn't need strong consistency —
+  nobody notices if a like count is off by one for a few seconds.
+
+That's three different scaling problems. Keep them separate in your design
+and you'll naturally reach for the right storage and consistency model for
+each.
+
+## Core services
+
+A workable high-level design breaks into these pieces:
+
+- **Client** (mobile app, primarily) — captures/selects media, calls the API
+  layer for everything else.
+- **API / edge layer** — stateless services behind a load balancer handling
+  auth, rate limiting, and routing to the right backend service.
+- **Upload service** — accepts the raw photo/video, writes it to a staging
+  area, and kicks off asynchronous processing. Returns quickly once the raw
+  file is safely stored, not once processing finishes.
+- **Media processing pipeline** — workers that generate multiple resolutions
+  (thumbnail, feed-size, full-size), strip EXIF data, and (for video)
+  transcode into a few renditions. Covered in depth in "Media Storage and
+  Delivery."
+- **Object storage** — durable blob storage for every rendition of every
+  photo/video ever uploaded.
+- **CDN** — sits in front of object storage and serves the actual bytes to
+  viewers; this absorbs essentially all read bandwidth.
+- **Post metadata service** — owns the post row itself: post ID, author,
+  caption, timestamp, storage pointers, visibility. Its own database.
+- **Graph service** — owns the follow relationships (who follows whom). A
+  distinct store from post metadata, since the access pattern is "get me
+  this user's followers/following," not "get me a post."
+- **Feed service** — the component that answers "what should this user see
+  right now?" Reads from a precomputed per-user timeline where possible.
+  Covered in depth in "Feed and Stories."
+- **Social graph actions (likes/comments) service** — high write volume,
+  eventually-consistent counters, backed by a queue-fed aggregation layer
+  rather than synchronous counter updates.
+- **Notification service** — fed asynchronously off of post, like, and
+  comment events; never sits on the critical path of the action that
+  triggered it.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph Write path
+        U[Uploader] --> UP[Upload Service]
+        UP --> RAW[(Raw Storage)]
+        UP --> PM[Post Metadata Service]
+        UP --> Q[Processing Queue]
+        Q --> MP[Media Processing Workers]
+        MP --> OBJ[(Rendition Storage)]
+        PM --> FO[Fan-out Worker]
+        FO --> TL[(Timeline Cache)]
+    end
+    subgraph Read path
+        V[Viewer] --> API[API / Edge]
+        API --> FS[Feed Service]
+        FS --> TL
+        V --> CDN[CDN]
+        CDN --> OBJ
+    end
+    GR[(Graph Service)] --> FO
+`} />
+
+## Walking the write path
+
+A user taps "share." The client uploads the raw file to the upload service,
+which streams it into raw storage and writes a post-metadata row marked
+"processing" — then returns success immediately. It does not wait for
+resizing or transcoding.
+
+That write also enqueues two things: a media-processing job (produce the
+renditions the app actually displays) and a fan-out job (push this post
+into the precomputed timelines of the author's followers). Once processing
+finishes, the post flips to "visible," and its renditions live in object
+storage behind the CDN. The fan-out worker is the piece that makes feed
+reads cheap later — more on that below.
+
+## Walking the read path
+
+A viewer opens the app. The client calls the feed service, which — for the
+overwhelming majority of users — just reads a precomputed list of post IDs
+out of a timeline cache keyed by that viewer's user ID. That's a single
+fast lookup, not a live query across everyone they follow. The client then
+resolves post IDs into content (fetching metadata plus signed CDN URLs) and
+streams the actual media bytes straight from the CDN — never through your
+application servers.
+
+This mirrors the same principle you'd apply to any read-heavy system: the
+API layer hands out pointers and small metadata; a CDN backed by object
+storage does 100% of the bandwidth-heavy work.
+
+### Fan-out-on-write vs. fan-out-on-read
+
+This is the one design decision worth spending real interview time on:
+
+- **Fan-out-on-write**: when a user posts, immediately push the post ID into
+  every follower's timeline cache. Reads become trivial (one cache lookup),
+  but a single post from an account with 50 million followers means 50
+  million cache writes — a "thundering herd" on the write side.
+- **Fan-out-on-read**: don't precompute anything; when a user opens their
+  feed, fetch recent posts from everyone they follow and merge them live.
+  This avoids the celebrity write-storm but makes every feed read
+  expensive, especially for someone following thousands of accounts.
+
+The practical answer most systems converge on is a hybrid: fan-out-on-write
+for the typical user (bounded follower count, cheap to push to), and
+fan-out-on-read for a small set of very-high-follower accounts, merged into
+the viewer's feed at read time. Say this explicitly in an interview — it
+shows you've thought about the tail, not just the average case.
+
+## Worked example: a post that goes viral
+
+A user with 20 million followers posts a photo that starts getting shared
+widely. Trace it through the design above:
+
+1. **Upload**: one write. The upload service stores the raw file, creates
+   one post-metadata row, and returns success in well under a second — none
+   of this depends on follower count.
+2. **Fan-out**: because this account is flagged as high-follower (past
+   whatever threshold you pick, say 1 million followers), the fan-out
+   worker skips pushing into 20 million individual timeline caches. Instead
+   it just marks the post as available; each follower's feed read will
+   merge it in live at read time.
+3. **Reads**: every one of those 20 million followers, on their next app
+   open, has their feed service fetch this one post directly (cheap, since
+   there are few high-follower accounts to check per user) and merge it
+   with their precomputed timeline from everyone else they follow.
+4. **Media delivery**: all 20 million of those viewers hit the CDN for the
+   same handful of image renditions — a close-to-ideal cache-hit scenario,
+   so object storage barely feels it.
+
+Without the hybrid fan-out split, step 2 would mean 20 million cache writes
+fired off the instant one person hits "share" — exactly the kind of spike
+that takes down a naively fan-out-everything design.
+
+<Callout type="warning">
+  A common mistake is designing the feed as a live query — "on read, fetch
+  the last N posts from every account this user follows, sort by time, and
+  return it." That's simple to describe but means every single feed open
+  triggers a fan-in read across potentially thousands of followed accounts,
+  which does not scale to a read-heavy, latency-critical product. Precompute
+  the common case (fan-out-on-write into a timeline cache) and only fall
+  back to live merging for the rare high-follower accounts that would make
+  precomputing too expensive.
+</Callout>
+
+## What this lesson set up
+
+This is deliberately a skeleton view: it names the services, shows how a
+post moves from upload to visible, and flags the fan-out trade-off — but it
+doesn't dig into media storage internals or feed ranking logic yet. Those
+get dedicated lessons next. The one idea to carry forward: almost every
+follow-up question in a photo-sharing interview ("how do you handle a
+celebrity account?", "how fresh does the feed need to be?", "what happens
+if a post is deleted after fan-out?") is really asking you to reason about
+which side of the write/read split is involved.
+
+<Quiz
+  lessonId="instagram-high-level-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should the upload service return success as soon as the raw file is stored, rather than waiting for media processing to finish?',
+      options: [
+        { id: 'a', text: 'Because processing (resizing, transcoding) can take noticeably longer than users will tolerate for an HTTP response, so it should run asynchronously', correct: true, explanation: 'Correct. Holding the upload request open until every rendition is generated would make posting feel slow; the client should be freed once the raw data is durably stored, with processing happening in the background.' },
+        { id: 'b', text: 'Because object storage does not support synchronous writes', correct: false, explanation: 'Object storage supports synchronous writes fine; the reason for returning early is latency, not a storage limitation.' },
+        { id: 'c', text: 'Because media processing must always happen on the client device instead', correct: false, explanation: 'Processing like multi-resolution resizing and transcoding is a server-side pipeline in this design, not something pushed to the client.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are good reasons to use fan-out-on-read instead of fan-out-on-write for a specific account? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The account has an extremely large follower count, making a write to every follower\'s timeline on each post too expensive', correct: true, explanation: 'This is exactly the celebrity/high-follower case: pushing one post into tens of millions of timeline caches synchronously is the thundering-herd problem fan-out-on-read avoids.' },
+        { id: 'b', text: 'It avoids ever having to merge data at read time', correct: false, explanation: 'The opposite is true — fan-out-on-read means merging happens at read time (fetching and combining recent posts from followed accounts live), not avoiding it.' },
+        { id: 'c', text: 'It keeps the write path cheap for posts from very high-follower accounts, shifting cost to the (comparatively rarer) reads that involve them', correct: true, explanation: 'Correct. It trades a huge fan-out write for a slightly more expensive merge on each affected read, which is the right trade when the follower count is extreme.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In a well-designed photo-sharing system, video and image bytes should be stored directly in the same relational database as post metadata (captions, timestamps, author IDs).',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Storing binary media in a relational database bloats the database, hurts backup/replication performance, and mixes two workloads (small structured rows vs. large blobs) with very different scaling needs.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Media bytes belong in object storage (served via a CDN); the database holds only metadata and pointers to where the actual bytes live.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why should like and comment counts be updated through an asynchronous, aggregated path rather than a synchronous database UPDATE on every tap?',
+      options: [
+        { id: 'a', text: 'Because likes and comments are rare events that rarely need fast updates', correct: false, explanation: 'The opposite is true — likes are extremely high-frequency, which is precisely why synchronous per-tap updates do not scale.' },
+        { id: 'b', text: 'Because a popular post can receive an enormous number of concurrent like/comment events, and batching those writes avoids hammering one row with contention', correct: true, explanation: 'Correct. Synchronously updating a single counter row on every like would create massive write contention on hot posts; queuing and aggregating in batches spreads that load and tolerates brief staleness in the displayed count.' },
+        { id: 'c', text: 'Because relational databases cannot store integer counters', correct: false, explanation: 'Relational databases store integers without any issue; the concern here is write throughput and contention under high concurrency, not data type support.' },
+      ],
+    },
+  ]}
+/>

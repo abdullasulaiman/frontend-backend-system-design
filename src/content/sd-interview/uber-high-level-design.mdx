@@ -1,0 +1,239 @@
+---
+title: "High-Level Design"
+module: "Design Uber"
+moduleOrder: 5
+order: 2
+track: "interview"
+summary: "Breaks a ride-hailing platform into its core services — location ingestion, matching, trip state, pricing, and notifications — and shows how a ride request flows through them."
+tags: ["uber", "system-design", "architecture", "ride-hailing", "real-time"]
+estMinutes: 13
+cheatsheet:
+  - "Split the design into a fast-changing 'where is everyone right now' plane (location ingestion, geospatial index) and a slower, durable 'what happened' plane (trip service, ledger) — they scale and fail independently."
+  - "A trip is a state machine (requested to matched to driver-en-route to in-progress to completed/cancelled) — model it explicitly as one row with a status column, not as scattered flags across services."
+  - "Matching is a read-heavy geospatial query (find nearby available drivers) followed by a write-heavy lock (claim one driver before two riders get matched to the same car) — those two steps need different guarantees."
+  - "Driver location updates are high-volume and loss-tolerant (a missed ping is fine); trip state transitions are low-volume and must not be lost — don't force them through the same queue or store."
+  - "Push notifications (driver assigned, driver arriving, trip started) are a separate delivery concern from the trip state machine itself — the state machine is the source of truth, notifications are a side effect of it changing."
+  - "Keep pricing/ETA and matching as pluggable services behind the trip service, not logic embedded inside it — both get replaced or A/B tested far more often than the trip state machine does."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson pinned the numbers down: tens of millions of trips a day,
+millions of drivers pushing a location update every few seconds, and a
+matching decision that has to happen in well under a second or the rider
+gives up and closes the app. Those numbers point at the shape of the design
+before you draw a single box. A ride-hailing backend isn't one service with
+one database — it's a handful of services with genuinely different load
+profiles glued together by one thing they all care about: **the current
+state of a trip**. Get that state machine right and the rest of the design
+falls into place; treat the whole system as "a database of drivers and a
+database of trips" and you'll struggle to explain how it survives Friday
+night surge.
+
+## Start from the two planes
+
+Before naming services, separate traffic into two categories, because they
+need opposite things from their storage:
+
+- **The location plane** — a continuous stream of GPS pings from every
+  active driver (and, during a trip, the rider too), used to answer "who's
+  nearby" and "where's my driver." High write volume, short-lived data,
+  tolerant of losing an occasional ping — nobody notices one dropped update
+  out of a ping every 4 seconds.
+- **The trip plane** — the handful of events that actually matter for
+  billing, support, and correctness: request created, driver matched, trip
+  started, trip ended, payment captured. Much lower volume, but every event
+  must be durable — losing a "trip completed" event is a real incident, not
+  a rounding error.
+
+Conflating these two is the single biggest source of over-engineered (or
+under-engineered) Uber designs. A store built for one is wrong for the
+other: a durable relational trip ledger can't take a location write every
+few seconds from millions of drivers, and an in-memory geospatial store
+built for churn-y location data is the wrong place to keep a legally
+important billing record.
+
+## Major components
+
+### Driver and rider apps
+
+Both are thin clients. The driver app streams location pings and renders
+incoming ride requests; the rider app renders nearby driver markers (from
+periodic snapshots, not a raw firehose) and the current trip state. Neither
+app talks to a single "backend" endpoint — both go through an API gateway
+that fans requests out to the right service.
+
+### API gateway / edge layer
+
+Handles auth, rate limiting, and request routing for both apps. Nothing
+architecturally special here beyond the rest of the platform, but worth
+naming explicitly so it's clear driver and rider traffic doesn't hit
+internal services directly.
+
+### Location service
+
+Ingests the location stream from every online driver and rider-in-trip,
+writes it into a fast, geo-indexed store (an in-memory grid/geohash index
+or a purpose-built geospatial database), and answers "which drivers are
+within `n` km of point `(lat, lng)`" queries. This is covered in depth two
+lessons from now — for this lesson, the key point is that it's a separate,
+horizontally-shardable service that nothing else needs to understand the
+internals of.
+
+### Matching / dispatch service
+
+Takes a ride request (rider location, destination, ride type), queries the
+location service for nearby available drivers, ranks them, and — the hard
+part — claims exactly one driver before a competing request can grab the
+same car. This is a distinct problem from the location query itself: one is
+"find candidates," the other is "resolve a race for a scarce resource." The
+next lesson goes deep on this; here it's one box that reads from the
+location service and writes a match into the trip service.
+
+### Trip service
+
+Owns the trip state machine and is the source of truth for "what is
+happening with this ride right now." Every other service reacts to state
+changes here rather than deciding trip state on its own:
+
+`requested -> matched -> driver_en_route -> in_progress -> completed`
+(with `cancelled` reachable from any state before `completed`).
+
+Backed by a durable, transactional store — this is the one place in the
+design where you want strong consistency and a real ACID story, because
+double-charging a rider or losing a completed trip is unacceptable.
+
+### Pricing / ETA service
+
+Computes an upfront fare estimate and a driver ETA, factoring in distance,
+current demand/supply imbalance (surge), and traffic. Deliberately kept
+as a service the trip service *calls*, not logic baked into it — pricing
+models change constantly (new surge algorithm, new promo logic) and you
+don't want every change to risk the trip state machine. Covered in its own
+lesson later in this module.
+
+### Notification service
+
+Pushes state changes out to devices: "driver assigned," "driver is 2
+minutes away," "trip started." It subscribes to trip-state-change events
+rather than being called synchronously by every other service — this keeps
+notification delivery (which can be slow, retried, or occasionally
+best-effort) from ever blocking a trip-state write.
+
+### Payment service
+
+Captures payment once a trip completes, using the fare computed by the
+pricing service and the final trip record. Kept external (Uber doesn't
+process card networks itself) but the trip service must not mark a trip
+"paid" until this service confirms — another reason the trip plane needs a
+durable, consistent store, not an eventually-consistent one.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    RiderApp[Rider app] --> Gateway[API gateway]
+    DriverApp[Driver app] --> Gateway
+    Gateway --> LocSvc[Location service]
+    Gateway --> MatchSvc[Matching / dispatch service]
+    Gateway --> TripSvc[Trip service]
+    DriverApp -->|GPS pings every few sec| LocSvc
+    MatchSvc --> LocSvc
+    MatchSvc --> TripSvc
+    TripSvc --> PriceSvc[Pricing / ETA service]
+    TripSvc --> PaySvc[Payment service]
+    TripSvc --> NotifSvc[Notification service]
+    NotifSvc --> DriverApp
+    NotifSvc --> RiderApp
+    LocSvc --> GeoStore[(Geo index: driver positions)]
+    TripSvc --> TripStore[(Trip ledger: durable, transactional)]
+`} />
+
+## Worked example: a rider requests a trip
+
+Trace one request through the boxes above. A rider taps "request ride" in
+the app; the request hits the **gateway**, which calls the **pricing
+service** for an upfront estimate (reading current demand/supply from the
+location service) and shows it to the rider for confirmation. On
+confirmation, the **trip service** creates a trip record in `requested`
+state and hands off to the **matching service**, which queries the
+**location service** for drivers within, say, 3 km, ranks them by ETA, and
+attempts to claim the top candidate. The claim succeeds; the trip service
+transitions the record to `matched` and the **notification service**
+pushes "driver assigned" to the rider and "new trip" to the driver. As the
+driver drives to pickup, their app keeps streaming pings to the **location
+service**, which the rider app polls to animate the driver's marker. Once
+the driver hits "arrived" and then "start trip," the trip service moves
+through `driver_en_route -> in_progress`. On drop-off, the driver taps "end
+trip," the trip service marks it `completed`, calls the **payment
+service** to capture the fare the pricing service quoted (adjusted for
+actual distance/time), and only then does the trip's status become
+final. Nine services touched, and each one only needed to know its own
+job — that's what keeps this tractable to draw and defend in 45 minutes.
+
+<Callout type="warning">
+  A common mistake is designing "the matching service" as if it does one
+  thing: find the nearest driver. In practice it does two things with very
+  different guarantees — a fast, approximate geospatial read (who's nearby)
+  followed by an exclusive write (claim that driver before someone else's
+  request does). If your design only talks about the read half, an
+  interviewer will immediately ask "what stops two riders from being matched
+  to the same driver at the same instant?" — have an answer ready (this is
+  exactly what the next lesson covers) rather than discovering the gap live.
+</Callout>
+
+## Where this leaves you
+
+This lesson's job was to name the services and justify the boundaries
+between them, especially the split between the churn-heavy location plane
+and the durable trip plane. The next three lessons go deep on the pieces
+this design glosses over: how matching actually resolves the driver-claim
+race under load, how location updates stay cheap and smooth at millions of
+concurrent drivers, and how pricing and ETA get computed. The module wraps
+up by assembling all of it into one interview-paced answer.
+
+<Quiz
+  lessonId="uber-high-level-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does this design keep driver location updates and trip-state events in separate stores rather than one shared database?',
+      options: [
+        { id: 'a', text: 'Location updates are high-volume and loss-tolerant, while trip-state events are low-volume and must be durable — a store tuned for one is the wrong choice for the other.', correct: true, explanation: 'Correct — forcing a churn-heavy, best-effort stream and a low-volume, must-not-lose ledger through the same store means over-provisioning one workload or under-serving the other.' },
+        { id: 'b', text: 'Because location data and trip data are always stored in the same table in real systems, just on different servers.', correct: false, explanation: 'The point isn’t server placement, it’s that the two workloads need fundamentally different consistency and durability guarantees.' },
+        { id: 'c', text: 'Because trip events happen far more frequently than location pings.', correct: false, explanation: 'The opposite is true — with millions of drivers pinging every few seconds, location volume vastly exceeds trip-state event volume.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are good reasons to keep pricing/ETA as a service the trip service calls, rather than logic embedded directly in the trip service? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Pricing and surge algorithms change far more often than the trip state machine does.', correct: true, explanation: 'Frequent changes to one component are a strong reason to isolate it — you don’t want every pricing tweak to risk the stability of trip-state transitions.' },
+        { id: 'b', text: 'It lets pricing be tested, versioned, or A/B tested independently of trip lifecycle logic.', correct: true, explanation: 'Correct — separating the two lets you experiment with pricing models without touching the code path responsible for correctness of trip state.' },
+        { id: 'c', text: 'It removes the need for the trip service to have any durable storage at all.', correct: false, explanation: 'The trip service still needs a durable, transactional store for trip state and billing correctness regardless of where pricing logic lives.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'The matching/dispatch service can be fully described as a single geospatial read: query for the nearest available drivers and return the top result.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'That describes only half the problem. Matching also has to exclusively claim a chosen driver so two concurrent ride requests can’t both be matched to the same car — a write/locking concern, not just a read.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — matching combines a fast geospatial read (find nearby candidates) with an exclusive claim/write step to resolve the race for a scarce driver, which is a separate guarantee from the read.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the trip state machine described in this lesson, which component is responsible for deciding when a trip transitions between states?',
+      options: [
+        { id: 'a', text: 'The trip service — every other service reacts to its state changes rather than deciding trip state independently.', correct: true, explanation: 'Correct — centralizing state transitions in the trip service is what makes it a reliable single source of truth for what actually happened on a ride.' },
+        { id: 'b', text: 'The notification service, since it is the one that tells the rider and driver what is happening.', correct: false, explanation: 'The notification service only announces state changes after they happen — it subscribes to the trip service, it doesn’t decide state.' },
+        { id: 'c', text: 'Whichever service last wrote to the location index.', correct: false, explanation: 'The location index tracks positions, not trip lifecycle — it has no role in deciding trip state transitions.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,160 @@
+---
+title: "Requirements and Cache Placement"
+module: "Distributed Cache"
+moduleOrder: 16
+order: 1
+track: "concept"
+summary: "Establishes the functional and non-functional requirements for a distributed cache and walks through where in the request path a cache can live, from in-process memory to a shared remote cluster."
+tags: ["caching", "distributed-systems", "requirements", "latency", "architecture"]
+estMinutes: 12
+cheatsheet:
+  - "A cache is never the system of record — define what happens on a cache miss and on total cache failure before anything else; the system must survive a cold cache."
+  - "State a hit-ratio target explicitly (e.g. 95%) — it's the number that tells you whether the cache tier is even worth the operational cost."
+  - "Local (in-process) caches are fastest but don't share state across nodes and duplicate memory per instance; a remote/distributed cache tier is slower per call but shared and much larger."
+  - "Cache-aside (application checks cache, falls back to the database, then populates the cache) is the default placement pattern — it keeps the cache layer dumb and the source of truth unambiguous."
+  - "Every non-functional requirement (latency budget, memory budget, QPS) should turn into a concrete number before you pick a placement — 'fast' and 'a lot of traffic' don't constrain a design."
+  - "Placement decisions here (local vs. remote, look-aside vs. inline) constrain later choices: eviction policy, write propagation, and how invalidation gets distributed all depend on where the cache physically sits."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design a distributed cache" sounds like a narrower question than "design a key-value store," but interviewers ask it precisely because the narrowness is deceptive. A cache isn't just a smaller, faster KV store — it's a KV store with a very specific contract: it's allowed to lose data, it's allowed to be wrong for a short window, and something else (a database, another service) always has the real answer. That contract changes almost every design decision downstream. Skip stating it, and you'll end up designing a second database instead of a cache.
+
+This is the first lesson in the Distributed Cache module, and it does for caching what the requirements lesson did for the Key-Value Store module: pin down what the cache needs to do and where it needs to sit in the architecture, so the lessons that follow — write policies and eviction, consistency and invalidation, sharding and replication — are each solving a problem this lesson creates, not inventing one from scratch.
+
+## Functional requirements
+
+Keep the API surface narrow and say so out loud:
+
+- **`get(key)` / `set(key, value, ttl)` / `delete(key)`** — the core contract. Batch variants (`mget`, `mset`) are common once you have real workloads, since one round trip for 50 keys beats 50 round trips.
+- **TTL (time-to-live) per entry.** Almost every cache entry should expire on its own, even if nothing ever writes over it — a cache with no TTL slowly turns into a second database that nobody manages.
+- **Size limits.** Cap the value size the cache will accept (a few KB to low MB is typical). A cache that accepts arbitrary large blobs stops behaving like a cache and starts behaving like a poorly-tuned object store.
+- **Namespacing.** Multiple services or features sharing one cache cluster need key prefixes or logical namespaces so a `user:123` key from the profile service can't collide with a `user:123` key meaning something else in the billing service.
+
+Notice what's deliberately absent: no transactions, no joins, no durability guarantee across a restart. If a candidate starts describing write-ahead logs for a cache, that's a sign the requirements conversation didn't happen.
+
+## Non-functional requirements
+
+This is where a caching design actually gets decided.
+
+### Latency
+
+State a real number: "reads under 1ms at p99" is a design constraint; "fast" is not. Sub-millisecond latency rules out anything that crosses multiple network hops or does disk I/O on the read path, and it's the entire reason caches exist in front of slower stores in the first place.
+
+### Hit ratio
+
+A cache is only worth its operational cost if it actually absorbs load. State a target — 90%, 95%, 99% — because it tells you how much traffic the backing store still has to survive on a miss, and it drives capacity planning for both tiers. A cache with a 40% hit ratio might be cheaper to delete than to operate.
+
+### Scale
+
+Concrete numbers again: expected QPS, number of distinct keys, average value size, and how many application nodes need to reach the cache. "500K reads/sec across 200 app servers, 20M distinct keys, 1KB average value" tells you whether one cache node can hold the working set in memory or whether you need to shard (covered in this module's sharding lesson).
+
+### Consistency / staleness tolerance
+
+How stale can a cached value be before it's a real problem? A product price cache tolerating 30 seconds of staleness is a very different design from a cache backing a feature flag that must flip within a second. This lesson only flags the question — the invalidation lesson later in this module answers it.
+
+### Failure behavior
+
+The most important non-functional requirement, and the one most often skipped: **what happens when the cache is completely unavailable?** The correct answer is always "requests fall through to the source of truth and get slower, not requests fail." If losing the cache brings the system down, it was never actually a cache.
+
+## Where does the cache live? Placement options
+
+Once requirements are pinned down, the placement question is: at which point in the request path does the cache sit, and how many copies of it exist?
+
+### In-process (local) cache
+
+A hash map living inside the application process's own memory. Fastest possible access — no network hop, no serialization — but the data isn't shared across instances, so N application servers each hold their own (possibly inconsistent) copy, multiplying memory use. Good for small, very hot, slowly-changing data (e.g. a feature-flag table), bad for anything both large and shared.
+
+### Remote / distributed cache tier
+
+A separate cluster of cache nodes (think Redis or Memcached-style deployments) that every application instance talks to over the network. One shared copy of the data instead of N duplicated copies, and it can be sized independently of the application fleet. The cost is a network round trip per access — still far cheaper than hitting the database, but no longer free. This is the default placement for most "design a distributed cache" interview answers, and the rest of this module (sharding, replication, consistency) assumes this topology.
+
+### Client-side cache
+
+The requesting client (a browser, a mobile app, or an upstream service) keeps its own copy and skips the request entirely on a hit. Eliminates the round trip completely, but invalidation is the hardest of any placement — you generally can't push an update to every client, so this pattern leans on short TTLs or version tokens rather than active invalidation.
+
+### Edge / CDN cache
+
+For content that's the same for many users (static assets, cacheable API responses), the cache sits geographically close to the requester at a CDN edge node rather than near the origin service. This module doesn't re-cover it — see the CDN lessons for the placement and invalidation trade-offs specific to that tier.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Client request] --> B[App server]
+  B --> C{In local cache?}
+  C -->|hit| D[Return from memory]
+  C -->|miss| E{In remote cache tier?}
+  E -->|hit| F[Return, populate local cache]
+  E -->|miss| G[Query database]
+  G --> H[Populate remote cache]
+  H --> F
+`} />
+
+### Cache-aside vs. inline placement
+
+Within a remote cache tier, there's a further choice of *who* talks to the cache. In the **cache-aside** (look-aside) pattern shown above, the application code explicitly checks the cache, and on a miss queries the database and writes the result back into the cache itself. The cache stays a dumb key-value store with zero knowledge of the database. In an **inline** placement, a proxy or library sits between the app and the database and handles the cache lookup/populate transparently (read-through), so application code just calls one interface. Cache-aside is simpler to reason about and is the more common default; inline caching reduces boilerplate but couples the cache layer to the data-access pattern. The next lesson in this module goes deeper on read-through/write-through/write-behind as write policies built on top of this placement choice.
+
+## Worked example: sizing a product-detail cache
+
+Say the prompt is "add a cache in front of the product-detail database for an e-commerce site with 10 million products, 50,000 reads/sec at peak, and a p99 latency budget of 5ms including the cache lookup."
+
+Requirements, stated concretely:
+
+- API: `get(productId)`, TTL of 10 minutes (prices/stock change slowly enough that 10 minutes of staleness is acceptable for the detail page).
+- Target hit ratio: 95% — meaning the database only needs to survive roughly 2,500 reads/sec, not 50,000.
+- Average value size: ~2KB (serialized product JSON).
+- Failure behavior: on a cache-cluster outage, requests fall through to the database and latency degrades, but the page still renders.
+
+Placement: a remote distributed cache tier, not in-process — 10 million products at 2KB each is 20GB, too large to duplicate across every application server's memory, and every app server needs a consistent, shared view. Cache-aside placement: the application checks the cache first, falls back to the database on a miss, and writes the fetched row back with the 10-minute TTL. That single sizing exercise — 20GB working set, 95% hit ratio, cache-aside placement — is exactly the input the sharding lesson later in this module needs to decide how many cache nodes are required and how keys get distributed across them.
+
+<Callout type="warning">
+  The most common mistake at this stage is skipping straight to "I'll use Redis with consistent hashing" without ever stating the hit-ratio target, the staleness tolerance, or — critically — what happens when the cache goes down. An interviewer will ask "what if the whole cache cluster is unreachable for 30 seconds?" If your answer is "the database falls over," you've designed a single point of failure, not a cache. State the fallback behavior before you pick a topology.
+</Callout>
+
+<Quiz
+  lessonId="cache-requirements-and-cache-placement"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Which statement best captures why a cache is fundamentally different from a general-purpose distributed key-value store?',
+      options: [
+        { id: 'a', text: 'A cache is always deployed on fewer machines than a key-value store.', correct: false, explanation: 'Node count is an implementation detail, not the defining property — a cache cluster can be just as large as a KV store cluster.' },
+        { id: 'b', text: 'A cache is allowed to lose data or serve stale results because something else is always the source of truth.', correct: true, explanation: 'Exactly — the cache is never authoritative. Losing an entry or serving a stale value just means a slower request or a short staleness window, not data loss, because the backing store still has the real answer.' },
+        { id: 'c', text: 'A cache does not support a get/set API.', correct: false, explanation: 'A cache almost always exposes the same narrow get/set/delete style API as a key-value store — the API shape is not the distinguishing factor.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are non-functional requirements that should be pinned down before choosing a cache placement? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Target hit ratio', correct: true, explanation: 'The hit ratio tells you how much load the backing store must still absorb and whether the cache is worth its operational cost.' },
+        { id: 'b', text: 'What happens to requests when the cache is completely unavailable', correct: true, explanation: 'This is the most important requirement to state up front — the system must degrade gracefully, not fail, when the cache goes down.' },
+        { id: 'c', text: 'The specific serialization format used for cached values', correct: false, explanation: 'That is an implementation detail decided later, not a requirement to gather up front.' },
+        { id: 'd', text: 'The p99 latency budget for a cache read', correct: true, explanation: 'A concrete latency number determines whether a local, in-process cache is required or a network hop to a remote tier is acceptable.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'An in-process (local) cache shares one copy of the data across every application server, the same way a remote cache tier does.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False — an in-process cache lives inside each application instance\'s own memory, so N servers hold N separate (and potentially inconsistent) copies.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Only a remote/distributed cache tier gives every application instance a single shared view of the data; a local cache duplicates it per process.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the cache-aside (look-aside) pattern, who is responsible for populating the cache after a miss?',
+      options: [
+        { id: 'a', text: 'The cache itself, automatically, with no application involvement', correct: false, explanation: 'That describes an inline/read-through placement, where a proxy or library handles the miss transparently — not cache-aside.' },
+        { id: 'b', text: 'The application code, which queries the database on a miss and writes the result back into the cache', correct: true, explanation: 'Correct — in cache-aside, the application explicitly checks the cache, falls back to the database, and populates the cache itself, keeping the cache a dumb key-value store.' },
+        { id: 'c', text: 'The database, by pushing every write directly into the cache', correct: false, explanation: 'That describes a write-through style policy, which is a separate concern from placement and is covered in the writing-policies lesson later in this module.' },
+      ],
+    },
+  ]}
+/>

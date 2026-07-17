@@ -1,0 +1,224 @@
+---
+title: "Why Distributed Logging Is Hard"
+module: "Distributed Logging"
+moduleOrder: 22
+order: 1
+track: "concept"
+summary: "Explains why logging stops being a solved problem once a request crosses many services, and what a distributed logging system has to solve that a single log file never did."
+tags: ["logging", "observability", "distributed-systems", "tracing", "reliability"]
+estMinutes: 11
+cheatsheet:
+  - "Once a request crosses more than one host, `ssh` + `grep` stops working — logs live on N different machines, some of which may already be gone (container restarts, autoscaling, spot termination)."
+  - "A correlation ID (a.k.a. trace ID / request ID) generated at the edge and threaded through every downstream call is what lets you reconstruct one request's story across services — without it, logs are just isolated fragments."
+  - "Clocks on different hosts disagree by tens to hundreds of milliseconds (NTP drift); timestamps alone can't be trusted to order events across machines — a monotonic per-request sequence or trace-span ordering is more reliable."
+  - "Log volume at scale is a cost and infrastructure problem, not just a storage one: thousands of hosts emitting even modest per-instance rates adds up to terabytes/day, which has to be shipped, parsed, indexed, and queried fast."
+  - "Unstructured, free-text log lines are fine for one engineer reading one file; at scale you need structured (JSON-ish) logs with consistent field names so a query system can filter and aggregate across services written by different teams."
+  - "Logs routinely contain PII and secrets (emails, tokens, request bodies) unless scrubbed at the source — redaction is a design requirement, not an afterthought bolted on later."
+  - "Sampling and log-level discipline (not shipping every DEBUG line from every host) are what keep the pipeline affordable — the next lesson covers the pipeline that makes this tractable."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+On a single server, logging is barely a design problem. You write to a
+file, rotate it before disk fills up, and when something breaks you `ssh`
+in and run `tail -f` or `grep`. The information you need is in one place,
+on one clock, in one process's view of the world.
+
+Break that single server into fifty microservices running on a fleet of
+containers that get rescheduled every few hours, and every one of those
+assumptions collapses. The log line you need might be on a host that no
+longer exists. The request you're debugging touched six services, each
+writing its own file, with no shared way to tell which lines belong to the
+same request. This lesson is about *why* that shift is hard — the next two
+lessons in this module ("Architecture and Pipeline" and "Designing the
+Logging System") cover how to actually build the system that solves it.
+
+## Logs are scattered by default
+
+In a distributed system, every process writes its own logs, locally, with
+no built-in awareness of any other process. That's the root of almost
+every problem in this space:
+
+- **No single place to look.** A checkout failure might have touched the
+  API gateway, an auth service, an inventory service, and a payment
+  service — four hosts, four log files, four independent views.
+- **Hosts are ephemeral.** Containers get killed and rescheduled,
+  autoscaling groups shrink, spot instances get reclaimed. If a log line
+  only exists on local disk, it can vanish minutes after being written,
+  well before anyone goes looking for it.
+- **Volume grows with fleet size, not with incidents.** One host logging
+  50 lines/second is nothing. Two thousand hosts logging 50 lines/second
+  each is 100,000 lines/second, all the time, whether or not anything is
+  wrong.
+
+None of this is solvable by writing better log messages — it's an
+infrastructure problem. You need something that pulls logs off every host
+continuously and puts them somewhere queryable before the host (and the
+log) disappears.
+
+## Correlating one request across many services
+
+Even once logs are centralized, you're staring at a pile of lines from
+unrelated requests, interleaved. The real question during an incident is
+almost never "what did service X log at 3:02pm" — it's "what happened to
+*this specific customer's request*, end to end."
+
+### Correlation IDs
+
+The standard fix is to generate a unique ID at the edge (the load balancer
+or API gateway) the moment a request arrives, and pass it through every
+downstream call — as an HTTP header, an RPC metadata field, or a message
+attribute on a queue. Every service logs that same ID with every line it
+writes about that request. Now "find everything about this request"
+becomes one query: filter by correlation ID across the centralized log
+store, instead of grepping N files and guessing which lines line up.
+
+This is the same idea distributed tracing systems build on, just at the
+logging layer rather than the span layer — a request ID is the thread
+that ties a scattered story back together.
+
+### Clock skew breaks ordering
+
+Once you have all the lines for one request, you'll want to order them —
+"what happened first." Timestamps seem like the obvious answer, but clocks
+on different hosts are not perfectly synchronized. Even with NTP, drift of
+tens to hundreds of milliseconds between hosts is normal, and a fast
+service-to-service call can complete well within that window. Two log
+lines from different hosts, five milliseconds apart, can display in the
+*wrong* order if you sort purely by wall-clock timestamp.
+
+Systems handle this with a mix of approaches: attaching a monotonically
+increasing per-request sequence number as the request hops between
+services, tolerating "approximately ordered" results and reconstructing
+strict order from causal relationships (this call happened *because* that
+one returned), or leaning on trace spans with explicit parent/child
+relationships instead of raw timestamps.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant U as Client
+    participant GW as API Gateway
+    participant AU as Auth Service
+    participant OR as Order Service
+    participant PAY as Payment Service
+    U->>GW: checkout request
+    Note over GW: generates req_id=abc123
+    GW->>AU: verify token (req_id=abc123)
+    AU-->>GW: ok (logs req_id=abc123)
+    GW->>OR: place order (req_id=abc123)
+    OR->>PAY: charge card (req_id=abc123)
+    PAY-->>OR: declined (logs req_id=abc123)
+    OR-->>GW: 402 error (req_id=abc123)
+    GW-->>U: checkout failed
+`} />
+
+Four services, four separate log files on four hosts — but one shared
+`req_id` lets you pull every line about this one failed checkout in a
+single query, in the right causal order, instead of grepping four
+machines and guessing.
+
+## Structured logs vs. free text
+
+`"User login failed for bob@example.com from 10.2.3.4"` is easy for a
+human to read and nearly useless for a machine to query at scale. Once
+you have millions of lines from dozens of services written by different
+teams, you need consistent, structured fields — `user_id`, `ip`,
+`status`, `service`, `req_id` — so the aggregation system can filter,
+group, and count without parsing English prose that varies subtly from
+one service to the next. Structured (JSON-like) logging is what makes
+"show me the error rate for the payment service in the last 10 minutes,
+broken down by error code" answerable at all, instead of an exercise in
+regex archaeology.
+
+## Cost, retention, and sensitive data
+
+Two problems compound once volume is real:
+
+- **Cost.** Shipping, parsing, indexing, and storing every log line from
+  every host is not free — indexed log storage is meaningfully more
+  expensive per byte than cold blob storage, so most systems tier data:
+  hot and indexed for a few days, cheap and searchable-but-slow after
+  that, deleted or archived after a retention window.
+- **Sensitive data.** Logs are an easy, unintentional leak path for PII
+  and secrets — emails, auth tokens, full request/response bodies. Unless
+  you scrub or redact at the source (or at ingestion, before indexing),
+  logs become a compliance liability that's expensive to fix after the
+  fact, because by then the data has already been copied into a searchable
+  store, possibly replicated to backups.
+
+## Worked example: sizing the problem
+
+Say your fleet has 2,000 hosts, each averaging 50 log lines/second at
+roughly 200 bytes/line (a structured line with a handful of fields plus a
+message). That's:
+
+- 2,000 × 50 = 100,000 lines/second fleet-wide
+- 100,000 × 200 bytes ≈ 20 MB/second
+- 20 MB/second × 86,400 seconds/day ≈ 1.7 TB/day
+
+That's before any request spikes, before verbose DEBUG logging gets left
+on in production, and before you've decided how long to keep any of it
+indexed. At 1.7 TB/day, "just index everything forever" is not a serious
+option — this is exactly the pressure that pushes real systems toward
+sampling, log-level filtering at the source, and tiered storage, which
+the next lesson covers when it walks through the ingestion pipeline.
+
+<Callout type="warning">
+  The most common mistake teams make is treating logging as "add
+  `console.log` / `logger.info` calls, ship them somewhere, done" and only
+  discovering the correlation-ID problem during a live incident, when
+  someone is trying to reconstruct a single failed request across five
+  services and realizes there's no shared ID connecting any of the log
+  lines. Bake a correlation ID into your request-handling middleware from
+  day one — retrofitting it after logs already exist without one means
+  your historical logs stay unqueryable across services forever.
+</Callout>
+
+<Quiz
+  lessonId="log-why-distributed-logging-is-hard"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does "ssh in and grep the log file" stop working as a debugging strategy in a distributed system?',
+      options: [
+        { id: 'a', text: 'grep is too slow to search large files', correct: false, explanation: 'grep\'s raw speed is not the core problem here — the problem is that the relevant lines are spread across many hosts, some of which may no longer exist.' },
+        { id: 'b', text: 'A single request\'s logs are scattered across many hosts, some of which may be ephemeral and already gone', correct: true, explanation: 'Each service writes its own local logs with no shared view; containers and autoscaled hosts can disappear before you go looking, so there is no longer one place to look.' },
+        { id: 'c', text: 'Log files cannot be read remotely over a network', correct: false, explanation: 'They can be read remotely; the issue is not access mechanics, it is that they are scattered across many independent hosts with no correlation between them.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine problems a distributed logging system has to solve that a single-host log file does not? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Correlating log lines from different services that belong to the same request', correct: true, explanation: 'Without a shared correlation ID, log lines from different services have no way to be tied back to the same originating request.' },
+        { id: 'b', text: 'Ordering events reliably when host clocks disagree by tens or hundreds of milliseconds', correct: true, explanation: 'Clock skew across hosts means wall-clock timestamps alone cannot be trusted to reconstruct a strict, correct ordering of fast cross-service calls.' },
+        { id: 'c', text: 'Choosing which programming language to write log statements in', correct: false, explanation: 'Language choice is unrelated to what makes distributed logging hard — the challenges are about scale, correlation, ordering, and volume, not syntax.' },
+        { id: 'd', text: 'Controlling storage and query cost as log volume grows with fleet size', correct: true, explanation: 'Indexed log storage is expensive per byte, and volume scales with number of hosts, not with how many incidents are happening — this pushes toward sampling and tiered retention.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Sorting log lines from different services purely by their recorded timestamp is always sufficient to reconstruct the true order of events in a request.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Clock skew between hosts (tens to hundreds of milliseconds, even with NTP) can make timestamp-only ordering wrong for fast cross-service calls that complete within that skew window.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — timestamp-only ordering is unreliable across hosts due to clock skew; systems compensate with sequence numbers, causal/parent-child span relationships, or tolerate approximate ordering.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A team ships unstructured, free-text log lines like "User login failed for bob@example.com". What is the main problem with this at scale, beyond the PII concern?',
+      options: [
+        { id: 'a', text: 'It is hard for a query system to filter, group, or count consistently across services when fields are embedded in prose that varies between teams', correct: true, explanation: 'Structured fields (user_id, status, service, req_id) let an aggregation system query directly; free text forces fragile parsing that breaks whenever wording changes slightly.' },
+        { id: 'b', text: 'Free-text logs take up more disk space than any other format', correct: false, explanation: 'Format verbosity is a minor factor compared to the real issue: queryability. A structured JSON line is not inherently smaller, and compression narrows size differences further.' },
+        { id: 'c', text: 'Free-text logs cannot be shipped off the host at all', correct: false, explanation: 'They can absolutely be shipped and centralized; the problem is what you can *do* with them once centralized, not whether they can be transported.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,116 @@
+---
+title: "Sharding and Replication"
+module: "Distributed Cache"
+moduleOrder: 16
+order: 4
+track: "concept"
+summary: "Covers how to split a cache across many nodes with consistent hashing and when to add replicas, focusing on what makes cache sharding different from database sharding: a cold shard is a performance problem, not a data-loss incident."
+tags: ["caching", "sharding", "replication", "consistent-hashing", "scalability"]
+estMinutes: 11
+cheatsheet:
+  - "A cache node dying is not a durability incident — the backing store still has the truth. Losing a shard just means a burst of misses and extra load on the origin, not lost data."
+  - "Use consistent hashing (with virtual nodes) to shard a cache; plain modulo hashing on node count remaps almost every key when you add or remove a node, which mass-invalidates the whole cache at once."
+  - "Cache replication exists for read scaling and faster failover, not durability — async, best-effort replication is fine because losing an unreplicated write just costs a re-fetch from the source of truth."
+  - "Hot keys break even key distribution: one popular key can still saturate a single shard even though the hash function spread keys perfectly. Fix with client-side local caching, key replication, or request coalescing — not a bigger cluster."
+  - "Pick your routing model deliberately: smart client library (Memcached-style, no proxy hop), routing proxy (Twemproxy/Envoy, simple clients), or self-routing cluster (Redis Cluster hash slots with MOVED redirects) — each trades a hop, an ops surface, or client complexity."
+  - "After a shard resets cold (deploy, failover, rebalance), guard the backing store from a stampede of simultaneous misses with request coalescing or a short jittered TTL ramp, not just 'let it refill.'"
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A single cache node tops out fast. Put a few hundred gigabytes of hot data in front of a busy service and one machine's RAM and network interface become the ceiling long before the backing database would be. The fix is the same one every stateful system reaches for eventually: split the keyspace across many nodes. But a cache splits differently than a database does, because a cache is disposable in a way a database isn't — losing a shard means a burst of cache misses, not a lost row. That single fact shapes almost every design choice in this lesson: how you route keys to shards, how aggressively you rebalance, and whether replication is even worth the cost.
+
+## Sharding: spreading keys across nodes
+
+Sharding a cache means deciding, for any given key, which node holds it. The naive approach — `hash(key) % number_of_nodes` — works until the node count changes. Add or remove one node and the modulo shifts for nearly every key, so nearly every key now maps to a different node than before. Every one of those keys is a guaranteed miss on its new home, all at once, right when your cluster topology is already in flux from the scaling event that triggered the change.
+
+**Consistent hashing** fixes this. Nodes and keys are hashed onto the same fixed-size ring (say, 0 to 2^32-1); a key belongs to the first node found walking clockwise from its position. Adding or removing one node only reassigns the keys between that node and its neighbor on the ring — a small, bounded fraction of the keyspace, not the whole cache. Real implementations place many **virtual nodes** per physical node around the ring so that a single physical node joining or leaving spreads its share of the reassigned keys across many other nodes evenly, instead of dumping the whole load onto one unlucky neighbor.
+
+This is the same mechanism used for sharding a key-value store's persistent data, but the stakes are different: a KV store rebalances data it must not lose, so it has to actually move bytes between nodes as ownership shifts. A cache rebalances ownership of a lookup, not the underlying data — the "moved" keys are simply cold on their new node and get repopulated from the backing store on the next request. That's slower for a while, but never wrong.
+
+### Routing: who decides which shard to talk to
+
+Three common patterns for actually getting a request to the right shard:
+
+- **Smart client library** — the client itself hashes the key and connects directly to the owning node. This is the classic Memcached model: no proxy, no extra hop, but every client needs the same hashing logic and the same view of cluster membership, or different clients disagree about where a key lives.
+- **Routing proxy** — a thin layer (Twemproxy, or a general proxy like Envoy configured for consistent-hash routing) sits between clients and shards. Clients stay simple; the proxy owns hashing and membership. Costs one extra network hop and a piece of infrastructure to keep highly available itself.
+- **Self-routing cluster** — the shards know the full topology and redirect misdirected requests. Redis Cluster splits the keyspace into 16,384 fixed hash slots, assigns ranges of slots to nodes, and returns a `MOVED` reply pointing the client at the right node if it guesses wrong. Clients cache the slot map after the first redirect, so subsequent requests go straight to the right shard.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    Client -->|hash key| Router{Routing layer}
+    Router -->|slot 0-5460| Shard1[Shard A + replica]
+    Router -->|slot 5461-10922| Shard2[Shard B + replica]
+    Router -->|slot 10923-16383| Shard3[Shard C + replica]
+    Shard1 -.async replicate.-> Shard1R[Replica A]
+    Shard2 -.async replicate.-> Shard2R[Replica B]
+    Shard3 -.async replicate.-> Shard3R[Replica C]
+`} />
+
+## Replication: why bother if the data isn't precious?
+
+If a cache miss just means "go ask the database," why replicate a cache at all? Two reasons, and neither is durability:
+
+- **Read scaling.** A hot key can be read thousands of times a second. One node serving all of those reads is a bottleneck even if the keyspace is otherwise evenly sharded. Read replicas let you spread that read traffic across multiple copies of the same shard.
+- **Faster failover.** Without a replica, losing a shard means every key on it is cold until the shard (or a replacement) comes back and refills from the backing store — a spike of origin load exactly when you can least afford it. With a warm replica ready to take over, failover is a routing change, not a cold start.
+
+Because the backing store is the real source of truth, cache replication can be **asynchronous and best-effort**. A replica that's a few hundred milliseconds behind is a non-issue — worst case, a reader gets a slightly stale cached value or a miss, both of which are already normal, expected outcomes for a cache. This is the opposite trade-off from database replication, where async replication risks losing acknowledged writes; here, the "lost" write is just a cache entry the origin will happily regenerate.
+
+<Callout type="warning">
+  Don't reason about cache replicas the way you reason about database replicas. A common mistake is treating "the replica hasn't caught up yet" as a durability risk worth paying synchronous-replication latency to avoid. It isn't — the backing store already has the durable copy. Spend synchronous-replication cost on your database, not your cache. If you find yourself wanting `W = N`-style guarantees for a cache, that's usually a sign the "cache" is quietly being used as a system of record, which is a design smell to flag out loud rather than engineer around.
+</Callout>
+
+## Hot keys: when even sharding isn't enough
+
+Consistent hashing distributes keys evenly, but it says nothing about *access frequency*. A trending post, a viral product page, or a celebrity's profile can turn one key into a disproportionate share of total traffic, overloading its shard even though the key distribution looks perfectly balanced on paper. Three practical mitigations, roughly in order of how often you'd reach for them:
+
+1. **Client-side local caching** for the very hottest keys — an in-process cache in front of the distributed one, even with a TTL of a few seconds, absorbs the bulk of the spike before it ever reaches the network.
+2. **Key replication** — store the hot key's value on multiple shards under key variants (`post:123#0`, `post:123#1`, ...) and have clients pick a variant at random, spreading one logical key's load across several physical nodes.
+3. **Request coalescing** at the shard or proxy level — collapse concurrent misses for the same key into one backing-store fetch, so a stampede of simultaneous requests for a newly-cold hot key doesn't turn into a stampede of identical origin queries.
+
+## Worked example: sizing shards for a feed cache
+
+Say a news-feed service needs to cache 300 GB of rendered feed fragments and expects 400,000 reads/sec at peak, with writes (feed regeneration) a small fraction of that. A single cache node realistically holds ~50 GB of RAM for data and comfortably serves ~60,000 ops/sec before latency degrades.
+
+By capacity: `300 GB / 50 GB ≈ 6` shards. By throughput: `400,000 / 60,000 ≈ 7` shards. Take the larger number and round up for headroom: 8 shards. Add one replica per shard for failover and read-scaling (doubling read capacity per shard and giving each shard a warm standby), for 16 nodes total. If access is skewed — say the top 1% of keys account for 20% of reads — layer in a small local cache on each application server for those keys rather than adding a ninth shard that barely helps, since a hot key on any shard still saturates that one shard regardless of how many total shards exist.
+
+## Quick check
+
+<Quiz
+  lessonId="cache-sharding-and-replication"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does adding a node to a cache cluster with plain hash(key) % node_count hashing cause a much bigger problem than the same operation with consistent hashing?',
+      options: [
+        { id: 'a', text: 'It remaps nearly every key to a different node at once, causing a mass cache miss right as the cluster is already changing shape', correct: true, explanation: 'Modulo hashing depends on the total node count, so changing that count shifts the target node for almost every key simultaneously — unlike consistent hashing, which only reassigns the small slice of keyspace near the changed node.' },
+        { id: 'b', text: 'It permanently corrupts the cached values on every node', correct: false, explanation: 'Rehashing changes which node a key routes to, not the value stored under that key — no corruption occurs, just a wave of misses.' },
+        { id: 'c', text: 'It requires the backing database to be resharded too', correct: false, explanation: 'Cache sharding is independent of how the backing store is partitioned; rehashing the cache does not require touching the sharding scheme used by the database itself.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements correctly describe why cache replication differs from database replication? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Cache replicas can safely use asynchronous, best-effort replication because the backing store already holds the durable copy', correct: true, explanation: 'Since a cache is not the source of truth, a replica lagging or losing an update just costs a re-fetch from the origin, not lost data.' },
+        { id: 'b', text: 'Cache replication is mainly about spreading read load and speeding up failover, not preventing data loss', correct: true, explanation: 'Those are the two real motivations for cache replicas — durability is not a driver, because the origin can always regenerate a cached value.' },
+        { id: 'c', text: 'A cache should always use synchronous replication with W = N, just like a database that cannot tolerate lost writes', correct: false, explanation: 'Paying synchronous-replication latency on a cache to protect data that is disposable by design is the wrong trade-off; that guarantee belongs on the database, not the cache.' },
+        { id: 'd', text: 'Losing an un-replicated cache write is equivalent in severity to losing an un-replicated database write', correct: false, explanation: 'A lost cache write just means a future read misses and refetches from the origin; a lost database write can mean permanently lost data — the severities are not comparable.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'If a cache shards keys with a good consistent-hashing scheme, hot-key overload on a single shard cannot happen because the hash function distributes keys evenly.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Even key distribution only balances how many distinct keys land on each shard, not how often each key is accessed. One extremely popular key can still overload the single shard it happens to land on.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — even distribution of keys does not imply even distribution of traffic. Hot keys need their own mitigations (local caching, key replication, request coalescing) regardless of how well the hashing scheme spreads keys overall.' },
+      ],
+    },
+  ]}
+/>

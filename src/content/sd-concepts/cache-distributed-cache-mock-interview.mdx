@@ -1,0 +1,139 @@
+---
+title: "Distributed Cache: Mock Interview"
+module: "Distributed Cache"
+moduleOrder: 16
+order: 6
+track: "concept"
+summary: "A timed mock interview that pulls together placement, eviction, consistency, and sharding decisions into a single end-to-end distributed cache design."
+tags: ["distributed-cache", "mock-interview", "system-design", "sharding", "consistency"]
+estMinutes: 14
+cheatsheet:
+  - "Start with numbers: read/write ratio, hot-key skew, and object size drive whether you need replication, a bigger eviction budget, or a smarter sharding key more than any other decision."
+  - "State your consistency target explicitly (best-effort with short TTL vs. actively invalidated) before drawing boxes — it changes almost every downstream choice."
+  - "Pick a writing policy per data type, not one policy for the whole system: write-through for money-adjacent data, write-back only where a rebuild-from-source path exists."
+  - "Consistent hashing with virtual nodes is the default answer for 'how do you shard' — justify it by naming what it fixes (uneven redistribution on node change) rather than just naming it."
+  - "Always narrate a hot-key mitigation (key splitting, local process cache, or a replica read) — interviewers listen for whether you know caches don't equalize load automatically."
+  - "Close with failure modes: what happens on a cache-node crash, a network partition between cache and origin, and a thundering herd after a mass eviction."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+import MockInterview from '../../components/MockInterview';
+
+Every lesson so far in this module handed you one piece of the puzzle — where the cache sits, how it evicts, how it stays consistent, how it shards. In the real interview, nobody asks you those questions one at a time. You get a single open-ended prompt, a whiteboard, and 45 minutes, and you have to assemble all four pieces yourself, out loud, while someone watches how you think.
+
+This lesson is that exercise. It's shorter on new theory and longer on how to run the conversation: what order to raise decisions in, which numbers to ask for, and where candidates typically lose the thread. Treat it like the real thing — set a timer, talk through your design before you look at the rubric.
+
+## How this fits into the interview
+
+A "design a distributed cache" prompt is really "design a distributed cache *for something*" — a caching layer in front of a product catalog, a session store, a leaderboard, a feed. The interviewer wants to watch you:
+
+1. Turn a vague ask into concrete requirements (traffic shape, data size, staleness tolerance).
+2. Make placement, eviction, consistency, and sharding decisions that are consistent with each other, not four disconnected answers.
+3. Defend the weak points of your own design before being asked.
+
+That third point is what separates a pass from a borderline result. Anyone can draw a ring of cache nodes. Fewer candidates volunteer "here's how a node failure degrades this system" without being prompted.
+
+## A structure for the 45 minutes
+
+Don't start drawing boxes in minute one. A rough time budget that works well for this specific prompt:
+
+- **Minutes 0–8: requirements.** Read vs. write ratio, approximate QPS, average object size, how stale a value is allowed to be, and whether losing a cached entry is "annoying" or "wrong data shown to a user."
+- **Minutes 8–15: placement and API shape.** Local process cache vs. shared cluster vs. both; cache-aside vs. read/write-through, tied to the read/write ratio you just got.
+- **Minutes 15–25: sharding and replication.** How keys map to nodes, how you rebalance on scale-out, and how many replicas per shard given your durability bar.
+- **Minutes 25–35: consistency and invalidation.** TTL-only vs. active invalidation, and what happens on a write under your chosen model.
+- **Minutes 35–45: failure modes and scale check.** Hot keys, node loss, thundering herd, and a rough capacity number.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    A[Clarify requirements] --> B[Placement + API: cache-aside vs write-through]
+    B --> C[Sharding: consistent hashing + replica count]
+    C --> D[Consistency: TTL vs active invalidation]
+    D --> E[Failure modes: hot key, node loss, thundering herd]
+    E --> F[Capacity check: QPS, memory, network]
+`} />
+
+## Questions a strong candidate asks first
+
+Vague prompts ("design a distributed cache for a social feed") reward candidates who narrow scope before designing. Useful clarifiers:
+
+- **What's being cached — computed results, or copies of source-of-truth rows?** A computed feed ranking is fine to lose and rebuild; a session token being wrong is a security bug, not a performance blip.
+- **What's the write pattern?** A catalog with 10,000 reads per write behaves completely differently from a counter that's written on every request.
+- **Is slightly stale data acceptable, and for how long?** "A price can be up to 30 seconds old" is a very different system from "a price must be exact the instant it changes."
+- **What does the client do on a cache miss or cache-node outage?** If there's no fallback path to the origin store, the cache isn't optional infrastructure — it's a single point of failure, and that reshapes the replication story.
+
+Getting these answers before designing is the single highest-leverage thing you can do in the first five minutes — it's also, unprompted, evidence to the interviewer that you don't treat "cache" as an interchangeable black box.
+
+## Where candidates lose points
+
+The failure pattern this lesson exists to prevent: a candidate draws a clean ring of cache nodes, picks LRU because it's the eviction policy they remember best, and never connects the eviction choice, the consistency choice, and the sharding choice to each other or to the requirements gathered earlier. The design sounds textbook-correct in isolation and falls apart the moment the interviewer asks "what if this key gets 50x normal traffic" or "walk me through what the client sees if this shard's primary just crashed."
+
+The fix isn't more knowledge — it's narrating the connective tissue: "I'm choosing write-through here *because* the read/write ratio you gave me is 200:1, so paying write latency to keep the cache accurate is cheap relative to how much read benefit we get" is a stronger sentence than just stating "I'll use write-through."
+
+<Callout type="interview">
+  When you're unsure which of two reasonable choices to make (e.g. TTL-only vs. active invalidation), say the trade-off out loud and pick one rather than silently defaulting or freezing up: "I'll go with short TTL plus best-effort invalidation on write — it's simpler to operate and the staleness window you described is tolerable. If it weren't, I'd add a pub/sub invalidation path at the cost of more moving parts." That sentence takes ten seconds and shows judgment, not just recall.
+</Callout>
+
+## Worked example: sizing the thing you just designed
+
+Suppose the requirements phase surfaced this: a product catalog service serving 40,000 reads/sec and 200 writes/sec, average cached object size 2 KB, and a staleness tolerance of about 10 seconds.
+
+- **Memory footprint**: if you cache the hottest 5 million SKUs (a reasonable working-set estimate for a large catalog), that's 5,000,000 × 2 KB ≈ 10 GB of live data. With headroom for metadata and fragmentation, budgeting 16–20 GB across the cluster is realistic — small enough that this could run comfortably on 3–4 modestly sized cache nodes rather than dozens.
+- **Read throughput per node**: 40,000 reads/sec spread across 4 nodes (ignoring hot-key skew for a moment) is 10,000 reads/sec/node — well within what a single in-memory cache process handles, so the bottleneck here is availability and rebalancing, not raw throughput.
+- **Replication choice**: with only 200 writes/sec, the cost of write-through plus 2 replicas per shard (for durability against a single node loss) is negligible relative to the 40,000 reads/sec being served — a good example of how the read/write ratio you asked for up front directly justifies a specific replica count instead of an arbitrary one.
+- **Staleness budget**: a 10-second tolerance means TTL-based expiry alone might be sufficient without building an active invalidation pipeline — worth stating explicitly as "I'm choosing not to build push invalidation because the staleness bar doesn't require it," which shows you're avoiding unnecessary complexity rather than missing it.
+
+That's the shape of reasoning to produce live: pull a number from the requirements, turn it into a memory or throughput estimate, and let the estimate justify the design choice.
+
+<Quiz
+  lessonId="cache-distributed-cache-mock-interview"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A candidate is given "design a distributed cache for a product catalog" with no other detail. What is the strongest first move?',
+      options: [
+        { id: 'a', text: 'Immediately draw a ring of cache nodes with consistent hashing, since that is the standard sharding answer.', correct: false, explanation: 'Sharding strategy depends on requirements (read/write ratio, object size, staleness tolerance) that have not been gathered yet — drawing it first skips the reasoning that justifies it.' },
+        { id: 'b', text: 'Ask about read/write ratio, staleness tolerance, and what happens on a cache miss before proposing any architecture.', correct: true, explanation: 'These answers directly determine writing policy, eviction pressure, and whether the cache is optional or load-bearing infrastructure — gathering them first lets every later choice be justified rather than assumed.' },
+        { id: 'c', text: 'Pick LRU eviction and write-through as safe, commonly used defaults, then move straight to sharding.', correct: false, explanation: 'These may turn out to be right, but picking them before knowing the access pattern or write volume means the choice is not actually justified — and it looks that way to an interviewer.' },
+        { id: 'd', text: 'Ask what programming language the caching layer should be implemented in.', correct: false, explanation: 'Implementation language is not a system design concern for this kind of interview and does not affect any of the architectural decisions being evaluated.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Given a catalog with a 200:1 read-to-write ratio and a 10-second staleness tolerance, which design choices are well justified by those two numbers? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Write-through (or write-behind with a short delay) rather than a purely lazy cache-aside pattern.', correct: true, explanation: 'With reads vastly outnumbering writes, paying write-side cost to keep the cache accurate is cheap relative to the read volume that benefits from it.' },
+        { id: 'b', text: 'Relying on TTL expiry alone rather than building an active invalidation pipeline.', correct: true, explanation: 'A 10-second staleness tolerance is generous enough that a short TTL can satisfy it without the added complexity of push-based invalidation.' },
+        { id: 'c', text: 'Skipping replication entirely, since writes are rare and losing a cache node is unlikely to matter.', correct: false, explanation: 'Write rarity does not reduce the value of replication for read availability — with 40,000 reads/sec dependent on the cache, losing a node without replicas still causes a large availability hit.' },
+        { id: 'd', text: 'Using a strict linearizable consistency protocol across all cache replicas.', correct: false, explanation: 'A 10-second staleness tolerance is the opposite signal — it explicitly says strict consistency is not required, so paying for linearizability would be over-engineering relative to the stated requirement.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In this mock-interview format, explicitly stating the trade-off behind a design choice (e.g. "I am choosing TTL over active invalidation because...") is generally viewed more favorably than silently picking one option without comment.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Interviewers are assessing judgment and reasoning, not just the final answer — narrating why a choice fits the stated requirements is direct evidence of that judgment.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Silent, unexplained choices give the interviewer no way to distinguish a reasoned decision from a guess, even if the guess happens to be reasonable.' },
+      ],
+    },
+  ]}
+/>
+
+<MockInterview
+  lessonId="cache-distributed-cache-mock-interview"
+  client:visible
+  prompt="Design a distributed caching layer in front of an online marketplace's product-listing service. The service currently reads directly from a relational database and is starting to see high read latency under load. Design the cache: where it sits, how data gets in and out of it, how it's sharded and replicated, and how it stays reasonably consistent with the underlying database. Assume you can ask the interviewer clarifying questions."
+  rubric={[
+    { point: 'Gathers requirements before designing', detail: 'Asks about read/write ratio, listing size and count, staleness tolerance, and what happens on a cache miss or outage before proposing an architecture.' },
+    { point: 'Justifies placement and writing policy together', detail: 'Chooses cache-aside, write-through, or write-behind and ties the choice explicitly to the read/write ratio and durability requirements gathered earlier, rather than picking a default.' },
+    { point: 'Designs sharding and replication with a rebalancing story', detail: 'Proposes consistent hashing (or an equivalent) to spread listings across cache nodes, states a replica count per shard, and explains what happens when a node is added or removed.' },
+    { point: 'Commits to a concrete consistency and invalidation approach', detail: 'Picks TTL-only, active invalidation on write, or a hybrid, and explains what a client can observe (e.g. how stale a listing price can be) under that choice.' },
+    { point: 'Handles hot keys and skew, not just average load', detail: 'Names at least one mitigation for a single popular listing overwhelming one shard — key splitting, a small local process cache, or reading from a replica.' },
+    { point: 'Reasons about failure modes and gives a rough capacity number', detail: 'Describes what happens on a cache-node crash, a thundering herd after a mass eviction or cold start, and ties the design to at least one estimate (memory footprint or per-node QPS) rather than leaving it fully qualitative.' },
+  ]}
+/>

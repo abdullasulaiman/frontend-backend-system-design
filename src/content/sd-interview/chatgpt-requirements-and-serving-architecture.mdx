@@ -1,0 +1,262 @@
+---
+title: "Requirements and Serving Architecture"
+module: "Design a ChatGPT-Style System"
+moduleOrder: 16
+order: 1
+track: "interview"
+summary: "Frames the requirements for an LLM chat product and builds the request-serving architecture — from API gateway through the inference cluster to streamed tokens — that everything else in this module scales."
+tags: ["llm-serving", "system-design", "streaming", "gpu-inference", "chat-systems"]
+estMinutes: 13
+cheatsheet:
+  - "The bottleneck isn't storage or bandwidth — it's GPU-seconds per token. Every design decision should trace back to keeping GPUs busy on decode work."
+  - "Prefill (processing the prompt) is compute-bound and parallel; decode (generating tokens one at a time) is memory-bandwidth-bound and sequential — they have different scaling levers."
+  - "Stream tokens over SSE/WebSocket as soon as they're generated. Waiting for the full response before sending anything turns a 10-second wait into a 10-second wait with no feedback — first-token latency, not total latency, drives perceived speed."
+  - "A conversation's KV cache anchors that conversation's follow-up turns to the same GPU (or node) that holds it — this is why chat sessions need sticky routing, unlike stateless request/response services."
+  - "Continuous batching (fusing decode steps across concurrent requests) is the single highest-leverage technique for GPU throughput — static batching wastes capacity waiting for the slowest request in a batch."
+  - "Split the system into a control plane (auth, rate limiting, conversation history, moderation) and a data plane (the GPU inference fleet) — they scale on completely different axes and fail independently."
+  - "Moderation and safety checks belong on both the input and the output path; running them only on the prompt misses harmful content the model itself generates."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Interviewers increasingly ask candidates to design a ChatGPT-style system,
+and it's a different animal from a typical CRUD-and-cache interview. There's
+no database schema to obsess over and no clever sharding key to find. The
+hard resource is GPU compute, the workload has an unusual shape (a huge,
+lumpy compute burst per request instead of a quick key lookup), and users
+expect a conversational, incrementally-appearing response rather than a
+single JSON blob. If you walk in and start whiteboarding a Postgres schema,
+you're solving the wrong problem. This lesson builds the requirements and
+the request-serving architecture; the next lesson in this module goes deep
+on how you scale the inference layer itself.
+
+## Clarifying the requirements
+
+Start by narrowing scope out loud — the interviewer wants to see you frame
+the problem, not just recite an architecture.
+
+### Functional requirements
+
+- A user sends a message in a conversation; the system streams back a
+  model-generated response token by token.
+- Conversations are multi-turn: each new message includes (or references)
+  prior turns as context.
+- Responses should be moderated — both the user's input and the model's
+  output — for disallowed content.
+- Users can view, continue, and delete their conversation history.
+
+Deliberately out of scope for this lesson (call this out explicitly in an
+interview): fine-tuning the model, training infrastructure, tool-use/agent
+orchestration, and retrieval-augmented generation over private documents.
+Those are worth a sentence ("I'd bolt a retrieval step onto the prompt
+before it reaches inference") but they're not the core serving problem.
+
+### Non-functional requirements
+
+- **Time to first token (TTFT)**: the perceived "did it start responding"
+  latency. Target under 300–500ms for a warm request.
+- **Inter-token latency**: how quickly tokens keep streaming once started.
+  Roughly 20–50ms/token reads as fluent; slower feels like it's stalling.
+- **Throughput**: total tokens/second the fleet can generate across all
+  concurrent users — this is the metric that determines GPU fleet size and
+  cost.
+- **Availability**: a degraded mode (shorter responses, a smaller model, or
+  a queue with an honest wait estimate) beats a hard failure under load.
+- **Cost**: GPU-hours are the dominant cost line by a wide margin — every
+  architectural choice trades against tokens-per-dollar.
+
+<Callout type="tip">
+  Say this trade-off out loud early: "This system is compute-bound, not
+  storage-bound." It reframes the whole interview and signals you understand
+  what's actually being asked, versus applying a generic web-service
+  template.
+</Callout>
+
+## Why LLM serving doesn't behave like a normal request
+
+A typical backend request does a small, roughly constant amount of work: a
+few index lookups, maybe a cache hit, serialize a response. An LLM request
+does a variable amount of GPU work proportional to (prompt length + response
+length), and that work happens in two distinct phases with very different
+performance characteristics:
+
+- **Prefill**: the model processes the entire input prompt in one shot,
+  computing attention over all prompt tokens in parallel. This is
+  compute-bound — it saturates the GPU's matrix-multiply units efficiently
+  because there's a lot of parallelizable work per token.
+- **Decode**: the model generates the response one token at a time. Each
+  step depends on the previous token (that's what "autoregressive" means),
+  so tokens cannot be parallelized within a single request. Decode is
+  memory-bandwidth-bound — the GPU spends most of its time re-reading the
+  model's weights and the growing key-value (KV) cache from memory, not
+  doing arithmetic.
+
+This split matters because it tells you where the money goes and what
+"utilization" even means here. A single user's decode step barely uses the
+GPU's compute capacity — which is exactly why serving many users'
+decode steps *together*, in a batch, is the core scaling technique (covered
+in depth in the next lesson). For this lesson, just internalize: prefill is
+a one-time burst per request, decode is the long tail, and the KV cache
+generated during prefill has to stay resident in GPU memory for the entire
+decode phase (and across a conversation's follow-up turns).
+
+## High-level serving architecture
+
+Split the system into a **control plane** — everything that's cheap,
+stateless, and horizontally scalable on commodity CPUs — and a **data
+plane** — the GPU inference fleet, which is expensive, stateful per
+request, and the actual bottleneck.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  U[User client] --> GW[API Gateway<br/>auth, rate limit]
+  GW --> MOD1[Input moderation]
+  MOD1 --> ROUTER[Session Router<br/>sticky by conversation]
+  ROUTER --> Q[Request Queue /<br/>Scheduler]
+  Q --> GPU1[GPU Node: prefill + decode]
+  Q --> GPU2[GPU Node: prefill + decode]
+  GPU1 --> MOD2[Output moderation<br/>on streamed tokens]
+  GPU2 --> MOD2
+  MOD2 --> STREAM[Token stream<br/>SSE / WebSocket]
+  STREAM --> U
+  ROUTER --> HIST[(Conversation<br/>history store)]
+`} />
+
+Walk through the pieces:
+
+- **API gateway**: authenticates the user, applies per-user rate limits
+  (both requests/minute and tokens/minute — a single huge prompt can be as
+  expensive as a hundred small ones), and terminates the client connection.
+- **Input moderation**: a lightweight classifier (much cheaper than the main
+  model) screens the prompt before it ever reaches an expensive GPU. Reject
+  or flag early — never spend a GPU cycle on a request you're going to
+  block anyway.
+- **Session router**: routes the request to a specific GPU node and,
+  critically, tries to route follow-up turns of the *same conversation*
+  back to a node that already has (or can cheaply reload) that
+  conversation's KV cache. This is the "stickiness" that makes chat serving
+  different from a stateless REST API.
+- **Request queue / scheduler**: admits requests into the GPU fleet's
+  batching window rather than firing them straight at a GPU. This is where
+  continuous batching decisions get made (next lesson).
+- **GPU nodes**: run prefill and decode, and stream tokens out as they're
+  produced rather than buffering the full response.
+- **Output moderation**: runs on the streamed output — often on a rolling
+  window of the last few tokens — so it can catch a response going off the
+  rails mid-stream and cut it off, without waiting for the full response to
+  complete first.
+- **Conversation history store**: a plain key-value or document store
+  keyed by conversation ID, holding the message log (not the KV cache,
+  which lives in GPU memory and is far too large and short-lived to
+  persist). On a new turn, prior messages are re-fetched from here and
+  re-tokenized if the node serving this turn doesn't already hold a warm
+  KV cache for the conversation.
+
+## Streaming: why it's not optional
+
+A ChatGPT-style response can take 5–15 seconds to fully generate. Returning
+it as one blob after generation completes means the user stares at a
+spinner for the entire duration. Streaming over Server-Sent Events or a
+WebSocket sends each token (or small batch of tokens) to the client the
+instant it's decoded, so the user sees the response materialize in
+real time.
+
+This changes what you optimize for. **Time to first token** becomes the
+metric users actually feel — a system with an 8-second TTFT and instant
+subsequent tokens feels slower than one with a 400ms TTFT and a steady
+30ms/token trickle, even if the second one takes just as long to finish
+the full response. Design the prefill path to prioritize getting that first
+token out fast; everything after is about sustaining a smooth per-token
+cadence, not front-loading more work.
+
+## Worked example: sizing time to first token
+
+Say your model needs roughly 1ms of prefill compute per prompt token per
+GPU (a simplified but reasonable ballpark for a mid-size model on a single
+modern accelerator, ignoring batching for a moment). A user pastes in a
+600-token prompt.
+
+Prefill time ≈ 600 tokens × 1ms = 600ms of raw compute, before the first
+output token can be decoded. Add ~50-100ms of network and moderation
+overhead, and you're looking at a ~650-700ms TTFT for this one request in
+isolation — already over the 300-500ms target from the requirements.
+
+Two levers fix this, and both show up as themes in the next lesson: (1)
+batch prefill for several incoming requests together so the GPU's
+parallelism isn't wasted on one request at a time, and (2) cap or truncate
+extremely long prompts (or summarize older turns instead of resending them
+verbatim) so a single pathological input doesn't blow the latency budget
+for everyone sharing that GPU's queue. Notice the tension: batching helps
+throughput but can hurt TTFT for an unlucky request that lands right after
+a batch closes — a scheduling trade-off you should be ready to discuss.
+
+<Callout type="warning">
+  A common mistake: designing the moderation and history layers as if they
+  sit "after" the real system, then bolting them on as an afterthought.
+  Interviewers will push on safety and history retrieval specifically
+  because they're easy to hand-wave. Put input moderation before the GPU
+  (protect expensive compute), output moderation on the streamed tokens
+  (don't wait for full generation to catch a bad response), and be explicit
+  that conversation history is a cheap CPU-side store, separate from the
+  GPU-resident KV cache — conflating the two makes your storage estimates
+  wildly wrong.
+</Callout>
+
+## What's next
+
+This lesson set up the shape of the problem and the request path. The next
+lesson, "Scaling Inference and the Design," goes into the mechanics of
+continuous batching, KV cache management, model/tensor parallelism across
+GPUs, and how to handle load spikes and multi-model fleets (e.g., routing
+cheap queries to a smaller model). The final lesson in this module is a
+timed mock interview that puts the whole design together.
+
+<Quiz
+  lessonId="chatgpt-requirements-and-serving-architecture"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Which resource is the primary bottleneck in an LLM chat serving system, driving most architectural decisions?',
+      options: [
+        { id: 'a', text: 'Disk I/O for conversation history', correct: false, explanation: 'Conversation history is small text data on a cheap CPU-side store — it is nowhere near the bottleneck.' },
+        { id: 'b', text: 'GPU compute and memory bandwidth for inference', correct: true, explanation: 'Prefill is compute-bound and decode is memory-bandwidth-bound on the GPU; keeping the GPU fleet efficiently utilized is the core scaling problem.' },
+        { id: 'c', text: 'Network bandwidth to the client', correct: false, explanation: 'Streamed text tokens are tiny compared to typical media payloads; network bandwidth to the client is not the constraint here.' },
+        { id: 'd', text: 'The conversation history database’s write throughput', correct: false, explanation: 'Writing chat messages is a lightweight, well-understood workload for any KV or document store, not the scaling challenge in this system.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are true about the prefill and decode phases of LLM inference? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Prefill processes the whole prompt in parallel and is compute-bound.', correct: true, explanation: 'Correct — prefill computes attention over all prompt tokens at once, which parallelizes well and saturates the GPU’s compute units.' },
+        { id: 'b', text: 'Decode generates tokens sequentially and is memory-bandwidth-bound.', correct: true, explanation: 'Correct — each decode step depends on the previous token, so within one request it cannot be parallelized, and most of the time goes to reading weights and the KV cache from memory.' },
+        { id: 'c', text: 'Decode is more efficient to parallelize per-request than prefill.', correct: false, explanation: 'The opposite is true: decode is inherently sequential per request (autoregressive), while prefill parallelizes well within a single request.' },
+        { id: 'd', text: 'The KV cache produced during prefill needs to stay available through decode and any follow-up turns in the conversation.', correct: true, explanation: 'Correct — this is exactly why conversations need sticky routing back to a node holding (or able to cheaply restore) that KV cache.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Streaming tokens to the client mainly matters because it reduces the total time it takes the model to finish generating a response.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Streaming does not speed up generation itself — total generation time is unchanged. It reduces perceived latency by showing partial output immediately.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Streaming improves time-to-first-token and perceived responsiveness; the total wall-clock time to generate all tokens stays the same either way.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why should input moderation run before a request reaches the GPU inference fleet, rather than only checking output afterward?',
+      options: [
+        { id: 'a', text: 'Because GPU inference cannot process disallowed content at all and would crash.', correct: false, explanation: 'The model has no special failure mode for disallowed prompts — it would generate a response like any other input; nothing about the GPU itself would crash.' },
+        { id: 'b', text: 'Because rejecting a bad request early avoids spending expensive GPU compute on a response that will be blocked anyway.', correct: true, explanation: 'Correct — GPU time is the scarce, costly resource, so filtering out requests you already know you’ll reject should happen as early and cheaply as possible.' },
+        { id: 'c', text: 'Because output moderation is not technically possible on streamed tokens.', correct: false, explanation: 'Output moderation on a streamed response is possible and is in fact recommended in this lesson — typically run over a rolling window of recent tokens.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,261 @@
+---
+title: "Map Data Model and Tiling"
+module: "Design Google Maps"
+moduleOrder: 3
+order: 3
+track: "interview"
+summary: "Explains how road, building, and terrain data is modeled as a graph and pre-rendered into a quadtree of zoom-level tiles so panning and zooming stay fast at global scale."
+tags: ["maps", "tiling", "geospatial", "data-modeling", "caching"]
+estMinutes: 12
+cheatsheet:
+  - "Model the drivable world as a graph: nodes are intersections/waypoints, edges are road segments carrying length, speed limit, and direction — this graph is what routing (next lesson) searches over."
+  - "Render map imagery once, offline, into fixed-size tiles (typically 256x256 or 512x512 px) indexed by (zoom, x, y) — never generate a tile per request."
+  - "Each zoom level roughly quadruples tile count (a quadtree): tile (z, x, y) splits into (z+1, 2x, 2y), (z+1, 2x+1, 2y), (z+1, 2x, 2y+1), (z+1, 2x+1, 2y+1)."
+  - "Vector tiles (geometry + styling rules) beat raster tiles (pre-drawn images) for interactive maps — they're smaller, support client-side re-styling, and rotate/relabel without a server round trip."
+  - "Don't pre-render every zoom level everywhere: sparse regions (ocean, wilderness) only need shallow zoom; dense cities justify rendering all the way to street level."
+  - "Tiles are near-static and cache beautifully at a CDN edge; keep frequently-changing data (traffic, live incidents) out of the tile entirely and overlay it client-side."
+  - "A (lat, lng) point converts to a tile coordinate via a standard projection (e.g. Web Mercator) — know that this conversion, not a database query, is how a client figures out which tiles to fetch while panning."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every interviewer designing a mapping product eventually asks some version
+of: "OK, but what does the data actually look like, and how does the client
+get a smooth, zoomable map without downloading the whole planet?" This is
+the question this lesson answers. The high-level design gives you boxes
+labeled "tile service" and "map storage" — this lesson is what's actually
+inside those boxes: how the physical world gets turned into a graph for
+routing and a pyramid of pre-rendered tiles for rendering, and why those are
+two genuinely different data models serving two genuinely different jobs.
+
+Get this wrong in an interview and it shows immediately: candidates who
+treat "map data" as one blob (say, "we store the map in a database and
+query it") can't explain why panning a map at street level doesn't hit a
+database at all, or why routing doesn't fetch tiles. Separating the two
+models up front makes both halves of the design fall out cleanly.
+
+## Two data models, not one
+
+Google Maps solves two different problems with the same underlying
+geography, and each needs its own representation:
+
+1. **"Show me what's here"** — rendering roads, buildings, water, and
+   points of interest as you pan and zoom. This is a **rendering** problem,
+   solved with **tiles**.
+2. **"Get me from A to B"** — computing a path and an ETA. This is a
+   **graph traversal** problem, solved with a **road network graph**.
+
+They share the same source data (surveyed roads, building footprints) but
+diverge completely in how that data is stored and accessed. Conflating them
+is the single most common design mistake for this problem — for example,
+trying to compute a route by querying rendered tiles, or trying to render
+a map by walking a routing graph. Keep them as two pipelines from the same
+raw data.
+
+## The road network graph
+
+For routing, represent the world as a weighted directed graph:
+
+- **Nodes**: intersections, dead ends, or synthetic waypoints inserted
+  along a long stretch of road so no single edge is unreasonably long.
+- **Edges**: a directed road segment between two nodes, carrying attributes
+  like length, speed limit, road class (highway vs. residential), one-way
+  flag, and turn restrictions at its endpoints.
+
+This graph is what the routing service (covered in the next lesson)
+searches over — Dijkstra-style or A*-style algorithms walk edges from a
+source node to a destination node. It's a relatively compact,
+mostly-static structure: from the requirements lesson's estimate of roughly
+500 million road segments worldwide, storing an edge as source node,
+destination node, and a handful of numeric attributes fits in well under a
+kilobyte per edge — a few hundred gigabytes total, small enough to keep
+partitioned in memory across a fleet of routing servers rather than hitting
+disk per lookup.
+
+Crucially, this graph is edited rarely (a new road opens; a street is
+closed) and read constantly, so it's built and refreshed as a batch
+pipeline, then pushed out to routing servers as an immutable snapshot —
+not updated row-by-row in a live transactional database.
+
+## Tiles: pre-rendering the world into a quadtree
+
+Rendering a world map on demand — running a rasterizer over raw geometry
+every time someone pans — would be far too slow and far too repetitive,
+since a huge number of users are looking at overlapping areas (downtown San
+Francisco gets viewed far more than mid-ocean). The fix: **pre-render the
+map once, offline, into small fixed-size images called tiles, and serve
+those tiles from cache.**
+
+A tile is addressed by three integers: `(zoom, x, y)`.
+
+- **Zoom** controls level of detail, typically ranging from 0 (the whole
+  world in one tile) to 20+ (individual buildings and street labels).
+- **x, y** locate the tile within that zoom level's grid, using a
+  projection (commonly Web Mercator) that maps latitude/longitude onto a
+  flat square grid.
+
+At zoom 0 there's exactly one tile covering the whole world. At zoom 1
+that tile splits into a 2x2 grid — 4 tiles. At zoom `n`, there are `4^n`
+tiles total, because each tile at zoom `n` splits into exactly four
+children at zoom `n+1`. This nesting structure is a **quadtree**: tile
+`(z, x, y)` is the parent of `(z+1, 2x, 2y)`, `(z+1, 2x+1, 2y)`,
+`(z+1, 2x, 2y+1)`, and `(z+1, 2x+1, 2y+1)`.
+
+The client doesn't know or care about this hierarchy explicitly — it just
+computes, from the current viewport's center and zoom level, which
+`(zoom, x, y)` tiles are visible, and requests exactly those, typically
+prefetching one ring of neighboring tiles so panning feels instant.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    W["Whole world\nzoom 0: 1 tile"] --> Z1["zoom 1: 4 tiles"]
+    Z1 --> Z2["zoom 2: 16 tiles"]
+    Z2 --> Z3["... zoom n: 4^n tiles"]
+    Z3 --> R["Client viewport\nrequests visible (zoom,x,y) set"]
+    R --> CDN["CDN edge cache"]
+    CDN -->|hit| R
+    CDN -->|miss| ORIGIN["Tile store\n(object storage)"]
+    ORIGIN --> CDN
+`} />
+
+### Raster vs. vector tiles
+
+- **Raster tiles** are pre-drawn images (PNG/JPEG/WebP) — simple to serve
+  and cache, but every style change (dark mode, a different label
+  language, highlighting a route) needs a whole new set of tiles rendered
+  server-side.
+- **Vector tiles** ship compact encoded geometry (roads as line strings,
+  buildings as polygons, labeled with metadata) plus a client-side style
+  sheet. The client renders the tile with GPU-accelerated code (this is how
+  modern Google Maps and Mapbox work). Vector tiles are usually smaller on
+  the wire, support smooth rotation and zoom animation, and let you restyle
+  the whole map (dark mode, traffic overlay, walking vs. driving theme)
+  without re-fetching a single byte of geometry — only the style sheet
+  changes.
+
+For an interview answer, vector tiles are the stronger default to propose:
+they cost more client-side rendering work but save enormous server-side
+rendering and storage cost, and they're what the leading real products
+actually ship.
+
+### Sparse rendering by density
+
+You don't pre-render every zoom level everywhere. Mid-ocean has no reason
+to exist past zoom 6 or so; downtown Tokyo needs tiles all the way to
+zoom 20. Rendering is driven by data density and, in practice, actual
+traffic — tiles for popular areas get generated (and refreshed on data
+changes) eagerly, while tiles for sparse regions can be generated lazily on
+first request and then cached, since nobody will ask for that ocean tile at
+zoom 19 more than once in a blue moon.
+
+## Keeping tiles static: where does traffic go?
+
+Tiles are ideal cache candidates specifically because road geometry and
+buildings barely change. Live traffic color-coding, incidents, and a
+user's own route overlay must **not** be baked into the tile itself, or
+you'd have to re-render and invalidate cache entries constantly for data
+that changes every few minutes. Instead:
+
+- The base tile (roads, buildings, labels) is served from cache, keyed only
+  by `(zoom, x, y)` and a data version.
+- Traffic, incidents, and the active route are separate data layers,
+  fetched independently and drawn on top by the client — usually as a thin
+  vector overlay keyed by the same tile coordinates, refreshed on a much
+  shorter interval (say, every 60-120 seconds) than the base tile.
+
+This separation is what lets the tile layer stay a near-pure CDN caching
+problem while the traffic layer stays a fast-changing, short-TTL problem —
+mixing them would force the whole tile to inherit traffic's freshness
+requirements.
+
+<Callout type="warning">
+  A common mistake is proposing "store the map in a relational database and
+  query rows for the current viewport" as the rendering path. At Google
+  Maps scale that means a database query, a server-side render, and a
+  network round trip on every pan — far too slow, and it throws away the
+  fact that millions of users are requesting the same handful of popular
+  tiles. Pre-render (or lazily render-and-cache) fixed tiles, keyed by
+  `(zoom, x, y)`, and let a CDN absorb the read traffic. A database (or
+  object store) sits behind the cache purely as the source of truth for
+  tiles that haven't been rendered yet or need a refresh.
+</Callout>
+
+## Worked example: how many tiles does one pan touch?
+
+Say a phone screen shows roughly 400x800 logical pixels, and tiles are
+256x256 pixels. A single viewport at any given zoom level covers about
+`(400/256) * (800/256)`, roughly 5 tiles, though in practice you round up
+and fetch a slightly larger grid — say a 3x4 grid, 12 tiles — so a small
+pan doesn't cause a visible gap while the newly-revealed edge tile loads.
+
+Now walk the deeper question an interviewer likes to ask: "How much does
+zooming in one level change what you fetch?" Zooming from level `n` to
+level `n+1` doesn't just add tiles — the whole visible area is now covered
+by four times as many tiles at the new zoom level, because each old tile's
+area is exactly covered by its four quadtree children. The client discards
+the old zoom level's tiles (or keeps them briefly as a low-res placeholder
+while the new ones load — the "blurry then sharp" effect you've seen in
+every map app) and requests roughly 4x as many tiles at the new zoom to
+cover the same physical area. This is exactly why tile storage is dominated
+by the deepest zoom levels: from the requirements lesson's estimate of
+around 5 billion tiles pre-rendered at 256 KB each (about 1.2 PB total),
+the overwhelming majority of that count sits in the last few zoom levels,
+since each one has roughly 4x the tiles of the level above it.
+
+## Where this leads
+
+With the map modeled as a graph for routing and a tile quadtree for
+rendering, the next lesson picks up the graph half of this story: how a
+routing service actually searches half a billion edges for a fast, valid
+path and keeps ETAs current as traffic shifts.
+
+<Quiz
+  lessonId="maps-map-data-model-and-tiling"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does Google Maps use two different data models — a road network graph and a tile quadtree — instead of one unified representation?',
+      options: [
+        { id: 'a', text: 'Because rendering (showing what is nearby) and routing (finding a path) are different problems with different access patterns, and each is solved far more efficiently by its own structure', correct: true, explanation: 'Rendering needs fast lookup of pre-drawn imagery by viewport; routing needs graph traversal over connectivity and weights. Forcing one structure to serve both would make each slower and more complex.' },
+        { id: 'b', text: 'Because regulations require map imagery and routing data to be stored separately', correct: false, explanation: 'This is a data-modeling and performance decision, not a regulatory one.' },
+        { id: 'c', text: 'Because tiles are only used for search, not rendering', correct: false, explanation: 'Tiles are the rendering mechanism (what the client displays while panning/zooming); search is a separate sub-system covered elsewhere in this module.' },
+        { id: 'd', text: 'Because the road graph changes every few seconds and tiles never change', correct: false, explanation: 'It is the reverse in relative terms: the road graph is comparatively static (edited rarely), and tiles themselves are also static — it is the traffic overlay layered on top of tiles that changes frequently, not the base tile or the graph.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements about map tiling are accurate? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A tile at zoom level n typically splits into four child tiles at zoom level n+1', correct: true, explanation: 'This quadtree relationship — one tile covering the same area as exactly four tiles at the next zoom level — is the standard structure behind tile pyramids.' },
+        { id: 'b', text: 'Vector tiles let the client re-style the map (e.g. dark mode) without re-fetching geometry', correct: true, explanation: 'Vector tiles ship geometry plus metadata; styling is applied client-side, so a style change only requires a new style sheet, not new tile downloads.' },
+        { id: 'c', text: 'Live traffic conditions should be baked directly into each cached tile for accuracy', correct: false, explanation: 'Baking fast-changing traffic data into a cached tile would force constant re-rendering and cache invalidation. Traffic should be a separate, short-TTL overlay layered on top of the static base tile.' },
+        { id: 'd', text: 'Every zoom level should be pre-rendered uniformly across the entire world, including open ocean', correct: false, explanation: 'Sparse areas like open ocean don’t need deep zoom levels pre-rendered; rendering effort should track data density and actual demand, not be uniform everywhere.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'The routing service computes paths by traversing rendered map tiles rather than a separate road network graph.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Tiles are pre-rendered imagery for display, not a traversable graph structure. Routing searches a dedicated graph of nodes (intersections) and weighted edges (road segments).' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — routing uses a separate road network graph built for traversal, entirely distinct from the tile pyramid used for rendering.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A viewport covers roughly 12 tiles at zoom level 14. Roughly how many tiles will it need at zoom level 15 to cover the same physical area?',
+      options: [
+        { id: 'a', text: 'About 48 tiles', correct: true, explanation: 'Each tile at one zoom level is covered by exactly 4 tiles at the next zoom level, so covering the same physical area at zoom 15 takes roughly 4x as many tiles: 12 x 4 = 48.' },
+        { id: 'b', text: 'About 12 tiles, the same count', correct: false, explanation: 'Tile count for the same physical area changes with zoom level — it does not stay constant, because each zoom step subdivides tiles into four smaller ones.' },
+        { id: 'c', text: 'About 24 tiles, double the count', correct: false, explanation: 'Tile count quadruples per zoom level (a quadtree), not doubles, since each dimension of the grid doubles.' },
+        { id: 'd', text: 'About 144 tiles', correct: false, explanation: 'That would be a 12x multiplier, which overshoots the actual per-zoom-level growth factor of roughly 4x.' },
+      ],
+    },
+  ]}
+/>

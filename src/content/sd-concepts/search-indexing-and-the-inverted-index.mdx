@@ -1,0 +1,155 @@
+---
+title: "Indexing and the Inverted Index"
+module: "Distributed Search"
+moduleOrder: 21
+order: 2
+track: "concept"
+summary: "Explains how the inverted index turns full-text search from a linear scan into a fast lookup, and how documents move from raw text to a searchable structure through analysis, tokenization, and index construction."
+tags: ["search", "inverted-index", "tokenization", "indexing", "text-analysis"]
+estMinutes: 12
+cheatsheet:
+  - "An inverted index maps each term to a postings list of document IDs (and positions) — search becomes a lookup, not a scan."
+  - "The analysis pipeline (tokenize, lowercase, remove stopwords, stem/lemmatize) determines what actually counts as a 'match' — it's a design decision, not a detail."
+  - "Building the index is the expensive part (O(total tokens)); querying it is cheap (O(query terms) lookups plus postings merge) — that asymmetry is the whole point."
+  - "Postings lists are stored sorted and compressed (delta encoding + variable-byte or bit-packed codes) because they dominate index size at scale."
+  - "Merging segments (like an LSM-tree compaction) keeps read-time postings-list merges cheap after many small incremental updates."
+  - "Stemming/lemmatization improves recall (match more relevant docs) but can hurt precision (match irrelevant ones) — the trade-off is tunable, not free."
+  - "The inverted index answers 'which documents contain this term'; ranking those documents well is a separate problem, covered next."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Say you're asked to find every document containing the word "timeout" across ten million support tickets. Scan every document, split it into words, and check: that's ten million documents times however many words each one holds, done on every single query. At web scale that's not slow — it's impossible. Every real search system, from a Postgres `tsvector` column to Elasticsearch to Google, solves this the same way: build a data structure once, ahead of time, that turns "which documents contain this word" into a direct lookup instead of a scan. That structure is the inverted index, and how you build it shapes everything downstream — what queries you can answer, how fresh your results are, and how much hardware you need.
+
+This lesson covers how raw documents become an inverted index: the analysis pipeline that decides what a "word" even is, the index structure itself, and how it's built and updated at scale. The next lesson in this module picks up from there and covers querying and ranking those results.
+
+## Why "inverted"
+
+A **forward index** maps documents to the terms they contain — document 42 contains "outage", "timeout", "retry". That's the natural way to store a document, and it's useless for search: to answer "which docs contain 'timeout'" you'd still have to scan every forward index entry.
+
+An **inverted index** flips the relationship: it maps each term to the list of documents that contain it.
+
+```
+"timeout"  -> [doc 42, doc 107, doc 3391, ...]
+"outage"   -> [doc 42, doc 88, ...]
+"retry"    -> [doc 42, doc 501, ...]
+```
+
+Each list is called a **postings list**. Looking up a single term is now `O(1)`-ish (a hash or B-tree lookup into the term dictionary) plus reading a list of document IDs — no scanning of document content at query time at all. A multi-term query like "timeout AND retry" becomes an intersection of two postings lists, which is fast because both lists are stored sorted by document ID.
+
+This is the same trick a relational database's secondary index uses (see the sibling lesson on database indexing) — trade write-time and storage cost for read-time speed. The difference is *what* gets indexed: a DB index is built on a column value; a full-text inverted index is built on every distinct token extracted from unstructured text, which is why the pipeline that produces those tokens matters so much.
+
+## The analysis pipeline: deciding what counts as a term
+
+Before anything goes into the index, raw text passes through an **analyzer**. This step is where most of the actual design decisions in a search system live — get it wrong and no index structure will save you.
+
+A typical pipeline:
+
+1. **Tokenization** — split text into candidate terms. "The API returned a 500 error" becomes tokens like `the`, `api`, `returned`, `a`, `500`, `error`. Sounds trivial until you hit hyphenated words, contractions, URLs, or CJK languages with no whitespace between words at all — tokenization rules are language- and domain-specific.
+2. **Lowercasing / normalization** — so "API" and "api" match the same postings list. Also handles accents, Unicode normalization forms, and sometimes number/date normalization.
+3. **Stopword removal** — drop extremely common words ("the", "a", "is") that appear in nearly every document and add index size without adding discriminating power. Optional: some systems keep stopwords for exact-phrase queries.
+4. **Stemming / lemmatization** — reduce words to a root form so "running", "runs", and "ran" all index under "run". Stemming is a fast heuristic (chop suffixes); lemmatization is a slower, dictionary-based reduction to the true root. This step directly trades **recall** (find more relevant docs by matching more word forms) against **precision** (avoid matching unrelated words that happen to share a stem).
+
+The output of this pipeline is a stream of normalized tokens per document — those tokens, not the raw words, are what actually gets indexed. Two search engines can index the identical raw documents and return completely different results because their analyzers differ.
+
+## Building the index
+
+For each document, run the analyzer to get its token stream, then for each token, append `(document ID, position)` to that token's postings list. Storing the **position** within the document (not just "this doc contains this term") is what enables phrase queries later — "network timeout" as an exact phrase needs to confirm "timeout" appears at position immediately after "network", not just that both words appear somewhere in the document.
+
+At small scale you can build this in memory. At scale, the standard approach is:
+
+- Process documents in batches, building small in-memory index **segments**.
+- Flush each segment to disk once it hits a size threshold, with postings lists already sorted by document ID.
+- Periodically **merge** segments in the background, combining postings lists for the same term across segments — much like how an LSM-tree compacts SSTables.
+
+This segment-and-merge design is why systems like Elasticsearch/Lucene can accept a continuous stream of writes without re-sorting the entire index on every update: new documents land in a fresh small segment, and merges happen asynchronously. It also means a document is searchable as soon as its segment is written, not only after a full index rebuild — the trade-off is that a query has to check every unmerged segment and combine results, so too many small segments slows queries down until the next merge.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A["Raw document"] --> B["Tokenize"]
+  B --> C["Lowercase + normalize"]
+  C --> D["Remove stopwords"]
+  D --> E["Stem / lemmatize"]
+  E --> F["Token stream"]
+  F --> G["Append to postings lists\n(term -> doc id, position)"]
+  G --> H["In-memory segment"]
+  H --> I["Flush to disk"]
+  I --> J["Background merge\nof segments"]
+`} />
+
+## Postings list storage: why compression matters
+
+For a corpus of any real size, postings lists dominate index size — common terms can have postings lists with millions of entries. Two techniques keep this manageable:
+
+- **Delta encoding**: since a postings list is sorted by document ID, store the *gap* between consecutive IDs instead of the IDs themselves. Gaps are small numbers, which compress far better than arbitrary large IDs.
+- **Variable-byte or bit-packed encoding**: encode each (usually small) delta using as few bytes/bits as it needs, rather than a fixed 4 or 8 bytes per entry.
+
+Together these can shrink postings lists by 5-10x, which matters directly for cost: smaller postings lists mean more of the index fits in memory or page cache, which is the difference between a query hitting RAM and a query hitting disk.
+
+## Worked example: sizing an index for support tickets
+
+Say you're indexing 50 million support tickets, averaging 200 words each after analysis, with roughly 400,000 distinct terms (a realistic vocabulary size once stopwords are removed and stemming collapses word variants).
+
+- Total tokens to index: 50,000,000 × 200 = 10 billion token occurrences.
+- Each occurrence becomes one postings-list entry: a document ID (delta-encoded, say ~1-2 bytes average after compression) plus a position (another 1-2 bytes compressed). Call it roughly 3 bytes per occurrence after compression.
+- Raw postings storage: 10,000,000,000 × 3 bytes ≈ 30 GB.
+- Add the term dictionary (400,000 terms, mapping term to postings-list location) — tiny by comparison, low tens of MB.
+
+So a 50M-document corpus compresses down to roughly 30 GB of postings data — small enough to shard across a handful of nodes and keep mostly in memory, which is exactly why the inverted index approach scales where a linear scan doesn't: you pay ~30 GB once at index-build time, and every query after that is a cheap lookup instead of a re-scan of the original text (which, unindexed, would itself be far larger than 30 GB once you count full document bodies rather than just tokens).
+
+<Callout type="warning">
+  A common mistake is treating the analyzer as an implementation detail you can change later without cost. In practice, changing tokenization, stemming rules, or stopword lists means every existing document's postings need to be **rebuilt from scratch** — you can't incrementally patch an inverted index to reflect a new analyzer, because the terms themselves changed. Teams that bolt on stemming after launch, or fix a tokenization bug for a new language, discover this means a full reindex of the entire corpus, which for a large corpus can take hours to days and needs a plan (dual-write to old and new indices, then cut over) rather than being a quick patch.
+</Callout>
+
+## Where this leaves you
+
+The inverted index answers one question well: which documents contain this term, and where. It says nothing yet about which of those matching documents the user actually wants to see first, how to handle typos or synonyms at query time, or how to combine multiple terms with relevance weighting instead of a strict AND/OR. That's ranking and querying, covered in the next lesson — and it's a genuinely separate problem: two search engines can build an identical inverted index over the same corpus and still produce very different result orderings.
+
+<Quiz
+  lessonId="search-indexing-and-the-inverted-index"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What does an inverted index primarily let a search system do that a forward index (document -> terms) cannot do efficiently?',
+      options: [
+        { id: 'a', text: 'Look up all documents containing a given term without scanning document content at query time', correct: true, explanation: 'That is exactly the inversion: term -> postings list of document IDs, turning a scan into a lookup.' },
+        { id: 'b', text: 'Store the original raw text of a document', correct: false, explanation: 'Both forward and inverted indices can coexist with stored raw text; storing raw text is not what distinguishes them.' },
+        { id: 'c', text: 'Guarantee results are returned in relevance order', correct: false, explanation: 'The inverted index tells you which documents match; ranking those matches by relevance is a separate concern covered in querying and ranking.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are typically part of the text-analysis pipeline before tokens are written into an inverted index? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Lowercasing and Unicode normalization', correct: true, explanation: 'This ensures "API" and "api" resolve to the same indexed term instead of two separate postings lists.' },
+        { id: 'b', text: 'Stemming or lemmatization to a root word form', correct: true, explanation: 'This collapses word variants like "running"/"runs"/"ran" to a common indexed term, trading precision for recall.' },
+        { id: 'c', text: 'Ranking documents by predicted relevance score', correct: false, explanation: 'Relevance ranking happens at query time using the built index; it is not a step in building the index itself.' },
+        { id: 'd', text: 'Stopword removal', correct: true, explanation: 'Extremely common, low-information words are often dropped to shrink the index and reduce noise in postings lists.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Changing a search system\'s stemming rules can typically be applied to an existing inverted index incrementally, without reprocessing already-indexed documents.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False — the terms actually stored in postings lists depend on the analyzer used when each document was indexed, so changing stemming rules requires reprocessing (reindexing) affected documents.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — analyzer changes (stemming, tokenization, stopwords) change what terms get indexed, so existing documents must be reanalyzed and reindexed to reflect the new rules; this is not an incremental patch.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why do production inverted indices commonly use delta encoding on postings lists?',
+      options: [
+        { id: 'a', text: 'Because postings lists are sorted by document ID, so storing small gaps between consecutive IDs compresses far better than storing full IDs', correct: true, explanation: 'Sorted order makes gaps small and repetitive, which compresses much more effectively than arbitrary large document IDs.' },
+        { id: 'b', text: 'Because it lets postings lists be searched without decompression', correct: false, explanation: 'Postings lists still need to be decoded (at least partially) to be read; delta encoding is a storage/compression technique, not a way to avoid decoding.' },
+        { id: 'c', text: 'Because it removes the need for a term dictionary', correct: false, explanation: 'A term dictionary mapping terms to their postings-list location is still required regardless of how the postings list entries themselves are encoded.' },
+      ],
+    },
+  ]}
+/>

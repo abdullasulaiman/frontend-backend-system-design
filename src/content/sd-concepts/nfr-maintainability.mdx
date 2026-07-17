@@ -1,0 +1,136 @@
+---
+title: "Maintainability"
+module: "Non-Functional Characteristics"
+moduleOrder: 4
+order: 4
+track: "concept"
+summary: "Explains maintainability as a system property covering operability, simplicity, and evolvability, and shows how architecture decisions trade short-term velocity for long-term ease of change."
+tags: ["maintainability", "operability", "architecture", "technical-debt", "observability"]
+estMinutes: 11
+cheatsheet:
+  - "Maintainability has three sub-properties: operability (easy to run day-to-day), simplicity (easy to understand), and evolvability (easy to change safely) — a system can be strong in one and weak in another."
+  - "Coupling is the enemy of evolvability: a change that must touch five services to ship one feature is a maintainability failure, not just a process annoyance."
+  - "Good abstractions reduce accidental complexity but the wrong abstraction is worse than none — it hides behavior interviewers and on-call engineers both need to see."
+  - "Observability (logs, metrics, traces) is what makes operability possible in production; without it, every incident becomes an investigation from zero."
+  - "Migrations, backward-compatible schema changes, and feature flags are the concrete tools that let you evolve a live system without a big-bang rewrite."
+  - "In interviews, call out one deliberate maintainability trade-off (e.g. an extra service boundary, a slower but reversible migration path) rather than treating it as an afterthought bolted on at the end."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Most systems spend far more of their life being operated and modified than being built. A payments service you stand up in three months might run for eight years, get touched by forty engineers who never met the original author, absorb a currency migration, a database re-shard, and three different on-call rotations. Availability and scalability get the attention in an interview because they're easy to quantify, but maintainability is what determines whether the team can keep shipping features into that system five years in without every change becoming a multi-week archaeology project.
+
+It's also the non-functional property most often skipped in interviews, because it doesn't show up as a number on a whiteboard. There's no "maintainability = 99.9%" the way there is for availability. That makes it easy to under-discuss — and easy to stand out by discussing it well.
+
+## Three sub-properties of maintainability
+
+It helps to break "maintainability" into three more concrete questions, because a system can score very differently on each.
+
+### Operability: how easy is it to run?
+
+Operability is about the people who keep the system alive day to day: can they deploy safely, see what's happening inside it, diagnose an incident quickly, and recover without heroics? A system with excellent operability has good logging and metrics, clear runbooks, safe rollback paths, and alerts that point at the actual problem rather than a symptom three layers removed.
+
+A system with poor operability might work fine until 3 a.m. on a Saturday, when the one person who understands the deploy process is asleep and the dashboards only show CPU, not queue depth or error rate by endpoint.
+
+### Simplicity: how easy is it to understand?
+
+Simplicity is about keeping *accidental* complexity down — complexity that comes from how the system is built, not from the problem it's solving. Every real system has some irreducible, essential complexity (a marketplace has to match buyers and sellers; that's inherent to the problem). Accidental complexity is the extra layer of indirection, the config flag nobody remembers the purpose of, the three different ways the codebase computes the same total.
+
+Good abstractions are the main tool for managing this — hiding a messy detail behind a clean interface. But an abstraction is a bet: it pays off if it hides the right things and stays out of the way when someone needs the details it hides. A leaky or wrong abstraction (a "generic" data layer that secretly assumes one specific access pattern) makes things worse, not better, because now you have the underlying complexity plus a wrapper that lies about it.
+
+### Evolvability: how easy is it to change safely?
+
+Evolvability is about making future changes cheap and low-risk. This is mostly a story about coupling. If adding one new field to an event requires coordinated deploys across six services because they all parse that event with hand-rolled logic and no shared schema, the system is hard to evolve — even if it's perfectly available and simply built today.
+
+Loose coupling, versioned APIs/schemas, and clear ownership boundaries are what keep evolvability high as a system grows past the size one team can hold in their head.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  M[Maintainability]
+  M --> O[Operability]
+  M --> S[Simplicity]
+  M --> E[Evolvability]
+  O --> O1["Logs / metrics / traces"]
+  O --> O2["Safe deploys and rollback"]
+  S --> S1["Low accidental complexity"]
+  S --> S2["Abstractions that hide the right things"]
+  E --> E1["Loose coupling between services"]
+  E --> E2["Backward-compatible schema changes"]
+`} />
+
+## Where maintainability shows up in architecture decisions
+
+Maintainability rarely gets its own line item in a design; it shows up as a modifier on almost every other decision.
+
+**Service boundaries.** Splitting a monolith into services can improve evolvability (independent deploys, independent scaling) but it costs operability upfront (now you need distributed tracing to follow a request across five hops instead of reading one stack trace). The interview-worthy point is that this is a real trade, not a free upgrade — "microservices are more maintainable" is wrong as a blanket statement.
+
+**Data model changes.** A schema migration that adds a required column with no default breaks every writer that doesn't know about it yet. The maintainable version adds the column as nullable, backfills it, updates writers, and only then makes it required — three small reversible steps instead of one risky one. This "expand, migrate, contract" pattern shows up constantly: add the new thing alongside the old, move traffic over gradually, remove the old thing only once nothing depends on it.
+
+**Feature flags and gradual rollout.** Shipping behind a flag decouples "deploy the code" from "turn on the behavior," which makes both operability (you can kill a bad change instantly, no redeploy) and evolvability (you can test a risky change on 1% of traffic) better at the cost of some extra complexity in the code itself — flags that never get cleaned up become their own maintainability debt.
+
+**Observability as a first-class component.** A design that treats logs/metrics/traces as an afterthought is optimizing for "works in the demo," not for "survives production." Structured logging with correlation IDs, dashboards for the metrics that actually predict user pain (queue depth, error rate, p99 latency — not just CPU), and distributed tracing across service boundaries are what make operability achievable once a system has more than one moving part.
+
+## Worked example: a "coupon codes" feature
+
+Say a checkout service needs to support coupon codes. The fast path: add a `coupon_code` column to the `orders` table, and inline the discount-calculation logic directly in the checkout request handler.
+
+That ships in a day, and it works. It's also a maintainability trap: six months later, marketing wants stackable coupons, then percentage-off vs. flat-off, then expiry dates, then per-customer limits. Each new rule gets bolted onto the same handler as another `if` branch. Nobody can reason about all the interactions anymore, and every change to checkout risks breaking coupons because they now live inside it.
+
+The more maintainable version extracts a small `Discount` service (or even just a well-bounded module) with its own schema for coupon rules, a clear interface (`calculate_discount(order, customer) -> amount`), and its own tests. It costs a bit more up front — an extra service boundary or module boundary, a defined contract — but every future coupon rule change touches one place, is testable in isolation, and doesn't risk regressing unrelated checkout logic. That's evolvability paid for with a small amount of day-one simplicity, which is usually the right trade once you expect a feature area to keep changing.
+
+<Callout type="warning">
+  A common interview mistake: treating maintainability as "just write clean code" and leaving it at that. Interviewers are listening for concrete mechanisms — schema versioning, service boundaries chosen around change patterns (not org chart convenience), observability built in from the start, migration strategies for live data — not a vague promise to write good code. If you can't point to one specific decision in your design that trades a bit of speed now for materially easier changes later, you probably haven't addressed maintainability at all.
+</Callout>
+
+## Maintainability versus the other non-functional properties
+
+It's worth being explicit about how this lesson connects to its siblings in this module: availability and fault tolerance are about staying up despite failure, scalability is about handling more load, and maintainability is about how cheaply the system can keep changing correctly over its lifetime. A system can be highly available and scalable today while being nearly unmaintainable — think of a monolith that's been patched for a decade, still serves traffic fine, but where every engineer is terrified to touch it. Conversely, a young, cleanly-modularized system might be extremely maintainable while still being immature on availability. They're independent axes, and a good design discussion touches all of them rather than assuming strength in one implies strength in another.
+
+<Quiz
+  lessonId="nfr-maintainability"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A team can deploy a new service version and roll it back safely, and their dashboards clearly show error rate and queue depth per endpoint. This is primarily describing which sub-property of maintainability?',
+      options: [
+        { id: 'a', text: 'Operability', correct: true, explanation: 'Safe deploys, rollback, and dashboards that surface the right signals are exactly what operability means: how easy the system is to run day to day.' },
+        { id: 'b', text: 'Simplicity', correct: false, explanation: 'Simplicity is about accidental complexity in the design itself, not about deploy/rollback/monitoring tooling.' },
+        { id: 'c', text: 'Evolvability', correct: false, explanation: 'Evolvability is about how cheaply the system can be changed going forward (coupling, schema versioning), not about operating the current version.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are concrete techniques for improving evolvability specifically? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Expand-migrate-contract schema changes (add nullable, backfill, then enforce)', correct: true, explanation: 'This lets you evolve a live schema in small reversible steps instead of one risky breaking change — a direct evolvability technique.' },
+        { id: 'b', text: 'Versioned APIs/schemas between services', correct: true, explanation: 'Versioning lets producers and consumers change independently without coordinated lockstep deploys, which is the core of evolvability.' },
+        { id: 'c', text: 'Adding more CPU and memory to the existing servers', correct: false, explanation: 'That addresses scalability/capacity, not how easy the system is to change safely — it does not reduce coupling or improve schema flexibility.' },
+        { id: 'd', text: 'Feature flags to decouple deploy from release', correct: true, explanation: 'Flags let you ship code changes independently of turning on behavior, making risky changes cheaper to roll out and reverse.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Splitting a monolith into microservices always improves a system\'s overall maintainability.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'It typically improves evolvability (independent deploys/scaling) but costs operability upfront — distributed tracing and cross-service debugging become necessary where a single stack trace used to suffice. It is a trade-off, not a strict improvement.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Splitting into services trades some operability (more moving parts to observe and debug) for potential gains in evolvability (looser coupling, independent deploys) — whether it is a net win depends on the system and team.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A coupon-discount feature is built by adding several nested if/else branches directly inside the main checkout request handler. Six months later, every new coupon rule risks breaking unrelated checkout logic. This is best described as a failure of which sub-property?',
+      options: [
+        { id: 'a', text: 'Simplicity and evolvability, due to accidental complexity and tight coupling', correct: true, explanation: 'Bolting unrelated rules into one handler increases accidental complexity (hard to understand) and couples unrelated concerns (checkout and discount logic), making future changes risky — both simplicity and evolvability suffer.' },
+        { id: 'b', text: 'Operability, because the service might go down under load', correct: false, explanation: 'Nothing here describes uptime or incident response; the problem is about how hard the code is to understand and safely extend, not about running it in production.' },
+        { id: 'c', text: 'Availability, because customers cannot use coupons', correct: false, explanation: 'Availability is about the system being reachable and responsive; this scenario is about the internal design becoming risky to change, which is a maintainability concern.' },
+      ],
+    },
+  ]}
+/>

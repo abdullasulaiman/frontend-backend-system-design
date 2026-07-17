@@ -1,0 +1,280 @@
+---
+title: "Streaming and CDN Delivery"
+module: "Design YouTube"
+moduleOrder: 1
+order: 5
+track: "interview"
+summary: "Explains how adaptive bitrate streaming, chunked video formats, and a multi-tier CDN work together to serve tens of thousands of concurrent viewers with fast, low-buffering playback."
+tags: ["streaming", "cdn", "adaptive-bitrate", "caching", "video"]
+estMinutes: 13
+cheatsheet:
+  - "Playback never fetches 'the video file' — it fetches a manifest (HLS .m3u8 or DASH .mpd) listing renditions, then small segments (2-10s) one at a time."
+  - "Adaptive bitrate (ABR) is a client-side decision: the player measures its own recent download throughput and switches renditions between segment boundaries, not mid-segment."
+  - "CDN edge caches absorb the vast majority of watch traffic; the origin should only ever see a cache miss on a cold or rare video, never a request per view."
+  - "Popularity is extremely skewed (a long tail), so cache warming/pre-positioning popular new uploads at edge nodes ahead of a spike beats reacting to cache misses after the fact."
+  - "Segment size is a trade-off: smaller segments mean faster ABR reaction and quicker startup but more request overhead and manifest complexity; larger segments are the reverse."
+  - "Signed, short-lived CDN URLs (or tokens) protect private/paywalled content without forcing every request back through the origin for auth."
+  - "A CDN miss storm on a viral video is a cache-key and pre-warming problem, not a 'scale the origin' problem — fix it by fanning the content out to edge nodes proactively."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+By the end of the last lesson, a video has been uploaded, transcoded into a
+ladder of resolutions and bitrates, and stored as segmented files in object
+storage. None of that work matters if the moment a viewer hits play, they
+wait five seconds staring at a spinner, or the picture turns to mush the
+second their Wi-Fi hiccups. This lesson is about the other half of the
+problem: getting those bytes to a viewer's screen fast, smoothly, and at a
+cost that doesn't bankrupt you at YouTube-scale traffic.
+
+Two ideas do almost all of the work here: **adaptive bitrate streaming**,
+which lets the player itself react to changing network conditions instead
+of committing to one quality upfront, and a **multi-tier CDN**, which moves
+video bytes physically close to viewers so the vast majority of watch
+traffic never touches your origin at all. Get these two right and playback
+feels instant and resilient; get them wrong and no amount of database
+tuning elsewhere will save the user experience.
+
+## Why you can't just serve "the video file"
+
+A naive design serves a single MP4 file per video and lets the browser
+download it. This fails in practice for three reasons:
+
+- **One bitrate can't fit all networks.** A viewer on fiber and a viewer on
+  a spotty 3G connection need different bitrates entirely; serving one file
+  either wastes bandwidth for the fast connection or stalls constantly for
+  the slow one.
+- **Seeking is expensive.** Jumping to the middle of a long MP4 without
+  segmentation means the player (or a range-request-savvy server) has to
+  locate and stream from an arbitrary byte offset, which is fragile across
+  CDNs and devices.
+- **You can't react mid-playback.** Network conditions change while a video
+  plays — a viewer walks from Wi-Fi to cellular. A single monolithic file
+  gives you no natural point to switch quality.
+
+The fix is to never think of video delivery as "download a file." Think of
+it as **fetch a small chunk of a few seconds of video, decide what quality
+to fetch next, repeat** — which is exactly what adaptive bitrate streaming
+does.
+
+## Adaptive bitrate streaming (ABR)
+
+During transcoding, each video is encoded into a ladder of renditions —
+say 240p, 480p, 720p, and 1080p, each at an appropriate bitrate — and each
+rendition is cut into short segments, typically 2-10 seconds long. Two
+manifest formats dominate in practice: **HLS** (`.m3u8` playlists, Apple's
+format, now broadly supported) and **MPEG-DASH** (`.mpd` manifests, an
+open standard). Both work the same way conceptually:
+
+1. The player first fetches a manifest listing every available rendition
+   and where to find its segments.
+2. The player picks a starting rendition (usually a low/medium one, to
+   start playback fast) and requests the first few segments.
+3. While playing, the player continuously measures its own recent download
+   throughput and buffer health.
+4. Based on that measurement, it decides — for the *next* segment, at the
+   next segment boundary — whether to step up, hold, or step down a
+   rendition.
+
+The critical detail: **ABR logic lives entirely in the client**, not the
+server. The server (or CDN) just serves whatever segment is requested; it
+has no idea what quality the player is "supposed" to be at. This keeps the
+server side stateless and simple, and it's why the same segmented assets
+in object storage can serve every device type and every network condition
+without any server-side branching logic.
+
+### Segment size is a real trade-off
+
+Shorter segments (2-4s) let the player react to a network change almost
+immediately and get the video playing sooner (less to download before the
+first segment completes), but they multiply the number of HTTP requests
+and manifest entries. Longer segments (6-10s) cut request overhead but mean
+a bad network moment takes longer to recover from, and a slower player
+start since the first segment itself takes longer to download. Most
+production systems land around 4-6 seconds as a practical middle ground.
+
+## The CDN: why origin-per-view doesn't work
+
+Recall the scale numbers from earlier in this module: tens of thousands of
+views per second at peak, globally distributed. If every one of those view
+requests hit your origin object storage directly, you'd need enormous
+egress bandwidth from a handful of regions, and every viewer far from that
+region would suffer real network latency before a single byte arrives.
+
+A **CDN (content delivery network)** solves this by caching video segments
+at edge locations physically close to viewers — often hundreds of
+points-of-presence (PoPs) worldwide. The flow for a request looks like:
+
+1. A viewer's player requests a segment; DNS or anycast routing sends the
+   request to the nearest edge PoP.
+2. If that edge PoP already has the segment cached (a **cache hit**), it
+   serves it directly — no trip back to your origin at all.
+3. If it doesn't (a **cache miss**), the edge PoP fetches the segment from
+   your origin (or a mid-tier regional cache) once, serves it to the
+   viewer, and caches it locally so the next viewer near that PoP gets a
+   hit.
+
+Because video-watching is extremely skewed — a small fraction of videos
+account for a large fraction of views (a long-tail distribution) — a
+well-tuned CDN turns "tens of thousands of origin requests per second"
+into "origin sees a cache miss on essentially only the first request for
+each segment, ever, per region." That's the entire reason CDNs make
+video-at-scale economically viable at all.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant P as Player
+    participant E as Edge PoP (CDN)
+    participant O as Origin (object storage)
+    P->>E: GET manifest.m3u8
+    E-->>P: manifest (renditions + segment URLs)
+    P->>E: GET segment_720p_014.ts
+    alt cache hit
+        E-->>P: segment (served from edge)
+    else cache miss
+        E->>O: GET segment_720p_014.ts
+        O-->>E: segment
+        E-->>E: cache it
+        E-->>P: segment
+    end
+`} />
+
+### Multi-tier caching
+
+Large-scale CDNs usually add a regional cache tier between edge PoPs and
+origin. A miss at an edge PoP first checks the regional cache before
+falling back to origin, so only the *first* edge PoP in a region ever pays
+the full origin round-trip — every other edge PoP nearby hits the regional
+cache instead, further reducing origin load and egress cost.
+
+### Cache keys and invalidation
+
+Segments are effectively immutable once transcoded — a given rendition's
+segment 14 never changes — so segments can be cached with very long TTLs
+and content-addressed keys (e.g. keyed by video ID, rendition, and segment
+index). Manifests are closer to metadata: they can change if you add a
+rendition or a video gets taken down, so they typically use much shorter
+TTLs or explicit invalidation. This split (immutable, long-TTL segments vs.
+short-TTL, frequently-refreshed manifests) is a pattern worth naming
+explicitly in an interview — it shows you understand why not everything in
+a CDN should be cached the same way.
+
+### Pre-warming for predictable spikes
+
+Reactive caching (only caching on a miss) works fine for steady-state
+traffic, but it struggles with a sudden spike — a video goes viral, or a
+major creator's new upload gets pushed to millions of subscribers within
+minutes. A large-scale platform typically **pre-warms** edge caches for
+predictable high-traffic content: pushing the first renditions of a known
+high-subscriber-count creator's video out to major edge regions right at
+publish time, rather than waiting for organic misses to populate the
+cache under peak load.
+
+## Handling access control without breaking caching
+
+Private or paywalled videos complicate CDN caching because you can't cache
+a response for "everyone" if only some viewers should see it. The standard
+approach is **signed URLs or signed cookies**: the origin/API server
+issues a URL (or cookie) with an embedded, time-limited signature after
+verifying the viewer's permissions once, and the CDN validates the
+signature at the edge without calling back to the origin per request. This
+keeps authorization enforcement out of the hot path while still gating
+access — the CDN can still cache the underlying segment bytes since the
+segment itself isn't secret, only the *ability to request it* is gated.
+
+## Worked example: serving a spike after a viral upload
+
+Say a video normally gets 50 views/sec steady-state, well within what a
+single edge PoP's cache handles trivially. It gets featured and spikes to
+20,000 views/sec across every region within an hour. Walk through what
+breaks and what doesn't:
+
+- **Segment caching handles it almost for free.** Every viewer requests the
+  same small set of segment files. After the first viewer in each region
+  causes a miss, every subsequent viewer there — the 2nd or the 20,000th —
+  is a cache hit. Origin load is driven by unique segments requested per
+  region, not total views, so the spike barely touches origin.
+- **ABR still matters per-viewer.** Each player independently reacts to its
+  own network conditions; a spike in global popularity doesn't change any
+  individual viewer's local network, so ABR keeps working exactly as it
+  does at low volume.
+- **The real risk is manifest and metadata load**, not segment bytes.
+  Manifests refresh on shorter TTLs, and view-count/engagement metadata
+  gets hit far more often relative to its cache lifetime — that's where
+  you'd reach for the read-path caching and database scaling techniques
+  from the next lesson.
+
+This example is worth stating plainly in an interview: CDNs make the
+*video bytes* nearly free to scale under a spike; the metadata/API layer
+around it is a separate scaling problem that needs its own answer.
+
+<Callout type="warning">
+  A common mistake is treating "add a CDN" as a single design decision that
+  automatically solves scale, without explaining *why* it works. Say the
+  mechanism out loud: segments are small, immutable, and highly
+  cacheable, viewing is long-tail (a small number of videos drive most
+  views), and ABR pushes quality-selection logic to the client so the
+  server side stays simple and stateless. An interviewer who hears "we'll
+  put a CDN in front of it" with no explanation of cache hit rates,
+  segment immutability, or the manifest/segment TTL split will (rightly)
+  push back and ask you to justify it.
+</Callout>
+
+## What this doesn't solve
+
+Worth naming so you don't over-claim: streaming and CDN delivery don't
+make discovery/search fast (a separate ranking and indexing problem), and
+they don't make the *first* viewer of a brand-new, unpopular video fast —
+that request is always a genuine cache miss. Both are fine trade-offs to
+state explicitly rather than problems to solve here.
+
+<Quiz
+  lessonId="youtube-streaming-and-cdn-delivery"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Where does the logic that decides which video rendition (bitrate/resolution) to request next live in an adaptive bitrate streaming system?',
+      options: [
+        { id: 'a', text: 'In the client player, based on its own measured throughput and buffer health', correct: true, explanation: 'ABR is a client-side decision — the player measures its own download performance and chooses the next segment\'s rendition at each segment boundary.' },
+        { id: 'b', text: 'In the CDN edge node, based on aggregate traffic to that PoP', correct: false, explanation: 'The CDN edge just serves whatever segment is requested; it has no per-viewer network-condition awareness and does not choose renditions.' },
+        { id: 'c', text: 'In the origin server, based on the viewer\'s account tier', correct: false, explanation: 'Origin/account tier might gate access to certain renditions, but the moment-to-moment quality-switching decision is not made there — it is made by the player reacting to live network conditions.' },
+        { id: 'd', text: 'In the transcoding pipeline, fixed once at upload time', correct: false, explanation: 'Transcoding only produces the ladder of renditions ahead of time; it does not decide which one any given viewer watches at any given moment.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements correctly describe why CDN caching works so well for video segments specifically? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Video segments are effectively immutable once transcoded, so they can be cached with very long TTLs', correct: true, explanation: 'A given rendition\'s segment never changes after transcoding, making it ideal for long-lived, content-addressed caching.' },
+        { id: 'b', text: 'Video popularity is long-tail, so a small number of unique segments account for most requests', correct: true, explanation: 'Because a relatively small set of popular videos drive most views, caching those segments converts huge view counts into a small number of origin fetches.' },
+        { id: 'c', text: 'Every viewer requests a slightly different byte range, so caching would not help without per-viewer keys', correct: false, explanation: 'The opposite is true — segments are small, fixed, whole units, so many different viewers requesting the same segment all get the exact same cached bytes.' },
+        { id: 'd', text: 'Manifests and segments should be cached with identical TTLs since they are both static files', correct: false, explanation: 'Manifests can change (new renditions, takedowns) and typically use shorter TTLs, while segments are immutable and can use much longer TTLs — treating them identically ignores this distinction.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'If a video suddenly spikes from 50 views/sec to 20,000 views/sec, a well-designed CDN setup means origin load for that video\'s segments grows roughly proportional to the number of unique segments, not the number of total views.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — once each segment is cached at an edge PoP after its first miss, additional viewers in that region are cache hits, so origin load tracks unique segments requested per region, not total view count.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Incorrect — this is exactly the mechanism that makes CDNs effective for spikes: origin sees roughly one fetch per segment per region, regardless of how many viewers subsequently hit that cached segment.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A private/unlisted video needs to stay behind access control while still benefiting from CDN edge caching. What is the standard way to reconcile these two requirements?',
+      options: [
+        { id: 'a', text: 'Disable CDN caching entirely for private videos and always serve them from origin', correct: false, explanation: 'This works but throws away all CDN benefits (latency, origin load) for every private video, which does not scale and is not how large platforms handle it.' },
+        { id: 'b', text: 'Use signed URLs or signed cookies with time-limited signatures that the CDN edge validates, while still caching the underlying segment bytes', correct: true, explanation: 'This is the standard pattern: authorization is checked once and encoded into a short-lived signature the edge can validate locally, so the CDN can still cache and serve segments quickly without a per-request origin round-trip.' },
+        { id: 'c', text: 'Route every private video request through the origin for a fresh permission check on every single segment', correct: false, explanation: 'This defeats the purpose of edge caching for that traffic and reintroduces per-request origin load and latency that CDNs exist to avoid.' },
+        { id: 'd', text: 'Store private videos in a completely separate, uncached CDN tier that all private videos share regardless of popularity', correct: false, explanation: 'Access control and cacheability are orthogonal concerns; signed URLs let private content stay cacheable at the edge without a separate uncached tier.' },
+      ],
+    },
+  ]}
+/>

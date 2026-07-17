@@ -1,0 +1,144 @@
+---
+title: "Media and End-to-End Encryption"
+module: "Design WhatsApp"
+moduleOrder: 11
+order: 5
+track: "interview"
+summary: "Explains how a chat system moves photos, videos, and voice notes through the same delivery pipeline as text, and how end-to-end encryption keeps every message and file unreadable to the server that relays it."
+tags: ["end-to-end-encryption", "media-pipeline", "key-management", "security", "distributed-systems"]
+estMinutes: 13
+cheatsheet:
+  - "Media never rides the message-delivery path: the client uploads to object storage first and sends only a small pointer (URL, key, size, thumbnail) through the chat pipeline from earlier lessons."
+  - "End-to-end encryption means the server can route ciphertext but never holds a key that decrypts it — only the sender's and recipients' devices hold the keys."
+  - "The Signal-style pattern is a per-device Double Ratchet: an initial key exchange (X3DH-style) establishes a shared secret, then every message derives a fresh key so compromising one message's key doesn't expose past or future ones."
+  - "Groups don't share one group key end-to-end in the simple case — the sender encrypts once per recipient device (a fan-out of small ciphertexts) using each pairwise session, or a periodically-rotated sender key shared over those same pairwise sessions."
+  - "Media files are encrypted client-side with a random one-time key before upload; that key travels inside the end-to-end-encrypted message, so object storage only ever holds ciphertext blobs."
+  - "New devices and reinstalls break existing sessions by design — plan an explicit re-key/re-trust flow (safety-number changes, re-establishing sessions) rather than treating it as an edge case."
+  - "The server can still do delivery, presence, and group fan-out (topics from earlier lessons) without reading content — encryption changes what travels over the wire, not who routes it."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every lesson so far in this module has treated a "message" as an opaque payload the server accepts, orders, and delivers. Two things break that abstraction in a real chat product. First, users send photos, videos, and voice notes, which are too large to push through a low-latency delivery pipeline built for short text frames. Second, and more consequentially for the design, WhatsApp's actual promise to users is that not even WhatsApp can read your messages — which means the server that does all that clever routing, fan-out, and ordering from the last two lessons must do it without ever seeing plaintext.
+
+Both problems show up together in interviews because they interact: media has to be encrypted too, and the key for a photo has to travel through the same end-to-end-encrypted channel as the text around it. This lesson covers how media flows through the system without touching the message pipeline directly, then builds up end-to-end encryption from key exchange to per-message keys to the harder case of group chats.
+
+## Media: a pointer travels through chat, not the file itself
+
+The message delivery system from lesson 3 is tuned for small, frequent, ordered payloads — it is the wrong tool for a 40MB video. Sending media reuses the same idea as any media-heavy system: separate the control-plane message from the actual bytes.
+
+1. The sender's client encrypts the file locally (details below), then uploads the ciphertext blob directly to object storage via a short-lived upload URL — the chat backend is never in the data path for the file itself.
+2. Once the upload completes, the client sends a normal chat message whose payload is small: a storage reference, file size, MIME type, a blurred/low-res thumbnail for the chat list preview, and the file's decryption key (itself encrypted for each recipient — see below).
+3. That small message flows through the exact ordering, fan-out, and delivery machinery covered in lessons 3 and 4 — recipients see "photo received" appear in the thread at the same reliability and ordering guarantees as any text message.
+4. Each recipient's client fetches the ciphertext blob from object storage over a plain CDN/HTTP path (this part doesn't need to be low-latency or ordered) and decrypts it locally using the key that arrived in step 2.
+
+This keeps the real-time pipeline real-time — a 2KB pointer message costs the same to route as a text message — while the actual bytes move over infrastructure built for bulk transfer, not chat.
+
+<Callout type="note">
+  Voice notes and video messages follow the identical shape. The only difference from a plain photo is that the client may transcode or downsample before encrypting, to keep the upload small on a poor connection — that happens before step 1, not as a server-side step, since the server never sees plaintext to transcode in the first place.
+</Callout>
+
+## End-to-end encryption: what problem it actually solves
+
+Transport encryption (TLS between client and server) protects data in transit from network eavesdroppers, but the server itself still sees plaintext — it has to, to terminate TLS and process the message. End-to-end encryption (E2EE) moves the trust boundary further: only the sender's device and the recipient's device(s) ever hold a key that can decrypt the content. The server sees ciphertext at every hop, including while it's queued for an offline recipient.
+
+That constraint changes what the server is allowed to do. It can still read metadata it needs to route (sender ID, recipient ID, timestamps, which queue to enqueue onto — all the mechanics from lessons 3 and 4), but the message body itself is opaque bytes to it. A subpoena, a database breach, or a rogue employee looking at the message table sees ciphertext, not conversations.
+
+### Key exchange: establishing a shared secret without meeting
+
+Two devices that have never communicated need to agree on a shared secret over a channel the server itself might be observing. The standard approach (the pattern popularized by the Signal Protocol, which WhatsApp's E2EE is built on) is an asynchronous handshake sometimes called X3DH ("Extended Triple Diffie-Hellman"):
+
+- Each device generates a long-term identity key pair once, plus a batch of disposable "one-time prekeys," and uploads only the *public* halves to the server.
+- To message someone for the first time, the sender fetches one of the recipient's public prekeys from the server and combines it with its own keys through a few Diffie-Hellman operations to derive a shared secret — without either device needing to be online at the same moment.
+- Because this only requires the recipient's *public* prekeys (harmless to store server-side), the handshake works even if the recipient is offline when the first message is sent, which matters for a chat app where recipients are frequently offline.
+
+### The Double Ratchet: a fresh key per message
+
+A single shared secret from the handshake above is a bad idea to reuse for every message — if that one key ever leaks, every past and future message under it is exposed. The Double Ratchet algorithm (also from the Signal Protocol lineage) fixes this by deriving a new key for every single message sent in a session, from a continuously advancing chain seeded by the initial shared secret.
+
+The practical property this buys: **forward secrecy** (a leaked key doesn't expose past messages, since past keys are already discarded) and a form of **post-compromise security** (the ratchet keeps advancing with fresh randomness, so the session heals going forward too). This is the mechanism that lets a company say "we could not decrypt your messages even if compelled to" and mean it structurally, not just as a policy promise.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant A as Alice's device
+    participant S as Server
+    participant B as Bob's device
+    A->>S: Fetch Bob's public prekey bundle
+    S-->>A: Public prekeys (Bob may be offline)
+    A->>A: Derive shared secret (X3DH)
+    A->>A: Ratchet: derive per-message key, encrypt
+    A->>S: Ciphertext (server cannot decrypt)
+    S->>B: Deliver ciphertext (queued if offline)
+    B->>B: Derive same per-message key, decrypt
+    Note over A,B: Next message uses a freshly ratcheted key
+`} />
+
+## Groups: no single shared key end-to-end
+
+Group chats break the tidy one-sender-one-recipient picture. A naive design gives the whole group one shared symmetric key — simple, but that key has to reach every member somehow, and revoking one member's access means rotating the key for everyone else, every time membership changes.
+
+Two patterns handle this in practice:
+
+- **Pairwise fan-out.** The sender re-encrypts the message once per recipient device, using the existing one-to-one Double Ratchet session it already has with each member. A 50-person group means 50 (or more, counting multi-device) small ciphertexts sent instead of one, which is more bandwidth but requires no new key-management primitive — it reuses everything from the direct-message case.
+- **Sender keys.** The sender generates a single symmetric "sender key" for the group, distributes it to each member once over their existing pairwise encrypted sessions, then encrypts subsequent group messages with that one key directly — cheaper per message than full pairwise fan-out, at the cost of rotating the sender key whenever membership changes (a member leaves, in particular, since they'd otherwise still hold a valid key).
+
+Either way, the group management concerns from lesson 4 (membership, admin changes, fan-out delivery) stay exactly as designed — what changes is that "sending a group message" now means "producing N encrypted copies or one sender-key-encrypted copy," not a change to how the server routes and stores them.
+
+## Worked example: sizing the key-exchange load
+
+Say the platform has 500 million daily active users, and on a typical day 2% of active users start a brand-new conversation with someone they've never messaged before (a fresh 1:1 chat, triggering a full X3DH handshake instead of reusing an existing ratchet session). That's 10 million handshakes/day, each requiring one prekey-bundle fetch from the server — roughly 115 requests/second on average, small compared to message-send QPS, but each user's device also needs to keep uploading fresh one-time prekeys as its stock gets consumed by others fetching them. If each device holds a batch of 100 prekeys and gets its bundle fetched roughly once a day, that's a lightweight, low-priority background replenishment job per active device — worth explicitly calling out in an interview as a small but real piece of infrastructure (a "prekey bank" service), distinct from the hot message-send path.
+
+<Callout type="warning">
+  A common design mistake: assuming "end-to-end encrypted" means the server can be designed exactly like an unencrypted system with an encryption layer bolted on top. It can't — group membership changes now require key rotation logic, multi-device support means encrypting once per device (not once per user), and any server-side feature that reads message content for convenience (spam scoring on text, generating link previews from message text, full-text search across message history) either has to move to the client or simply can't exist without breaking the E2EE guarantee. Decide up front which "smart" server features you're giving up in exchange for the privacy property — don't discover the conflict after the delivery pipeline is built.
+</Callout>
+
+<Quiz
+  lessonId="whatsapp-media-and-end-to-end-encryption"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does a photo sent in a chat travel as a small pointer message through the delivery pipeline, rather than as the file itself?',
+      options: [
+        { id: 'a', text: 'Because the message delivery pipeline is tuned for small, frequent, ordered payloads, and large files belong on bulk-transfer infrastructure instead', correct: true, explanation: 'Separating the control-plane message (a pointer) from the bulk data (the file, fetched separately from object storage) keeps the real-time pipeline fast for everyone regardless of file sizes elsewhere in the system.' },
+        { id: 'b', text: 'Because object storage cannot be reached from mobile clients directly', correct: false, explanation: 'Clients upload directly to object storage via a short-lived URL; the chat backend is deliberately kept out of that data path, not the other way around.' },
+        { id: 'c', text: 'Because end-to-end encryption only works on payloads smaller than a few kilobytes', correct: false, explanation: 'Encryption itself has no such size limit; the size constraint here is about the delivery pipeline\'s latency/throughput design, not the cipher.' },
+        { id: 'd', text: 'Because group chats do not support media messages', correct: false, explanation: 'Group chats support media the same way 1:1 chats do; this is unrelated to why the file itself bypasses the message pipeline.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these does end-to-end encryption specifically buy you, beyond what plain TLS between client and server already provides? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The server itself cannot read message plaintext, even while routing or storing it', correct: true, explanation: 'TLS only protects data in transit from network observers; the server still terminates TLS and sees plaintext. E2EE keeps the server from ever holding a decrypting key at all.' },
+        { id: 'b', text: 'Forward secrecy, where a leaked key does not expose previously sent messages', correct: true, explanation: 'The Double Ratchet derives a fresh key per message and discards old ones, so a single compromised key does not unlock the whole message history.' },
+        { id: 'c', text: 'Guaranteed message ordering across a group chat', correct: false, explanation: 'Ordering is handled by the delivery/sequencing mechanisms covered in the message-delivery lesson; encryption is orthogonal to ordering.' },
+        { id: 'd', text: 'Protection against network eavesdroppers between client and server', correct: false, explanation: 'That protection is what TLS already provides; it is not the differentiator E2EE adds on top.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In the sender-key approach to group encryption, the group\'s symmetric key must be rotated whenever a member leaves the group.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'A departed member otherwise still holds a valid sender key and could keep decrypting future group messages, so rotation on membership change is required to maintain the security guarantee.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Without rotation, a removed member retains a working decryption key for all subsequent group messages, defeating the point of removing them.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why can a device establish an encrypted session with a recipient who is currently offline, using the X3DH-style handshake?',
+      options: [
+        { id: 'a', text: 'Because the handshake only requires the recipient\'s pre-uploaded public prekeys, not a live round-trip with the recipient\'s device', correct: true, explanation: 'The recipient publishes public prekeys ahead of time; the sender fetches and combines them with its own keys to derive a shared secret without the recipient needing to be online at that moment.' },
+        { id: 'b', text: 'Because the server temporarily holds the recipient\'s private key on their behalf', correct: false, explanation: 'The server only ever stores public prekeys; holding a private key server-side would defeat end-to-end encryption entirely.' },
+        { id: 'c', text: 'Because messages sent to offline users are held as plaintext until the recipient reconnects', correct: false, explanation: 'Messages are encrypted before leaving the sender and stay ciphertext while queued; the server never needs plaintext to hold a message for later delivery.' },
+        { id: 'd', text: 'Because offline recipients automatically fall back to unencrypted delivery', correct: false, explanation: 'There is no such fallback — encryption applies regardless of the recipient\'s online status, which is exactly what the asynchronous handshake is designed to support.' },
+      ],
+    },
+  ]}
+/>

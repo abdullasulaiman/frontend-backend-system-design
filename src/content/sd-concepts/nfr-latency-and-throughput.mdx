@@ -1,0 +1,157 @@
+---
+title: "Latency and Throughput"
+module: "Non-Functional Characteristics"
+moduleOrder: 4
+order: 7
+track: "concept"
+summary: "Explains latency and throughput as distinct, sometimes conflicting performance metrics, and how percentiles, queueing, and concurrency shape both."
+tags: ["latency", "throughput", "performance", "queueing", "percentiles"]
+estMinutes: 12
+cheatsheet:
+  - "Latency is how long one request takes; throughput is how many requests complete per unit time. Optimizing one can hurt the other (batching raises throughput but adds queueing latency)."
+  - "Never quote a single latency number without a percentile. p50 tells you the typical case; p99 and p999 tell you what your unluckiest users experience."
+  - "Averages hide tail latency. A system with a 20ms average and a 4-second p99 will still generate a steady stream of angry users and timeout retries."
+  - "Little's Law: average concurrent requests in a system equals arrival rate times average latency. Rising concurrency at fixed arrival rate is a symptom of rising latency, not free capacity."
+  - "Throughput has a ceiling set by your slowest serial resource (a lock, a single DB connection pool, a single-threaded step) — parallelizing everything else won't move that ceiling."
+  - "Queueing delay grows nonlinearly as utilization approaches 100%; keep hot paths well under saturation (a common target is 70-80% utilization) if p99 latency matters."
+  - "Retries and timeouts convert latency problems into throughput problems: a slow dependency held under load multiplies effective request volume until the whole tier tips over."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Make it fast" is the vaguest requirement in system design, and it's also one interviewers probe the hardest, because "fast" actually means two different things that often pull in opposite directions. Latency is how long a single request takes to complete. Throughput is how many requests the system can complete per second. A batch job that groups a thousand writes into one disk flush every 50ms has fantastic throughput and terrible latency for any individual write that got queued behind the batch. A system that processes each request the instant it arrives has great latency and can fall over the moment concurrent load exceeds what one request-at-a-time processing can sustain.
+
+Every architecture decision in this course — caching, sharding, async processing, load balancing — is ultimately a lever on one or both of these numbers, usually trading one for the other. Getting this lesson right means you can say, precisely, what you're optimizing for and why, instead of reaching for "add a cache" as a reflexive answer to every performance question.
+
+## Latency: how long one thing takes
+
+Latency is the time between a request being issued and its response being received. It's a per-request measurement, and in any real system, it's not a single number — it's a distribution. Different requests hit different code paths, different requests hit warm vs. cold caches, and different requests land on a server that's briefly overloaded by a garbage collection pause or a noisy neighbor.
+
+That's why latency is reported as **percentiles**, not averages:
+
+- **p50 (median)** — half of requests are faster than this. Represents the typical experience.
+- **p95 / p99** — 95% or 99% of requests are faster than this. Represents the experience of your unluckiest users.
+- **p999** — one in a thousand requests is slower than this. At scale, "one in a thousand" can be thousands of real users per day.
+
+An average blends the fast, cache-hit requests with the slow, cache-miss-plus-retry requests into one meaningless number. A service that's mostly 10ms but occasionally 5 seconds might average out to a comfortable-looking 30ms — while a meaningful fraction of users sit through a 5-second stall. Interviewers who ask "what's your latency target?" are really asking whether you know to answer with a percentile, e.g. "p99 under 200ms," not a single average.
+
+### Where latency comes from
+
+Latency in a distributed request is the sum of several components, and naming them precisely is useful in an interview:
+
+- **Network transit** — physical distance and hops. Cross-region calls (say, US to EU) add tens to over a hundred milliseconds you cannot optimize away with better code.
+- **Queueing delay** — time spent waiting for a free thread, connection, or CPU core before work even starts. This is the component that grows explosively under load (more below).
+- **Processing time** — actual CPU/IO work: query execution, serialization, business logic.
+- **Serialization / transport overhead** — encoding a response, TLS handshake costs, HTTP overhead.
+
+A useful mental habit: when a request is "slow," ask which of these four buckets it's slow in. "Slow because of queueing" (add capacity or shed load) has a completely different fix than "slow because of network transit" (move data closer to the user, e.g. a CDN or regional deployment).
+
+## Throughput: how much work gets done
+
+Throughput is a rate — requests per second, transactions per second, messages per second, bytes per second. It answers "how much capacity does this system have," independent of any single request's latency.
+
+Throughput is bounded by whichever resource saturates first: CPU, disk IOPS, network bandwidth, a database connection pool, or — very commonly in interviews — a single serialized resource like a lock or a single-writer log. You can add ten more application servers behind a load balancer, but if they all funnel writes through one Postgres primary, your throughput ceiling is still that one primary's write capacity. Finding "the thing that doesn't scale horizontally" in a proposed design is one of the most common threads interviewers pull on.
+
+### Little's Law: the link between the two
+
+Latency and throughput aren't independent — they're connected by a simple, useful relationship called Little's Law:
+
+```
+L = λ × W
+```
+
+Where `L` is the average number of requests concurrently "in flight" in the system, `λ` (lambda) is the arrival rate (requests/sec), and `W` is the average time each request spends in the system (latency).
+
+The practical reading: if your arrival rate is steady but you notice the number of in-flight/concurrent requests climbing, that's not "free extra capacity being used" — it's a direct signal that average latency `W` is rising. This is exactly what happens right before an outage: request volume looks unchanged on the dashboard, but requests are queueing longer, so more of them are simultaneously in flight, consuming more memory and connections, until the system runs out of one of those resources and falls over.
+
+## The tension: why you can't just optimize both
+
+Techniques that raise throughput often do so by adding latency, and vice versa:
+
+- **Batching** (grouping writes, coalescing network calls) raises throughput per unit of overhead but makes every batched item wait for the batch to fill or its timer to fire.
+- **Increasing concurrency limits** raises throughput up to a point, then queueing delay dominates and both metrics get worse together — this is the saturation zone described below.
+- **Adding a cache** improves both, which is why it's the most common lever reached for — but only for requests that hit the cache; cache misses can be *slower* than the uncached path due to the added lookup.
+- **Synchronous fan-out** (calling five downstream services and waiting for all of them) can maximize each individual response's completeness at the cost of tail latency: your p99 is now bounded by the slowest of five calls, not the average of one.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Client request] --> B{Queue}
+  B -->|server free| C[Process]
+  B -->|servers busy| D[Wait in queue]
+  D --> C
+  C --> E[Response]
+  D -. "queueing delay grows\nnonlinearly near saturation" .-> B
+`} />
+
+### Utilization and the queueing cliff
+
+As a server's utilization (the fraction of time it's busy) climbs toward 100%, queueing delay doesn't grow linearly — it grows sharply, approaching infinity as utilization approaches 100%. A server at 50% utilization might add 2ms of queueing delay; the same server at 90% utilization might add 20ms; at 98%, it might add 200ms, purely from requests waiting their turn, with processing time unchanged. This is why capacity planning targets headroom (commonly 70-80% sustained utilization) rather than running hot — the last 20% of utilization is where p99 latency quietly explodes even though throughput looks fine on average.
+
+## A worked estimation
+
+Say you're designing a payment-authorization service. Requirements: p99 latency under 300ms, and you need to support 2,000 requests/sec at peak.
+
+Each request currently measures at:
+- 40ms network round trip (client to your region's edge and back)
+- 15ms average processing time (fraud check + ledger write)
+- A connection pool of 50 workers per instance
+
+Using a simplified queueing estimate, at 50 workers each taking ~15ms of processing time, one instance can complete roughly `50 / 0.015s ≈ 3,300` requests/sec if request arrivals were perfectly smooth — but real traffic is bursty, not smooth, so that's the theoretical ceiling, not a safe operating point. Planning for 70% utilization of that ceiling gives you a safe sustained throughput of about 2,300 requests/sec per instance — enough headroom for the 2,000 requests/sec target plus a burst margin, without pushing into the steep part of the queueing curve.
+
+The 40ms network round trip is fixed cost you can't process away — it puts a floor under your best-case latency. Your remaining 260ms budget (300ms target minus 40ms network) has to cover queueing delay plus processing time plus any retries. If you added a synchronous call to a third-party fraud API with its own 100ms p99, your effective p99 for the whole authorization becomes at minimum 40 + 100 + 15 = 155ms in the best case, and the fraud API's own tail latency (not just its average) now directly eats into your 300ms budget.
+
+<Callout type="warning">
+  A common mistake is designing and load-testing against average latency, then being surprised when production p99 blows past the SLA. Averages are dominated by the common, cache-hit, uncontended path; percentiles expose the queueing, retry, and cold-path behavior that only shows up under real, bursty traffic. Always state and test against a percentile target (e.g. "p99 under 300ms at 2,000 req/sec"), and load-test with realistic burstiness, not a smooth, steady request rate — a steady synthetic load test can hide the exact queueing cliff described above.
+</Callout>
+
+## Where this connects
+
+This lesson sits alongside [Scalability](/system-design/nfr-scalability) (throughput ceilings are exactly what scaling out or up addresses) and [Availability](/system-design/nfr-availability) (a system that's technically "up" but blown through its latency SLA is functionally unavailable to its users). When you design a system in an interview, state your latency target as a percentile and your throughput target as a rate up front — it forces you to justify every caching, batching, and fan-out decision against numbers instead of vibes.
+
+<Quiz
+  lessonId="nfr-latency-and-throughput"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A service reports an average latency of 25ms. Why might this number be misleading on its own?',
+      options: [
+        { id: 'a', text: 'It hides the tail of the distribution — a small fraction of slow requests can be masked by a majority of fast ones', correct: true, explanation: 'Averages blend fast cache-hit requests with slow cache-miss or retried requests; a system can average 25ms while its p99 is seconds long.' },
+        { id: 'b', text: 'Averages always underestimate the true throughput of the system', correct: false, explanation: 'Latency and throughput are different metrics; an average latency number says nothing about requests-per-second capacity.' },
+        { id: 'c', text: 'It is only a problem if the sample size is small', correct: false, explanation: 'The masking effect gets worse, not better, with more requests — a large sample size does not fix the fact that averages ignore the shape of the distribution.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of the following would you expect to increase throughput at the cost of higher per-request latency? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Batching multiple writes together before flushing to disk', correct: true, explanation: 'Batching amortizes fixed overhead across many items, raising throughput, but each item now waits for the batch to fill or its timer to fire.' },
+        { id: 'b', text: 'Coalescing several small network calls into one larger call on a timer', correct: true, explanation: 'This trades immediate per-call latency for fewer, more efficient calls overall, raising aggregate throughput at the cost of the delay added by the timer.' },
+        { id: 'c', text: 'Adding a well-hit cache in front of a slow database', correct: false, explanation: 'A cache typically improves both metrics for cache hits — lower latency and higher throughput — rather than trading one for the other.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'According to Little\'s Law, if the request arrival rate stays constant but the number of concurrent in-flight requests keeps climbing, that indicates rising average latency, not extra free capacity being used.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Little\'s Law states concurrency equals arrival rate times latency (L = λ × W). With λ fixed, a rising L can only mean W (latency) is rising — a classic early warning sign before an overload-driven outage.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This misreads Little\'s Law. With arrival rate held fixed, increasing concurrency directly implies increasing average latency, not extra idle capacity being absorbed.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A single instance can theoretically handle 3,300 requests/sec at 100% utilization. Why is it unsafe to plan capacity right up to that ceiling?',
+      options: [
+        { id: 'a', text: 'Queueing delay grows sharply as utilization approaches 100%, so p99 latency degrades badly well before the theoretical throughput ceiling is reached', correct: true, explanation: 'Queueing theory shows delay rises nonlinearly near saturation; real bursty traffic will push p99 far past acceptable levels long before hitting the raw throughput ceiling.' },
+        { id: 'b', text: 'The theoretical ceiling is always wrong regardless of load pattern', correct: false, explanation: 'The ceiling calculation itself can be a reasonable estimate; the issue is that operating close to it exposes you to a sharp latency penalty under real, non-smooth traffic.' },
+        { id: 'c', text: 'Instances are not allowed to run above 50% utilization by cloud providers', correct: false, explanation: 'This is not a platform-imposed rule; the 70-80% guidance is a capacity-planning heuristic to stay off the steep part of the queueing curve, not an external constraint.' },
+      ],
+    },
+  ]}
+/>

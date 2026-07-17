@@ -1,0 +1,135 @@
+---
+title: "Pub-Sub Requirements and Model"
+module: "Pub-Sub"
+moduleOrder: 18
+order: 1
+track: "concept"
+summary: "Defines the topic/publisher/subscriber model that underlies every pub-sub system and the requirements you must pin down before designing one."
+tags: ["pub-sub", "requirements", "distributed-systems", "messaging", "fan-out"]
+estMinutes: 11
+cheatsheet:
+  - "A pub-sub system's core entities are topic, publisher, subscription, and subscriber — a subscription (not the subscriber process) is what owns a read position, which is why one subscriber code path can have many independent subscriptions."
+  - "The defining trait vs. a plain work queue: every subscription gets its own full copy of every message, so N subscribers means N independent read cursors over the same log, not N consumers racing for one message."
+  - "Push delivery minimizes latency but needs backpressure and retry/dead-letter handling on the broker side; pull delivery puts the consumer in control of its own pace at the cost of poll latency."
+  - "State the delivery guarantee explicitly — almost all real pub-sub systems are at-least-once, which means subscribers must tolerate and de-duplicate redelivered messages."
+  - "Ordering is only guaranteed within a partition (or within one topic if unpartitioned) — across partitions there is no ordering guarantee unless you pay for a single-writer bottleneck."
+  - "Fan-out multiplies read load: one publish can turn into dozens of deliveries, so throughput math must account for (publish rate) times (number of subscriptions), not just publish rate alone."
+  - "Decide topic granularity (one broad topic with filters vs. many narrow topics) up front — it drives both subscriber complexity and how easily new consumers can be added later without touching publishers."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A ride-hailing app's driver sends a location update every few seconds. That single update needs to reach a live map for riders, an ETA-recalculation service, a fraud-detection job watching for GPS spoofing, and a data warehouse loader — four completely different systems, built by four different teams, each of which should be able to start or stop consuming without the driver's phone or the location-ingest service knowing or caring. That's the problem pub-sub exists to solve: one event, an unknown and changing number of independent interested parties, none of them coupled to each other or to the producer.
+
+This sits right next to the messaging queue module you may have just covered, and interviewers sometimes blur the two, so it's worth being precise from the start. A queue's job is to hand each message to *one* worker out of a pool, so the work gets done exactly once. Pub-sub's job is to hand each message to *every* subscriber that asked for it, so N independent consumers each see the full stream. Same underlying machinery (brokers, partitions, offsets, replication) often powers both — Kafka, for instance, can be used either way — but the requirement you're solving for is different, and it changes how you reason about scale, ordering, and correctness. This lesson builds the vocabulary and requirements checklist; the next lesson in this module, Architecture and Fan-Out, takes those requirements and builds the actual broker design.
+
+## The core entities
+
+Four names cover almost every pub-sub system you'll see in an interview or in production:
+
+- **Topic** — a named, durable stream of messages about one subject (`driver-locations`, `order-events`, `sensor-readings`). Publishers write to a topic without knowing who, if anyone, is reading it.
+- **Publisher** — anything that produces a message and sends it to a topic. Publishers don't address individual subscribers; they address the topic and move on.
+- **Subscription** — a named binding between a subscriber and a topic that tracks its own read position (an offset, a cursor, a "last delivered" pointer). This is the entity people most often skip in a system-design answer, and it's the one that actually matters: the subscription, not the subscriber process, owns "how far have I read."
+- **Subscriber** — the consumer process attached to a subscription, pulling or receiving messages and acknowledging them.
+
+The reason the subscription is its own entity: it's what makes fan-out work without producers or other subscribers ever knowing about it. Add a new subscription tomorrow — say, a new analytics team wants driver locations too — and it starts reading from wherever it attaches (usually "now," sometimes "from retained history"), with its own independent offset, touching nothing else in the system.
+
+## Push vs. pull delivery
+
+Once a subscription exists, how does a message actually reach the subscriber?
+
+- **Push** — the broker calls the subscriber (an HTTP webhook, a gRPC stream) as soon as a message arrives. Lowest latency, but the broker now has to handle a slow or downed subscriber, retries, and backoff — the complexity moves to the sender.
+- **Pull** — the subscriber polls the broker for the next batch of messages at its own pace. The subscriber controls its own load and can batch efficiently, but there's inherent poll latency and wasted empty polls if traffic is sparse.
+
+Most large-scale systems (Kafka, Kinesis, Google Cloud Pub/Sub's pull mode) default to pull for exactly this reason: it puts backpressure control where the consumer's own capacity is best understood. Push variants (SNS-to-webhook, Cloud Pub/Sub's push mode) trade that control away for lower latency and simpler consumer code — good for "notify a webhook when this happens," worse for "a consumer group that needs to process a firehose without falling over."
+
+## Functional requirements to pin down
+
+- **Topic model** — one broad topic per subject with subscriber-side filtering (all sensor readings on one topic, subscribers filter by device type), or many narrow topics (one topic per device type)? Broad topics are easier for publishers and simpler to add filters to later; narrow topics push filtering cost onto the publisher but keep each subscriber's read volume lean.
+- **Message shape** — a payload plus attributes/headers (event type, key, timestamp) used for routing and filtering, distinct from the raw body. State whether attributes are required for the interview's use case (e.g., a `driverId` used as the partition key).
+- **Fan-out cardinality** — how many subscriptions does a typical topic have, and does that number change at runtime? A topic with 3 fixed subscribers behaves very differently from one where any team can attach a new subscription without warning.
+- **Retention and replay** — can a brand-new subscription read history, or only messages published after it was created? "New consumers can replay the last 7 days" is a very different storage requirement than "new consumers only see new messages."
+
+## Non-functional requirements
+
+**Delivery guarantee.** State it explicitly, the same as you would for a queue: at-most-once, at-least-once, or exactly-once-in-effect. Nearly every real pub-sub system is at-least-once — a broker that isn't sure whether a subscriber's ack was received will redeliver rather than risk silently dropping a message. That single fact drives a hard requirement on subscribers: they must be idempotent or dedup on a message ID, because "processed twice" will happen.
+
+**Ordering.** Ordering is a per-partition (or per-unpartitioned-topic) property, never a global one, for the same reason it isn't free in a queue: a single global order requires a single writer, which caps throughput. If the interview's use case needs "all events for one entity in order" (all of one driver's location pings, in order), route by that entity's ID to one partition and only promise order within it.
+
+**Latency.** Pub-sub systems are frequently latency-sensitive in a way batch-oriented queues aren't — a live map showing a driver's location a full second late is a worse product than one that's occasionally out of order. State an end-to-end delivery latency target (e.g., "under 200ms from publish to delivery, p99") as its own requirement, separate from throughput.
+
+**Scalability and isolation.** How many topics, how many subscriptions per topic, and does one noisy topic or slow subscriber affect others sharing the same broker cluster? Multi-tenant isolation (per-topic quotas, per-subscription backpressure) is worth naming as a requirement if the system serves many independent teams.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  P1[Driver app] -->|publish| T[Topic: driver-locations]
+  P2[Dispatch service] -->|publish| T
+  T --> S1[Subscription: live-map]
+  T --> S2[Subscription: eta-service]
+  T --> S3[Subscription: fraud-check]
+  S1 --> C1[Rider map consumer]
+  S2 --> C2[ETA consumer]
+  S3 --> C3[Fraud-detection consumer]
+`} />
+
+## Worked example: sizing the driver-location fan-out
+
+Take the ride-hailing example from the intro and put real numbers on it. Say the platform has 500,000 active drivers, each publishing a location update every 4 seconds — that's 125,000 publishes/sec at peak. Three subscriptions read the topic: the live-map service, the ETA service, and fraud detection. A fourth, a warehouse loader, gets added next quarter with no changes to any publisher.
+
+Publish-side load is straightforward: 125,000 messages/sec, each maybe 200 bytes (driver ID, lat/lng, timestamp) — 25 MB/sec of raw ingest. The number that actually sizes the broker cluster's read path is fan-out: with 3 live subscriptions each reading every message, total delivery volume is 3 x 125,000 = 375,000 deliveries/sec, not 125,000. Add the warehouse loader later and it's 500,000/sec, again with zero publisher-side change — which is exactly the property pub-sub is bought for. Ordering only needs to hold per driver, so partitioning by `driverId` across, say, 200 partitions keeps each partition's throughput manageable (~625 messages/sec/partition) while giving every driver's stream of updates a consistent order. Delivery guarantee: at-least-once is fine, since a duplicate or slightly-late location ping is a rendering glitch, not a business-correctness failure — a much easier bar than the "can't lose an acknowledged charge" requirement you'd write down for a payments queue.
+
+<Callout type="warning">
+  A common mistake is sizing a pub-sub system using only the publish rate and forgetting that fan-out multiplies read load by the number of subscriptions — and that subscription count often isn't fixed. If an interviewer says "and we'll probably add a couple more consumer teams later," that's a hint your capacity plan needs headroom on the *delivery* side, not just the *ingest* side, and that adding a subscription should be a config change, not a re-architecture.
+</Callout>
+
+## Where this leads
+
+Nail these down in order — core entities (topic, publisher, subscription, subscriber), delivery model (push vs. pull), delivery guarantee, ordering scope, retention, and fan-out-adjusted throughput — and you have exactly the inputs the next lesson needs to design the broker, partitioning, and fan-out mechanics themselves. Skip this step and you'll end up debating implementation details (how many partitions? webhook or long-poll?) without ever having said what the system is actually required to guarantee.
+
+<Quiz
+  lessonId="pubsub-pub-sub-requirements-and-model"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the key functional difference between a pub-sub topic and a plain work queue?',
+      options: [
+        { id: 'a', text: 'A topic can only have one publisher, while a queue can have many', correct: false, explanation: 'Cardinality of publishers is not the distinguishing property — both models commonly support many publishers.' },
+        { id: 'b', text: 'Each independent subscription on a topic receives its own full copy of every message, whereas a queue hands each message to only one worker', correct: true, explanation: 'Correct. Pub-sub broadcasts to every subscription; a queue distributes each message to exactly one consumer out of a pool, so the work happens once.' },
+        { id: 'c', text: 'Topics guarantee exactly-once delivery, while queues only guarantee at-most-once', correct: false, explanation: 'Delivery guarantees are a separate, orthogonal design choice — neither model inherently implies a specific guarantee.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are true reasons a "subscription" is modeled as its own entity, separate from the subscriber process? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It lets a new consumer attach to a topic and start reading independently, without changing anything about existing publishers or subscribers', correct: true, explanation: 'Because the subscription owns its own read position, adding one is isolated from every other part of the system.' },
+        { id: 'b', text: 'It tracks its own read position (offset/cursor), independent of every other subscription on the same topic', correct: true, explanation: 'That independent read position is exactly what allows several subscriptions to consume the same topic at different paces without interfering with each other.' },
+        { id: 'c', text: 'It guarantees the subscriber will never receive a duplicate message', correct: false, explanation: 'A subscription tracking its own offset says nothing about duplicate delivery — most pub-sub systems are at-least-once and can still redeliver on retries regardless of subscription design.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'If a topic has 3 active subscriptions, the read-side (delivery) throughput the broker must sustain is roughly 3 times the publish rate, not equal to it.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct. Fan-out means each subscription gets a full copy of every message, so total deliveries scale with (publish rate) times (number of subscriptions).' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Read-side throughput is not equal to the publish rate when there is more than one subscription — each additional subscription adds another full copy of the stream to deliver.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A system needs every location update for a given driver processed in the order it was sent, but ordering across different drivers does not matter. What does this imply?',
+      options: [
+        { id: 'a', text: 'The topic must be unpartitioned so every message passes through a single writer', correct: false, explanation: 'A single writer would preserve global order, which is stronger than required here, and would cap throughput unnecessarily.' },
+        { id: 'b', text: 'Messages should be partitioned by driverId, since ordering only needs to hold within each driver\'s stream, not across drivers', correct: true, explanation: 'Correct. Routing all of one driver\'s events to the same partition preserves per-key order while still spreading load across many partitions for throughput.' },
+        { id: 'c', text: 'Push delivery must be used instead of pull to preserve ordering', correct: false, explanation: 'Push vs. pull is a delivery-mechanism choice about how messages reach a subscriber, not about how ordering is preserved within the broker\'s storage layer.' },
+      ],
+    },
+  ]}
+/>

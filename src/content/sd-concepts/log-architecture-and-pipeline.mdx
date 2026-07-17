@@ -1,0 +1,229 @@
+---
+title: "Architecture and Pipeline"
+module: "Distributed Logging"
+moduleOrder: 22
+order: 2
+track: "concept"
+summary: "Walks through the end-to-end pipeline that turns log lines scattered across thousands of hosts into a searchable, queryable stream — from local agent through transport, buffering, processing, and storage."
+tags: ["logging", "pipeline", "kafka", "log-shipping", "observability"]
+estMinutes: 12
+cheatsheet:
+  - "Never let an application write logs synchronously to a remote service — always write to local disk (or stdout) first and let a separate agent ship them."
+  - "The pipeline is: agent (tail + parse) -> transport/buffer (queue) -> processing (parse, enrich, filter) -> storage (hot index + cold archive) -> query/alerting."
+  - "A durable buffer (Kafka or similar) between agents and processors is what absorbs traffic spikes and lets you restart/scale processors without losing logs."
+  - "Parsing and enrichment belong in the pipeline, not in the query layer — indexing structured fields once is cheaper than re-parsing raw text on every search."
+  - "Hot/cold tiering (fast index for recent data, cheap object storage for old data) is what keeps both cost and query latency reasonable at scale."
+  - "Back-pressure has to go somewhere: buffer on disk, drop low-priority logs, or slow down the app — decide explicitly, don't let it happen by accident (e.g. OOM-killing the agent)."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson established the hard constraints: massive write volume, a
+need for durability without slowing down the services being logged, and
+the reality that a single request's story is scattered across dozens of
+machines. This lesson answers the natural next question: what does a system
+that actually satisfies those constraints look like end to end?
+
+There's no single "correct" logging architecture, but almost every
+production system — whether built from an ELK stack, Loki, Splunk, or an
+in-house pipeline — follows the same shape. Once you can name the stages
+and explain what each one buys you, you can reason about any variant an
+interviewer throws at you, including "what if we swap the storage layer" or
+"what if we need real-time alerting on top of this."
+
+## The five stages of a logging pipeline
+
+Think of log data moving through five stages, each with a distinct job:
+
+1. **Generation** — the application or infrastructure component emits a log
+   line (a request handler, a kernel, a proxy).
+2. **Collection** — a local agent picks up that line without the
+   application having to know or care where logs ultimately end up.
+3. **Transport and buffering** — the collected lines move off the host and
+   through a durable queue that decouples producers from consumers.
+4. **Processing** — raw lines get parsed into structured fields, enriched
+   with metadata, and possibly filtered or sampled.
+5. **Storage and query** — processed logs land in a store optimized for
+   the access patterns engineers actually use (recent-and-fast,
+   old-and-cheap), with a query and alerting layer on top.
+
+Each stage exists because skipping it creates a specific failure mode.
+Skip local buffering and a network blip drops logs. Skip the queue and a
+processing outage backs up straight into application latency. Skip parsing
+and every query becomes a full-text scan over unstructured text at
+petabyte scale.
+
+### Generation and collection: the agent's job
+
+Applications should do the least possible work related to logging: write a
+line to stdout or a local file, and move on. All the "get this line
+somewhere useful" logic lives in a **collection agent** running alongside
+the app — think Fluentd, Filebeat, Vector, or a custom sidecar. The agent's
+responsibilities:
+
+- **Tail** log files (or read a local socket/stdout stream) as new lines
+  appear.
+- **Track offsets** so a restart resumes from where it left off instead of
+  re-sending or dropping lines.
+- **Batch and compress** lines before sending them onward — sending one
+  network call per log line is a throughput killer.
+- **Apply light, cheap filtering** at the source (e.g. drop known-noisy
+  debug lines) so you're not paying transport and storage cost for data
+  nobody will query.
+
+Keeping this logic out of the application is what makes the pipeline
+swappable — the app never needs a code change when you migrate storage
+backends.
+
+### Transport and buffering: the shock absorber
+
+This is the stage that most distinguishes a logging system that survives
+production traffic from one that doesn't. Agents push batches into a
+**durable, ordered queue** — commonly Kafka, though any append-only log
+with consumer offsets works the same way conceptually.
+
+The queue's job is to absorb the mismatch between how fast logs are
+produced and how fast they can be processed:
+
+- A deploy that suddenly triples error-log volume doesn't crash the
+  processing tier — it just makes the queue's backlog temporarily longer.
+- A processing-tier outage or slow deploy doesn't lose data — messages sit
+  in the queue until consumers catch up, bounded by the topic's retention
+  window (typically hours to a few days of headroom).
+- Multiple independent consumers can read the same stream — one path
+  builds the search index, another feeds real-time alerting, another
+  archives to cold storage — without agents needing to know about any of
+  them.
+
+This is also naturally where you shard: partition the topic by service or
+by a hash of a request/trace identifier, so a hot service doesn't create a
+bottleneck for everyone else and downstream processors can scale
+horizontally per partition.
+
+### Processing: parse once, query many times
+
+Raw log lines are just strings. A processing tier (Logstash, a stream
+processor, or custom consumers reading the queue) turns them into
+structured, indexable events:
+
+- **Parsing** — extract fields from a known format (JSON logs are cheap to
+  parse; free-text logs need regex/grok-style patterns).
+- **Enrichment** — attach metadata the app didn't include directly: which
+  host, container, region, and deploy version emitted it; resolving a
+  service name from an IP.
+- **Filtering and sampling** — drop lines that match a known noise pattern,
+  or sample high-volume, low-value log levels (e.g. keep 1% of `DEBUG`
+  lines but 100% of `ERROR` lines).
+
+Doing this once, in the pipeline, instead of on every query later is the
+single biggest lever for keeping query latency low at scale. Re-parsing
+raw text on every search is fine at gigabytes; it falls over at terabytes.
+
+### Storage and query: hot vs. cold
+
+Not all logs need the same access pattern. An engineer debugging an
+incident wants sub-second search over the last few hours; almost nobody
+needs sub-second search over data from eight months ago, but compliance or
+postmortems still need it to exist.
+
+That split drives a **tiered storage** design:
+
+- **Hot tier** — a search-optimized index (inverted index over structured
+  fields, like Elasticsearch/OpenSearch or a purpose-built log index) held
+  for a short, expensive window — commonly 3-14 days.
+- **Cold tier** — the same data, compressed, in cheap object storage
+  (S3-style), for a much longer retention window, queryable but slower
+  (batch jobs, occasional restores into a temporary hot index).
+
+A query/alerting layer sits on top of the hot tier for interactive search
+and dashboards, and can also run rules against the live stream (straight
+off the queue) for real-time alerting that doesn't wait for indexing to
+finish.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  App["App / Host\n(writes local log line)"] --> Agent["Collection Agent\n(tail, batch, offset-track)"]
+  Agent --> Queue["Durable Queue\n(Kafka-style, partitioned)"]
+  Queue --> Proc["Processing\n(parse, enrich, filter)"]
+  Proc --> Hot["Hot Index\n(recent, fast search)"]
+  Proc --> Cold["Cold Storage\n(cheap, long retention)"]
+  Queue --> Alert["Real-time Alerting\n(reads stream directly)"]
+  Hot --> Query["Query / Dashboard UI"]
+  Cold -.->|"restore on demand"| Hot
+`} />
+
+## Worked example: sizing the buffer
+
+Say you run 2,000 hosts, each emitting an average of 500 log lines/second
+at roughly 300 bytes/line. That's:
+
+- **Volume**: `2,000 x 500 = 1,000,000` lines/second across the fleet, or
+  about `1,000,000 x 300 bytes = 300 MB/s` raw.
+- **Queue retention headroom**: if you want the queue to absorb a 2-hour
+  processing outage without losing data, you need `300 MB/s x 3,600 x 2 ≈
+  2.1 TB` of retained queue storage for that one outage window — and if you
+  wanted days of retention instead of hours, that number grows into the tens
+  of terabytes fast, which is why queues are partitioned and retention is
+  usually tuned in hours, not days, with cold storage handling long-term
+  retention instead of the queue itself.
+- **Partitioning**: to keep any single partition's throughput manageable
+  (say, a target of 10 MB/s per partition), you'd want roughly `300 MB/s /
+  10 MB/s = 30` partitions minimum, likely partitioned by service name or a
+  hash of host ID so no single noisy service can dominate one partition.
+
+This is the kind of back-of-envelope math that turns "we need a queue" into
+a concrete partition count and retention setting you can defend in an
+interview.
+
+<Callout type="warning">
+  A common mistake is treating the collection agent as infinitely reliable
+  and skipping local buffering on the host. If the agent only holds logs in
+  memory and the network to the queue is down, a burst of traffic or a
+  30-second network blip means silent data loss — no error, no alert, just
+  gaps in the record right when something interesting was happening. Always
+  give the agent a local disk-backed buffer (or read directly from
+  already-persisted log files) so transport hiccups turn into delay, not
+  loss.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="log-architecture-and-pipeline"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the primary purpose of putting a durable queue (like Kafka) between the collection agents and the processing tier?',
+      options: [
+        { id: 'a', text: 'It decouples producers from consumers so a slow or failed processing tier does not cause data loss or back-pressure on the applications being logged.', correct: true, explanation: 'The queue absorbs the mismatch in rate between production and consumption, buffering during spikes or outages so upstream services are unaffected.' },
+        { id: 'b', text: 'It replaces the need for a hot search index entirely.', correct: false, explanation: 'The queue is a transport/buffer layer, not a query layer — you still need an indexed store for fast search over recent logs.' },
+        { id: 'c', text: 'It compresses log lines to reduce storage cost in the cold tier.', correct: false, explanation: 'Compression can happen at multiple stages (agent batching, cold storage), but that is not the queue\'s defining purpose.' },
+        { id: 'd', text: 'It parses raw log lines into structured fields.', correct: false, explanation: 'Parsing and enrichment happen in the processing stage, which consumes from the queue — the queue itself just stores and orders raw batches.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of the following are good reasons to use tiered (hot/cold) storage for logs rather than one uniform store? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Most searches target recent data, so keeping only a short window in an expensive, fast index controls cost.', correct: true, explanation: 'Interactive debugging overwhelmingly targets the last few hours or days; paying index cost for months of rarely-queried data is wasteful.' },
+        { id: 'b', text: 'Long-term retention (compliance, postmortems) still needs the data to exist, just not at interactive query speed.', correct: true, explanation: 'Cold, cheap object storage satisfies "must be retrievable" without paying for always-on fast indexing.' },
+        { id: 'c', text: 'It eliminates the need for a processing/enrichment stage.', correct: false, explanation: 'Tiering is a storage decision; parsing and enrichment still need to happen upstream regardless of which tier data ends up in.' },
+        { id: 'd', text: 'It guarantees exactly-once delivery of log lines.', correct: false, explanation: 'Delivery guarantees come from the transport/queue design (offsets, acknowledgements), not from how storage is tiered.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Applications should write logs directly to the remote logging service (over the network) rather than to a local file or stdout, so no separate collection agent is needed.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'This couples request latency to the availability and performance of the remote logging service, and any network issue risks either blocking the app or losing logs. Writing locally and letting an agent ship the data is the standard, safer pattern.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the standard pattern writes locally first (file or stdout), and a decoupled collection agent handles shipping, so a slow or unavailable downstream never blocks or crashes the application.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,248 @@
+---
+title: "Location Search and Scaling"
+module: "Design Google Maps"
+moduleOrder: 3
+order: 5
+track: "interview"
+summary: "Covers geospatial indexing for 'search near me' queries and the sharding, caching, and replication strategies that let the search, tile, and routing sub-systems scale independently."
+tags: ["geospatial-search", "sharding", "caching", "scalability", "geohash"]
+estMinutes: 12
+cheatsheet:
+  - "Proximity search ('coffee near me') is a different problem from text search — you need a spatial index (geohash, quadtree, or a spherical cell scheme) to find candidates near a point, then rank them by distance plus relevance."
+  - "Geohash and similar grid encodings have a boundary problem: two points meters apart can land in different cells if they straddle a cell edge, so always query the center cell plus its neighbors, not just one cell."
+  - "A quadtree beats a fixed grid for uneven density — it subdivides dense areas (cities) into many small cells and leaves sparse areas (open ocean, desert) as a few large ones, keeping candidate counts per cell roughly even."
+  - "Shard the search index by geography, not by hash of an ID — a query for 'restaurants in Chicago' should only fan out to the shards covering Chicago, not scatter-gather across every shard worldwide."
+  - "Geographic sharding creates hot shards (Manhattan vs. rural Montana); fix this by splitting hot cells further and merging cold ones, not by making every shard cover equal land area."
+  - "Cache aggressively at the query level — popular searches ('Starbucks', 'gas station') repeat constantly for nearby users, and search results can tolerate a few minutes of staleness."
+  - "Scale each sub-system (tiles, search, routing, location ingestion) independently — they have different read/write ratios and different sharding keys, so one global scaling strategy won't fit all of them."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every mapping app lives or dies on one interaction: a user types "coffee"
+or taps a pin and expects a ranked list of nearby places back in a couple
+hundred milliseconds. That interaction looks like a text search problem,
+but it isn't — it's a geospatial problem wearing a search box. Get the
+indexing wrong and a query for "pizza near me" in Manhattan either scans
+half the planet's restaurant data or misses a place two blocks away
+because it landed in the "wrong" grid cell. This lesson covers how to
+index locations for fast proximity search, and then zooms out to how the
+whole system from the earlier lessons — tiles, routing, and search —
+actually scales under real traffic.
+
+## Why proximity search needs its own index
+
+A normal text search (an inverted index mapping words to documents) tells
+you *which* documents mention "coffee." It tells you nothing about
+*distance*. You could intersect a text match with a location filter, but
+without a spatial index, checking "is this place near the user" against
+millions of rows means a full scan with a distance calculation on every
+row — computing a distance formula against millions of candidates per
+query using CPU-heavy geometry doesn't scale to tens of thousands of
+searches a second.
+
+The fix is the same one used for every "find nearby" problem: encode
+two-dimensional location into a structure that groups nearby points
+together, so a proximity query becomes a cheap lookup into a small number
+of buckets instead of a scan of everything.
+
+## Three ways to bucket the world
+
+### Fixed grid (geohash-style)
+
+Divide the world into a grid and encode each latitude/longitude pair into
+a short string or integer that identifies which cell it falls in. Points
+in the same cell share the same code; points in neighboring cells share a
+common prefix, which lets you widen or narrow your search radius just by
+truncating or extending the code you match against.
+
+The catch: cells are fixed-size rectangles, so density is ignored. A
+sparse cell in the Nevada desert and a packed cell in central Tokyo hold
+wildly different numbers of places, and cell boundaries are arbitrary —
+two coffee shops fifty meters apart can end up in different cells if a
+boundary happens to run between them. Any grid-based scheme has to query
+the center cell plus its immediate neighbors, never just one cell, or
+it'll silently miss nearby results sitting just across a boundary line.
+
+### Quadtree
+
+A quadtree fixes the density problem by subdividing recursively: start
+with one cell covering the whole area, and split a cell into four
+quadrants whenever it holds more than some threshold of points. Dense
+areas end up many levels deep with small cells; sparse areas stay
+shallow with large cells. This keeps the number of candidate points per
+leaf roughly constant regardless of where in the world you're searching,
+which is exactly what you want for a search index's shard sizing (more on
+that below).
+
+### Spherical cell hierarchies
+
+Grid schemes based on raw latitude/longitude distort badly near the
+poles, where lines of longitude converge — a "square" cell near the
+equator covers a very different real-world area than one near Greenland.
+Production mapping systems typically project the globe onto a cube or
+similar solid first, then apply a hierarchical cell scheme on each face,
+which keeps cell areas close to uniform everywhere and avoids the polar
+distortion problem entirely. The underlying idea is the same as a
+quadtree — recursive subdivision into a searchable hierarchy — just
+applied to a sphere instead of a flat plane.
+
+<Callout type="note">
+  Lesson 3 (Map Data Model and Tiling) uses similar recursive-subdivision
+  ideas for rendering tiles at different zoom levels. That's not a
+  coincidence — both problems are "index space so nearby things are cheap
+  to find" — but the tile index optimizes for rendering a fixed viewport,
+  while the search index here optimizes for ranking arbitrary points by
+  distance from a query location.
+</Callout>
+
+## Serving a "near me" query end to end
+
+A real query combines the spatial index with the text index: first
+narrow to a small set of geo cells around the user's location, then
+filter and rank within that set by text relevance, rating, and distance.
+Doing it in the other order — text-match everything named "coffee"
+globally, then filter by distance — throws away the one filter (location)
+that shrinks the candidate set the fastest.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    U[User query + location] --> G[Geo index: find nearby cells]
+    G --> C[Candidate places in those cells]
+    C --> F[Text-match filter]
+    F --> R[Rank: distance + relevance + rating]
+    R --> Ca[Query cache]
+    Ca --> Resp[Response to user]
+`} />
+
+## Scaling the search service
+
+Once places are indexed spatially, the same index shape decides how you
+shard the service:
+
+- **Shard by geography, not by a hash of place ID.** A query for
+  restaurants in Chicago should hit only the shards covering the Chicago
+  area, not scatter-gather across every shard on the planet. Geographic
+  sharding is what makes a single "near me" query cheap.
+- **Expect hot shards, and plan for them.** A cell covering Manhattan
+  might hold a hundred times more places than a same-sized cell covering
+  rural Montana. Use the quadtree/hierarchical approach so hot regions
+  get split into many small, independently-scaled shards while cold
+  regions stay as a handful of large ones — don't force every shard to
+  cover equal land area.
+- **Cache at the query level.** Searches for common terms ("coffee,"
+  "gas station," "pharmacy") repeat constantly from users in the same
+  area. A cache keyed by rounded location plus search term absorbs a large
+  fraction of traffic, and search results can tolerate a few minutes of
+  staleness — a newly-opened cafe missing from results for ten minutes
+  isn't a user-visible failure the way a stale traffic-jam warning would
+  be.
+- **Replicate for both read throughput and latency.** Read replicas of
+  each geo-shard handle read scaling; placing replicas in the same region
+  as the users querying them cuts round-trip latency, which matters far
+  more for a 200ms interactive search than for a background batch job.
+
+This is the same pattern the rest of the system already relies on. Map
+tiles (lesson 3) scale by being nearly-static and CDN-cacheable. Routing
+(lesson 4) scales by keeping the road graph mostly in memory and
+partitioning it geographically for the heaviest queries. Location
+ingestion (lesson 1) scales by treating pings as a high-volume write
+stream partitioned by trip, not by routing every ping through a
+relational database. Search scaling reuses geographic partitioning too,
+but its read/write ratio and cache-friendliness are different enough that
+it deserves its own service, its own shard boundaries, and its own
+scaling policy — resist the urge to force one global "scale everything
+the same way" story onto sub-systems that behave differently.
+
+## Worked example: sizing a search shard
+
+Take the numbers from this module's estimation lesson: roughly 26,000
+search queries per second at peak. Suppose a quadtree-based index splits
+the world so that no single leaf cell holds more than about 2,000 places,
+and a single search shard comfortably serves 3,000 queries per second
+from memory. That's roughly nine shards needed just to absorb peak load
+with no headroom — round up to say fifteen for failover and uneven
+traffic distribution across time zones (peak search traffic in Tokyo and
+peak traffic in New York don't overlap, so a shard sized for its own
+region's evening rush has slack the rest of the day).
+
+Now add caching: if a query-level cache absorbs 40% of traffic because
+common searches repeat so often, the backend shards only need to handle
+about 15,600 queries per second combined, cutting the shard count
+estimate roughly in half. This is why "add a cache in front of the search
+index" is one of the highest-leverage scaling moves available here — it
+directly reduces how much geographic sharding you need to build and
+operate.
+
+<Callout type="warning">
+  A common mistake is designing the geospatial index and then bolting
+  text search on top as an afterthought — or the reverse, building a
+  full-text search cluster and only later realizing every query also
+  needs a location filter. Decide up front which filter narrows the
+  candidate set fastest (almost always location, since it's a much
+  smaller fan-out per query), and make that the first-stage lookup. Doing
+  text matching first and location filtering second turns every query
+  into a much bigger scan than it needs to be.
+</Callout>
+
+## Quick check: how it all fits together
+
+Across this module: requirements and estimation (lesson 1) told you where
+the load actually lives, the high-level design (lesson 2) drew the
+sub-systems, the data model and tiling lesson (lesson 3) covered how map
+rendering data is structured and indexed, routing and ETA (lesson 4)
+covered the graph-search side, and this lesson covers how places get
+found and how each of those pieces scales independently. In an interview,
+that's the arc to walk through out loud: scope it, design it, then show
+you know which parts of the design bend under load and why.
+
+<Quiz
+  lessonId="maps-location-search-and-scaling"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why is a plain full-text inverted index not enough to serve a "coffee near me" query efficiently?',
+      options: [
+        { id: 'a', text: 'An inverted index has no concept of distance, so filtering matches down to nearby ones would require scanning and computing distance against every text match', correct: true, explanation: 'Text indexes group documents by word, not by location, so proximity filtering on top of a pure text index means checking distance against every matching document individually.' },
+        { id: 'b', text: 'Inverted indexes cannot store business names longer than a few characters', correct: false, explanation: 'This is not a real limitation of inverted indexes and is not the reason a spatial index is needed.' },
+        { id: 'c', text: 'Full-text search is always slower than geospatial search regardless of query shape', correct: false, explanation: 'Neither is universally slower — the issue here is that only a spatial index can cheaply narrow candidates by location before doing any text matching.' },
+        { id: 'd', text: 'Inverted indexes cannot be sharded', correct: false, explanation: 'Inverted indexes can absolutely be sharded (commonly done in real search systems); shardability is not the reason a spatial index is needed here.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine advantages of a quadtree (or similar recursive-subdivision scheme) over a fixed-size grid for indexing places? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It adapts cell size to local density, keeping candidate counts per cell roughly even', correct: true, explanation: 'Dense areas subdivide into many small cells and sparse areas stay as a few large ones, which is exactly what a fixed grid cannot do.' },
+        { id: 'b', text: 'It completely eliminates the need to check neighboring cells for a query near a boundary', correct: false, explanation: 'Boundary effects still exist in a quadtree — a point near a cell edge can still be geometrically closer to a point in a sibling cell, so neighbor checks are still needed.' },
+        { id: 'c', text: 'It helps keep shard sizes for a geo-sharded search index more balanced across hot and cold regions', correct: true, explanation: 'Because leaf cell sizes track density, shards built from those leaves naturally hold comparable numbers of places whether they cover Manhattan or rural farmland.' },
+        { id: 'd', text: 'It guarantees the search index never needs a cache', correct: false, explanation: 'Caching is still valuable regardless of the underlying spatial index structure — a quadtree changes how candidates are found, not whether repeated popular queries benefit from caching.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Sharding a location search index by geography means every shard should cover roughly the same land area.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Equal land area produces wildly uneven load — a Manhattan-sized shard and a Montana-sized shard covering the same area hold very different numbers of places. Shards should be sized by place density, not raw area.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — geographic shards should be sized so each holds a comparable number of places or query load, which means dense areas get many small shards and sparse areas get a few large ones.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A query-level cache in front of the search service absorbs 40% of peak traffic. What is the main practical benefit of adding it, based on this lesson?',
+      options: [
+        { id: 'a', text: 'It reduces the number of backend search shards needed to serve peak load, since cached queries never reach them', correct: true, explanation: 'Cutting the traffic that reaches backend shards directly reduces how much geographic sharding and shard capacity needs to be provisioned.' },
+        { id: 'b', text: 'It removes the need for a geospatial index entirely', correct: false, explanation: 'Caching reduces load on the index, it does not replace the need for one — uncached queries (long-tail searches, new locations) still need the spatial index to find candidates.' },
+        { id: 'c', text: 'It guarantees search results are always perfectly up to date', correct: false, explanation: 'The opposite is true — caching introduces some staleness by design; the lesson argues this is an acceptable trade-off for search results specifically.' },
+        { id: 'd', text: 'It eliminates the need to shard the search index by geography', correct: false, explanation: 'Caching and sharding solve different problems — caching cuts repeated-query load, while sharding is what makes each individual uncached query cheap to serve in the first place.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,272 @@
+---
+title: "Requirements and Estimation"
+module: "Design Twitter"
+moduleOrder: 6
+order: 1
+track: "interview"
+summary: "Scopes a Twitter-style microblogging system into functional and non-functional requirements, then derives tweet, timeline, and engagement throughput to justify a read-heavy, fan-out-driven architecture."
+tags: ["requirements", "capacity-estimation", "timeline", "fan-out", "interview-framework"]
+estMinutes: 12
+cheatsheet:
+  - "Timeline reads outnumber tweet writes by several orders of magnitude — design the read path (precomputed timelines, caching) before touching the write path."
+  - "The follower graph is the single number that shapes everything downstream: most accounts have a handful of followers, a tiny fraction have millions — that skew, not the average, drives the fan-out design."
+  - "State DAU, tweets/day, average and max follower counts, and timeline-loads/day explicitly before computing QPS — the timeline-read:tweet-write ratio is the number every later decision traces back to."
+  - "A tweet write must never be lost once acknowledged, but a like/retweet counter or a timeline position can lag by seconds without anyone noticing — durability and consistency requirements are not uniform across the data model."
+  - "Media (photos, video) dominates storage; tweet text and metadata are a rounding error by comparison — don't spend the estimation budget counting characters."
+  - "Flag the 'celebrity problem' (accounts with tens of millions of followers) explicitly in requirements — it's the constraint that forces a hybrid push/pull design in the next lesson, not an edge case to handle later."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design Twitter" shows up in almost every system design interview loop
+because it looks deceptively simple — post a short message, show it to
+followers — and then quietly turns into one of the hardest fan-out
+problems in the field. The trap is treating it like a chat app (deliver
+one message to one recipient) or a blog (write once, read rarely). Twitter
+is neither: it's a system where a single write from one account can need
+to appear, within seconds, in the timelines of tens of millions of
+followers, while the overwhelming majority of accounts have so few
+followers that the same operation is nearly free.
+
+This lesson exists to pin down the requirements and the numbers before any
+of that gets designed. The timeline-generation strategy, the data model,
+and the scaling decisions in the rest of this module are all direct
+responses to the read:write ratio and the follower-count skew we establish
+here.
+
+## Step 1: Scope the functional requirements
+
+Agree on scope out loud rather than assuming everything is in play. A
+reasonable core for an interview-sized version of Twitter:
+
+- **Post a tweet**: short text (up to some character limit), optionally
+  with an image or video attached.
+- **Follow**: a user follows other users; following is one-directional
+  (unlike a mutual "friend" relationship).
+- **Home timeline**: a reverse-chronological (or lightly ranked) feed of
+  tweets from accounts a user follows.
+- **Like and retweet**: lightweight engagement actions that also need to
+  surface in timelines and counts.
+- **User timeline / profile**: the list of tweets a single account has
+  posted.
+
+Explicitly defer and say so: direct messages, search, trending topics,
+detailed abuse/spam ML, ads, and threaded replies as a first-class nested
+structure are all real features of the product, but each is its own
+design problem. Naming them and moving on is a strong signal in an
+interview.
+
+### Non-functional requirements
+
+- **Extremely read-heavy.** Users check timelines far more often than
+  they post — the read path has to be fast and cheap even though the
+  underlying data changes constantly.
+- **Low write-to-read latency for the home timeline.** A tweet from a
+  followed account should show up within a few seconds, not minutes — this
+  is closer to a "live feed" latency budget than a batch-report one.
+- **Tweets must be durable once acknowledged.** Losing a posted tweet is a
+  hard failure; a like count or retweet count lagging by a few seconds is
+  invisible to users.
+- **Available over strictly consistent.** It's fine if two users briefly
+  see slightly different versions of a timeline or counter; it's not fine
+  if the whole write path goes down because one replica is unreachable.
+- **Highly skewed load.** A small number of accounts (celebrities, news
+  outlets) generate a disproportionate share of both fan-out reads and
+  writes — the system has to survive that skew, not just the average case.
+
+## Step 2: Establish the scale
+
+Rough, explicitly-stated assumptions beat no assumptions. A workable set
+of numbers for a large (Twitter-sized) platform:
+
+- 250 million daily active users (DAU).
+- Each DAU opens their home timeline about 6 times per day, loading
+  roughly 40 tweets per open.
+- 1 in 500 DAU posts at least one tweet on a given day.
+- Each DAU performs about 15 engagement actions per day (likes + retweets
+  combined).
+- Average follower count across all accounts: about 200. But the
+  distribution is heavily skewed — the top accounts have tens of millions
+  of followers.
+- Average tweet: roughly 100 characters of text (call it 300 bytes with
+  metadata); about 1 in 5 tweets includes a photo (~200 KB average).
+
+<Callout type="tip">
+  Say the numbers out loud before computing anything: "Let's assume 250
+  million DAU, roughly 40 tweets per timeline load, and 6 loads a day per
+  user — does that match the scale you had in mind?" Turning the estimate
+  into a checkpoint with the interviewer beats silently crunching numbers.
+</Callout>
+
+## Step 3: Derive traffic and storage numbers
+
+Work through tweet writes, timeline reads, and engagement writes
+separately — each stresses a different part of the system.
+
+### Tweet write throughput
+
+- Daily tweets: 250,000,000 divided by 500 is 500,000 tweets/day.
+- Writes per second (average): 500,000 divided by 86,400 is about
+  6/sec — tiny, even with a generous 10x peak multiplier (roughly 60/sec
+  at peak).
+
+### Timeline read throughput
+
+- Daily timeline opens: 250,000,000 multiplied by 6 is 1.5 billion
+  opens/day.
+- Tweets served: 1.5 billion multiplied by 40 is 60 billion tweet-views/day.
+- Opens per second (average): 1.5 billion divided by 86,400 is about
+  17,000/sec; at a 5x peak multiplier, roughly 85,000 timeline-assembly
+  requests/sec at peak.
+- That's a read:write ratio on the order of **2,800:1** on requests alone,
+  and far higher on the number of individual tweet-records touched, since
+  each read pulls back 40 tweets.
+
+### Engagement (like/retweet) throughput
+
+- Daily engagement actions: 250,000,000 multiplied by 15 is 3.75 billion
+  actions/day.
+- Actions per second (average): 3.75 billion divided by 86,400 is about
+  43,000/sec; at a 5x peak multiplier, roughly 215,000/sec at peak.
+- Like this figure looks big, but each action is a small counter increment
+  and a cheap join-table row, not a timeline rewrite — it's a different
+  kind of load than tweet writes or timeline reads.
+
+### Storage
+
+- Daily text storage: 500,000 tweets multiplied by 300 bytes is about
+  150 MB/day — trivial even over years.
+- Daily media storage: 1 in 5 tweets (100,000/day) multiplied by 200 KB is
+  about 20 GB/day, or roughly 7 TB/year — and this is the dominant
+  storage line item by a wide margin over text.
+
+The contrast is the key takeaway: **tweet writes are cheap, storage for
+text is cheap, and even engagement writes are individually cheap — the
+expensive part is assembling and serving personalized timelines at
+~85,000 requests/sec, especially for the follower-count outliers.**
+
+<Mermaid client:visible chart={`
+flowchart TB
+    T["500K tweets/day\n(~6/sec avg, ~60/sec peak)"] --> TS["Tweet storage\n~150MB text/day, trivial"]
+    M["100K tweets/day w/ media\n(~20GB/day)"] --> MS["Media storage\n~7TB/year, dominant"]
+    E["3.75B engagements/day\n(~215K/sec peak)"] --> EC["Cheap counter + join writes"]
+    R["1.5B timeline opens/day\n(~85K assemblies/sec peak)"] --> TL["Precomputed / cached\nhome timeline"]
+    EC -.->|like/retweet signal| TL
+    style T fill:#4a5568,color:#fff
+    style M fill:#4a5568,color:#fff
+    style E fill:#2b6cb0,color:#fff
+    style R fill:#2b6cb0,color:#fff
+    style TS fill:#4a5568,color:#fff
+    style MS fill:#4a5568,color:#fff
+    style EC fill:#4a5568,color:#fff
+    style TL fill:#4a5568,color:#fff
+`} />
+
+## Step 4: State the resulting design constraints
+
+1. **Home timelines should be mostly precomputed, not assembled from
+   scratch per request** — at ~85,000 read requests/sec, running a live
+   query across every followed account's recent tweets on each timeline
+   open is far too expensive to do synchronously for every user.
+2. **Tweet writes are cheap enough to afford some extra work per write** —
+   with only ~60 writes/sec at peak, a design that pushes each new tweet
+   out to precomputed follower timelines (fan-out-on-write) is affordable
+   for typical accounts.
+3. **The follower-count skew breaks a uniform fan-out-on-write strategy** —
+   pushing one tweet into tens of millions of follower timelines the
+   instant it's posted is a completely different cost profile than pushing
+   it to 200 followers. This "celebrity problem" needs a hybrid push/pull
+   design, which the next lesson builds explicitly.
+4. **Storage engineering should be planned around media, not text** —
+   photo/video bytes dwarf tweet text by a couple of orders of magnitude,
+   so object storage and CDN delivery for media matter more than the
+   schema for the tweet row itself.
+
+## Worked example: sanity-checking a celebrity tweet
+
+Suppose an account with 50 million followers posts a single tweet. A pure
+fan-out-on-write design would immediately insert that one tweet into 50
+million separate precomputed timeline structures — a 50-million-write
+burst triggered by one event, dwarfing the entire system's average tweet
+write rate (6/sec) by seven orders of magnitude for that one moment.
+
+Even if this happens only 20 times a day across all such large accounts,
+that's `20 x 50,000,000` = 1 billion extra fan-out writes/day purely from
+outlier accounts — more than double the total tweet-write volume the rest
+of the platform generates. That's the concrete number that justifies
+**not** fanning out to every follower for very large accounts, and instead
+computing their tweets into a follower's timeline at read time (pull) —
+the hybrid model the next lesson designs in detail.
+
+<Callout type="warning">
+  A common mistake is spending the whole estimation phase on tweet
+  character counts and storage bytes, because it feels like a clean,
+  countable exercise. For a microblogging platform, text storage is
+  almost always a rounding error. The numbers that actually drive the
+  design are the timeline-read:tweet-write ratio and the shape of the
+  follower graph — specifically, how far the largest accounts sit from
+  the average. Skip that and you have no numeric justification for the
+  fan-out strategy you'll need to defend in the next lesson.
+</Callout>
+
+## Where this leads
+
+The shape derived here — cheap tweet writes, a read path two to three
+orders of magnitude larger than the write path, media as the real storage
+cost, and a follower graph with a long, heavy tail — is exactly what the
+next lesson's high-level design responds to: a tweet-ingestion service, a
+fan-out worker that treats "normal" and "celebrity" accounts differently,
+and a timeline service built to serve precomputed data fast. Keep these
+numbers in mind going forward; every architectural choice in this module
+should trace back to one of them.
+
+<Quiz
+  lessonId="twitter-requirements-and-estimation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'With 250 million DAU each opening their timeline 6 times/day and loading 40 tweets per open, which figure is closest to the average timeline-open requests per second the system must sustain?',
+      options: [
+        { id: 'a', text: 'About 17,000/sec', correct: true, explanation: '250,000,000 x 6 = 1.5 billion opens/day; divided by 86,400 seconds/day is approximately 17,000 opens/sec on average.' },
+        { id: 'b', text: 'About 1,700/sec', correct: false, explanation: 'This undershoots by a factor of 10 — 1.5 billion divided by 86,400 is close to 17,000, not 1,700.' },
+        { id: 'c', text: 'About 85,000/sec', correct: false, explanation: 'That is the estimated peak figure (average times a roughly 5x peak multiplier), not the average the question asks for.' },
+        { id: 'd', text: 'About 60,000,000/sec', correct: false, explanation: 'This confuses tweets served per day (60 billion) with a per-second rate; it overshoots by many orders of magnitude.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasonable non-functional priorities to state upfront when scoping a Twitter-like system? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Like and retweet counts can be eventually consistent', correct: true, explanation: 'A count off by a few for a short window is invisible to users, and treating every engagement action as a strongly consistent write would unnecessarily bottleneck one of the highest-volume write streams in the system.' },
+        { id: 'b', text: 'A tweet must not be silently lost once the write is acknowledged to the user', correct: true, explanation: 'Durability of the authored tweet itself is a hard requirement, unlike the surrounding approximate metrics such as like counts or timeline freshness.' },
+        { id: 'c', text: 'Every home timeline should be computed live from raw data on every single request, with no precomputation', correct: false, explanation: 'At the derived ~85,000 requests/sec peak, computing every personalized timeline live from scratch on every request is not viable — some precomputation or caching strategy is required.' },
+        { id: 'd', text: 'A single fan-out-on-write strategy should push every tweet to every follower uniformly, regardless of follower count', correct: false, explanation: 'This is the "celebrity problem" trap: uniformly pushing to every follower breaks down for accounts with millions of followers and needs a hybrid push/pull approach instead.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'For a microblogging platform at this scale, raw tweet text storage is typically the dominant capacity-planning constraint, more so than media or timeline-read compute.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Incorrect — text storage in the worked estimate is about 150 MB/day, dwarfed by media storage (~20 GB/day) and by the compute cost of assembling ~85,000 timelines/sec.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — tweet text is cheap to store; media storage and timeline-assembly compute are the actual dominant constraints at this scale.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'An account with 50 million followers posts a single tweet. What does this scenario mainly illustrate for the design?',
+      options: [
+        { id: 'a', text: 'That tweet text storage costs scale unpredictably with follower count', correct: false, explanation: 'Storage cost for one additional tweet is unaffected by how many people follow the account; the issue here is write fan-out, not storage.' },
+        { id: 'b', text: 'That a pure fan-out-on-write strategy can create a massive write burst for a single event, motivating a hybrid push/pull design for high-follower accounts', correct: true, explanation: 'Pushing one tweet into tens of millions of individual follower timeline structures at once is exactly the "celebrity problem" that justifies computing timelines on read (pull) for outsized fan-out targets rather than pushing universally.' },
+        { id: 'c', text: 'That like and retweet counts need to become strongly consistent to handle popular accounts correctly', correct: false, explanation: 'Engagement-count consistency is a separate concern from timeline fan-out; making counts strongly consistent would not address the fan-out write burst at all.' },
+        { id: 'd', text: 'That search indexing becomes the primary bottleneck at this follower count', correct: false, explanation: 'Search was explicitly scoped out as deferred and is not the bottleneck implied by this scenario, which specifically stresses timeline fan-out on a single write event.' },
+      ],
+    },
+  ]}
+/>

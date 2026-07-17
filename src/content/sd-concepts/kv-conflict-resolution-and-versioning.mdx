@@ -1,0 +1,130 @@
+---
+title: "Conflict Resolution and Versioning"
+module: "Key-Value Store"
+moduleOrder: 10
+order: 4
+track: "concept"
+summary: "Explains why replicated key-value stores end up with conflicting versions of the same key and how vector clocks, last-write-wins, and CRDTs each resolve them."
+tags: ["key-value-store", "vector-clocks", "conflict-resolution", "crdt", "eventual-consistency"]
+estMinutes: 12
+cheatsheet:
+  - "Conflicts happen because replication plus availability means two replicas can each accept a write for the same key before either has seen the other's write."
+  - "Last-write-wins (LWW) is simple and cheap but silently drops writes whenever clocks skew or two writes land in the same tick — fine for caches, risky for anything users would notice losing."
+  - "Vector clocks track one counter per replica/coordinator that wrote the key, letting you tell a causal update (`A --> B`) apart from a true concurrent conflict (siblings)."
+  - "When versions are concurrent (neither vector clock dominates the other), don't guess — surface both siblings and let the write path (client app or a merge function) reconcile them."
+  - "Vector clocks grow with every distinct writer; prune old entries with a timestamp/size cap or you'll bloat every value's metadata forever."
+  - "CRDTs (counters, OR-sets, etc.) push reconciliation into the data type itself, so merges are automatic and mathematically guaranteed to converge — at the cost of only supporting operations that type allows."
+  - "Read repair (fixing a stale replica during a read) and anti-entropy via Merkle trees (fixing it in the background) are how conflicts actually get cleaned up across the cluster, not just detected."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson set up quorum-based replication: a write is durable once `W` replicas acknowledge it, and a read is consistent enough once you've queried `R` replicas. That design keeps the store available even when a replica is slow or partitioned — but it opens a gap. If two clients write the same key to two different replicas during a partition, or a replica misses an update and later rejoins with stale data, you can end up with more than one "current" value for a key. Someone has to decide what the real value is. That someone is the conflict-resolution layer, and how you build it is one of the most consequential decisions in a key-value store's design.
+
+## Why conflicts happen at all
+
+Conflicts are the direct cost of choosing availability under partition (the AP side of CAP, covered in the NFR module). A strongly consistent, single-leader store avoids this problem by refusing concurrent writes to the same key — every write goes through one leader, in order. A store that accepts writes at multiple replicas, or that keeps serving writes even when some replicas are unreachable (sloppy quorums and hinted handoff from the replication lesson), trades that guarantee away for uptime. The result: two versions of `user:42:profile` can both be "valid" for a moment, and the system needs a rule for what happens next.
+
+## Detecting conflicts: timestamps vs. causality
+
+The simplest approach is **last-write-wins (LWW)**: tag every write with a timestamp, and when two versions collide, keep the one with the later timestamp. It's cheap, requires no extra metadata beyond a clock reading, and works fine for data where losing an update occasionally is acceptable — a view counter, a session cache, a "last seen online" field. The catch is that "later" depends on clocks agreeing, and clocks on different machines never agree perfectly. A write that logically happened second can carry an earlier timestamp because its server's clock drifted, and LWW will silently discard it with no error, no retry, and no signal to the client that anything was lost.
+
+**Vector clocks** fix the underlying problem by tracking causality instead of wall-clock time. Each key's version carries a small map of `{replica_id: counter}`. Every time a replica handles a write for that key, it increments its own counter in the map. Comparing two version vectors tells you one of two things:
+
+- One vector's counters are all `≥` the other's (and at least one is strictly greater) — the first is a **descendant** of the second. It's safe to just keep the newer one; the old one is truly obsolete.
+- Neither vector dominates the other — the writes are **concurrent**. They happened without either replica knowing about the other, and there's no safe automatic choice. Both versions ("siblings") must be kept until something resolves them.
+
+That second case is the interesting one. LWW would just pick a winner and lose data; a vector-clock-based store instead surfaces both siblings — typically on the next read — and pushes the actual decision to whoever can make it safely: the application, a user, or a merge function.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant R1 as Replica R1
+    participant R2 as Replica R2
+    participant App as Client app (read)
+    Note over R1,R2: both start at cart:kavya = ["apples"], clock {R1:1}
+    R1->>R1: write "add bananas" -> clock {R1:2}
+    R2->>R2: write "add milk" (partitioned, hasn't seen R1's write) -> clock {R1:1, R2:1}
+    App->>R1: GET cart:kavya
+    App->>R2: GET cart:kavya
+    Note over App: neither clock dominates - siblings!
+    App->>App: merge items: apples + bananas + milk
+    App->>R1: PUT merged value, clock {R1:2, R2:1}
+`} />
+
+## Who reconciles: server, client, or the data type
+
+There are three places reconciliation logic can live, and each pushes complexity somewhere different:
+
+**Server-side, automatic (LWW).** The store decides on its own, using a total order it can compute cheaply — usually a timestamp, sometimes a fixed replica-priority tiebreak. No application code needed, but the store can silently drop a write it had no business dropping.
+
+**Client-side, application-driven.** The store detects concurrency (vector clocks) but doesn't guess at semantics — it hands both siblings back to the application, which knows what merging *means* for that data. A shopping cart merges by unioning items. A "list of a user's devices" merges by unioning device IDs. A bank balance almost never merges automatically — that one probably shouldn't be a plain KV write in the first place. This is more work per data type, but it never silently loses information the application cares about.
+
+**Data-structure-driven (CRDTs).** Conflict-free replicated data types bake the merge function into the type itself, so *any* two versions merge deterministically and the result is provably consistent no matter the order updates arrive in. A G-counter (grow-only counter) merges by taking the max of each replica's partial count. An OR-set merges by unioning adds and removing only elements whose specific "add tag" is also in the other side's tombstones. CRDTs are the least error-prone option when your data fits one of the known types, but they don't generalize to arbitrary values — you can't wrap "any JSON blob" in a CRDT and expect a sane merge.
+
+Most production key-value stores mix these: LWW as the default for opaque blobs, vector clocks (or a variant) for callers who opt into sibling resolution, and CRDT-backed counters/sets as a specialized value type.
+
+## Closing the loop: read repair and anti-entropy
+
+Detecting and resolving a conflict on one read doesn't fix the other replicas that are still holding the stale version. Two background mechanisms handle that, both building on the quorum reads/writes from the replication lesson:
+
+- **Read repair**: when a quorum read discovers replicas disagree, the coordinator pushes the resolved (or newer) version back to the stale replicas right then, piggybacking the fix on a read that was happening anyway.
+- **Anti-entropy**: replicas periodically compare data even without a client read triggering it, using Merkle trees to diff large key ranges in `O(log n)` comparisons instead of transferring every key. Any range whose hash differs gets walked down to the actual mismatched keys, which then go through the same conflict-resolution path.
+
+Without one of these, a replica that missed a write during a partition can stay stale indefinitely — quorum reads mask it from clients, but the underlying divergence never gets cleaned up.
+
+## Worked example: sizing vector clock overhead
+
+Suppose your store has 300 nodes, and hot keys typically get written through 5-10 distinct coordinators over their lifetime before you prune. A vector clock entry is roughly a node ID (8 bytes) plus a counter (4-8 bytes) — call it 16 bytes per entry. A key with 8 active entries costs about 128 bytes of clock metadata. On a value that's itself 200 bytes (a small profile record), that's a 64% overhead — not free, but tolerable. The real risk is unbounded growth: if you never prune and a key gets touched by dozens of coordinators over months, the clock can eventually outweigh the value itself. Production systems cap this by dropping the oldest entries once the vector exceeds a size threshold (accepting a small risk of re-flagging an already-resolved version as a false conflict) or by expiring entries older than a time window.
+
+<Callout type="warning">
+  The most common mistake teams make here is defaulting to last-write-wins on wall-clock timestamps for data where losing a write is actually a problem — then discovering the loss only when a customer complains that "my item disappeared from my cart" or "my settings reverted." Clock skew of even a few hundred milliseconds across data-center replicas is normal, not exceptional, and LWW has no way to distinguish "genuinely older" from "clock was behind." Reserve LWW for data where staleness is cheap (caches, presence, counters where a CRDT fits better anyway), and use causality tracking wherever a lost write would be a real, visible failure to a user.
+</Callout>
+
+<Quiz
+  lessonId="kv-conflict-resolution-and-versioning"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Two replicas each accept a write for the same key during a network partition, and neither has seen the other\'s update. What does a vector clock comparison show?',
+      options: [
+        { id: 'a', text: 'One vector dominates the other, so the store can safely keep the dominant one', correct: false, explanation: 'Domination requires one vector\'s counters to be all >= the other\'s. Two writes made without either side seeing the other typically produce vectors where neither dominates.' },
+        { id: 'b', text: 'The vectors are concurrent (siblings) and neither can be safely discarded automatically', correct: true, explanation: 'This is exactly the concurrent case: neither counter set is a superset of the other, so the store must keep both versions and let something else (app, CRDT merge) reconcile them.' },
+        { id: 'c', text: 'The store falls back to comparing wall-clock timestamps embedded in the vector', correct: false, explanation: 'Vector clocks intentionally avoid wall-clock time; comparison is based purely on the per-replica counters, which is what makes them immune to clock skew.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine downsides of relying on plain last-write-wins (timestamp-based) conflict resolution? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Clock skew between nodes can cause a logically later write to be discarded', correct: true, explanation: 'LWW trusts the timestamp, not causality, so a write from a node whose clock is slightly behind can lose to an "earlier" write from a node whose clock is ahead.' },
+        { id: 'b', text: 'It silently drops data with no signal to the client that a write was lost', correct: true, explanation: 'The losing write simply vanishes; there is no error returned and no sibling surfaced for the app to notice.' },
+        { id: 'c', text: 'It requires every value to be a CRDT type like a counter or set', correct: false, explanation: 'LWW works on opaque values of any shape; it does not require or benefit from CRDT structure. That constraint applies to CRDT-based merging, not LWW.' },
+        { id: 'd', text: 'It adds no extra per-write metadata compared to vector clocks', correct: false, explanation: 'This is true, but it is an advantage of LWW, not a downside: a timestamp field is far cheaper than a growing per-replica counter map, which is exactly why LWW is attractive for low-value data despite its risk of silent loss.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'CRDTs (like G-counters or OR-sets) resolve conflicts by merging deterministically inside the data type itself, without needing the application to write custom merge logic for that value.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'That is the core CRDT property: the merge function is defined by the type (e.g. max() for a G-counter, union of adds/tombstones for an OR-set) and always converges regardless of arrival order.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'CRDTs are specifically designed so the merge is automatic and built into the type; the trade-off is that they only cover the specific operations that type supports, not arbitrary values.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A quorum read finds that two replicas returned different versions of a key. The coordinator resolves the conflict and pushes the winning version back to the stale replica immediately as part of that same request. What is this called?',
+      options: [
+        { id: 'a', text: 'Anti-entropy', correct: false, explanation: 'Anti-entropy is a background process (often using Merkle trees) that compares replicas independent of any client read, not something triggered by a specific read request.' },
+        { id: 'b', text: 'Read repair', correct: true, explanation: 'Read repair fixes a stale replica opportunistically during a read that already discovered the divergence, rather than waiting for a separate background pass.' },
+        { id: 'c', text: 'Sloppy quorum', correct: false, explanation: 'Sloppy quorum is about accepting writes on substitute nodes when the natural replicas are unreachable, via hinted handoff — a different mechanism from fixing stale data found during a read.' },
+      ],
+    },
+  ]}
+/>

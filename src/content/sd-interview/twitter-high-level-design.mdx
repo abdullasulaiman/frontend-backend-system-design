@@ -1,0 +1,242 @@
+---
+title: "High-Level Design"
+module: "Design Twitter"
+moduleOrder: 6
+order: 2
+track: "interview"
+summary: "Breaks a Twitter-style microblogging system into its core services and shows how the write path (posting a tweet) and read path (loading a timeline) route through them differently."
+tags: ["system-design", "architecture", "timeline", "fan-out", "microblogging"]
+estMinutes: 12
+cheatsheet:
+  - "Split the write path (tweet service, follow graph, engagement counters) from the read path (timeline service, caches) — the read path takes orders of magnitude more traffic and needs its own scaling story."
+  - "A tweet write only has to hit the tweet service and the event bus before returning success; indexing, notifications, and timeline delivery all happen asynchronously off that event."
+  - "The home timeline is a fan-out problem, not a query problem — deciding push vs. pull vs. hybrid is the single biggest architectural call in this design (full mechanics in the next lesson)."
+  - "The follow graph is read constantly (building timelines, checking who-follows-whom) and written rarely (a follow/unfollow click) — treat it as its own service with its own storage and caching strategy."
+  - "Engagement counters (likes, retweets, replies) are high-write, low-consistency-requirement data — buffer and batch them instead of updating a tweet row synchronously per action."
+  - "Media (images, video) never flows through the tweet service's database path — it goes to object storage plus a CDN, with only a URL/reference stored alongside the tweet."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson pinned down the numbers: hundreds of millions of daily
+users, a read-to-write ratio that's lopsided by a factor of a hundred or more,
+and a home timeline that has to feel instant no matter how many accounts a
+user follows. Now we turn those numbers into boxes and arrows. The trap in
+this design is treating it like "a database of tweets with a query for
+'tweets from people I follow, sorted by time.'" That query is fine at small
+scale and falls over completely at Twitter scale, because a single tweet from
+a popular account can need to appear in tens of millions of other people's
+timelines almost immediately. Getting the component boundaries right around
+that problem is what this lesson is about.
+
+## Start from the two access patterns
+
+Before naming a single service, separate what happens on a write from what
+happens on a read, because they have almost nothing in common at this scale:
+
+- **Write path**: posting a tweet, following/unfollowing an account, liking a
+  tweet, retweeting, replying. Comparatively low volume, and each individual
+  write is cheap — but a single tweet write can trigger a huge amount of
+  *downstream* fan-out work.
+- **Read path**: loading a home timeline, loading a single user's profile
+  timeline, opening a single tweet's detail view, searching. This is where
+  essentially all of the traffic lives, and where the user directly feels
+  latency — a timeline that takes two seconds to load reads as a broken app.
+
+The asymmetry is the whole story here: a system that's merely "correct" for
+writes but slow or expensive for reads will fail the moment it has real
+traffic, because reads outnumber writes by a huge margin.
+
+## The major components
+
+- **Client** (web, mobile) — composes tweets, renders timelines, and talks to
+  a single API layer for everything.
+- **API / edge layer** — stateless services behind a load balancer that
+  handle auth, rate limiting (crucial here — this is a public write API), and
+  routing to the right backend service.
+- **Tweet service** — owns the tweet as a durable record: create, delete,
+  fetch by ID. This is the source of truth for tweet text and metadata, and
+  it's intentionally *not* where timelines get built.
+- **Media service** — handles image/video upload, transcoding, and storage.
+  Media never lives in the same datastore as tweet text; the tweet record
+  just holds a reference (URL) into object storage served through a CDN.
+- **Follow graph service** — who follows whom. Read on almost every timeline
+  build and every profile view, written only on a follow/unfollow click — a
+  classic read-heavy, write-light service that deserves its own storage and
+  cache rather than living inside the tweet service.
+- **Timeline service** — assembles the ranked list of tweets for a user's
+  home timeline. It consumes the follow graph and a stream of new tweets and
+  decides how those tweets land in a timeline. *How* it does that (push vs.
+  pull vs. hybrid fan-out) is deep enough to be its own lesson right after
+  this one — here we're only deciding that this service exists and what it
+  depends on.
+- **Engagement service** — likes, retweets, reply counts. Split out from the
+  tweet service for the same reason a Q&A app splits votes from content: the
+  write rate and contention profile are completely different from editing
+  tweet text (which, on Twitter, mostly doesn't even happen).
+- **Search / indexing service** — an inverted index over tweet text and
+  hashtags, kept eventually consistent with the tweet service via an event
+  stream, never queried synchronously on write.
+- **Notification service** — tells a user "so-and-so replied to you" or
+  "someone you follow just tweeted," driven off the same event stream as
+  search indexing.
+- **Event bus / queue** — the backbone connecting the tweet-creation write to
+  every asynchronous consumer (timeline fan-out, search indexing,
+  notifications) without making the original write wait on any of them.
+- **Primary datastore** — durable storage for tweets, users, and the follow
+  graph, typically a distributed key-value or wide-column store once volume
+  demands it (schema choices are the next lesson's job).
+- **Cache layer** — in front of hot tweets, assembled timelines, and follow
+  graph lookups, since read volume dwarfs write volume by a huge margin.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    C[Client] --> API[API / Edge Layer]
+    API --> TWEET[Tweet Service]
+    API --> MEDIA[Media Service]
+    API --> TL[Timeline Service]
+    API --> GRAPH[Follow Graph Service]
+    API --> ENG[Engagement Service]
+    TWEET --> DB[(Primary DB)]
+    GRAPH --> DB
+    TWEET --> BUS[[Event Bus]]
+    ENG --> BUS
+    BUS --> SEARCH[Search Index]
+    BUS --> NOTIF[Notification Service]
+    BUS --> FANOUT[Timeline Fan-out Worker]
+    FANOUT --> TL
+    TL --> CACHE[(Timeline Cache)]
+    C --> CACHE
+    MEDIA --> CDN[(Object Storage / CDN)]
+`} />
+
+## Walking the write path: posting a tweet
+
+A user submits a tweet to the tweet service, which validates it (length,
+attached media references) and writes it to the primary datastore as the
+durable record. That write returns success as soon as it's persisted — it
+does **not** wait for search indexing, notifications, or timeline fan-out to
+finish. Instead, the tweet service publishes a "tweet created" event onto the
+event bus, and independent consumers react to it: the search index updates,
+the notification service alerts mentioned or replying users, and a timeline
+fan-out worker figures out how this new tweet should reach followers' home
+timelines.
+
+That last step is where account size matters. For most accounts (thousands
+of followers or fewer), pushing the new tweet directly into every follower's
+precomputed timeline on write keeps reads fast and cheap. For an account with
+tens of millions of followers, pushing on every single tweet turns one write
+into tens of millions of writes — its own storm. The practical resolution
+most real systems reach is a hybrid: push for normal-sized accounts, pull
+high-follower-count accounts into the timeline at read time and merge the two
+sources together. The exact mechanics of that merge — and what "normal-sized"
+means as a threshold — is the entire subject of the next lesson.
+
+## Walking the read path: loading a home timeline
+
+Loading a home timeline is a fan-*in* read: many source accounts, one merged,
+time-ordered (or ranked) view for a single user. The timeline service's job
+is to serve that merged view from a cache whenever possible, since the same
+user reloads their timeline constantly and most of it hasn't changed since
+the last load. A single tweet's detail view (someone clicking into a tweet to
+see its replies) is a much smaller fan-in — one tweet plus its reply thread —
+and gets its own lightweight cache entry, distinct from the timeline cache.
+
+## Worked example: a tweet from a high-follower account
+
+Say an account with 20 million followers posts a tweet, and within the first
+minute a million of those followers have the app open. Trace it:
+
+1. The tweet write itself is one row insert and one event onto the bus —
+   trivial for the datastore, regardless of the account's follower count.
+2. If the fan-out worker naively pushed this tweet into 20 million
+   precomputed timelines synchronously, that's 20 million writes triggered by
+   one tweet — a write amplification problem far worse than anything on the
+   read side. This is exactly the case that pushes designs toward a pull (or
+   hybrid) strategy for large accounts.
+3. The million active followers requesting their timeline in that first
+   minute are a read-side problem instead: the timeline service merges this
+   account's tweet in at read time (since it wasn't pushed), and the merged
+   result gets cached briefly so that repeated reloads by the same user don't
+   redo that merge from scratch every time.
+4. Engagement (likes, retweets) on the viral tweet spikes hard in that same
+   window. Those counters get buffered and batched by the engagement service
+   rather than updated with a synchronous row write per like — otherwise the
+   single tweet row becomes a hot-row bottleneck under millions of
+   near-simultaneous updates.
+
+Every one of these decisions traces back to the same principle: never let
+one popular write turn into millions of expensive writes or millions of
+uncached reads.
+
+<Callout type="warning">
+  A common mistake is designing a single "timeline service" that both stores
+  tweets and computes every user's timeline by querying "all tweets from
+  followed accounts, ordered by time" on every request. That query looks
+  clean on a whiteboard but requires joining across a potentially huge follow
+  list at read time, for every single timeline load, from every single user —
+  it doesn't survive contact with real traffic. Precomputing (pushing) for
+  most accounts and falling back to on-demand merging (pulling) only for the
+  accounts where push is too expensive is what makes this design scale; don't
+  present "just query it live" as the whole answer.
+</Callout>
+
+## What this lesson set up
+
+This is a skeleton on purpose: which services exist and how a tweet flows
+between them on write and on read, not the timeline data model (next lesson),
+not the exact push/pull fan-out algorithm and its thresholds (also next
+lesson), and not sharding, replication, or how a single hot user's timeline
+gets served under sustained load (the final lesson). The one idea to carry
+forward is the write/read asymmetry: almost every follow-up question in this
+interview — "what if this account has 50 million followers," "what if the
+timeline needs to be ranked, not chronological" — is really asking you to
+defend a specific point on the push-vs-pull spectrum.
+
+<Quiz
+  lessonId="twitter-high-level-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does the tweet-creation write return success before search indexing, notifications, or timeline fan-out have run?',
+      options: [
+        { id: 'a', text: 'Because those steps are optional and can be skipped entirely', correct: false, explanation: 'They are not optional — they still need to happen, just asynchronously, off the critical path of the write.' },
+        { id: 'b', text: 'Because the write only needs to durably persist the tweet; everything else is driven off an event and can complete independently', correct: true, explanation: 'Correct. Once the tweet is durably stored, the user\'s write is complete — indexing, notifying, and fanning out are downstream consumers of an event, not preconditions for a successful write.' },
+        { id: 'c', text: 'Because the primary datastore is too slow to support synchronous indexing', correct: false, explanation: 'The reason is architectural (decoupling the write from its consequences), not a performance limitation of the datastore.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these services would you expect to be read constantly but written rarely? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Follow graph service', correct: true, explanation: 'Following/unfollowing is a rare click compared to how often the follow graph gets read to build timelines and check relationships.' },
+        { id: 'b', text: 'Engagement service (likes/retweets/replies)', correct: false, explanation: 'Engagement is written constantly on popular tweets — it is a high-write service, the opposite pattern.' },
+        { id: 'c', text: 'Search / indexing service', correct: false, explanation: 'It is updated on essentially every new tweet via the event stream, and also read constantly — it is not a low-write service.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A single "timeline service" that computes every home timeline by querying all tweets from followed accounts live, on every page load, scales acceptably as follower counts grow.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'It does not — a live join across a large follow list on every single timeline load is exactly the pattern that falls over at scale, which is why precomputed (push) delivery exists for most accounts.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. This naive live-query approach is the common-pitfall mistake in this lesson; real designs push most accounts\' tweets ahead of time and only compute on demand for the accounts where push is too expensive.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Where should an uploaded image or video attached to a tweet be stored?',
+      options: [
+        { id: 'a', text: 'Inline in the same primary datastore row as the tweet text', correct: false, explanation: 'Storing large binary media alongside small text records bloats the primary datastore and hurts every query that touches that table.' },
+        { id: 'b', text: 'In object storage served through a CDN, with only a reference URL kept on the tweet record', correct: true, explanation: 'Correct. Media has very different size and access patterns than tweet text, so it belongs in object storage behind a CDN, referenced by the tweet rather than embedded in it.' },
+        { id: 'c', text: 'In the follow graph service, since it is also read-heavy', correct: false, explanation: 'The follow graph service stores relationships between accounts, not media assets — these have nothing to do with each other.' },
+      ],
+    },
+  ]}
+/>

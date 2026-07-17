@@ -1,0 +1,149 @@
+---
+title: "Transactions and Consistency"
+module: "Databases"
+moduleOrder: 9
+order: 5
+track: "concept"
+summary: "Covers what a transaction actually guarantees (ACID), the isolation levels and anomalies between them, and why guaranteeing those things gets much harder once a system spans multiple nodes or services."
+tags: ["transactions", "acid", "isolation-levels", "distributed-transactions", "databases"]
+estMinutes: 13
+cheatsheet:
+  - "ACID = Atomicity (all-or-nothing), Consistency (invariants hold before/after), Isolation (concurrent transactions don't see each other's half-finished work), Durability (a commit survives a crash)."
+  - "Isolation levels trade correctness for throughput: Read Uncommitted (dirty reads) < Read Committed (no dirty reads, non-repeatable reads possible) < Repeatable Read (phantoms possible) < Serializable (behaves like transactions ran one at a time)."
+  - "Most production systems default to Read Committed, not Serializable — full serializability costs enough throughput that teams add explicit locking only where the anomaly actually matters (e.g. a balance check-then-update)."
+  - "MVCC (used by Postgres, MySQL/InnoDB, and others) gives readers a consistent snapshot without blocking writers, which is why 'readers never block writers' in most modern relational databases."
+  - "Two-phase commit (2PC) gives atomicity across nodes but blocks everyone if the coordinator dies mid-commit — it doesn't scale well and is rarely used across service boundaries in practice."
+  - "The Saga pattern replaces one distributed ACID transaction with a sequence of local transactions plus compensating actions, trading atomicity for availability and throughput."
+  - "The 'C' in ACID (data invariants hold) and the 'C' in CAP (all replicas agree on the latest value) are different concepts — don't conflate them in an interview."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every data store you've looked at so far in this module — how to pick one, how to replicate it, how to shard it, how to index it — eventually runs into the same question: what happens when two operations touch the same data at the same time, or when one operation needs to change several pieces of data together and something fails halfway through? A bank transfer that debits one account but crashes before crediting the other isn't a hypothetical bug, it's the default behavior of a system that hasn't thought about transactions. This lesson covers what a transaction actually promises, the real trade-offs behind "isolation," and why those promises get much harder to keep once your data — or your services — span more than one node.
+
+## What a transaction guarantees: ACID
+
+A transaction bundles a group of reads and writes so the system treats them as one unit. The classic guarantee is **ACID**:
+
+- **Atomicity** — either every write in the transaction happens, or none do. If a transfer debits account A and the process crashes before crediting account B, atomicity means the debit gets rolled back too, not left dangling.
+- **Consistency** (in the ACID sense) — the transaction moves the database from one valid state to another, respecting whatever invariants your schema and application define (foreign keys, check constraints, "balance can't go negative"). The database enforces the invariants you declared; it doesn't know your business rules beyond that.
+- **Isolation** — concurrent transactions behave, from each transaction's point of view, as if it had the database to itself (to a degree the isolation level controls — more below).
+- **Durability** — once a transaction commits, the result survives a crash. This is usually implemented with a write-ahead log flushed to disk before the commit is acknowledged.
+
+Atomicity and durability are close to binary — a database either has them or it's not being honest about "committed." Isolation is where the interesting trade-offs live, because perfect isolation is expensive, and most systems deliberately don't pay for it everywhere.
+
+## Isolation levels: how much interleaving you allow
+
+Running transactions one at a time would be trivially correct and trivially slow. Isolation levels are named points on a spectrum between "fully serial" and "no isolation at all," each one permitting a specific category of anomaly in exchange for more concurrency:
+
+- **Read Uncommitted** — a transaction can see another transaction's uncommitted writes (a **dirty read**). Rarely used deliberately; if transaction A reads a balance that transaction B later rolls back, A acted on data that never really existed.
+- **Read Committed** — you only ever see committed data, but if you read the same row twice within one transaction, it can change between reads (a **non-repeatable read**) because another transaction committed in between. This is the default in Postgres and Oracle.
+- **Repeatable Read** — re-reading the same row within a transaction always returns the same value, but a range query can still see new rows appear that match its filter (a **phantom read**) if another transaction inserts matching rows and commits. This is MySQL/InnoDB's default.
+- **Serializable** — the strongest level: the result is equivalent to *some* serial (one-at-a-time) ordering of the transactions, even though they actually ran concurrently. No dirty reads, no non-repeatable reads, no phantoms.
+
+Each step up costs more: more locking, more retries on conflict, or more bookkeeping to detect conflicting reads. That's why "just use Serializable everywhere" is rarely the right interview answer — it's a real option, but you should say what it costs (typically lower throughput and more transaction retries under contention), not just name it.
+
+## How isolation actually gets implemented
+
+Two broad mechanisms show up in almost every database you'll discuss:
+
+**Locking** — a transaction acquires a lock before reading or writing a row; conflicting transactions wait or abort. Simple to reason about, but readers and writers can block each other, and locks held across a slow transaction stall everyone else touching that data.
+
+**MVCC (multi-version concurrency control)** — instead of locking rows for reads, the database keeps multiple versions of each row and gives every transaction a consistent snapshot as of when it started. A reader sees the version that was committed at its snapshot time, regardless of writes happening concurrently. This is why Postgres and MySQL/InnoDB can say "readers never block writers, writers never block readers" for most operations — the classic locking trade-off simply doesn't apply to plain reads. MVCC doesn't eliminate all conflicts, though: two transactions trying to update the *same* row still need to serialize somehow, usually via a write lock on that row or an abort-and-retry on conflict.
+
+## When a transaction crosses a boundary: distributed transactions
+
+Everything above assumes one node with one log. Once data (or services) live on separate nodes — which is exactly what the Partitioning and Sharding lesson in this module gets you — atomicity across nodes needs its own protocol.
+
+**Two-phase commit (2PC)** is the classic approach: a coordinator asks every participant "can you commit?" (prepare phase); if everyone says yes, it tells them all to commit (commit phase). It gives you atomicity across nodes, but it has a well-known failure mode — if the coordinator crashes after participants have said "yes" but before sending the final commit, those participants are stuck holding locks, unable to unilaterally commit or abort, until the coordinator recovers. That blocking behavior, plus the extra network round trip on every transaction, is why 2PC is rarely used across independent services in practice, even though it still shows up inside some single-cluster distributed databases.
+
+**Sagas** are the pattern most teams reach for instead, when a business operation spans multiple services (order service, payment service, inventory service). A saga runs a sequence of local transactions, each one committing independently; if a later step fails, the saga runs **compensating transactions** to undo the effects of the steps that already succeeded (e.g. "refund the payment" instead of rolling back a distributed commit). You trade true atomicity for availability and throughput — there's a window where the system is in an intermediate, partially-applied state — and you take on the job of writing correct compensations.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant O as Order Service
+    participant P as Payment Service
+    participant I as Inventory Service
+    O->>P: charge card (local transaction)
+    P-->>O: payment succeeded
+    O->>I: reserve stock (local transaction)
+    I-->>O: reservation failed (out of stock)
+    O->>P: compensate: refund card
+    P-->>O: refund completed
+    Note over O: saga ends in a consistent end state,<br/>never a stuck half-committed one
+`} />
+
+## Worked example: a transfer that must not lose money
+
+Say `transfer(accountA, accountB, amount)` needs to debit A and credit B atomically, inside one database. Wrapped in a transaction at Read Committed:
+
+```
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 'A';
+UPDATE accounts SET balance = balance + 100 WHERE id = 'B';
+COMMIT;
+```
+
+Atomicity guarantees both updates land or neither does, even if the process crashes between the two statements. But Read Committed alone doesn't stop a subtler bug: if your application first does `SELECT balance FROM accounts WHERE id = 'A'` to check for sufficient funds, then issues the `UPDATE` in a second step, another transaction can debit A in between your read and your write — a classic **read-then-write race**, not fully covered by non-repeatable-read protection since it's two separate statements racing against another transaction's write. The fix is either a single atomic `UPDATE accounts SET balance = balance - 100 WHERE id = 'A' AND balance >= 100` (letting the database check the invariant atomically), or `SELECT ... FOR UPDATE` to lock the row for the duration of the transaction, or bumping to Serializable and handling the resulting retry-on-conflict in application code. Naming this specific race — not just "use transactions" — is what separates a senior answer.
+
+<Callout type="warning">
+  A common mistake: assuming a "transaction" across two calls to two different microservices behaves like a database transaction just because each call happens to touch a database underneath. It doesn't — there's no shared commit log, no single coordinator by default, and no automatic rollback if the second call fails after the first one succeeded. If you need atomicity-like behavior across services, you have to design it explicitly (2PC, a saga with compensations, or an idempotent retry plus reconciliation job) — it never falls out for free just because each individual service is ACID-compliant internally.
+</Callout>
+
+## Consistency, disambiguated
+
+"Consistency" gets overloaded in this space, and interviewers notice when candidates blur the terms:
+
+- **ACID consistency** — the database enforces the invariants you declared (constraints, foreign keys) within a single transaction.
+- **Replica consistency** (the "C" in CAP, covered in the Non-Functional Characteristics module's [Consistency: CAP and PACELC](/system-design/nfr-consistency-cap-and-pacelc) lesson) — whether every replica of the same data agrees on the latest value.
+- **Isolation-level "consistency"** — informally, how much of another transaction's in-flight work you can observe.
+
+They interact — a strongly-isolated transaction on a single leader doesn't help you if a stale read replica serves the next request — but they're answers to different questions, and conflating them is one of the fastest ways to sound shakier than you are on this topic.
+
+<Quiz
+  lessonId="db-transactions-and-consistency"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A transaction reads a row, and before it commits, a second transaction updates and commits a change to that same row, which the first transaction then re-reads and sees. What anomaly is this?',
+      options: [
+        { id: 'a', text: 'Dirty read', correct: false, explanation: 'A dirty read is seeing another transaction\'s uncommitted data. Here the second transaction already committed before the re-read happened, so this is not a dirty read.' },
+        { id: 'b', text: 'Non-repeatable read', correct: true, explanation: 'Reading the same row twice within one transaction and getting different values, because another transaction committed a change in between, is the definition of a non-repeatable read. Read Committed allows this; Repeatable Read and Serializable prevent it.' },
+        { id: 'c', text: 'Phantom read', correct: false, explanation: 'A phantom read is about a range query returning a different *set of rows* on a second execution (new rows appearing), not a single row\'s value changing.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements about two-phase commit (2PC) are accurate?',
+      options: [
+        { id: 'a', text: 'It can leave participants blocked holding locks if the coordinator crashes after the prepare phase but before sending the final commit', correct: true, explanation: 'This is 2PC\'s best-known weakness: participants that voted "yes" cannot unilaterally decide to commit or abort, so they stay blocked until the coordinator recovers.' },
+        { id: 'b', text: 'It guarantees atomicity across multiple nodes when it completes successfully', correct: true, explanation: 'That is exactly what 2PC is designed to provide: either all participants commit or all abort, coordinated via the prepare/commit phases.' },
+        { id: 'c', text: 'It is the pattern most commonly recommended today for coordinating writes across independent microservices', correct: false, explanation: 'The opposite is true in practice — its blocking failure mode and extra round trips make sagas with compensating transactions the more common choice across independent services.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'MVCC (multi-version concurrency control) means that in most operations, readers do not block writers and writers do not block readers.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — by keeping multiple versions of each row and giving each transaction a consistent snapshot, MVCC lets reads proceed against an older version while a writer creates a newer one, avoiding the classic reader/writer lock contention.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'MVCC is specifically designed to avoid that contention for plain reads; it does not eliminate the need to serialize conflicting writes to the same row, but readers and writers not blocking each other is its defining benefit.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'An order service calls a payment service, which succeeds, then calls an inventory service, which fails due to no stock. Using the Saga pattern, what happens next?',
+      options: [
+        { id: 'a', text: 'The order service runs a compensating transaction, such as refunding the payment', correct: true, explanation: 'Sagas replace cross-service atomicity with a sequence of local transactions plus compensations; since the payment step already committed, undoing it requires an explicit compensating action like a refund, not an automatic rollback.' },
+        { id: 'b', text: 'The payment service automatically rolls back because inventory failed', correct: false, explanation: 'There is no shared transaction coordinator across independently-committed local transactions, so nothing rolls back automatically — that is precisely the problem sagas are designed to handle via explicit compensation.' },
+        { id: 'c', text: 'The whole operation is retried from scratch as one atomic unit', correct: false, explanation: 'Sagas do not retry the entire operation as a single atomic unit — each local transaction has already committed independently, so recovery is handled through compensations for the steps that succeeded, not a blanket retry.' },
+      ],
+    },
+  ]}
+/>

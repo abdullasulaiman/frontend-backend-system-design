@@ -1,0 +1,153 @@
+---
+title: "Scaling and Consumer Groups"
+module: "Distributed Messaging Queue"
+moduleOrder: 17
+order: 6
+track: "concept"
+summary: "Explains how partitions and consumer groups let a messaging queue scale horizontally on both the write and read side, and what breaks when partition counts, rebalances, and hot keys aren't planned for."
+tags: ["messaging-queue", "consumer-groups", "partitioning", "scalability", "rebalancing"]
+estMinutes: 12
+cheatsheet:
+  - "Partitions are the unit of both parallelism and ordering — a topic scales by adding partitions, but ordering is only guaranteed within a single partition, never across them."
+  - "A consumer group is a set of consumers that split a topic's partitions between them — each partition is owned by exactly one consumer per group, so a group can never have more active consumers than partitions."
+  - "Multiple independent consumer groups can each read the full topic at their own pace — the broker doesn't delete a message just because one group consumed it; every group tracks its own offset."
+  - "Rebalancing (reassigning partitions when a consumer joins or leaves) is necessary but disruptive — it pauses consumption group-wide during the handoff, so tune session timeouts and prefer incremental/cooperative rebalancing over stop-the-world strategies."
+  - "Partition count is a one-way door in most systems: you can raise it later, but doing so reshuffles which keys map to which partition and can break ordering guarantees consumers were relying on."
+  - "A hot key (one partition getting far more traffic than the rest) caps your effective throughput at that one partition's limit no matter how many partitions or consumers you add elsewhere."
+  - "Size partition count for your target consumer parallelism, not just current throughput — going from 8 to 64 partitions later means a migration, not a config flag."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every earlier lesson in this module assumed a queue could absorb whatever load you threw at it. In practice, a single broker process handling a single stream of messages tops out fast — one disk, one network interface, one CPU doing serialization. And a single consumer reading that stream tops out even faster, because processing (calling downstream services, writing to a database, doing real work) is almost always slower than the broker can hand messages off. Scaling a messaging queue means answering two separate questions: how do you split the write/storage side across many machines, and how do you split the read side across many consumers without breaking the guarantees the earlier lessons established? The mechanism for both is the same idea wearing two hats: partitioning.
+
+## Partitions: the unit of parallelism
+
+A topic isn't one log — it's split into partitions, each an independent, ordered, append-only log living on (and replicated across) a subset of brokers. A producer decides which partition a message goes to, typically by hashing a key (e.g. `user_id`) mod the partition count, or round-robining if there's no key and ordering doesn't matter.
+
+This buys you two things at once:
+
+- **Write scaling.** Partitions spread across brokers, so total write throughput isn't capped by one machine's disk or NIC — it's roughly `(per-partition throughput) x (partition count)`, up to broker hardware limits.
+- **Read scaling.** Partitions are the unit consumers pull from independently, so many consumers can make progress in parallel instead of fighting over one log.
+
+The cost is the one you already saw in the ordering lesson: ordering is guaranteed only *within* a partition. Two messages with the same key always land on the same partition and are delivered in order to whichever consumer owns it; two messages with different keys have no ordering relationship at all. Partition count is chosen as a trade-off between parallelism and the blast radius of "how much can one partition's traffic skew."
+
+## Consumer groups: splitting the read side
+
+A **consumer group** is a named set of consumer instances that cooperatively read a topic. The broker guarantees that within a group, each partition is assigned to exactly one consumer at a time — never two consumers in the same group reading the same partition simultaneously. That single rule is what makes work-queue semantics ("each message processed once by the group") possible on top of a partitioned, replicated log.
+
+A few consequences fall directly out of that rule:
+
+- **Parallelism is capped by partition count.** A topic with 8 partitions can usefully have at most 8 consumers in one group; a 9th sits idle. This is the single most common scaling mistake — see the pitfall below.
+- **Fewer consumers than partitions means some consumers own multiple partitions.** Perfectly normal, just means less parallelism than the ceiling.
+- **Groups are independent of each other.** A second consumer group reading the same topic gets its own full copy of every partition and tracks its own offsets. This is how one topic serves both a "process the order" consumer group and an entirely separate "archive to data warehouse" consumer group without either affecting the other's progress.
+
+Offsets are the bookkeeping that makes this work: each partition tracks, per group, the position of the last acknowledged (or committed) message. A consumer joining a group late doesn't need history replayed to it manually — it just resumes from its group's committed offset on each partition it's assigned.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  subgraph Topic["Topic: orders (4 partitions)"]
+    P0[Partition 0]
+    P1[Partition 1]
+    P2[Partition 2]
+    P3[Partition 3]
+  end
+  subgraph GroupA["Consumer Group: payment-service"]
+    CA1[Consumer A1]
+    CA2[Consumer A2]
+  end
+  subgraph GroupB["Consumer Group: analytics"]
+    CB1[Consumer B1]
+  end
+  P0 --> CA1
+  P1 --> CA1
+  P2 --> CA2
+  P3 --> CA2
+  P0 --> CB1
+  P1 --> CB1
+  P2 --> CB1
+  P3 --> CB1
+`} />
+
+Notice group A splits the four partitions across two consumers (two each), while group B reads all four partitions with a single consumer — each group's assignment is independent, and both read the same underlying partitions without interfering.
+
+## Rebalancing: the cost of elasticity
+
+When a consumer joins or leaves a group (deploy, crash, scale-out), the broker has to reassign partitions among the remaining members — a **rebalance**. This is what makes consumer groups elastic, but it isn't free:
+
+- During a rebalance, consumers in the group typically stop processing while the new assignment is computed and handed out — a "stop the world" pause, whose length scales with group size and partition count in naive implementations.
+- A consumer is considered dead (triggering a rebalance) if it misses a heartbeat or session-timeout window — so a consumer stuck in a slow processing loop (no heartbeat sent) can get evicted and trigger a rebalance even though it was still alive, just slow.
+- Modern brokers mitigate this with **incremental/cooperative rebalancing**: only the partitions that actually need to move are reassigned, and unaffected consumers keep processing during the transition, instead of every consumer pausing for every rebalance.
+
+The practical implication: don't treat "add a consumer" as a free, instant scaling lever. Frequent scale-out/scale-in (e.g. aggressive autoscaling reacting to every small load spike) causes frequent rebalances, and each one has a real latency cost on the consumer side.
+
+## Choosing and changing partition count
+
+Partition count is usually the hardest capacity number to get right because it's expensive to change later:
+
+- Too few partitions caps consumer parallelism below what you need, even if you add more consumer instances.
+- Too many partitions adds per-partition overhead (open file handles, replication traffic, broker metadata) and can make individual partitions small and inefficient.
+- Increasing partition count later **changes the hash-to-partition mapping** for keyed messages (since it's typically `hash(key) mod partition_count`). Messages for the same key that used to land on partition 3 might now land on partition 7 — breaking the "same key always to the same partition, always in order" guarantee across the transition, unless the migration is handled carefully (e.g. draining old partitions before cutting over).
+
+A reasonable interview approach: size partition count for your *target* peak consumer parallelism (how many consumer instances you want processing in parallel at scale), not today's traffic — and state explicitly that raising it later is a migration, not a config change.
+
+## Worked example: sizing a click-tracking pipeline
+
+Say you're designing ingestion for a click-tracking topic: 200,000 events/sec at peak, keyed by `session_id` so all clicks in one session stay ordered. Each consumer instance, after accounting for a downstream write to a database, can process about 8,000 events/sec.
+
+To hit peak throughput with headroom, you want roughly `200,000 / 8,000 ≈ 25` consumers actively working in one group — so you need at least 25 partitions, and probably plan for 32 or 48 to leave room for growth and for `session_id` hashing to not distribute perfectly evenly (some partitions will run a bit hotter than others). If one particular session generates disproportionate traffic (a bot, a load test), that session's partition becomes a hot spot no amount of extra partitions elsewhere fixes — the fix there is either a better partition key or explicit hot-key handling (e.g. splitting a synthetic key like `session_id:shard` for known-heavy producers), not just adding more partitions to the topic.
+
+<Callout type="warning">
+  The most common scaling mistake: adding consumer instances to a group past the partition count and assuming throughput keeps climbing. It doesn't — every consumer beyond the partition count sits completely idle, and you've just added infrastructure cost with zero benefit. If you need more parallelism than your partition count allows, you have to add partitions (with the rebalancing/migration cost discussed above), not just add consumers.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="mq-scaling-and-consumer-groups"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A topic has 6 partitions and one consumer group with 6 consumers already assigned one partition each. What happens if a 7th consumer joins the same group?',
+      options: [
+        { id: 'a', text: 'It stays idle — the group already has one consumer per partition, so there is nothing left to assign it.', correct: true, explanation: 'A consumer group can never usefully exceed its partition count; each partition is owned by exactly one consumer in the group, so the 7th consumer gets no partition.' },
+        { id: 'b', text: 'The broker automatically doubles the partition count to make room.', correct: false, explanation: 'Brokers do not auto-increase partition count in response to consumer count — that is a manual, disruptive operation with mapping implications.' },
+        { id: 'c', text: 'It splits one existing partition\'s messages with another consumer round-robin.', correct: false, explanation: 'A partition is owned by exactly one consumer at a time within a group — two consumers never share reads of the same partition concurrently.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements about consumer groups are correct? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Two different consumer groups reading the same topic maintain separate offsets and don\'t affect each other\'s progress.', correct: true, explanation: 'Each consumer group tracks its own committed offset per partition, so one group consuming does not remove or advance progress for another.' },
+        { id: 'b', text: 'Adding or removing a consumer from a group triggers a rebalance of partition ownership.', correct: true, explanation: 'Membership changes (join, leave, crash, timeout) are exactly what triggers the broker to reassign partitions among the group\'s remaining members.' },
+        { id: 'c', text: 'A message is deleted from a partition as soon as one consumer group acknowledges it.', correct: false, explanation: 'Retention is independent of any single group\'s acknowledgment — the message stays available (per the queue\'s retention policy) for other groups to read too, as covered in the storage and retention lesson.' },
+        { id: 'd', text: 'Naive rebalancing strategies can pause the entire group\'s consumption while reassignment happens.', correct: true, explanation: 'Stop-the-world rebalancing pauses all consumers in the group during reassignment; cooperative/incremental rebalancing was built specifically to avoid this.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Increasing a topic\'s partition count from 8 to 16 is a safe, transparent operation for consumers relying on same-key-to-same-partition ordering.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Changing partition count changes the hash(key) mod partition_count mapping for most implementations, which can move a key to a different partition and break the ordering guarantee consumers assumed, unless the migration is handled deliberately.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — partition count changes are a migration concern, not a transparent config bump, precisely because they can reshuffle key-to-partition assignment.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A single session_id is generating far more events than any other session, and its partition is running hot even though the topic has 48 partitions. What is the most direct fix?',
+      options: [
+        { id: 'a', text: 'Add more partitions to the topic.', correct: false, explanation: 'Adding partitions spreads different keys further apart on average, but does nothing for one already-overloaded key — that key still hashes to one single partition.' },
+        { id: 'b', text: 'Add more consumers to the group.', correct: false, explanation: 'Extra consumers only help if there are idle partitions to assign them to; they cannot split the load of one already-hot partition further.' },
+        { id: 'c', text: 'Change the partition key strategy for that traffic (e.g. shard the hot key) so its load spreads across multiple partitions.', correct: true, explanation: 'A hot key\'s load is bounded by a single partition\'s capacity regardless of total partition or consumer count; the fix is changing how that traffic maps to partitions, e.g. a composite key.' },
+      ],
+    },
+  ]}
+/>

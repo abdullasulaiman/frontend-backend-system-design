@@ -1,0 +1,171 @@
+---
+title: "Architecture and Data Flow"
+module: "Monitor Server-Side Errors"
+moduleOrder: 14
+order: 2
+track: "concept"
+summary: "Walks through the end-to-end path a server-side error takes from the moment it's thrown to the moment an engineer is paged, and the components that sit along that path."
+tags: ["observability", "error-monitoring", "architecture", "distributed-systems", "logging"]
+estMinutes: 12
+cheatsheet:
+  - "Capture happens in-process (an exception handler, middleware, or SDK) — this is the only place you have the full stack trace and request context; everything downstream only has what you captured."
+  - "Never let error reporting block the request path: buffer events locally and ship them asynchronously (batched HTTP, or via a local agent/sidecar) so a slow collector never adds latency to user-facing calls."
+  - "Fingerprint errors (stack trace plus exception type, normalized) to group occurrences into issues — without grouping, a single bug generates thousands of unreviewable individual events."
+  - "The ingestion pipeline needs a queue (Kafka/Kinesis/SQS) between collection and processing so a burst of errors during an incident doesn't overwhelm storage or get dropped."
+  - "Sampling and rate-limiting at the SDK or ingestion layer are essential — an error storm (e.g. a bad deploy) can produce more volume than a naive pipeline can ingest or than anyone needs to see."
+  - "Store raw events for a short window (days) and aggregated issue-level data for a long window (months) — you rarely need every individual event past the initial triage."
+  - "Alerting must be decoupled from storage: alert on rate-of-change and thresholds computed from the stream, not by querying the same store engineers use for investigation."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson established *what* a server-side error monitoring system needs to do: capture exceptions, preserve context, group duplicates, and alert on-call engineers fast. This lesson is about *how* — the concrete pipeline of components that turns a raw exception thrown deep inside some service into a Slack page with a stack trace and a link to the exact request that caused it.
+
+This matters because the architecture questions here are exactly what an interviewer will push on. "Where does this happen — in-process or out-of-process?" "What happens if the collector is down when an error occurs?" "How do a thousand instances of the same bug become one ticket instead of a thousand?" Getting the data flow right, end to end, is most of the design.
+
+## The five stages every error passes through
+
+Regardless of the specific tools (Sentry, Rollbar, or a homegrown system), server-side error monitoring follows the same five stages:
+
+1. **Capture** — an exception or fatal condition occurs inside a running service and is intercepted before the process would otherwise crash or silently swallow it.
+2. **Enrichment** — context is attached: stack trace, request ID, user/tenant ID, service version, host, and any breadcrumbs (recent log lines or events leading up to the failure).
+3. **Transport** — the enriched event is sent out of the process, toward a central collector.
+4. **Ingestion & processing** — the collector receives events, deduplicates/groups them into issues, and persists them.
+5. **Alerting & presentation** — on-call engineers are notified when thresholds are crossed, and a dashboard/search UI lets anyone drill into an issue's occurrences.
+
+Each stage has a distinct failure mode, and a good design treats them as separable concerns rather than one monolithic "logging call."
+
+## Capture: where the error actually gets caught
+
+Capture is almost always implemented as a language-level hook: a global exception handler, an HTTP middleware that wraps every request handler in a try/catch, an uncaught-exception listener on the process, or an SDK woven into the framework (Django middleware, Express error-handling middleware, a JVM `UncaughtExceptionHandler`).
+
+This is the one place in the whole pipeline where you have the *complete* picture — the actual stack trace with local variable context, the exact request that triggered it, and the process's in-memory state. Once the error leaves this stage, you only have whatever you chose to serialize. That's why enrichment happens immediately, in the same code path, before anything is queued for transport.
+
+Two categories of capture exist:
+
+- **Handled**: your own code catches an exception and explicitly reports it (`captureException(err)`), often because it degrades gracefully but the failure is still worth knowing about.
+- **Unhandled**: a global hook catches whatever the framework didn't handle itself — this is the safety net for the "we didn't anticipate this" cases, which in practice are most production incidents.
+
+## Enrichment: attaching the context that makes an error debuggable
+
+A bare stack trace ("`NullPointerException` at `OrderService.java:142`") is barely actionable. Enrichment attaches:
+
+- **Request context** — method, path, headers (scrubbed of secrets), request ID for tracing, user/tenant ID.
+- **Environment** — service name, version/commit SHA, host/pod, region.
+- **Breadcrumbs** — the last N log lines, DB queries, or outbound calls made by this request before it failed, giving a timeline leading up to the crash.
+- **Fingerprint inputs** — the normalized stack trace and exception type, computed here so later grouping is cheap.
+
+This is also where you decide what *not* to send — PII scrubbing has to happen before the event leaves the process, not downstream, because you can't un-ship data that already left your infrastructure.
+
+## Transport: getting the event out without hurting the request
+
+The event now needs to leave the process and reach a central system. The overriding constraint: **reporting an error must never add meaningful latency to the request that triggered it, and must never be a new source of failures itself.**
+
+Two dominant patterns:
+
+- **Async in-process buffering** — the SDK queues the event in memory and a background thread/goroutine flushes a batch to the collector every few seconds or when the buffer fills. If the collector is unreachable, events drop (with a bounded local buffer) rather than blocking or crashing the app.
+- **Local agent/sidecar** — the app writes to a local Unix socket or `localhost` port, and a sidecar agent (also handling retries, batching, and backpressure) forwards to the central system. This decouples the app's failure modes from the network's.
+
+Either way, transport is over HTTP(S) or a lightweight binary protocol, batched, and treated as best-effort: losing a few error events during a network blip is an acceptable trade for never letting monitoring itself take down the service it's monitoring.
+
+<Callout type="warning">
+  A common design mistake: making error reporting synchronous and blocking — `await reportError(err)` directly in the request path with no timeout. If the error-reporting collector is slow or down (which is disproportionately likely during an actual incident, when the network or infra is already stressed), every failing request now also hangs waiting on the reporting call, compounding the outage instead of just recording it. Always fire-and-forget with a bounded local buffer and a short timeout.
+</Callout>
+
+## Ingestion, grouping, and storage
+
+At the central collector, incoming events land on a **message queue** (Kafka, Kinesis, or similar) before any processing touches them. This buffer absorbs bursts — a bad deploy that suddenly throws on every request can produce orders of magnitude more events per second than the steady state, and the queue keeps that spike from overwhelming the database or getting silently dropped.
+
+Consumers behind the queue do the real work:
+
+- **Fingerprinting/grouping** — hash the normalized stack trace (plus exception type) into a fingerprint, and either attach the event to an existing "issue" with that fingerprint or create a new one. This is what turns 10,000 occurrences of the same null-pointer bug into 1 issue with a count of 10,000, instead of 10,000 unreviewable rows.
+- **Rate limiting / sampling** — if an issue is firing at an extreme rate, store full detail for a sample of occurrences and just increment a counter for the rest. You need to know it happened 50,000 times; you don't need to store 50,000 identical stack traces.
+- **Persistence, tiered by age** — raw individual events go to a short-retention store (days) since they're mainly useful for immediate triage; issue-level aggregates (counts, first-seen, last-seen, affected versions) go to a longer-retention store (months) for trend analysis.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Service instance\nthrows exception] --> B[Capture +\nEnrichment\nin-process]
+  B --> C[Async transport\nbatched, non-blocking]
+  C --> D[(Ingestion queue\nKafka/Kinesis)]
+  D --> E[Grouping &\nfingerprinting]
+  E --> F[(Issue store\naggregates)]
+  E --> G[(Raw event store\nshort retention)]
+  F --> H[Alerting engine]
+  F --> I[Dashboard / search UI]
+  H --> J[On-call engineer]
+`} />
+
+## Alerting: a separate consumer, not an afterthought
+
+Alerting reads from the same grouped-issue stream but is architecturally its own consumer, evaluating rules like "issue X exceeded 100 occurrences/minute" or "a brand-new issue appeared in a production service" against a sliding window. It's kept separate from the query path engineers use to investigate (the dashboard/search UI) so that a spike in read traffic from someone debugging doesn't compete with, or get confused with, the alerting evaluation itself. Alerting output routes to paging systems (PagerDuty, Opsgenie) or chat (Slack), typically deduplicated per issue so a storm of 10,000 events pages once, not 10,000 times.
+
+## Worked example: tracing one NullPointerException
+
+Say a `payment-service` instance throws a `NullPointerException` because a downstream `getUserProfile` call returned `null` for a deleted account, and this happens for 3,000 requests over 2 minutes during a bad rollout.
+
+1. **Capture**: the JVM's global uncaught-exception handler (wired by the monitoring SDK) intercepts it before the thread dies.
+2. **Enrichment**: the SDK attaches the request ID, the deleted account's user ID, `payment-service` version `v2.14.3`, and the last 20 log lines showing the profile lookup.
+3. **Transport**: the SDK buffers this in memory and flushes a batch of up to 50 events every 2 seconds to the ingestion endpoint over HTTPS, non-blocking.
+4. **Ingestion**: 3,000 events land on the Kafka topic within 2 minutes — well within the queue's throughput, so nothing is dropped even though it's ~25x the service's normal error rate.
+5. **Grouping**: all 3,000 share the same normalized stack trace fingerprint, so they collapse into a single issue, incrementing its counter from 0 to 3,000 and recording `v2.14.3` as the first affected version.
+6. **Alerting**: the alerting engine's rule ("new issue in `payment-service` production, rate greater than 10/min") fires once, pages the on-call engineer via PagerDuty with a link to the issue.
+7. **Investigation**: the engineer opens the issue, sees the grouped stack trace, one representative full event with request context, the affected-version history, and confirms it started exactly at the `v2.14.3` deploy — pointing straight at the rollback.
+
+That's the entire value of the architecture: 3,000 raw crashes became one page with an obvious root cause, in under a minute.
+
+## Common pitfalls in this pipeline
+
+<Callout type="warning">
+  Grouping by raw, unnormalized stack trace text is a frequent design bug. Two occurrences of the *same* logical error can have slightly different stack traces if they include memory addresses, line numbers that shift between builds, or interleaved async frames — causing the same bug to fragment into dozens of "different" issues. Normalize traces (strip addresses, collapse framework-internal frames, hash on function names plus relative structure) before fingerprinting, or grouping quietly stops working and every dashboard looks noisy even during a single-root-cause incident.
+</Callout>
+
+The next lesson in this module takes this architecture and turns it into a concrete system design: sizing the queue and storage tiers, choosing between push- and pull-based alerting, and handling multi-region deployments.
+
+<Quiz
+  lessonId="srv-err-architecture-and-data-flow"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does context enrichment (request ID, stack trace, breadcrumbs) happen in-process at capture time rather than later in the pipeline?',
+      options: [
+        { id: 'a', text: 'Because the collector cannot accept large payloads', correct: false, explanation: 'Payload size is not the real constraint here — collectors are designed to accept enriched events; this is not why enrichment happens early.' },
+        { id: 'b', text: 'Because the in-process context (full stack trace, local request state) is only available at the moment of failure and is lost once the event leaves the process', correct: true, explanation: 'Exactly — once an event is serialized and shipped, you only have what was captured. There is no way to retroactively recover local variables or the exact request state after the fact.' },
+        { id: 'c', text: 'Because enrichment is cheaper to do at the central collector, which has more compute capacity', correct: false, explanation: 'Cost/compute is not the driver; the driver is data availability — the raw context simply does not exist anywhere except inside the failing process at that instant.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which design choices help prevent error reporting from becoming a new source of production incidents? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Sending error events asynchronously with a bounded local buffer, dropping events if the collector is unreachable', correct: true, explanation: 'Fire-and-forget with a bounded buffer means a down collector cannot block or crash the reporting service.' },
+        { id: 'b', text: 'Awaiting the reporting call synchronously so you know for certain the error was recorded before returning a response', correct: false, explanation: 'This is the anti-pattern: it makes every request depend on the health of the monitoring system, so a slow/down collector directly degrades user-facing latency.' },
+        { id: 'c', text: 'Putting a message queue between ingestion and processing so a burst of errors does not overwhelm storage', correct: true, explanation: 'The queue absorbs bursts (e.g. from a bad deploy) so downstream processing and storage are not overloaded, and events are not lost.' },
+        { id: 'd', text: 'Sampling full event detail once an issue exceeds a high occurrence rate, while still incrementing its counter', correct: true, explanation: 'Sampling keeps storage and processing costs bounded during an error storm while still preserving accurate counts and a representative sample for debugging.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Alerting should query the same store and query path that engineers use to search and investigate issues, to keep the architecture simple.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Coupling them means investigation query load can interfere with alert evaluation (or vice versa), and it blurs a real-time streaming concern (alerting) with an interactive-query concern (search/dashboards). They are usually kept as separate consumers of the grouped-issue data.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — alerting is typically a separate consumer evaluating rules over a stream/window, decoupled from the interactive dashboard/search path engineers use to investigate.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A bug causes the same NullPointerException to occur 5,000 times in ten minutes across many instances. What should the ingestion/processing stage do with these events?',
+      options: [
+        { id: 'a', text: 'Store all 5,000 as separate, unrelated issues so no detail is lost', correct: false, explanation: 'This is exactly what fingerprinting/grouping is meant to prevent — it would flood the dashboard with 5,000 entries for one underlying bug, making triage effectively impossible.' },
+        { id: 'b', text: 'Fingerprint the normalized stack trace, group all 5,000 occurrences under one issue, and increment its counter', correct: true, explanation: 'Grouping by fingerprint is the core mechanism that turns a flood of raw events into one actionable issue with an occurrence count.' },
+        { id: 'c', text: 'Discard all but the first occurrence since the rest are duplicates with no value', correct: false, explanation: 'Discarding loses the accurate count and trend data (e.g. rate of increase, affected versions); the right move is to group and count, not drop.' },
+      ],
+    },
+  ]}
+/>

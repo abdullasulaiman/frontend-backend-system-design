@@ -1,0 +1,232 @@
+---
+title: "Tries and Data Structures"
+module: "Design Typeahead Suggestion"
+moduleOrder: 12
+order: 2
+track: "interview"
+summary: "Explains why a trie augmented with per-node top-k caching is the standard data structure for typeahead, and compares it against hash maps and sorted arrays to show what each trade-off actually costs."
+tags: ["trie", "data-structures", "autocomplete", "typeahead", "caching"]
+estMinutes: 12
+cheatsheet:
+  - "A trie stores one node per shared character, not per string — prefix lookup costs O(p) for a prefix of length p, independent of how many strings share that prefix."
+  - "A plain trie only tells you which strings share a prefix; it does not rank them. You still need frequency data and a way to retrieve the top-k efficiently at each node."
+  - "Caching the top-k completions at every node (computed offline, refreshed periodically) turns query time into an O(1) lookup instead of a DFS over every completion under that prefix."
+  - "Precomputing top-k at every node costs extra memory (roughly k pointers per node) and makes writes/updates more expensive, since a frequency change can ripple up to every ancestor node — a classic space/write-cost-for-read-speed trade-off."
+  - "A hash map of prefix-to-top-k results is simpler to build than a trie but duplicates data across every prefix of every string, and updates require re-touching every affected prefix entry."
+  - "Real systems rebuild ranking data on a delay (minutes to hours) rather than updating a live trie per keystroke — recency doesn't need to be second-by-second for typeahead to feel good."
+  - "Merging children with a single child (radix/compressed trie) shrinks memory further but complicates incremental updates — usually not worth the complexity for typeahead unless memory is the bottleneck."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson established the shape of the problem: hundreds of
+thousands of queries per second, most of them prefixes of two to five
+characters, each one needing a ranked list of completions back in well
+under 100ms. That constraint rules out anything that scans data at query
+time. What's left is a small family of data structures built specifically
+to answer "which of my millions of stored strings start with this
+prefix" instantly — and the one nearly every real typeahead system reaches
+for is the trie.
+
+This lesson covers what a trie actually buys you, why a plain trie isn't
+enough on its own, and how caching the top completions at each node turns
+prefix lookup into the O(1)-feeling operation a typeahead service needs.
+
+## Why not simpler structures first
+
+Before reaching for a trie, it's worth ruling out the obvious alternatives,
+because the trade-offs explain *why* the trie wins here.
+
+- **A sorted list of strings with binary search.** Binary search finds
+  where a prefix would sit in O(log n) comparisons, and everything
+  matching the prefix sits in a contiguous range right after it. This
+  actually works reasonably well for lookup. The problem is updates:
+  inserting a new high-frequency string into a sorted array is an O(n)
+  shift, and typeahead data updates constantly as new queries and
+  frequencies come in.
+- **A hash map keyed by exact string.** A hash map answers "does this
+  exact string exist" in O(1), but a prefix isn't an exact key — there's no
+  way to ask a hash map "give me everything that starts with `ap`"
+  without scanning every key, which defeats the point.
+- **A hash map keyed by every prefix.** You could precompute every prefix
+  of every string as a key (`a`, `ap`, `app`, `appl`, `apple`, all mapping
+  to a ranked list). This actually gives O(1) lookup, and some real
+  systems do exactly this as a flattened cache layer. The cost is
+  duplication: a string of length n contributes to n separate map entries,
+  and a frequency change for one string means updating every one of its
+  prefix entries. It works as a read-optimized cache built *from* a trie,
+  but it's an awkward primary structure to maintain.
+
+The trie sits in between: it shares storage across common prefixes (unlike
+the flattened hash map), and it supports incremental insertion naturally
+(unlike a sorted array), because inserting a new string just walks or
+creates nodes character by character.
+
+## The trie: prefix lookup in O(p)
+
+A trie (from re**trie**val, usually pronounced "try") is a tree where each
+edge represents one character, and each root-to-node path spells out a
+prefix. A node marked as "end of word" means the path down to it is a
+complete stored string, not just a prefix of a longer one.
+
+Walking down from the root by the characters of a query prefix costs one
+step per character — O(p) for a prefix of length p, completely independent
+of how many total strings are stored or how many share that prefix. Once
+you're at the node for `"ap"`, every string starting with `"ap"` lives
+somewhere in the subtree rooted there. That's the core guarantee a trie
+gives you: shared prefixes are stored once, and reaching "the node for
+this prefix" is fast and constant-ish regardless of dataset size.
+
+### What a plain trie doesn't solve
+
+Reaching the right node is only half the problem. A typeahead service
+needs the *top-k* completions by frequency, not all of them, and not in
+arbitrary order. A plain trie, on its own, only tells you which strings
+exist under a prefix — retrieving the best k means a depth-first walk of
+the entire subtree, scoring every leaf, and sorting. For a popular short
+prefix like `"th"` that might sit above hundreds of thousands of stored
+queries, that walk is far too slow to do on every keystroke.
+
+This is the actual engineering problem this lesson is about: a trie gives
+you fast prefix *location*, but ranking still needs a separate mechanism
+layered on top.
+
+## Precomputing top-k at every node
+
+The standard fix is to precompute and cache the top-k completions at every
+node in the trie, not just at the leaves. Each node stores a small,
+pre-sorted list — say, the top 10 completions by frequency for the prefix
+that node represents. A query then becomes: walk to the node for the
+typed prefix (O(p)), and return the list already sitting there (O(k) to
+copy it out, or O(1) if you just hand back a reference).
+
+This shifts cost from query time to build/update time, which is exactly
+the trade-off a read-heavy, write-tolerant workload wants (typeahead reads
+outnumber writes by many orders of magnitude, as the requirements lesson
+established).
+
+The cost of that shift is real, though:
+
+- **Memory.** Every node now carries roughly k extra pointers/references
+  instead of zero. For a trie with millions of nodes, that multiplies
+  memory footprint meaningfully — it's a direct space-for-speed trade.
+- **Update propagation.** When a string's frequency changes (someone
+  searches it enough times to bump its rank), every ancestor node from the
+  leaf back up to the root might need its cached top-k list re-evaluated,
+  since the string could now newly qualify for one of those lists. That's
+  an O(depth) update in the best case, and touching every ancestor's
+  cached list is more work than updating a single counter.
+
+Because full, live propagation on every search event is expensive at
+scale, real systems don't do it synchronously. They batch: log raw query
+events, and periodically (every few minutes to a few hours) run an offline
+job that recomputes frequencies and rebuilds the top-k caches for the
+whole trie, then swaps the new version in. A typeahead suggestion being
+"slightly stale" — reflecting popularity data from twenty minutes ago
+instead of the last second — is invisible to users. This is worth stating
+explicitly in an interview: **it's a deliberate, reasonable trade of
+strict recency for update simplicity**, not a shortcut you're hiding.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    Q["Query stream\n(raw searches)"] --> AGG["Offline aggregation job\n(batched, every few minutes)"]
+    AGG --> FREQ["Updated frequency counts"]
+    FREQ --> BUILD["Rebuild trie + top-k caches"]
+    BUILD --> SWAP["Swap in new trie version"]
+    U["User types prefix"] --> LOOKUP["Walk trie to prefix node\nO(p)"]
+    LOOKUP --> CACHE["Return cached top-k\nO(k)"]
+    SWAP -.serves.-> LOOKUP
+    style Q fill:#2b6cb0,color:#fff
+    style U fill:#9c4221,color:#fff
+    style CACHE fill:#4a5568,color:#fff
+`} />
+
+## Worked example: building the cache for one branch
+
+Say the trie has a node for the prefix `"ap"`, and the strings stored
+under that subtree with their frequencies are: `"apple"` (950), `"app"`
+(600), `"application"` (420), `"apply"` (380), `"appreciate"` (90). With
+`k = 3`, the cached list at the `"ap"` node is `["apple", "app",
+"application"]`, sorted descending by frequency. That list was computed
+once, offline, by walking the subtree and keeping a running top-3 (a small
+min-heap of size 3 is enough — push each candidate, pop the smallest when
+the heap exceeds size 3).
+
+Now a user types `"a"`, then `"ap"`. Each keystroke is a separate lookup:
+the client (or a debounced request, covered in the frontend course, but
+relevant here on the backend edge too) asks the service for completions
+of `"ap"`. The service walks two trie edges from the root, arrives at the
+node, and returns the three cached strings directly — no scoring, no
+sorting, no subtree walk, at request time. If `"apply"` later overtakes
+`"application"` in frequency, that's a change caught by the next offline
+rebuild, not by anything happening synchronously during search traffic.
+
+<Callout type="warning">
+  A common mistake is treating a plain, uncached trie as "the" typeahead
+  data structure and stopping there. That gets you fast prefix lookup but
+  leaves ranking unsolved — you'd still have to walk and score every
+  string under a hot prefix on every request, which is exactly the kind of
+  work a sub-100ms latency budget can't absorb at high QPS. The trie
+  alone answers "what strings share this prefix"; a working typeahead
+  design needs the trie *plus* a caching or precomputation strategy for
+  "what are the best k of them," and a story for how that cache gets
+  refreshed as popularity shifts.
+</Callout>
+
+## Where this leads
+
+The trie plus per-node top-k cache is the storage/lookup structure; it
+doesn't yet decide *what* frequency data feeds it or how personalization
+adjusts the ranking for a specific user — that's the next lesson. And this
+lesson deliberately left out how the trie itself gets sharded, replicated,
+and kept in sync across servers serving hundreds of thousands of queries
+per second; that's covered once the full design and scaling lessons put
+the whole system together.
+
+<Quiz
+  lessonId="typeahead-tries-and-data-structures"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the main reason a trie is preferred over a plain hash map keyed by full strings for typeahead prefix lookup?',
+      options: [
+        { id: 'a', text: 'A hash map cannot efficiently answer "give me everything starting with this prefix" without scanning keys, while a trie reaches the prefix\'s node in one walk', correct: true, explanation: 'A hash map keyed by exact string gives O(1) exact-match lookup but has no notion of prefix locality, so answering a prefix query means scanning; a trie\'s structure makes the prefix node directly reachable in O(p).' },
+        { id: 'b', text: 'A trie uses less memory than a hash map in every case', correct: false, explanation: 'Not universally true — a trie shares storage across common prefixes, but with per-node top-k caching added, its memory overhead can exceed a simple hash map\'s for some datasets. Memory isn\'t the deciding factor here.' },
+        { id: 'c', text: 'A hash map cannot store strings longer than a fixed length', correct: false, explanation: 'Hash maps have no such string-length restriction; this isn\'t a real limitation of hash maps.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'boolean',
+      prompt: 'A plain trie, without any additional caching or precomputation, can return the top-k most popular completions for a prefix in O(p + k) time, where p is the prefix length.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A plain trie only locates the subtree for a prefix in O(p); finding the top-k by frequency within that subtree still requires walking and scoring every string under it, which is not O(k) without a precomputed cache.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — without a precomputed top-k cache at each node, ranking requires a walk over the whole subtree under the prefix, which can be far more expensive than O(p + k) for a popular, high-fanout prefix.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'multi',
+      prompt: 'Which of these are real costs of caching a precomputed top-k list at every trie node? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Extra memory per node to store the cached list', correct: true, explanation: 'Every node now holds roughly k additional references instead of zero, which multiplies meaningfully across a trie with millions of nodes.' },
+        { id: 'b', text: 'A frequency change for one string may require re-evaluating cached lists at every ancestor node up to the root', correct: true, explanation: 'A string newly qualifying for a top-k list affects every ancestor prefix node on its path, not just its own leaf, making live updates more expensive than a single counter increment.' },
+        { id: 'c', text: 'Prefix lookup time becomes worse than O(p)', correct: false, explanation: 'Lookup time is unaffected (still O(p) to reach the node); the cache only adds cost to memory and to update/build time, not to query-time traversal.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why do most real typeahead systems rebuild trie top-k caches on a periodic offline schedule (minutes to hours) rather than updating them synchronously on every search event?',
+      options: [
+        { id: 'a', text: 'Because slightly stale popularity data is invisible to users, and batching avoids the cost of touching every ancestor node on every single query', correct: true, explanation: 'Typeahead relevance tolerates a delay of minutes without a noticeable UX difference, so batching updates trades a small amount of freshness for a much simpler and cheaper update path.' },
+        { id: 'b', text: 'Because tries cannot support insertion after they are first built', correct: false, explanation: 'Tries fully support incremental insertion of new strings; that is one of their advantages over a sorted array. The batching choice is about update cost and freshness trade-offs, not a structural limitation.' },
+        { id: 'c', text: 'Because per-node caching only works if the whole trie is rebuilt from scratch each time', correct: false, explanation: 'Incremental updates to cached lists are technically possible; systems choose batch rebuilding for simplicity and cost reasons, not because incremental updates are impossible.' },
+      ],
+    },
+  ]}
+/>

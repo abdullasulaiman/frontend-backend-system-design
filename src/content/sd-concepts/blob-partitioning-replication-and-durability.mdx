@@ -1,0 +1,139 @@
+---
+title: "Partitioning, Replication, and Durability"
+module: "Blob Store"
+moduleOrder: 20
+order: 3
+track: "concept"
+summary: "Explains how a blob store splits large objects into chunks for placement, and how it chooses between replication and erasure coding to hit an extreme durability target without paying for full copies everywhere."
+tags: ["partitioning", "replication", "durability", "erasure-coding", "blob-store"]
+estMinutes: 12
+cheatsheet:
+  - "Blob stores partition below the object: a large object is split into fixed-size chunks (tens of MB each), and each chunk is placed independently — never route a whole multi-GB object to a single storage node."
+  - "Durability is not availability. Durability asks 'will this data ever come back if I wait long enough'; availability asks 'can I read it right now.' A store can be durable but briefly unavailable during a failover, or available but quietly losing data to undetected bit rot."
+  - "Replication (e.g. 3 full copies) is simple and cheap to repair but costs 3x storage. Erasure coding (e.g. 6 data shards + 3 parity shards) tolerates the same 3 failures at ~1.5x storage, at the cost of CPU for encode/decode and more network traffic to repair a lost shard."
+  - "Durability math multiplies independent failure probabilities — it only holds if replicas/shards sit in genuinely independent failure domains (different racks, ideally different AZs) and the repair window after a failure is short. Slow repair is the silent killer of 'eleven nines' claims."
+  - "Checksums on every chunk plus a background scrubbing job are what catch silent bit rot — corruption a disk reports as a successful read. Without active scrubbing, a bad chunk can sit undetected until the day you need it."
+  - "Erasure coding pays off most on large, colder objects where the storage savings dwarf the CPU cost; small, hot objects are often still replicated because encoding overhead per byte is worse and repair-shard fetches add latency you can't afford on the hot path."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A blob store's entire value proposition is "give us your data and we will not lose it, at a cost you can afford." That sounds like the same replication problem a key-value store solves, but blobs break the usual playbook in two ways: objects range from a 2KB thumbnail to a 50GB video file, so you can't route "the object" to one shard the way you'd route a small key-value pair, and the durability bar is much higher — losing someone's only copy of a video isn't a stale read you retry, it's gone forever. This lesson covers how a blob store partitions objects for placement, and how it picks between replication and erasure coding to hit a durability target like "eleven nines" without tripling every storage bill.
+
+## Partitioning below the object, not at the object
+
+A key-value store partitions by routing each *key* to a shard. A blob store can't do that cleanly for large objects — a 50GB video routed to a single node makes that node a bottleneck for every upload and download of that object, and a bounded amount of hardware failure destroys the whole thing at once.
+
+Instead, blob stores split each object into fixed-size **chunks** (implementations vary, but tens of MB per chunk is typical) and place each chunk independently, usually by hashing a chunk identifier onto a set of storage nodes. This buys three things:
+
+- **Parallelism** — uploading a large object writes many chunks to many nodes concurrently instead of streaming everything through one node's disk and network interface.
+- **Bounded blast radius** — losing a node only affects the chunks it held, not entire objects; recovery work is chunk-sized, not object-sized.
+- **Uniform placement logic** — a 2KB object is just "one chunk," so the same placement and repair machinery handles every object size without a special case.
+
+The object's chunk list — which chunk IDs make it up, and in what order — lives in the metadata layer (covered in the previous lesson), not in the data path itself.
+
+## Placement across failure domains
+
+Where a chunk's copies (or shards — more on that below) land matters as much as how many there are. If three copies of a chunk all sit in the same rack, a single top-of-rack switch failure or a power event can take out all three at once — the replication count was real, but the independence it's supposed to buy wasn't.
+
+Production placement policies are explicit about spreading copies across failure domains: one per rack at minimum, one per availability zone where the deployment spans multiple AZs, and increasingly one full replica set in a separate region for disaster recovery against a whole-region event. This is the same failure-domain-aware placement idea you'd apply to any replicated system, just applied to chunks instead of whole records.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    O["Object: 300MB video"] --> C1["Chunk 1"]
+    O --> C2["Chunk 2"]
+    O --> C3["Chunk 3"]
+    C2 --> R1["Rack A - Node 12"]
+    C2 --> R2["Rack B - Node 47"]
+    C2 --> R3["Rack C - Node 88"]
+    R1 -. different power/network path .- R2
+    R2 -. different power/network path .- R3
+`} />
+
+## Replication vs. erasure coding
+
+Once chunks are placed, the store needs redundancy so a single failed disk or node doesn't lose the chunk. There are two standard approaches, and most large blob stores use both, chosen per object class.
+
+**Replication** stores `N` full copies of a chunk (3 is a common default, matching the reasoning behind key-value replication factors). It's simple: repairing a lost copy means copying one full chunk from a surviving replica. The cost is storage: 3 copies means 3x the raw bytes on disk for every byte of logical data.
+
+**Erasure coding** splits a chunk into `k` data shards and adds `m` parity shards computed from them (Reed-Solomon codes are the common choice), such that *any* `k` of the `k + m` shards are enough to reconstruct the original chunk. A common configuration is `6 + 3`: tolerating the loss of any 3 shards — the same fault tolerance as 3x replication — at a storage overhead of only `9/6 = 1.5x` instead of `3x`.
+
+The trade-offs erasure coding introduces:
+
+- **CPU cost** — encoding on write and decoding on repair (or on read, if a shard is missing) takes real compute, unlike replication's plain byte copy.
+- **Repair cost** — reconstructing one lost shard requires fetching `k` other shards across the network, not just one replica's worth of bytes. A single-shard loss under `6 + 3` pulls 6x the data of that shard to rebuild it.
+- **Read latency on the degraded path** — if a shard needed for a read is missing, the read has to fetch enough other shards and decode, which is slower than reading a plain replica.
+
+Because of that repair and latency cost, erasure coding tends to be applied to large, infrequently-accessed objects where the storage savings are big and the CPU/network cost of an occasional repair is easily absorbed. Small or frequently-read objects are often still replicated, since the fixed overhead of erasure coding per object and the repair-path latency aren't worth it at that size.
+
+## Durability is a probability, and it depends on repair speed
+
+"Eleven nines of durability" (`99.999999999%`) means the store expects to lose roughly one object out of 10^11 per year — not "we never lose data," but "the probability of permanent loss is vanishingly small." That number comes from multiplying failure probabilities, and it only holds if the copies/shards sit in independent failure domains, and the store repairs a lost copy fast enough that a *second* independent failure is unlikely before repair finishes.
+
+Say a disk has a 1% annual failure rate (AFR) and failures are independent across 3 replicas in 3 different racks. The naive yearly loss probability for "all 3 fail simultaneously" looks like `0.01^3 = 0.000001%` — already six nines. But the real risk is losing a second and third replica *during the repair window* after the first fails, which can be hours, not a year. If a failed replica typically takes 2 hours to detect and fully re-replicate, the relevant probability window shrinks from "a year" to "a couple of hours" — what pushes achievable durability from six nines toward eleven. This is why fast failure detection and fast re-replication are durability features, not just operational hygiene — the same replication factor with slower repair has materially worse durability, even though the replica count on paper looks identical.
+
+## Catching corruption before you need the data
+
+Replica count and repair speed protect against a node disappearing outright. They don't protect against **bit rot** — a disk silently returning corrupted bytes for a read it reports as successful. Every chunk is stored with a checksum (a hash of its contents), and a background **scrubbing** process continuously reads chunks, recomputes the checksum, and compares. A mismatch triggers the same repair path as a lost replica: rebuild the chunk from a good copy or from `k` other shards, and replace the corrupted one. Without active scrubbing, a corrupted chunk can sit undetected for months — discovered only when a read actually needs it, at which point you may find every other copy already rotted too.
+
+## Worked example: sizing storage for a 10 PB object store
+
+Say a photo-and-video store holds 10 PB of logical data and needs the equivalent of 3-failure tolerance. Two options:
+
+- **3x replication**: 10 PB x 3 = 30 PB of physical storage.
+- **6+3 erasure coding**: 10 PB x 1.5 = 15 PB of physical storage.
+
+At a rough $18/TB/month for durable object storage hardware and operations, that's roughly $540,000/month (replication) versus $270,000/month (erasure coding) — a $3.2M/year gap on the same logical 10 PB, for the same fault tolerance. That gap is why large blob stores invest in erasure coding despite the added complexity: at this scale, storage savings dwarf the extra CPU and repair-network cost, especially for the "write once, read rarely" objects that dominate blob store volume (backups, archived media, cold log data).
+
+<Callout type="warning">
+  A common mistake is treating "replication factor 3" as an automatic durability guarantee regardless of how it's deployed. Three copies on three disks in the same server give you almost none of the protection three copies spread across racks and AZs give you — a single power supply or switch failure can take all three at once. The same applies to repair speed: a system that detects a failed node in 6 hours and takes 2 more days to re-replicate has meaningfully worse durability than one with the same replication factor but a 10-minute detection and 1-hour repair window, because the "second failure during the repair window" risk is proportional to how long that window stays open. Durability comes from replica count *and* failure-domain independence *and* repair speed together — quoting just the replication factor in an interview is incomplete.
+</Callout>
+
+<Quiz
+  lessonId="blob-partitioning-replication-and-durability"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why do blob stores typically split a large object into fixed-size chunks before placing it on storage nodes, rather than storing the whole object on one node?',
+      options: [
+        { id: 'a', text: 'To avoid a single node being a bottleneck for upload/download and to bound the amount of data lost or needing repair if one node fails', correct: true, explanation: 'Chunking parallelizes transfer across nodes and keeps the failure/repair unit small and predictable, regardless of how large the overall object is.' },
+        { id: 'b', text: 'Because metadata databases cannot store references to objects larger than a few megabytes', correct: false, explanation: 'The metadata layer stores a chunk list, which works for objects of any size; chunking is about data placement and parallelism, not a metadata size limit.' },
+        { id: 'c', text: 'Because erasure coding requires objects to be pre-split before any redundancy can be applied at all', correct: false, explanation: 'Chunking happens regardless of whether replication or erasure coding is used for redundancy; it is a placement decision, not solely an erasure-coding requirement.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine trade-offs of choosing erasure coding (e.g. 6 data + 3 parity shards) over 3x replication for the same fault tolerance? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Lower storage overhead (about 1.5x instead of 3x) for the same tolerance of 3 failures', correct: true, explanation: 'This is the main reason to choose erasure coding — 9 total shards tolerating 3 losses costs 1.5x the logical data, versus 3x for full replication.' },
+        { id: 'b', text: 'Higher CPU cost to encode chunks on write and decode/reconstruct on repair or degraded reads', correct: true, explanation: 'Erasure coding requires real computation (e.g. Reed-Solomon encode/decode), unlike a replication scheme, which just copies bytes.' },
+        { id: 'c', text: 'Repairing a single lost shard requires fetching multiple other shards across the network, not just one replica', correct: true, explanation: 'Reconstructing a missing shard under a k+m scheme needs k surviving shards, so repair network traffic is higher than copying one replica in a replication scheme.' },
+        { id: 'd', text: 'It eliminates the need for placement across separate racks or availability zones', correct: false, explanation: 'Erasure-coded shards still need failure-domain-aware placement, exactly like replicas — putting all shards in one rack undermines the fault tolerance either scheme provides.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'If a store keeps 3 replicas of every chunk, its durability number is fixed regardless of how quickly it detects and repairs a failed replica.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Durability depends heavily on repair speed: the risk that matters is a second and third independent failure happening during the window before the first failed replica is repaired. A slower repair window means more exposure time and lower real-world durability, even with the same replica count.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — replication factor alone does not determine durability. Failure-domain independence and how fast the system detects and re-replicates after a failure both materially change the actual probability of permanent data loss.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A disk silently returns corrupted bytes for a chunk without reporting any read error. What mechanism is specifically designed to catch this kind of failure?',
+      options: [
+        { id: 'a', text: 'Increasing the replication factor from 3 to 5', correct: false, explanation: 'More copies do not help if nothing is actively checking whether any of those copies are still correct — the corruption can go undetected regardless of how many silent copies exist.' },
+        { id: 'b', text: 'Per-chunk checksums combined with a background scrubbing process that recomputes and compares them', correct: true, explanation: 'Scrubbing actively reads chunks and verifies their checksums on an ongoing basis, which is what surfaces silent bit rot before a real read needs the data — a lost node or disk failure alone would not.' },
+        { id: 'c', text: 'Choosing erasure coding instead of replication', correct: false, explanation: 'Erasure coding changes the storage overhead and repair mechanics for detected failures; by itself it does not add active corruption detection — checksumming and scrubbing are still required.' },
+      ],
+    },
+  ]}
+/>

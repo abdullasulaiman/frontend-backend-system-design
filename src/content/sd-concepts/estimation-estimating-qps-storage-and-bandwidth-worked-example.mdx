@@ -1,0 +1,223 @@
+---
+title: "Estimating QPS, Storage, and Bandwidth (Worked Example)"
+module: "Back-of-the-Envelope Estimation"
+moduleOrder: 5
+order: 2
+track: "concept"
+summary: "Walks through the actual arithmetic — traffic, QPS, storage, and bandwidth — for a concrete system, so you can reproduce the same steps under interview pressure."
+tags: ["estimation", "capacity-planning", "qps", "storage", "worked-example"]
+estMinutes: 12
+cheatsheet:
+  - "Convert everything to a per-second rate first (QPS) — most other numbers (storage/day, bandwidth) fall out of QPS times payload size times seconds-in-a-day."
+  - "Daily active users (DAU) x actions/user/day / 86,400 gives average QPS; multiply average QPS by 2-3x for peak QPS unless the prompt gives you a real traffic curve."
+  - "Storage estimates need three inputs: records/day, bytes/record, and retention period — then multiply, and multiply again by replication factor (commonly 3x)."
+  - "Round aggressively to one significant figure as you go (e.g. 8.64x10^4 seconds/day becomes ~10^5) — precision beyond that wastes interview time and rarely changes the design decision."
+  - "State whether a number is per-second, per-day, or total-over-retention explicitly — mixing up the time unit is the single most common estimation mistake."
+  - "Bandwidth is just QPS x average request/response size — compute read and write bandwidth separately since they usually have very different ratios."
+  - "Sanity-check the final number against a familiar reference point (a single modern DB node, a $ /GB storage cost) to catch order-of-magnitude errors before you present it."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson made the case for estimating at all — it tells you whether
+you need a distributed system in the first place, and which resource (CPU,
+storage, or bandwidth) is going to be your bottleneck. This lesson is the part
+where you actually do the arithmetic. Interviewers care less about the final
+number than about watching you get there: which assumptions you state out
+loud, which units you're tracking, and whether you catch your own errors. This
+lesson works through one system end to end — a photo-sharing service — so you
+have a template you can adapt to whatever prompt you get.
+
+## The four numbers you're almost always asked for
+
+Nearly every back-of-the-envelope pass in a system design interview reduces to
+four related numbers:
+
+1. **QPS (queries per second)** — how many requests per second hit your
+   system, split by read vs. write since they often need different scaling
+   strategies.
+2. **Storage** — how much data accumulates, usually expressed as
+   total-over-some-retention-period plus a growth rate.
+3. **Bandwidth** — how many bytes per second move across the network, again
+   split by read vs. write (ingress vs. egress).
+4. **Memory / cache size** — how much hot data you'd want in RAM to keep a
+   given fraction of requests off disk (this one depends on the other three,
+   so we treat it as a follow-on).
+
+The trick is that these aren't four independent calculations — QPS multiplied
+by payload size gives you bandwidth, and daily write QPS multiplied by record
+size and retention gives you storage. Get QPS right and the rest mostly falls
+out of it.
+
+## Step 1: Turn user counts into QPS
+
+Start from whatever traffic number the interviewer gives you or you agree to
+assume — usually daily active users (DAU). Convert to actions per day, then
+divide by the number of seconds in a day.
+
+A day has 86,400 seconds. Round that to `10^5` for mental math — you're
+rarely trying to be more precise than 15% in this exercise, and rounding
+early keeps the arithmetic in your head instead of on a calculator.
+
+Average QPS = (DAU x actions/user/day) / 86,400
+
+That's your **average** load. Real traffic isn't flat — it peaks around
+lunch and evenings and troughs overnight. Unless the prompt gives you an
+actual traffic curve, a standard move is to assume peak load is **2 to 3
+times** average. State that assumption explicitly rather than silently
+baking it in — an interviewer may push back with "assume peak is 5x, this is
+a live sports app," and you want to be able to recompute quickly.
+
+## Step 2: Storage needs three inputs, not one
+
+Storage estimates fail most often because candidates forget one of three
+required inputs:
+
+- **Write rate** — new records created per day (often just your write QPS x
+  86,400).
+- **Record size** — bytes per record, including any metadata you're storing
+  alongside the payload.
+- **Retention** — how long you keep the data (forever, 1 year, 30 days).
+
+Total storage = writes/day x bytes/record x retention (days)
+
+Then apply a **replication factor**. Almost no real system keeps a single
+copy of data — 3x replication (common in systems like HDFS or a typical
+Cassandra/DynamoDB deployment) is a reasonable default to state unless told
+otherwise. Multiply your total by that factor at the end, not the beginning,
+so you can clearly separate "logical data size" from "physical storage
+footprint."
+
+## Step 3: Bandwidth is QPS times payload size
+
+Once you have read and write QPS, bandwidth is a single multiplication per
+direction:
+
+Bandwidth (bytes/sec) = QPS x average payload size (bytes)
+
+Do this separately for reads and writes — a social feed might have 100x more
+reads than writes, but each write (e.g. uploading a photo) might be 50x
+larger than each read (fetching a thumbnail URL). Conflating the two hides
+which direction actually dominates your network cost.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[DAU + actions/user/day] --> B["Average QPS<br/>(divide by 86,400)"]
+  B --> C["Peak QPS<br/>(x2-3 average)"]
+  B --> D["Writes/day<br/>(write QPS x 86,400)"]
+  D --> E["Storage<br/>(x bytes/record x retention)"]
+  E --> F["Physical storage<br/>(x replication factor)"]
+  C --> G["Bandwidth<br/>(QPS x payload size)"]
+`} />
+
+## Worked example: a photo-sharing service
+
+Let's size a service where users upload and view photos. Assume the
+interviewer gives you: 50 million DAU, each user uploads 1 photo every 10
+days and views 20 photos/day. Average photo size: 500 KB. Metadata per
+photo (owner, timestamp, caption, tags): roughly 1 KB. Retention: keep
+photos indefinitely (this is the product).
+
+**Write QPS.** Uploads/day = 50M / 10 = 5 million. Average write QPS = 5M /
+86,400 ≈ 58. Round to ~60. Peak write QPS (x3) ≈ 180.
+
+**Read QPS.** Views/day = 50M x 20 = 1 billion. Average read QPS = 1B /
+86,400 ≈ 11,600. Round to ~12,000. Peak read QPS (x3) ≈ 36,000.
+
+Already this tells you something: reads outnumber writes by roughly
+**200:1**. That single ratio should steer your whole design toward
+aggressive read caching (CDN for photo bytes, an in-memory or edge cache for
+metadata) rather than optimizing the write path.
+
+**Storage.** 5 million photos/day x 500 KB ≈ 2.5 TB/day of photo bytes, plus
+5M x 1 KB = 5 GB/day of metadata (small enough to mostly ignore next to the
+photo bytes). Over one year: 2.5 TB x 365 ≈ 912 TB/year, call it ~1 PB/year.
+With 3x replication, physical storage grows by ~3 PB/year. That number alone
+tells you "we need object storage (something like S3-class blob storage),
+not a single database's disk" — which is exactly the kind of design
+conclusion this estimate is supposed to produce.
+
+**Bandwidth.** Write bandwidth ≈ 60 QPS x 500 KB ≈ 30 MB/s average, ~90 MB/s
+at peak. Read bandwidth ≈ 12,000 QPS x 500 KB ≈ 6 GB/s average, ~18 GB/s at
+peak — assuming every view fetches a full-size photo. In reality you'd serve
+a compressed thumbnail (say 50 KB) for feed browsing and only the full 500
+KB on open, which drops average read bandwidth by roughly 10x. Calling that
+out shows the interviewer you're thinking about the design, not just
+plugging numbers into a formula.
+
+<Callout type="warning">
+  The most common estimation mistake isn't a bad formula — it's silently
+  mixing time units. Candidates compute a "storage per day" number, then a
+  few lines later multiply "QPS" (a per-second rate) by that same number as
+  if it were also per-second. Before every multiplication, say the unit out
+  loud: "so that's 2.5 terabytes *per day*, times 365 days, gives us the
+  *annual* total." It costs you five seconds and catches an error that
+  would otherwise produce a number off by four or five orders of magnitude
+  — the kind of mistake that undermines an otherwise strong interview.
+</Callout>
+
+## Sanity-checking your numbers
+
+Once you have a number, ask "does this feel right?" against something
+familiar: a single beefy database node today comfortably handles tens of
+thousands of simple reads/sec, so 12,000 average read QPS is very doable on
+a handful of nodes with caching — it's not "Google-scale," and your design
+shouldn't over-engineer for it. Conversely, 3 PB/year of blob storage is
+firmly in "you need a managed object store, not a single filesystem"
+territory. If your computed QPS or storage number feels absurd for the
+product described (e.g. you calculate more storage than exists in most
+enterprise data centers for a niche internal tool), you've likely made an
+arithmetic or unit error — go back and check before you build a whole
+architecture on top of a wrong number.
+
+## Quiz
+
+<Quiz
+  lessonId="estimation-estimating-qps-storage-and-bandwidth-worked-example"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A service has 20 million DAU, each performing 5 actions/day. What is the approximate average QPS?',
+      options: [
+        { id: 'a', text: '~1,150', correct: true, explanation: '20M x 5 = 100M actions/day. 100M / 86,400 seconds ≈ 1,157, so ~1,150 is the right order of magnitude.' },
+        { id: 'b', text: '~100,000', correct: false, explanation: 'That would be the actions/day figure divided by seconds in an hour, not seconds in a day — check the unit conversion.' },
+        { id: 'c', text: '~20,000,000', correct: false, explanation: 'That is just the DAU count with no division by time at all — QPS must be a per-second rate.' },
+        { id: 'd', text: '~5', correct: false, explanation: 'That is the actions-per-user-per-day figure, not a system-wide per-second rate.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which inputs are required to compute total physical storage for a system? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Records written per day', correct: true, explanation: 'You need the write rate to know how much new data accumulates each day.' },
+        { id: 'b', text: 'Average bytes per record', correct: true, explanation: 'Record size converts a record count into a byte count.' },
+        { id: 'c', text: 'Retention period', correct: true, explanation: 'Storage keeps growing until data is deleted or expires — without a retention window, "total storage" is undefined.' },
+        { id: 'd', text: 'Peak QPS', correct: false, explanation: 'Peak QPS affects how much compute/throughput capacity you need at a given instant, but total storage accumulated depends on the write rate over time, not the peak momentary rate.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'It is standard practice to assume peak QPS is roughly 2-3x average QPS when the interviewer has not given you an explicit traffic curve.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'This is a common, reasonable default assumption to state explicitly — it accounts for daily traffic variation without requiring real historical data.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'A 2-3x multiplier is exactly the standard default used when no real traffic curve is available; it is a reasonable, commonly stated assumption.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the worked photo-sharing example, why did read/write ratio (roughly 200:1) matter for the design?',
+      options: [
+        { id: 'a', text: 'It indicated the system should prioritize aggressive read caching over write-path optimization', correct: true, explanation: 'When reads dominate this heavily, a CDN/cache in front of reads gives far more benefit than optimizing the comparatively rare write path.' },
+        { id: 'b', text: 'It had no design implication, it was just an interesting number', correct: false, explanation: 'The read/write ratio directly informs where to invest engineering effort — it is one of the most actionable numbers in the whole estimate.' },
+        { id: 'c', text: 'It meant the write path needed to be sharded across more nodes than the read path', correct: false, explanation: 'The opposite is closer to true here — the far larger read volume is what typically requires more scaling investment (caching, replicas, CDN), not the comparatively small write volume.' },
+      ],
+    },
+  ]}
+/>

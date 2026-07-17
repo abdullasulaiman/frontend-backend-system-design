@@ -1,0 +1,131 @@
+---
+title: "Feed and Stories"
+module: "Design Instagram"
+moduleOrder: 8
+order: 4
+track: "interview"
+summary: "Covers how Instagram's home feed and Stories tray get generated and ranked, and why the two features end up with almost opposite architectures despite looking similar on screen."
+tags: ["feed-ranking", "fan-out", "stories", "ephemeral-data", "instagram"]
+estMinutes: 13
+cheatsheet:
+  - "Feed generation is the same push/pull/hybrid trade-off as any social timeline: fan-out-on-write for normal accounts, fan-out-on-read (pull-and-merge) for high-follower accounts, because a single celebrity post can't trigger tens of millions of synchronous writes."
+  - "A precomputed feed stores post IDs plus a small ranking score, never full post bodies — resolve media, captions, and like counts from the post store at render time so one edit doesn't require rewriting millions of copies."
+  - "Feed ranking (which post) and feed ordering (what order) are two different models: a lightweight candidate-generation pass narrows thousands of eligible posts down to a few hundred, then a heavier ranking model orders just that shortlist."
+  - "Stories are architecturally the opposite of the main feed: no ranking needed (chronological by author, tray ordered by 'closeness'/recency of interaction), 24-hour TTL handles cleanup, and per-viewer read state (not global like counts) is the hard part."
+  - "Use TTL-based expiry (Redis EXPIRE or a DynamoDB TTL attribute) for story content instead of a cron sweep — it's cheaper, and it naturally handles the fact that every story expires at a slightly different time."
+  - "The read-state problem for Stories (who has and hasn't viewed each of a user's stories) is a small, per-author, per-story set — don't confuse it with feed ranking; it's closer to a lightweight join table than a ranking pipeline."
+  - "Cache the assembled feed and the story tray at the edge (or in a session cache) keyed by user ID, invalidated by new posts/stories from followed accounts — don't recompute either from scratch on every app open."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson got media into durable storage and out to viewers efficiently. This lesson answers a different question: once a post exists somewhere, how does it end up in the right people's feeds, in the right order, and how does the Stories tray at the top of the screen work at all given that its content is supposed to vanish after a day?
+
+These two features look similar — both are "things from people you follow, shown near the top of the app" — but they solve almost opposite engineering problems. The feed is a ranking problem over a permanent, ever-growing corpus. Stories are a freshness-and-expiry problem over a tiny, ephemeral one. An interviewer who asks "design Instagram" and lets you get away with treating them the same hasn't tested you yet — a strong answer explains why they diverge.
+
+## Feed generation: the same fan-out trade-off, applied to posts
+
+Building a home feed is fundamentally the same problem covered in this course's Twitter timeline lesson: the feed is a merge of posts from everyone you follow, and there are exactly two moments you can do that merge — when a post is created, or when the feed is read.
+
+**Fan-out-on-write (push).** When a user posts, look up their followers and insert a reference to the new post into each follower's precomputed feed list (typically a capped list in Redis or a wide-column store, keyed by user ID). Reads are then just "fetch my list." This is cheap for the 99%+ of accounts with a normal follower count, and it falls over for accounts with millions of followers — one post from a huge creator account would otherwise mean millions of synchronous writes from a single API call.
+
+**Fan-out-on-read (pull).** Do nothing at post time; when a user opens the app, query every followed account for recent posts and merge live. This makes posting always cheap, but shifts cost to reads — a user following 1,000 accounts triggers up to 1,000 lookups on every feed refresh, and reads vastly outnumber posts.
+
+The standard fix is the same hybrid: push for accounts under a follower threshold, and skip fan-out for accounts above it, letting their posts be pulled in and merged at read time by the relatively small number of people who follow big accounts. If you haven't seen that trade-off worked through in detail with a worked queue-sizing example, it's covered thoroughly in the sibling Twitter module — no need to re-derive it here; just recognize it's the identical shape of problem with "tweet" replaced by "post."
+
+## Ranking: candidate generation, then scoring
+
+A pure reverse-chronological feed was Instagram's original design and it's a legitimate, simpler answer for an interview if you say so explicitly and explain the trade-off: chronological is trivial to compute (it's just the merged fan-out list, sorted by timestamp) but wastes attention on stale or low-quality posts when a user hasn't opened the app in a while. A ranked feed reorders that same candidate set by predicted relevance instead of recency.
+
+Ranking a feed for hundreds of millions of users on every open is too expensive to do as one heavyweight step, so production systems split it into two stages:
+
+- **Candidate generation**: a cheap, high-recall pass that narrows "everything from everyone you follow, plus some recommended accounts" down to a few hundred candidates — recent posts, filtered by basic rules (not already seen, not from a blocked account), pulled from the precomputed fan-out list plus a small pull-tier merge for big accounts.
+- **Ranking**: a heavier model scores just those few hundred candidates using signals like predicted likelihood of like/comment/share, how long since you last saw a post from that author, and content type (video tends to get weighted differently than a photo). Only the ranking stage needs to be that expensive, because it runs over hundreds of items, not the full corpus.
+
+This two-stage split is a general pattern worth naming explicitly in an interview — it's the same shape used by search engines (retrieve then re-rank) and recommendation systems generally, not something specific to feeds.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  P[New post] --> Fan{Author follower count}
+  Fan -- below threshold --> W[Fan-out write to followers precomputed feed]
+  Fan -- above threshold --> Store[Store post only, no fan-out]
+  Open[User opens app] --> Cand[Candidate generation]
+  W --> Cand
+  Store --> Cand
+  Cand --> Rank[Ranking model scores candidates]
+  Rank --> Cache[Assembled feed cached per user]
+  Cache --> UI[Feed shown in app]
+`} />
+
+## Stories: the opposite architecture
+
+Stories flip almost every assumption the feed relies on:
+
+- **No ranking model needed for content order within a story.** A single user's story is just their posts in chronological order for the 24 hours they're live.
+- **The tray ordering (whose stories appear first) is a much simpler heuristic** than feed ranking — typically "closest friends and most-interacted-with accounts first, unseen before seen," not a learned model scoring individual pieces of content.
+- **Expiry is a first-class requirement, not an afterthought.** Every story needs to disappear exactly 24 hours after posting, for every viewer, with no manual cleanup job.
+- **Per-viewer state matters far more than aggregate counts.** The feed cares about global like/comment counts; Stories care about *who specifically* has viewed *this* story, because the author-facing "seen by" list is a core feature.
+
+### Handling expiry without a sweep job
+
+The naive approach — a cron job that scans all stories and deletes ones older than 24 hours — doesn't scale and adds latency-shaped bugs (a story that's 23:59:59 old is still technically live and must still render). The standard fix is to let the storage layer expire entries natively: a TTL attribute in DynamoDB, or a Redis key with `EXPIRE` set to 24 hours from creation. The story simply stops existing (or stops being returned) at the right instant per-item, with no batch job, no lag, and no wasted reads scanning already-expired rows.
+
+Underlying media (the actual video/image file) doesn't need to be hard-deleted at that same instant — it's fine to lazily garbage-collect the S3/blob object on a slower schedule, since the story is already invisible once the metadata/TTL record is gone.
+
+### Read-state tracking
+
+Each story needs a small set of "which user IDs have viewed this" — conceptually a row per `(story_id, viewer_id, timestamp)`, kept only as long as the story itself is live. This is a lightweight, high-write, short-lived table, not a ranking problem: writes happen every time someone views a story, and the only read pattern the author-facing UI needs is "give me the list of viewers for my story," which is a straightforward key-based lookup, not a computation.
+
+## Worked example: sizing story writes
+
+Say the platform has 500 million daily active users, and 30% of them post at least one story per day, averaging 4 story segments each. That's `500M * 0.3 * 4 = 600` million story-segment creates per day, or roughly 7,000/second average (higher at peak, so plan for 3x — about 21,000/second).
+
+Now consider views: an average story gets viewed by 15% of the author's followers, and the average account has 300 followers. Per story-segment, that's `300 * 0.15 = 45` view-events. Across 600 million segments/day, that's 27 billion view-events/day — about 312,000/second average, and roughly 1 million/second at peak. That view-write volume is an order of magnitude larger than the story-creation volume itself, which is the number that should drive your storage choice: you want a store optimized for a huge volume of small, short-lived writes (a wide-column store or Redis) rather than one tuned for read-heavy relational queries.
+
+<Callout type="warning">
+A common mistake in this lesson's topic is treating Stories as "just a smaller version of the feed" and trying to reuse the feed's ranking pipeline for it, or conversely applying the feed's TTL-free permanent storage model to story content. Stories aren't a subset of the feed problem — they're a different problem (freshness/expiry-driven, per-viewer-state-heavy) that happens to render in a similar-looking UI surface. Design its data model and expiry mechanism independently rather than bolting story features onto the existing feed/post infrastructure; trying to force one schema to serve both usually means the story path inherits complexity (like counts, comment threads, permanent storage) it never needed, and the feed path inherits constraints (TTL semantics) it never wanted.
+</Callout>
+
+<Quiz lessonId="instagram-feed-and-stories" client:visible questions={[
+  {
+    id: 'q1',
+    kind: 'mcq',
+    prompt: 'Why does pure fan-out-on-write become a problem for a feed system, even though it works well for most accounts?',
+    options: [
+      { id: 'a', text: 'It makes every feed read expensive because the read path has to merge results from every followed account live', correct: false, explanation: 'That describes fan-out-on-read (pull), not fan-out-on-write. Push makes reads cheap by precomputing feeds at write time.' },
+      { id: 'b', text: 'A post from an account with a very large follower count triggers a write into every one of those followers\' precomputed feeds at once', correct: true, explanation: 'Correct — under pure push, write cost scales with the poster\'s follower count, so a huge-follower account turns one post into an enormous burst of writes from a single request.' },
+      { id: 'c', text: 'It requires the feed to always be shown in strict chronological order', correct: false, explanation: 'Fan-out strategy (push vs. pull) is a separate concern from ranking/ordering — a push-based feed can still be reordered by a ranking model after the candidates are assembled.' },
+    ],
+  },
+  {
+    id: 'q2',
+    kind: 'multi',
+    prompt: 'Which of these are genuine architectural differences between the main feed and Stories? (Select all that apply.)',
+    options: [
+      { id: 'a', text: 'Stories rely on TTL-based expiry as a core requirement; the main feed does not need automatic content expiry', correct: true, explanation: 'Correct — every story must disappear 24 hours after posting for everyone, which is a first-class storage requirement Stories has and the permanent feed does not.' },
+      { id: 'b', text: 'The main feed needs a two-stage candidate-generation-then-ranking pipeline; Stories\' within-story ordering does not need an equivalent ranking model', correct: true, explanation: 'Correct — a single story is just chronological content from one author; the heavier "which items and in what order" ranking problem is specific to the feed\'s scale and relevance goals.' },
+      { id: 'c', text: 'Stories cannot use a fan-out/push mechanism at all, since their content is temporary', correct: false, explanation: 'Being temporary doesn\'t block using push-style delivery — a story\'s existence can still be pushed to a tray/notification structure for followers; the temporary nature only changes how it\'s expired, not whether push delivery is viable.' },
+    ],
+  },
+  {
+    id: 'q3',
+    kind: 'boolean',
+    prompt: 'A precomputed feed list stored per user should contain full post content (media URLs, captions, current like counts) rather than just post IDs and a ranking score.',
+    options: [
+      { id: 'true', text: 'True', correct: false, explanation: 'Storing full content per follower copy means any edit to a post — an updated like count, a caption edit — would require rewriting it across every follower\'s stored copy, which doesn\'t scale.' },
+      { id: 'false', text: 'False', correct: true, explanation: 'Correct — feed lists should store lightweight references (post ID plus a ranking score) and resolve full content from the post store at render time, keeping the feed store small and edits cheap.' },
+    ],
+  },
+  {
+    id: 'q4',
+    kind: 'mcq',
+    prompt: 'What is the best way to track which viewers have seen a given story?',
+    options: [
+      { id: 'a', text: 'Run the same ranking model used for the feed over each story\'s viewer list', correct: false, explanation: 'Viewer tracking for Stories is a simple per-story, per-viewer record lookup, not a relevance-ranking problem — there is nothing to rank, just a list to record and retrieve.' },
+      { id: 'b', text: 'Maintain a lightweight, short-lived set of (story ID, viewer ID, timestamp) records that expire alongside the story itself', correct: true, explanation: 'Correct — this is a small, high-write, short-lived data structure well suited to a fast key-value or wide-column store, and it naturally disappears when the story itself expires.' },
+      { id: 'c', text: 'Recompute the viewer list from application logs whenever the author checks it', correct: false, explanation: 'This adds unnecessary read-time latency and complexity for a value that\'s cheap to maintain incrementally as views happen; logs are a fallback/audit source, not the primary read path.' },
+    ],
+  },
+]} />

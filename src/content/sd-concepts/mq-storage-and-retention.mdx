@@ -1,0 +1,244 @@
+---
+title: "Storage and Retention"
+module: "Distributed Messaging Queue"
+moduleOrder: 17
+order: 4
+track: "concept"
+summary: "Explains how a durable messaging queue persists messages as an append-only log, how consumer offsets replace per-message deletes, and how retention policies decide when data actually gets freed."
+tags: ["storage", "retention", "message-queue", "durability", "log-structured-storage"]
+estMinutes: 12
+cheatsheet:
+  - "Durable queues persist messages to an append-only log on disk before acking the producer — the message survives a broker restart because it's on disk, not just held in memory."
+  - "Consumers track a read position (offset/cursor) per queue or partition; the broker doesn't delete a message the moment one consumer reads it, which is what makes replay and multiple independent consumer groups possible."
+  - "Retention is time-based (keep N days), size-based (keep N GB, drop oldest), or both — whichever limit is hit first triggers deletion, usually of a whole closed segment file, not individual messages."
+  - "Sequential appends and sequential segment deletes are why log-structured storage is fast on spinning disks and SSDs alike — no random-access rewrites, no per-message deletion bookkeeping."
+  - "Log compaction (retain only the latest value per key, not full history) is a different retention model from time/size-based deletion — use it for 'current state' topics (e.g. latest user profile), not for event streams where every event matters."
+  - "Storage capacity = throughput x message size x retention window x replication factor — forgetting the replication factor is the most common under-provisioning mistake."
+  - "Tiered storage (recent segments on fast local disk, older segments offloaded to object storage) lets you extend retention from days to months without scaling local disk on every broker."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lessons in this module treated "the queue" as a black box that
+accepts a message and eventually hands it to a consumer. That box has to
+actually keep the message somewhere between those two events — and *how*
+it stores it determines almost everything else about the system's
+behavior: whether a broker crash loses data, whether a slow consumer can
+fall behind without the queue running out of room, whether you can replay
+last Tuesday's events to rebuild a downstream cache, and how much you pay
+in disk and network for all of it. Storage and retention aren't
+implementation detail you can defer to "whatever the database does" — the
+storage model *is* the design decision that makes durable, replayable
+messaging possible in the first place.
+
+## Two storage models, and why one wins
+
+A naive queue could store each message as a row in a table and delete the
+row once a consumer acknowledges it. That works for a single consumer
+group, but it breaks the moment you need two independent consumers to read
+the same message (say, a fraud-detection service and an analytics
+pipeline both subscribed to the same order-events queue) — whichever
+consumer acks first deletes the message out from under the other.
+
+The model almost every durable messaging queue uses instead is an
+**append-only log**: messages are written sequentially to the end of a
+file (or a set of files called **segments**), and they stay there,
+untouched, until a retention policy — not a consumer ack — decides they're
+old enough to discard. Consumers don't remove messages by reading them;
+they track their own **offset** (a position, effectively "I've read up
+through byte/record N"), and reading forward just means walking the log
+past that point. Multiple consumer groups can read the same log at
+completely different offsets without interfering with each other at all,
+because none of them mutate the log — they only advance their own
+private cursor.
+
+This distinction matters for an interview: if you say "the queue deletes a
+message once it's consumed," you've just made independent consumer groups
+and replay impossible, and a good interviewer will ask how you'd support a
+second consumer that needs to reprocess the last day's data. "It's a log,
+consumers track their own offset, retention is separate from consumption"
+is the answer that keeps those doors open.
+
+## Segments: why the log isn't one giant file
+
+A partition's log is split into **segments** — files capped at a size
+(commonly a few hundred MB to a few GB) or a time window (e.g., a new
+segment every hour). Only the newest segment is ever appended to; every
+older segment is closed and immutable. This split matters for two
+operational reasons:
+
+- **Deletion is cheap.** Enforcing retention means deleting whole closed
+  segment files once they age out, which is a fast file-system unlink, not
+  scanning and rewriting a giant file to remove old records one by one.
+- **Indexing is cheap.** Each segment gets a small companion index
+  mapping offsets (or timestamps) to byte positions within that segment,
+  so a consumer asking "give me everything after offset 4,522,001" or
+  "give me everything after 3pm yesterday" can jump straight to the right
+  segment and byte range instead of scanning from the beginning.
+
+Sequential writes to the active segment, plus the OS page cache serving
+recent reads straight from memory, are what let log-structured storage
+sustain very high throughput on ordinary disks — there's no random-access
+read/write pattern to fight, which is the same reason B-tree-heavy
+databases often struggle to keep up with append-only logs on write-heavy
+workloads.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    subgraph Log["Partition log (segments)"]
+        S1["Segment 1\\n(closed, immutable)"]
+        S2["Segment 2\\n(closed, immutable)"]
+        S3["Segment 3\\n(active, appending)"]
+    end
+    P[Producer] -->|append| S3
+    CA["Consumer A\\noffset = 1,200"] -.->|reads from| S1
+    CB["Consumer B\\noffset = 3,900"] -.->|reads from| S2
+    Retention["Retention job"] -->|deletes when expired| S1
+`} />
+
+## Retention policies: when does data actually go away
+
+Retention decides how long a segment sticks around after it's closed,
+independent of whether anyone has consumed it yet. The common policies,
+usually combined:
+
+- **Time-based**: delete segments whose newest message is older than a
+  configured window (24 hours, 7 days, 30 days). Simple to reason about
+  and to size capacity for.
+- **Size-based**: cap total log size per partition (or per topic); when
+  the cap is hit, delete the oldest segment(s) first, regardless of age.
+  This protects disk from filling up if throughput spikes unexpectedly.
+- **Whichever limit hits first wins.** Most production configs set both —
+  a 7-day time limit *and* a size cap — so a sudden 10x traffic spike
+  doesn't silently blow past the disk budget while waiting for the time
+  window to kick in.
+
+### Log compaction: a different kind of retention
+
+Time and size-based retention delete by *age*. **Log compaction** instead
+deletes by *key*: for a log where each message has a key (e.g., a user
+ID) and represents "the current value for this key," compaction keeps
+only the most recent message per key and discards older ones, no matter
+how old the most recent one is. This is the right model for a topic
+representing current state — "user 482's latest profile," "product 91's
+latest price" — where you only ever care about the newest value and want
+a consumer that reads the whole log from the start to end up with exactly
+current state, not a full history of every intermediate update.
+
+Compaction is the wrong tool for an event stream where every individual
+event matters (every order placed, every payment attempted) — compacting
+that would silently destroy history a downstream system may need to
+replay or audit. Pick per-topic based on whether the topic models "facts
+that happened" (keep them all, time/size retention) or "current state"
+(keep only the latest, compaction).
+
+## Storage cost and replication
+
+Retained data has to live somewhere durable, and durability almost always
+means **replication** — the same message stored on multiple broker nodes
+so a single disk or node failure doesn't lose it (mechanically similar to
+the replication covered in the key-value store module, applied here to
+log segments instead of key-value records). That means your actual
+storage budget is `retained data x replication factor`, not just the raw
+retained data — a detail that's easy to forget when sizing a cluster and
+expensive to discover after the fact.
+
+### Tiered storage for long retention
+
+Keeping months of data on the same fast local disks every broker uses for
+active writes gets expensive and doesn't scale independently of
+throughput. **Tiered storage** splits this: recent segments (say, the
+last 24-48 hours) stay on local disk for low-latency reads, while older,
+closed segments get offloaded to cheaper object storage (S3-style
+blob storage). Consumers reading recent data hit local disk; consumers
+replaying old history hit object storage at higher latency but far lower
+cost per GB. This is how a queue can offer 90-day or 1-year retention
+without every broker needing a 90-day-sized local disk.
+
+## Worked example: sizing storage for an order-events queue
+
+Say you're designing the order-events queue for an e-commerce platform:
+50,000 messages/sec sustained, average message size 1 KB, required
+retention window of 7 days, replication factor 3.
+
+Raw ingest rate: `50,000 msg/s x 1 KB = ~50 MB/s`.
+
+Per day: `50 MB/s x 86,400 s/day = ~4.3 TB/day`.
+
+Retained (7 days, one copy): `4.3 TB/day x 7 = ~30 TB`.
+
+With replication factor 3: `30 TB x 3 = ~90 TB` of total cluster disk
+just for this one queue's retained data — before accounting for indexes,
+in-flight segments, or headroom for traffic spikes (most teams provision
+30-50% headroom above the raw retention math). This is the number that
+turns into "how many brokers, how much disk per broker" — if each broker
+has 4 TB of usable disk, this queue alone needs roughly 22-23 brokers'
+worth of disk capacity, which is exactly why retention window is a
+cost lever teams tune aggressively: dropping retention from 7 days to 3
+days cuts this queue's storage need by more than half.
+
+<Callout type="warning">
+  A common mistake is assuming an acknowledged message can be deleted
+  immediately, the way a traditional task queue deletes a job once a
+  worker finishes it. In a log-structured durable queue, acking tells the
+  broker "this consumer group is done with this message" — it does not
+  free any disk, because other consumer groups may still need it and
+  retention is governed by the time/size policy, not by consumption.
+  Conflating the two leads to two failure modes: either engineers panic
+  that "acked messages aren't being deleted, is there a leak?" (there
+  isn't — that's by design), or they set retention far shorter than
+  necessary assuming acked data is already gone, and then a slow or
+  temporarily-down consumer group falls behind its own offset far enough
+  that the messages it still needs have already expired and are
+  unrecoverable.
+</Callout>
+
+## Quick check
+
+<Quiz
+  lessonId="mq-storage-and-retention"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why do most durable messaging queues store messages in an append-only log rather than deleting each message as soon as one consumer acknowledges it?',
+      options: [
+        { id: 'a', text: 'Append-only logs use less disk space overall', correct: false, explanation: 'An append-only log with a retention window typically uses more disk than delete-on-ack, since messages stick around until the policy expires them, not the moment they are read.' },
+        { id: 'b', text: 'It lets multiple independent consumer groups read the same messages at their own pace without interfering with each other, and enables replay', correct: true, explanation: 'Since consumers track their own offset instead of mutating the log, one group acking or falling behind has no effect on another group, and any consumer can rewind its offset to reprocess history.' },
+        { id: 'c', text: 'It removes the need for replication', correct: false, explanation: 'Replication is a separate durability concern (surviving node/disk failure) and applies to log segments the same way it would to any other storage model.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements about segments in a partition log are correct? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Only the newest (active) segment is ever appended to; older segments are immutable once closed', correct: true, explanation: 'This is what makes sequential writes and cheap whole-file deletion possible — closed segments are never rewritten.' },
+        { id: 'b', text: 'Retention typically deletes whole expired segment files rather than scanning for individual expired messages', correct: true, explanation: 'Deleting a closed segment is a fast file-system operation; rewriting a file to strip out individual old records would be far more expensive.' },
+        { id: 'c', text: 'Each segment must be re-indexed from scratch every time a consumer reads from it', correct: false, explanation: 'Segments have a small companion index built once (mapping offsets or timestamps to byte positions), so lookups jump straight to the right position instead of rebuilding an index per read.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Log compaction and time-based retention are two names for the same mechanism: both delete data purely based on how old it is.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'They are different mechanisms. Time/size-based retention deletes by age or volume regardless of key; compaction deletes by key, keeping only the newest message per key no matter how old that newest message is.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — compaction retains the latest value per key (suited to "current state" topics), while time/size-based retention discards whole segments once they exceed an age or size limit (suited to event-history topics).' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A queue ingests 20,000 messages/sec at 2 KB average size, with a 3-day retention window and replication factor 3. Roughly how much total cluster disk does retained data for this queue require?',
+      options: [
+        { id: 'a', text: '~10 TB', correct: false, explanation: 'That is roughly the single-copy retained size (20,000 x 2 KB = 40 MB/s -> ~3.5 TB/day -> ~10.4 TB over 3 days) but omits the replication factor of 3.' },
+        { id: 'b', text: '~31 TB', correct: true, explanation: '40 MB/s x 86,400 s = ~3.5 TB/day; over 3 days that is ~10.4 TB of unique data; multiplied by a replication factor of 3 gives roughly 31 TB of total cluster disk.' },
+        { id: 'c', text: '~3.5 TB', correct: false, explanation: 'That is only one day of unique (unreplicated) data — it neither covers the full 3-day retention window nor accounts for replication.' },
+      ],
+    },
+  ]}
+/>

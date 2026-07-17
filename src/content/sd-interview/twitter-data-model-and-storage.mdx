@@ -1,0 +1,173 @@
+---
+title: "Data Model and Storage"
+module: "Design Twitter"
+moduleOrder: 6
+order: 4
+track: "interview"
+summary: "Maps tweets, the social graph, and timelines to distinct storage engines chosen for their actual read/write and consistency requirements, not a single one-size-fits-all database."
+tags: ["data-modeling", "database-schema", "sharding", "storage-systems", "social-graph"]
+estMinutes: 12
+cheatsheet:
+  - "Don't use one database for everything — tweets (write-once, read-heavy), the social graph (adjacency queries), and timelines (precomputed lists) have different shapes and belong in different stores."
+  - "Shard tweets by `author_id` so a user's own tweets co-locate on one shard; generate tweet IDs with a Snowflake-style scheme (timestamp + shard + sequence) so they sort by creation time without a central counter."
+  - "Model follows as two directional edge tables — followers and following — because the two queries the graph must answer (`who follows me` and `who do I follow`) each need their own indexed access path."
+  - "A precomputed timeline is a materialized, denormalized cache of tweet IDs, not a live join over the follow graph — treat it as disposable and rebuildable, not as the source of truth."
+  - "The source of truth for a tweet's content is the tweets table; every other copy (timeline entries, search index, cache) is a derived projection that can be rebuilt or briefly stale without ever losing data."
+  - "Retweets, likes, and reply counts are separate high-write tables or counters, not columns updated in place on the tweet row — the same hot-row and idempotency problems that show up in any high-traffic write path apply here too."
+  - "Media (images, video) never lives in the primary database — store a URL/key pointing at object storage or a CDN, and keep the row itself small enough to fit comfortably in cache."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson worked out how a timeline gets *built* — push fan-out for most users, pull fan-out for celebrities with huge follower counts, a hybrid for everyone in between. None of that fan-out logic means anything until you've pinned down what actually gets written and read: what a tweet row looks like, how the follow graph is stored so "who follows me" and "who do I follow" are both fast, and where the fanned-out timeline entries themselves live. This is the lesson where an interviewer stops asking "how does data flow" and starts asking "what's actually in the row, and which database is it in."
+
+The recurring theme across this entire system is that a handful of access patterns dominate — read a tweet, read a timeline, check who follows whom — and each one wants a different storage engine optimized for it. Cramming tweets, the social graph, and timelines into one relational database works at small scale and falls over hard once a single user has tens of millions of followers or a celebrity tweet gets liked a million times in an hour.
+
+## The core entities
+
+Four entities carry almost all of the system's load:
+
+- **Tweet** — the content itself: text, author, timestamp, and denormalized engagement counters.
+- **User** — profile, and (importantly for the timeline lesson) counts of followers/following used to decide fan-out strategy.
+- **Follow edge** — a directional relationship between two users.
+- **Timeline entry** — a precomputed pointer to a tweet, one row per `(user_id, tweet_id)`, produced by the fan-out process.
+
+Each of these has a distinct access pattern, so each gets its own storage decision rather than a shared schema.
+
+### Tweets: sharded by author, immutable once written
+
+```
+tweets
+  tweet_id      bigint PK   -- Snowflake-style: time + shard + sequence
+  author_id     bigint FK -> users.id
+  text          varchar(280)
+  media_key     varchar      -- pointer into object storage, nullable
+  like_count    int          -- denormalized, reconciled async
+  retweet_count int          -- denormalized, reconciled async
+  reply_count   int          -- denormalized, reconciled async
+  created_at    timestamp
+```
+
+A tweet is written once and almost never updated (Twitter/X doesn't support editing tweet text) — it's about as close to an append-only log entry as a social product gets. That makes it a good fit for a key-value or wide-column store (something like Cassandra or DynamoDB, or a sharded relational store if you want SQL) sharded by `author_id`, so fetching "all of this user's recent tweets" — needed for their profile page — is a single-shard range scan instead of a scatter-gather across the cluster.
+
+`tweet_id` is worth generating deliberately rather than with an auto-increment column: a Snowflake-style ID (a timestamp bit-packed with a shard/worker ID and a per-millisecond sequence number) sorts lexicographically by creation time and requires no central counter service, which would otherwise become a single point of contention for every write in the system.
+
+### The social graph: two directional edge tables
+
+```
+followers        -- "who follows user X"
+  user_id       bigint FK -> users.id
+  follower_id   bigint FK -> users.id
+  created_at    timestamp
+  PRIMARY KEY (user_id, follower_id)
+
+following        -- "who does user X follow"
+  user_id       bigint FK -> users.id
+  followee_id   bigint FK -> users.id
+  created_at    timestamp
+  PRIMARY KEY (user_id, followee_id)
+```
+
+This looks like duplication — and it is, deliberately. The graph needs to answer two very different queries fast: "give me every follower of this user" (used by the fan-out job when someone tweets) and "give me everyone this user follows" (used to build a pull-based timeline read, or just to render a profile's following list). Storing both directions as their own indexed table means each query is a single indexed lookup instead of a full scan or a self-join on one bidirectional table. The write cost of a follow action doubles (insert into both tables), but follows are orders of magnitude rarer than timeline reads, so that trade is an easy one.
+
+At very large scale this graph is itself sharded, typically by `user_id` on each table, which is exactly why the previous lesson's celebrity problem exists: a celebrity's row in `followers` isn't one row, it's tens of millions of rows that no single shard can hold or scan cheaply — which is precisely why fanning out on write to every follower doesn't work for them.
+
+### Timeline entries: a precomputed, disposable projection
+
+```
+timeline_entries
+  user_id     bigint       -- whose timeline this entry belongs to
+  tweet_id    bigint
+  inserted_at timestamp
+  PRIMARY KEY (user_id, inserted_at, tweet_id)
+```
+
+This table is the output of the fan-out-on-write process from the previous lesson: when a followed user tweets, a row gets inserted into every follower's `timeline_entries`. Reading a timeline is then `SELECT tweet_id FROM timeline_entries WHERE user_id = ? ORDER BY inserted_at DESC LIMIT 20` — cheap, indexed, no join across the follow graph at read time. In production this table is usually a capped list in something like Redis (a sorted set keyed by user, capped at a few hundred entries) rather than a full relational table, since it's regenerable and doesn't need long-term durability the way a tweet's content does.
+
+That regenerability is the important conceptual point: if a `timeline_entries` row is lost, nothing irreplaceable happened — it can be rebuilt by re-querying the follow graph and the tweets table. Losing a row from the `tweets` table is data loss. Treating those two failure modes identically is a common design mistake.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  T[(tweets table, sharded by author_id)]
+  F[(follow graph: followers / following)]
+  W[Fan-out worker on new tweet]
+  TL[(timeline_entries per user, cache-backed)]
+  R[Timeline read]
+  T --> W
+  F --> W
+  W --> TL
+  TL --> R
+  T --> R
+`} />
+
+## Engagement data: counters that don't live on the tweet row
+
+Likes, retweets, and replies each get their own table rather than an in-place increment on `tweets.like_count`:
+
+```
+likes
+  user_id   bigint FK -> users.id
+  tweet_id  bigint FK -> tweets.tweet_id
+  created_at timestamp
+  PRIMARY KEY (user_id, tweet_id)
+```
+
+The `(user_id, tweet_id)` primary key makes liking idempotent — the same user liking the same tweet twice is a no-op, not a double-count, and a retried request after a timeout can't inflate the count. `tweets.like_count` is then a cached aggregate, updated asynchronously by a worker consuming a stream of like events, not written synchronously inside the like request. A viral tweet accumulating thousands of likes per second would otherwise turn one row into a severe write hotspot, contending with every read of that same row.
+
+<Callout type="warning">
+A frequent mistake in this lesson is treating the tweet row as the single source of truth for everything — text, media, and every engagement counter — and updating `like_count`/`retweet_count` with a direct `UPDATE` on every like or retweet. Two things break under load: the row becomes a write hotspot exactly when it's most popular (contending with the read traffic that popularity also brings), and without a separate `likes` table keyed by `(user_id, tweet_id)`, there is no way to make liking idempotent or to prevent one user's click (or retried request) from being counted twice. Keep engagement events in their own tables and treat the counter on the tweet as a reconciled cache, not the record of truth.
+</Callout>
+
+## Worked example: sizing the tweets table
+
+Say the interviewer asks you to size storage for tweet text alone, ignoring media, at 200 million daily active users each posting an average of 2 tweets a day.
+
+That's 400 million tweets per day. At roughly 300 bytes per tweet (280 characters of text plus fixed-width fields for `tweet_id`, `author_id`, timestamp, and the three counters), that's `400,000,000 x 300 bytes ≈ 120 GB per day` of new tweet rows, or a little over 43 TB a year before any replication factor or index overhead.
+
+That number by itself tells you two things worth saying out loud in an interview: first, this easily exceeds what a single machine (or even a single un-sharded database) can hold, which is why sharding by `author_id` isn't optional at this scale — it's the only way to keep each shard's working set small enough to serve reads out of memory or fast SSD. Second, 120 GB/day of pure text is small compared to what media storage would add if a meaningful fraction of those 400 million daily tweets include an image or video, which is exactly why media is never stored in this table — it goes to object storage, referenced by a `media_key`, keeping the row itself lean.
+
+## Quiz
+
+<Quiz lessonId="twitter-data-model-and-storage" client:visible questions={[
+  {
+    id: 'q1',
+    kind: 'mcq',
+    prompt: 'Why store followers and following as two separate directional tables instead of one bidirectional follow table?',
+    options: [
+      { id: 'a', text: 'Because a single table cannot represent a directional relationship at all', correct: false, explanation: 'A single table could store direction with a column — the real reason is query performance, not representational impossibility.' },
+      { id: 'b', text: 'Because the graph needs fast, independently indexed answers to two different queries ("who follows me" and "who do I follow"), and one table optimized for both would require a self-join or a full scan for one direction', correct: true, explanation: 'Correct. Each direction is its own hot, high-volume query (fan-out reads followers; timeline/profile reads read following), so each gets its own indexed table at the cost of a slightly more expensive write.' },
+      { id: 'c', text: 'Because follows need to be stored in a different database engine than tweets', correct: false, explanation: 'The follow graph tables can live in the same engine as other relational data — the split into two tables is about query direction, unrelated to which engine is chosen.' },
+    ],
+  },
+  {
+    id: 'q2',
+    kind: 'multi',
+    prompt: 'Which of these statements about timeline_entries are accurate? (Select all that apply.)',
+    options: [
+      { id: 'a', text: 'It can be safely rebuilt from the tweets table and the follow graph if lost, unlike the tweets table itself', correct: true, explanation: 'Correct — it is a derived, disposable projection produced by the fan-out process, not a primary record.' },
+      { id: 'b', text: 'It should be treated with the same durability guarantees as the tweets table, since losing a row is equally bad in both cases', correct: false, explanation: 'The opposite is true — losing a tweets row is real data loss, while losing a timeline_entries row just means a regenerable cache entry needs to be rebuilt.' },
+      { id: 'c', text: 'It is typically read with a simple range query keyed by user, avoiding a live join across the follow graph at read time', correct: true, explanation: 'Correct — that is the entire point of precomputing it: reads become a cheap indexed lookup instead of a graph traversal.' },
+    ],
+  },
+  {
+    id: 'q3',
+    kind: 'boolean',
+    prompt: 'A tweet\'s like_count should be updated with a direct increment inside the same request that records the like, so the count is always exactly correct.',
+    options: [
+      { id: 'true', text: 'True', correct: false, explanation: 'Doing this synchronously creates a write hotspot on popular tweets and, without a separate idempotent likes table, risks double-counting on retried requests.' },
+      { id: 'false', text: 'False', correct: true, explanation: 'Correct — likes should be recorded in their own idempotent table keyed by (user_id, tweet_id), with like_count maintained as an asynchronously reconciled cache.' },
+    ],
+  },
+  {
+    id: 'q4',
+    kind: 'mcq',
+    prompt: 'Why generate tweet IDs with a Snowflake-style scheme (timestamp + shard + sequence) instead of a simple auto-increment column?',
+    options: [
+      { id: 'a', text: 'Auto-increment columns cannot be indexed', correct: false, explanation: 'Auto-increment columns index fine on a single machine — the problem is coordination across many shards, not indexing.' },
+      { id: 'b', text: 'A single auto-increment counter would need to be coordinated across every shard for every write, becoming a bottleneck, whereas a Snowflake-style ID lets each shard generate unique, time-sortable IDs independently', correct: true, explanation: 'Correct. Removing the central counter is exactly what lets tweet writes scale horizontally across shards without contention, while still sorting roughly by creation time.' },
+      { id: 'c', text: 'Because tweet IDs need to encode the author\'s user ID directly', correct: false, explanation: 'Snowflake-style IDs typically encode a timestamp, a shard/worker ID, and a sequence number — not the author ID, which is stored in its own column.' },
+    ],
+  },
+]} />

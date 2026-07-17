@@ -1,0 +1,240 @@
+---
+title: "Designing the Editing Service"
+module: "Design Google Docs"
+moduleOrder: 13
+order: 4
+track: "interview"
+summary: "Zooms into the editing service itself — the per-document actor, op log, revision numbers, resync protocol, and sharding scheme that turn an OT or CRDT algorithm into a running system."
+tags: ["docs", "editing-service", "sharding", "websockets", "consistency"]
+estMinutes: 13
+cheatsheet:
+  - "Treat each open document as a single-writer actor: one in-memory owner process applies every op for that document in order, so you never need a distributed lock for the hot path."
+  - "Route documents to owners with consistent hashing on document ID, and keep a directory (or the hash ring itself) as the source of truth for 'who owns doc X right now.'"
+  - "Every op is tagged with the revision it was based on; the owner assigns the next revision number and transforms or merges against anything committed since, then broadcasts the rebased op plus the new revision to every other connected client."
+  - "Persist an append-only op log per document plus periodic snapshots — replay-from-snapshot bounds recovery time; the raw op log alone would make crash recovery replay the whole document history."
+  - "Reconnecting clients resync by revision number: send your last-seen revision, get back the missing ops (or a fresh snapshot if you're too far behind) — never a full re-fetch on every hiccup."
+  - "Keep cursor/presence updates on a separate, unpersisted fan-out path from the durable edit path — they're high-frequency and lossy-tolerant, and mixing them into the op log wastes storage and slows replay."
+  - "A single global lock per document across the cluster is the most common bottleneck; the fix is pinning one owner per document, not locking around a shared store."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+By this point you've picked a collaboration algorithm (OT or CRDT) and sketched
+the high-level boxes: clients, an editing service, storage. That's the
+skeleton an interviewer expects in the first fifteen minutes. What separates a
+pass from a strong pass is what happens when they ask, "okay, walk me through
+what the editing service actually does when two people type in the same
+paragraph at the same time." That question has a precise, concrete answer, and
+this lesson builds it: the per-document owner, the revision-numbered op log,
+the resync protocol for reconnects, and the sharding scheme that lets the
+service handle millions of documents without a global lock anywhere in sight.
+
+## What the editing service actually owns
+
+Strip away the algorithm choice and the editing service has five concrete
+jobs for every open document:
+
+1. **Session management** — track which clients currently have the document
+   open and which WebSocket connection belongs to which client.
+2. **Op sequencing** — assign a total order to concurrent edits so every
+   client ends up applying the same operations in a way that converges.
+3. **Transform or merge** — run the OT transform (or CRDT merge) so an op
+   written against an older state applies cleanly to the current state.
+4. **Broadcast and acknowledgment** — fan the resulting op out to every other
+   connected client, and ack the sender so their local buffer can clear.
+5. **Durability** — persist enough that a crash or failover doesn't lose
+   committed edits.
+
+Everything below is really just "how do you implement these five jobs so they
+work correctly under concurrency and at scale."
+
+## One owner per document, not a shared lock
+
+The single biggest architectural decision is this: **each open document has
+exactly one owner process at a time**, and every op for that document funnels
+through it. Think of it as an actor — an in-memory object holding the current
+document state, the pending-op transform logic, and the list of connected
+clients, all mutated by a single-threaded event loop.
+
+This matters because op sequencing and transform are inherently
+order-sensitive. If two servers could both assign revision numbers to
+concurrent ops for the same document, you'd need a distributed lock or
+consensus round *per keystroke* to avoid ordering conflicts — far too slow for
+something in the typing latency path. Pinning one owner sidesteps that
+entirely: ordering becomes a local, single-process concern, which is cheap and
+fast.
+
+The owner is picked by **consistent hashing on document ID**. A routing layer
+(or the clients themselves, if they're handed a redirect) hashes the doc ID to
+find which shard server should own it, connects there, and that server loads
+the document into memory on first open (and evicts it after some idle period
+with no connected clients).
+
+<Mermaid client:visible chart={`
+flowchart LR
+    C1[Client A] -->|WS| R[Routing layer]
+    C2[Client B] -->|WS| R
+    R -->|hash doc_id| S1[Owner shard: doc 42]
+    R -->|hash doc_id| S2[Owner shard: doc 99]
+    S1 --> L1[(Op log + snapshot: doc 42)]
+    S2 --> L2[(Op log + snapshot: doc 99)]
+`} />
+
+## The edit path, step by step
+
+Here's what happens for a single keystroke, assuming an OT-based service (the
+mechanics are nearly identical for CRDT, minus the transform step):
+
+1. Client applies the edit locally immediately (optimistic UI) and sends the
+   op to the owner over its WebSocket, tagged with the revision the client
+   last saw — call it `baseRev`.
+2. The owner checks: has anything committed since `baseRev`? If yes, it
+   transforms the incoming op against each of those intervening ops, in
+   order, producing an op that's valid against the *current* state.
+3. The owner assigns the next revision number, appends the (possibly
+   transformed) op to the document's in-memory history and durable op log,
+   and applies it to the in-memory document state.
+4. The owner broadcasts the transformed op plus its new revision number to
+   every other connected client, and sends an ack (with the same revision) to
+   the original sender.
+5. Every client — sender included — now agrees on both the document content
+   and the current revision number.
+
+The revision number is doing real work here: it's what lets step 2 happen at
+all. Without a monotonic per-document counter, the owner has no way to know
+which ops the incoming edit does and doesn't already account for.
+
+## Durability: op log plus snapshots
+
+Persisting every op forever and replaying from op 1 on every load doesn't
+scale — a document edited daily for three years has a huge history. The
+standard fix is a **snapshot + op log** pair:
+
+- The full document state is snapshotted periodically (every N ops, or every
+  few minutes of activity, whichever comes first).
+- Only ops since the last snapshot are replayed to reconstruct current state
+  on load or failover.
+- Older op log segments can be archived or discarded entirely if you don't
+  need edit history/version restore — if you do (Google Docs' version
+  history is a real feature), keep them in cold storage rather than in the
+  live path.
+
+This also gives you your failover story for free: if the owner shard dies,
+another shard takes over, loads the last snapshot, replays the op log tail,
+and resumes — no data loss, bounded recovery time.
+
+## Reconnects: resync by revision, not full refetch
+
+Clients drop connections constantly — laptop lids close, wifi flakes,
+tunnels lose signal. The naive fix, re-downloading the whole document on
+every reconnect, wastes bandwidth and adds latency exactly when you want the
+editor to feel instant.
+
+Instead, the client remembers its last-acknowledged revision number locally.
+On reconnect, it sends that revision to the owner, which replies with just
+the ops committed since then — a small diff in the common case (a few
+seconds or minutes offline). Only if the client is so far behind that the
+op log tail was already discarded does the owner fall back to shipping a
+fresh snapshot.
+
+This same mechanism doubles as your **catch-up path for a client that just
+opened the document for the first time** — it's the same "give me
+everything since revision 0" request, just a larger diff.
+
+## Presence and cursors: a separate, disposable channel
+
+Live cursor positions and "who's viewing" indicators look like edits but
+behave completely differently: they're high-frequency (every mouse move or
+selection change), and losing one is harmless — the next update supersedes
+it. Routing presence through the same durable op log wastes storage and adds
+noise to a history you might want to keep clean for version restore.
+
+Keep presence on its own fan-out path: same WebSocket connection is fine, but
+tag presence messages separately, skip the op log and revision-number
+machinery entirely, and just broadcast-and-forget to connected clients. If a
+presence update is lost during a brief hiccup, the next one (a second later)
+fixes it.
+
+## Worked example: two editors, one sentence
+
+Say a document is at revision 40 and reads `"The cat sat."`. Two clients,
+Alice and Bob, are both looking at revision 40.
+
+- Alice inserts `" quietly"` after `"sat"` → op based on rev 40.
+- At nearly the same instant, Bob inserts `"black "` before `"cat"` → also
+  based on rev 40.
+
+Both ops arrive at the owner within milliseconds of each other. Say Alice's
+arrives first: the owner sees no ops committed since rev 40, so it applies
+hers directly, producing `"The cat sat quietly."` and revision 41, then
+broadcasts it.
+
+Bob's op arrives a moment later, still tagged `baseRev 40`. The owner
+transforms it against Alice's now-committed op — inserting `"black "` before
+`"cat"` doesn't overlap with an insertion after `"sat"`, so the position
+adjusts cleanly (or CRDT merge resolves it via each character's stable
+position). The result: `"The black cat sat quietly."` at revision 42,
+broadcast to both clients. Alice's client, which had only seen up through her
+own edit, applies Bob's incoming op locally and converges to the same text.
+Neither user did anything differently — the owner's transform step is what
+made two conflicting-looking edits land correctly.
+
+<Callout type="warning">
+  A common mistake is protecting document state with a lock or transaction
+  around a shared database row instead of pinning a single in-memory owner
+  per document. That forces every keystroke through a round trip to a shared
+  store under contention, and it gets dramatically worse the moment two
+  editors are typing in the same document at once — exactly the case you're
+  designing for. The single-owner-actor model keeps the hot path in memory
+  and only touches durable storage for the op log append and periodic
+  snapshot, not for every ordering decision.
+</Callout>
+
+## Where this leaves you
+
+At this point you've got: one owner per open document, picked by consistent
+hashing; a revision-numbered op path that sequences and transforms concurrent
+edits; snapshot-plus-log durability; a resync protocol for reconnects; and a
+disposable presence channel that doesn't pollute the durable history. The
+next lesson, Scaling and Offline Support, builds on exactly this design to
+handle a document going viral (thousands of simultaneous editors), a client
+going fully offline for hours, and how the single-owner model behaves when
+its shard fails mid-edit.
+
+<Quiz
+  lessonId="docs-designing-the-editing-service"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does the editing service pin a single owner process per open document instead of letting any shard server handle any op for it?',
+      options: [
+        { id: 'a', text: 'To avoid needing a distributed lock or consensus round per op just to assign a consistent order to concurrent edits', correct: true, explanation: 'Correct — with one owner, sequencing and transform become a local, single-threaded concern instead of a distributed coordination problem on every keystroke.' },
+        { id: 'b', text: 'Because CRDTs require a single owner to function at all', correct: false, explanation: 'CRDTs are actually designed to merge correctly with no single owner. Single-owner is a service-design choice made for simplicity and low-latency sequencing, used with either OT or CRDT.' },
+        { id: 'c', text: 'To reduce the number of WebSocket connections a client needs to open', correct: false, explanation: 'Connection count is unrelated — a client still opens one connection either way; single-owner is about where ordering decisions are made.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these should live in the durable, revision-numbered op log?',
+      options: [
+        { id: 'a', text: 'Text insert and delete operations', correct: true, explanation: 'These are the actual edits that must be replayable and durable — exactly what the op log is for.' },
+        { id: 'b', text: 'Formatting changes like bold/italic toggles', correct: true, explanation: 'These are content-changing edits too, and need the same ordering and durability guarantees as text edits.' },
+        { id: 'c', text: 'Live cursor position updates', correct: false, explanation: 'Presence is high-frequency and disposable — losing one is harmless since the next update supersedes it. Routing it through the durable op log wastes storage and slows replay.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'When a client reconnects after a brief disconnect, it should re-download the entire document rather than resyncing from its last-known revision number.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A full re-download wastes bandwidth and adds latency for what is usually a small gap. The client should send its last-acknowledged revision and receive only the ops committed since then.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — resync-by-revision is the standard approach; a full snapshot re-fetch is only needed as a fallback when the client is so far behind that the relevant op log tail has already been discarded.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,130 @@
+---
+title: "Context, Latency, and the Design"
+module: "AI-Powered Code Assistant"
+moduleOrder: 19
+order: 2
+track: "interview"
+summary: "Works through how an AI coding assistant assembles the right code context under a tight token budget, and how that context pipeline reshapes the architecture around two very different latency classes: inline completions and chat."
+tags: ["code-assistant", "context-retrieval", "latency-budget", "prompt-caching", "embeddings"]
+estMinutes: 13
+cheatsheet:
+  - "Inline completions and chat are different products with different latency budgets — roughly 100-300ms end-to-end for ghost-text suggestions, several seconds acceptable for chat/agentic answers. Don't design one pipeline for both."
+  - "Context assembly is a ranking problem under a token budget, not a 'send more context' problem — cursor-adjacent code, open tabs, and recently edited files usually outrank generic repo-wide semantic search hits."
+  - "Combine a symbol/exact-match index (for 'find this function definition') with a vector/embedding index (for 'find code related to this concept') — neither alone covers both query types well."
+  - "Prefix/prompt caching on the stable part of the prompt (system instructions, repo context) turns a full re-encode into an incremental one on every keystroke-driven request — this is often the single biggest latency win."
+  - "Debounce keystrokes and cancel in-flight completion requests when the cursor moves or new input arrives; a request that finishes after it's stale just wastes GPU capacity."
+  - "Re-index incrementally (changed files/functions only) on save, not the whole repo on every edit — full re-indexing at edit frequency doesn't scale past a trivially small codebase."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson settled the requirements and sketched the major pieces: an editor extension, a backend that talks to an LLM, and some notion of "understanding the codebase." That sketch hides the two hardest problems in this system. First, the model doesn't know your codebase — every request has to hand it *just enough* of the right code to be useful, out of a repo that's almost always far bigger than the context window. Second, "AI coding assistant" is really two products wearing one name: an inline completion that has to feel instantaneous, and a chat/agent flow that can afford to think. Get either one wrong and the tool feels broken, even if the model itself is excellent.
+
+This lesson works through how context gets built and budgeted, and how the latency split between completion and chat drives the rest of the design.
+
+## Two products, two latency budgets
+
+A developer accepts or rejects an inline suggestion in the time it takes to glance at it — anything much past 100-150ms of added typing latency reads as lag, and past 300-400ms people stop trusting the feature and turn it off. A chat question ("why is this test flaky?") tolerates a few seconds; users expect to wait for a real answer, the same way they wait for a search result.
+
+That gap forces different engineering choices at almost every layer:
+
+| Concern | Inline completion | Chat / agentic |
+|---|---|---|
+| Latency budget | ~100-300ms end-to-end | 1-10s+ acceptable |
+| Model | small, fast, often local/edge | larger, more capable |
+| Context | tight, cursor-local | broader, multi-file, multi-turn |
+| Cancellation | constant — keystrokes race requests | rare — user waits for the answer |
+
+Treating these as one pipeline with one model and one context-assembly path is the most common design mistake in this problem. They share infrastructure (the same repo index, the same auth and billing) but diverge sharply in the request path.
+
+## Building context: what actually goes in the prompt
+
+The model only knows what you send it. For a repo with hundreds of thousands of lines, deciding what fits in a context window of, say, 8K-32K tokens is a ranking problem, not a retrieval-everything problem. A reasonable priority order, richest signal first:
+
+1. **Cursor-local code** — the current function, its enclosing class, and a window of lines around the cursor. This is almost always the highest-value context and costs the fewest tokens.
+2. **Open editor state** — other tabs the developer has open, and recently edited files. A developer working across two files is telling you, implicitly, that both are relevant.
+3. **Symbol resolution** — if the code references a function, type, or import from elsewhere in the repo, pull that definition in. This needs a symbol index (built from parsing/AST, similar to what a language server maintains), not just text search.
+4. **Semantically related code** — a vector search over embeddings of code chunks (functions, classes) to find code that's conceptually related but not textually or structurally linked — useful for "is there already a helper that does this?" style completions and for chat questions about unfamiliar parts of the codebase.
+5. **Project-level context** — README, style conventions, a short repo summary — low volume, included by default since it's cheap and stable.
+
+Chat and agentic requests can afford to go several levels deep into (3) and (4), including multi-hop retrieval ("find the caller of this function, then find what calls that"). Inline completion mostly stays at (1) and (2) because there's no latency budget left for a retrieval round-trip once you've spent it on model inference.
+
+### Indexing: symbol index and vector index, kept separate
+
+A single index rarely serves both "jump to the exact definition of `parseInvoice`" and "find code related to invoice parsing" well. Exact/structural lookups (go-to-definition, references, imports) are served by a symbol table built from parsing each file's AST — cheap to build, updated incrementally as files change, and precise. Semantic lookups are served by an embedding index over chunked code (typically per-function or per-class, with some overlap) stored in a vector database, queried with the embedding of the current context or the user's question. Production assistants run both and merge results, rather than picking one.
+
+Re-indexing has to be incremental. On save, only the changed file's symbols and embeddings get recomputed and upserted — re-embedding an entire multi-million-line repo on every keystroke or even every save doesn't scale, and it isn't necessary since most of the repo didn't change.
+
+## Latency inside the completion path
+
+Once context is assembled, the request still has to travel through retrieval, prompt construction, model inference, and back. For the completion path specifically, three techniques matter most:
+
+- **Prompt/prefix caching.** The system instructions and stable repo context (file summary, imports) are usually identical across many consecutive keystrokes in the same file. If the inference engine caches the KV state for that shared prefix, each new request only has to encode the small delta — the few new characters typed — instead of re-processing the whole prompt from scratch. This is frequently the single biggest latency lever available, because it turns an `O(prompt length)` cost into something close to `O(new tokens)`.
+- **Debouncing and cancellation.** A user typing at normal speed fires a keystroke every 50-150ms. Firing a completion request per keystroke wastes GPU capacity on requests that are obsolete before they return. Debounce briefly (a short quiet window, or triggering only at natural pause points like after a `.` or newline), and — critically — cancel any in-flight request the moment the cursor moves or new input invalidates it, so the GPU slot frees up rather than finishing a suggestion nobody will see.
+- **Small, fast models on the hot path.** Inline completion typically runs a smaller model (sometimes distilled or quantized, sometimes served at the edge closer to the developer) chosen for latency over raw capability, reserving the larger model for chat where the budget allows it.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  Editor[Editor: cursor + open tabs] --> Extractor[Local context extractor]
+  Extractor --> Assembler[Context assembler / ranker]
+  SymIdx[(Symbol index)] --> Assembler
+  VecIdx[(Vector index)] --> Assembler
+  Assembler -->|tight budget, cached prefix| FastModel[Fast model: inline completion]
+  Assembler -->|larger budget, multi-turn| ChatModel[Larger model: chat / agent]
+  FastModel --> Editor
+  ChatModel --> Editor
+`} />
+
+## Worked example: budgeting an inline completion
+
+Say the product target is a 200ms end-to-end budget for inline completion, measured from keystroke to suggestion rendered. A rough breakdown: 20ms for the editor extension to detect the pause and send the request, 30ms of network round-trip to the nearest inference region, 100ms for model inference itself (a small model, short output — a line or two of code), 20ms to stream the result back, and 30ms of buffer for the editor to render it. That's already the full 200ms with almost nothing spent on retrieval.
+
+This is exactly why cursor-local context and prefix caching matter more here than fancy repo-wide retrieval: if a vector search adds even 50ms, it consumes a quarter of the entire budget for a feature that's judged on feeling instant. Contrast this with a chat request answering "explain how retries work in this service" — a 2-3 second budget comfortably covers a multi-hop symbol lookup, a vector search across several files, and inference on a larger model, because the user's expectation for that interaction is closer to a targeted search than to typing feedback.
+
+<Callout type="warning">
+A common mistake is designing one context-assembly pipeline and one model tier for "the AI assistant" as a single feature, then discovering in review that inline completion is unusably laggy because every request pays for a full semantic search and a large model. Be explicit in the interview that completions and chat are different latency contracts requiring different models, different context budgets, and different cancellation behavior — sharing the underlying indexes is fine and expected, sharing the request path usually isn't.
+</Callout>
+
+<Quiz lessonId="code-assistant-context-latency-and-the-design" client:visible questions={[
+  {
+    id: 'q1',
+    kind: 'mcq',
+    prompt: 'Why does prefix/prompt caching help inline completion latency so much more than it helps a one-off chat question?',
+    options: [
+      { id: 'a', text: 'Because consecutive keystrokes in the same file share almost the same prompt prefix, so the cached KV state avoids re-encoding it on every request', correct: true, explanation: 'Correct — completion requests fire repeatedly with nearly identical stable context (system instructions, file context); caching that prefix turns each request into an incremental encode of just the new characters.' },
+      { id: 'b', text: 'Because chat requests never reuse any part of the prompt across turns', correct: false, explanation: 'Chat also benefits from prefix caching across turns of the same conversation — the difference is completion fires far more frequently per second, so the win compounds faster and matters more against its tighter budget.' },
+      { id: 'c', text: 'Because completion requests use a larger context window than chat requests', correct: false, explanation: 'It is usually the opposite: completion context is kept intentionally small to fit the tight latency budget, while chat can afford a larger context window.' },
+    ],
+  },
+  {
+    id: 'q2',
+    kind: 'multi',
+    prompt: 'Which of these are good reasons to maintain a separate symbol index alongside a vector/embedding index in a code assistant? (Select all that apply.)',
+    options: [
+      { id: 'a', text: 'Exact lookups like "go to the definition of this function" are better served by structural/AST-based lookup than by semantic similarity search', correct: true, explanation: 'Correct — a symbol index gives precise, deterministic results for definitions and references, which embedding similarity search is not designed to guarantee.' },
+      { id: 'b', text: 'Finding conceptually related code that doesn\'t share exact names or imports needs semantic similarity, not exact structural matching', correct: true, explanation: 'Correct — this is exactly the case a vector index over code embeddings is good at, and a symbol index can\'t answer at all.' },
+      { id: 'c', text: 'A single index type can never be updated incrementally, so two are required for performance reasons alone', correct: false, explanation: 'Both symbol indexes and vector indexes can be updated incrementally per changed file; the reason to keep two is that they answer different kinds of queries well, not an update-performance limitation.' },
+    ],
+  },
+  {
+    id: 'q3',
+    kind: 'boolean',
+    prompt: 'It is reasonable for an inline-completion request and a chat request in the same product to use the same model and the same context-assembly depth, since both are "the AI assistant."',
+    options: [
+      { id: 'true', text: 'True', correct: false, explanation: 'They have very different latency budgets (roughly 100-300ms vs. seconds) and different context needs, so sharing a request path usually makes completion feel laggy or forces chat to skip useful retrieval.' },
+      { id: 'false', text: 'False', correct: true, explanation: 'Correct — completion and chat should use different models and different context-assembly depth, even though they can share the same underlying symbol and vector indexes.' },
+    ],
+  },
+  {
+    id: 'q4',
+    kind: 'mcq',
+    prompt: 'A developer types a function call quickly, and the completion request fired after the first keystroke finishes and returns a suggestion only after three more keystrokes have already changed the line. What should the system do with that response?',
+    options: [
+      { id: 'a', text: 'Discard it — the request should have been canceled when the newer keystrokes invalidated it, and rendering a stale suggestion now would confuse the user', correct: true, explanation: 'Correct — cancellation on invalidation is exactly the mechanism that prevents stale, wasted completions from being rendered or from occupying GPU capacity after they\'re no longer useful.' },
+      { id: 'b', text: 'Render it anyway, since the model did the work and discarding it would waste the computation', correct: false, explanation: 'Rendering a suggestion that no longer matches the current cursor context is worse than not rendering anything — it actively misleads the developer, regardless of the sunk inference cost.' },
+      { id: 'c', text: 'Queue it and show it after the next suggestion completes, to preserve ordering', correct: false, explanation: 'Ordering doesn\'t make a stale suggestion valid; queuing an outdated completion just delays showing an irrelevant result instead of preventing it.' },
+    ],
+  },
+]} />

@@ -1,0 +1,173 @@
+---
+title: "Metrics, Push vs. Pull, and Storage"
+module: "Distributed Monitoring"
+moduleOrder: 13
+order: 2
+track: "concept"
+summary: "Covers what a metric actually is, the push vs. pull models for getting metrics out of services, and why time-series storage needs its own specialized design."
+tags: ["monitoring", "metrics", "time-series", "observability"]
+estMinutes: 12
+cheatsheet:
+  - "A metric is a name, a set of labels, a timestamp, and a numeric value — everything downstream (dashboards, alerts, retention) is built on that shape."
+  - "Counters only go up (resets on restart); gauges go up and down; histograms/summaries capture distributions like latency so you can compute percentiles."
+  - "Pull (scrape) centralizes scheduling and makes liveness trivial to infer from a failed scrape, but needs service discovery and struggles with short-lived jobs."
+  - "Push suits ephemeral/batch jobs and works through NAT/firewalls in one direction, but the client owns retry/buffering and a silent client looks identical to an idle one."
+  - "A label with unbounded cardinality (user_id, request_id, raw URL) can blow up a time-series database's index — that's the single most common outage-by-monitoring mistake."
+  - "Time-series databases exploit that adjacent points change slowly: delta/XOR encoding plus columnar storage routinely gets 90%+ compression versus naive storage."
+  - "Downsampling and retention tiers (raw for 7 days, 5-min rollups for a year) trade query resolution for storage cost — decide the trade-off per metric, not globally."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson made the case for watching a distributed system instead of hoping it behaves. This lesson gets concrete about the first pillar of that: metrics. Before you can design a monitoring system, you need to answer three unglamorous but decisive questions: what shape does a metric have, how does it travel from a service to a place you can query it, and what does it take to store billions of these points cheaply enough that the monitoring system doesn't cost more than the thing it's watching?
+
+Get these wrong and the symptoms show up much later, as an interview candidate's worst nightmare: a monitoring system that itself falls over during an incident, or a storage bill that grows faster than the fleet it's monitoring.
+
+## What a metric actually is
+
+A metric is a numeric measurement of something at a point in time, plus enough context to slice it later. Concretely, each data point is:
+
+- **A metric name** — `http_requests_total`, `checkout_latency_ms`, `queue_depth`.
+- **A set of labels (dimensions)** — key-value pairs like `service=checkout`, `region=us-east-1`, `status_code=500`. Labels are what let you go from "requests are failing" to "requests are failing in us-east-1 for the checkout service."
+- **A timestamp.**
+- **A value** — a single number.
+
+That "name + labels + timestamp + value" tuple is the atomic unit every dashboard, alert rule, and retention policy is built on. It's worth internalizing because it explains most of the design decisions later in this lesson: labels are what make a time-series database's job hard (see cardinality below), and the timestamp is what makes it fundamentally different from a general-purpose database.
+
+### The four metric types you'll actually use
+
+- **Counter** — monotonically increasing (total requests served, total errors). It only resets when the process restarts. You almost never read a counter's raw value; you read its *rate of change* (requests/sec over the last minute).
+- **Gauge** — a value that goes up and down (current queue depth, memory in use, number of open connections). You read it directly.
+- **Histogram** — buckets observations into ranges (e.g. request latency in `<10ms`, `<50ms`, `<100ms`, `<500ms` buckets) so you can estimate percentiles (p50, p95, p99) after the fact from pre-aggregated bucket counts.
+- **Summary** — similar goal to a histogram (percentiles), but computes them client-side per instance before shipping, which is cheaper to query but can't be meaningfully aggregated across instances afterward.
+
+The practical takeaway: if you need "p99 latency across the whole fleet," reach for histograms, not summaries — summaries lock in the aggregation boundary too early.
+
+## Push vs. pull: how metrics leave the service
+
+This is the design decision every monitoring system has to make, and it shapes almost everything downstream.
+
+### Pull (scrape-based)
+
+The monitoring system knows (via service discovery) which instances exist, and periodically calls an HTTP endpoint like `/metrics` on each one to fetch its current values. Prometheus is the canonical example of this model.
+
+Advantages:
+- **Centralized control of scrape frequency and load** — you can slow down scraping under monitoring-system pressure without touching every service.
+- **Liveness is a side effect** — a failed scrape *is* a signal ("this instance stopped responding"), no separate heartbeat needed.
+- **Easier to reason about duplicate data** — one scraper, one schedule, no risk of double-counting from retries.
+
+Disadvantages:
+- Needs service discovery to know what to scrape, which adds a moving part.
+- Doesn't fit short-lived jobs well — a batch job that runs for 4 seconds may finish before it's ever scraped (commonly solved with a push gateway that jobs push a final snapshot to, which then gets scraped instead).
+- The monitoring system needs network access *into* every instance, which can be awkward across trust boundaries or firewalls.
+
+### Push (agent/client-initiated)
+
+Each service (or a local agent/sidecar next to it) sends its metrics outbound to a collector on its own schedule. StatsD and most APM agents work this way.
+
+Advantages:
+- Works naturally through NAT/firewalls — the client only needs outbound access.
+- Fits ephemeral and batch workloads well — a Lambda function or a short-lived job can push a final value right before exiting instead of waiting to be discovered.
+- No service-discovery dependency for the monitoring system.
+
+Disadvantages:
+- The client owns retry and buffering logic — a network blip means every instance independently decides whether to drop, buffer, or retry.
+- **A silent, dead client is indistinguishable from an idle one that has nothing to report** — you lose the free liveness signal pull gives you, and need a separate "haven't heard from X in N minutes" alert.
+- Easy to accidentally overload the collector: a fleet-wide config change (e.g. lowering the push interval) fans out instantly across every instance with no central throttle.
+
+Most large-scale systems end up running both: pull for long-lived services (steady load, easy liveness), push for batch/serverless workloads and for cases where a local agent needs to buffer during network partitions.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  subgraph Pull
+    S1[Service A] -.scraped by.- M1[Monitoring server]
+    S2[Service B] -.scraped by.- M1
+    M1 -->|"service discovery"| SD[(Registry)]
+  end
+  subgraph Push
+    S3[Batch job] -->|pushes metrics| C[Collector]
+    S4[Serverless fn] -->|pushes metrics| C
+  end
+  M1 --> TSDB[(Time-series DB)]
+  C --> TSDB
+`} />
+
+## Storage: why metrics need a specialized database
+
+Metrics have a shape that makes a general-purpose relational or document database a poor fit at scale: mostly-append-only writes, timestamp-ordered access, and queries that almost always filter by a time range and aggregate (sum, average, percentile) rather than fetch individual rows. Time-series databases (TSDBs) like Prometheus's own storage engine, InfluxDB, or M3DB are built around three ideas:
+
+1. **Columnar, per-series storage.** Points for the same metric+label combination (a "series") are stored contiguously, so a query for one series' last hour doesn't have to scan unrelated series.
+2. **Delta/XOR encoding.** Adjacent timestamps and values in a series usually change by a small amount, so storing "the delta from the previous point" instead of the raw value compresses dramatically — Facebook's Gorilla paper reported roughly 90%+ compression this way, and most modern TSDBs use a variant of it.
+3. **Downsampling and retention tiers.** Nobody needs per-second resolution from 18 months ago. A typical policy keeps raw (e.g. 15-second) resolution for 7–14 days, rolls up to 5-minute averages for a year, and rolls up further (or deletes) beyond that — trading query resolution for a storage bill that doesn't grow linearly forever.
+
+### The cardinality trap
+
+The single most common way teams accidentally break their own monitoring: putting an unbounded-cardinality value into a label. A metric like `http_requests_total{status_code=500}` is fine — a handful of status codes. A metric like `http_requests_total{user_id=12345}` is not — with a million users, that one metric name explodes into a million distinct time series, each with its own index entry, and the TSDB's memory and disk usage can grow by orders of magnitude overnight. This is exactly why labels should describe *dimensions you'd want to alert or dashboard on* (region, service, status class), not identifiers for individual entities (user ID, request ID, raw URL path with query string).
+
+## Worked example: sizing metrics storage for a mid-size fleet
+
+Say you run 2,000 service instances, each exposing 200 distinct time series (a mix of counters, gauges, and histogram buckets), scraped every 15 seconds.
+
+- Series count: `2,000 x 200 = 400,000` active time series.
+- Points per second: at one point per series per scrape, that's `400,000 / 15s ≈ 26,700 points/sec`.
+- Raw bytes per point: roughly 16 bytes uncompressed (8-byte timestamp + 8-byte float value), before compression.
+- Raw ingest rate: `26,700 x 16 bytes ≈ 427 KB/sec`, or about 37 GB/day uncompressed.
+- With Gorilla-style delta/XOR compression (commonly 90%+ reduction for slowly-changing series), that drops to roughly **3–4 GB/day** for raw-resolution storage.
+
+Keep 14 days of raw resolution and that's roughly 45-55 GB — comfortably within a single modern TSDB node, before even applying downsampling for longer retention. This is the kind of back-of-envelope math an interviewer wants to see you do out loud: it justifies *why* compression and downsampling matter, rather than just asserting that they do.
+
+<Callout type="warning">
+  Don't design the metrics pipeline as if it can never fail. A common mistake is routing every service's metrics through a single collector or scrape target with no buffering — during a real incident (the exact moment you need metrics most), that collector is also under load, and a naive push pipeline with no local buffering will drop the very data points that would explain the outage. Give push-based agents a local ring buffer with bounded retry, and give pull-based scrapers enough headroom (separate scrape budget, staggered schedules) that scraping itself doesn't become a cascading failure during a spike.
+</Callout>
+
+The next lesson puts these pieces together into an actual monitoring system architecture — collectors, a storage tier, an alerting layer, and a query/dashboard layer — and walks through the trade-offs of building versus adopting an existing stack.
+
+<Quiz
+  lessonId="mon-metrics-push-vs-pull-and-storage"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'You need fleet-wide p99 latency computed after the fact by aggregating across many instances. Which metric type fits best?',
+      options: [
+        { id: 'a', text: 'Histogram', correct: true, explanation: 'Histograms report bucketed counts that can be merged across instances and used to estimate percentiles after aggregation, which is exactly what fleet-wide p99 needs.' },
+        { id: 'b', text: 'Summary', correct: false, explanation: 'Summaries compute percentiles client-side per instance before shipping, so those pre-computed percentiles cannot be correctly re-aggregated across instances afterward.' },
+        { id: 'c', text: 'Counter', correct: false, explanation: 'A counter only tracks a monotonically increasing total (like total requests); it has no notion of a value distribution, so it cannot yield a percentile.' },
+        { id: 'd', text: 'Gauge', correct: false, explanation: 'A gauge reports a single current value like queue depth; it has no way to represent the distribution of many observations at once.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine advantages of a pull-based (scrape) metrics model over push? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A failed scrape doubles as a liveness signal, with no separate heartbeat needed', correct: true, explanation: 'Because the monitoring system initiates each scrape on a schedule, a scrape that fails or times out directly tells you the instance is unreachable.' },
+        { id: 'b', text: 'It fits short-lived batch jobs better than push', correct: false, explanation: 'This is backwards — pull struggles with jobs that finish before they can be scraped; push (or a push gateway) fits ephemeral workloads better.' },
+        { id: 'c', text: 'Scrape frequency and load can be tuned centrally without touching every service', correct: true, explanation: 'Since the monitoring server drives the schedule, it can throttle or stagger scrapes fleet-wide from one place instead of reconfiguring every client.' },
+        { id: 'd', text: 'It works without any service discovery mechanism', correct: false, explanation: 'The opposite is true — pull needs to know what to scrape, so it depends on service discovery; push clients simply send data without the monitoring system needing to enumerate them first.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Adding a label like user_id to a metric is generally safe because time-series databases are designed to handle very large numbers of distinct label values efficiently.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'This is the cardinality trap: a label with millions of distinct values multiplies the number of stored time series by that same factor, which can blow up index size and memory use, not something TSDBs handle for free.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — unbounded-cardinality labels (user IDs, request IDs, raw URLs) are one of the most common causes of a metrics backend degrading or falling over.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A time-series database typically achieves large storage savings over a naive row-per-point format mainly by:',
+      options: [
+        { id: 'a', text: 'Storing every point as an independent, uncompressed row indexed by primary key', correct: false, explanation: 'That describes the naive approach TSDBs are specifically designed to avoid — it wastes space because adjacent points in a series are usually very similar.' },
+        { id: 'b', text: 'Delta/XOR encoding of adjacent timestamps and values within a series, plus columnar storage per series', correct: true, explanation: 'Because consecutive points in a series usually change by a small amount, encoding the deltas (rather than raw values) compresses very well, and grouping points by series avoids scanning unrelated data.' },
+        { id: 'c', text: 'Replacing timestamps with sequential integers', correct: false, explanation: 'This does not describe how TSDB compression actually works and would lose real time information needed for time-range queries and alignment across series.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,150 @@
+---
+title: "Requirements of a Messaging Queue"
+module: "Distributed Messaging Queue"
+moduleOrder: 17
+order: 1
+track: "concept"
+summary: "Establishes the functional and non-functional requirements that separate a simple in-memory queue from a production distributed messaging system, setting up the trade-offs the rest of the module resolves."
+tags: ["messaging-queue", "requirements", "distributed-systems", "durability", "scalability"]
+estMinutes: 11
+cheatsheet:
+  - "A messaging queue's core contract is three verbs: publish (or produce), consume, and acknowledge — everything else (topics, partitions, consumer groups) is built on top of that."
+  - "Decouple producers from consumers in both time and space: producers should never block on whether a consumer is up, slow, or even exists yet."
+  - "Pick a delivery guarantee (at-most-once, at-least-once, exactly-once-in-effect) as a stated requirement before designing — don't let it fall out of whatever the storage layer happens to do."
+  - "Durability requirement drives everything downstream: 'can't lose acknowledged messages' means disk + replication before ack; 'best effort is fine' means you can stay in memory and skip a lot of complexity."
+  - "State throughput and message size as real numbers (e.g. 200K msgs/sec, 5 KB average) before drawing partitions — partition count and broker count both fall out of this math."
+  - "Ordering is only free within a single partition/queue shard — if you need global ordering across partitions, you've just created a bottleneck or a much harder design problem, so scope it carefully."
+  - "Retention (how long undelivered or already-consumed messages are kept) is a distinct requirement from durability — a queue can be durable but still discard messages after 7 days or once every consumer group has read them."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every backend system eventually hits the same problem: two services need to communicate, but they shouldn't have to be up, fast, or even aware of each other at the same instant. An order service that calls a shipping service synchronously breaks the moment shipping is slow or down. A messaging queue exists to remove that coupling — a producer drops a message and moves on; a consumer picks it up whenever it's ready. That sounds simple, and a single-machine queue (a list with a lock around it) is simple. A *distributed* messaging queue that survives broker crashes, scales past one machine's disk and network, and gives callers a precise answer to "can a message get lost or delivered twice?" is a genuinely hard distributed systems problem — and, like every hard design problem, it starts with writing down what you actually need before picking an architecture.
+
+This is the first lesson in the Distributed Messaging Queue module. The lessons that follow — delivery semantics, ordering and deduplication, storage and retention, the full design, and scaling with consumer groups — each answer a question this lesson raises. Nail the requirements here and the rest of the module reads as "here's the mechanism that satisfies the requirement we already stated," instead of a pile of unmotivated Kafka trivia.
+
+## Start with the contract, not the broker
+
+Strip away any particular product's terminology and a messaging queue's functional surface is three operations:
+
+- **Publish** (or produce) — a producer sends a message, addressed to a queue or topic, and gets an acknowledgment that the system has accepted it.
+- **Consume** — a consumer pulls (or is pushed) the next available message.
+- **Acknowledge** — a consumer tells the system "I successfully processed this," which lets the system stop holding it for that consumer.
+
+Everything else — topics vs. queues, partitions, consumer groups, dead-letter queues — is machinery built to make those three operations work correctly at scale. Stating the contract this plainly in an interview is worth doing out loud: it forces you to ask, next, exactly what "accepted," "next available," and "successfully processed" mean under failure, which is where the real requirements live.
+
+## Functional requirements to pin down
+
+- **Point-to-point or publish/subscribe?** Does exactly one consumer get each message (a work queue — e.g. "process this payment"), or does every subscriber get its own copy (a topic — e.g. "an order was placed," fanned out to email, inventory, and analytics services)? These lead to different internal designs even though both look like "a queue" from the outside.
+- **Message size and shape.** Are messages tiny control signals (a job ID, a few hundred bytes) or larger payloads (a full order object, tens of KB)? Large or unbounded payloads usually push you toward storing the blob elsewhere (object storage) and passing a reference through the queue, rather than shipping megabytes through the broker itself.
+- **Push or pull delivery.** Does the broker push messages to consumers as they arrive, or do consumers pull at their own pace? Pull gives consumers natural backpressure control (they ask for more only when ready); push can overwhelm a slow consumer unless it's paired with flow control.
+- **Producer/consumer cardinality.** One producer and one consumer is trivial. Many producers and many independent consumer groups, each reading the same stream at its own pace, is the case that actually needs partitioning and offset tracking — say which one you're designing for.
+
+## Non-functional requirements: where the design gets hard
+
+### Durability
+
+Can an acknowledged message ever be lost? For a queue carrying "refresh this cache entry" hints, losing a message occasionally is a non-event — the next hint fixes it. For a queue carrying "charge this customer's card" or "this order was paid," losing a message is a business-correctness bug. This single answer decides whether you can hold messages in memory and reply fast, or must write to disk (and replicate across brokers) before acknowledging a publish — which is exactly the trade-off the Storage and Retention lesson in this module works through.
+
+### Delivery guarantee
+
+State one of three targets explicitly, because each implies different retry and dedup logic downstream:
+
+- **At-most-once** — a message is delivered zero or one times; fine for metrics or best-effort notifications, never fine for billing.
+- **At-least-once** — a message is delivered one or more times (retries on ambiguous failures cause duplicates); the far more common real-world default, but it pushes the duplicate-handling problem onto the consumer.
+- **Exactly-once (in effect)** — the system behaves as if each message is processed exactly once, usually by combining at-least-once delivery with idempotent consumers or dedup keys, not by a magic "exactly-once wire protocol."
+
+The next lesson in this module goes deep on these three; here you just need to state which one the system requires and why.
+
+### Ordering
+
+Do consumers need messages in the order they were published? Global ordering across an entire distributed queue is expensive — it forces everything through a single writer or a strict sequencing step, which caps throughput. Ordering *within* a single partition (all events for one `orderId` always land in the same partition, and that partition is read in order) is nearly free and usually sufficient. Say explicitly whether you need per-key ordering (common) or global ordering (rare, and a red flag to question the requirement) before designing partitioning.
+
+### Throughput and scale
+
+Vague adjectives ("high throughput") don't drive a design. "300,000 messages/sec sustained, ~2 KB average message size, 500 producers, 50 consumer processes across 5 consumer groups" does — it tells you the aggregate bandwidth (~600 MB/sec), roughly how many partitions you need so no single partition's leader becomes the bottleneck, and how many consumer processes each group needs to keep up.
+
+### Availability and retention
+
+If a broker node fails, should publishing and consuming keep working uninterrupted? That requires replicating each partition across multiple brokers and electing a new leader on failure — extra machinery that's wasted effort if the queue is allowed brief unavailability. Separately: how long should the system keep a message — until every subscribed consumer group has acknowledged it, or for a fixed window (e.g. 7 days) regardless, so a new consumer group added later can still replay history? That's a retention requirement, distinct from durability, and it drives storage sizing directly.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Producer publishes message] --> B{Durability requirement}
+  B -->|can't lose it| C[Write to disk + replicate before ack]
+  B -->|best effort ok| D[Ack from memory, low latency]
+  A --> E{Ordering requirement}
+  E -->|per-key order needed| F[Partition by key]
+  E -->|no ordering needed| G[Partition round-robin for max spread]
+  C --> H[Storage and Retention lesson]
+  F --> I[Ordering and Dedup lesson]
+`} />
+
+<Callout type="warning">
+  The most common mistake at this stage is jumping straight to "I'll use Kafka-style partitions with consumer groups" before stating what durability, ordering, and delivery-guarantee actually need to be for *this specific system*. An interviewer will ask "why at-least-once instead of exactly-once here?" or "why do you need global ordering?" — if the answer traces back to a stated requirement (e.g. "duplicate charges are unacceptable, so we need dedup on top of at-least-once"), you look deliberate. If the guarantee was just assumed because it's what a popular broker defaults to, it looks memorized. Spend two minutes stating requirements before drawing partitions.
+</Callout>
+
+## Worked example: sizing a queue for order events
+
+Say the prompt is "design a messaging queue to carry order-placed events from a checkout service to inventory, email, and analytics services." A reasonable requirements pass, stated out loud:
+
+- Publish/subscribe, not point-to-point — three independent consumer groups (inventory, email, analytics) each need their own copy of every event.
+- Durability required: losing an order-placed event means inventory never decrements and email never sends — both are real business impact, so an acknowledged publish must survive a single broker failure.
+- At-least-once delivery is acceptable, provided each consumer is idempotent (email service dedups by order ID before sending); exactly-once wire semantics aren't worth the complexity here.
+- Per-order ordering matters (an order's "placed" event must be processed before its "cancelled" event, if one follows), but ordering across different orders doesn't.
+- Throughput: 20,000 orders/minute at peak, ~333/sec, average event size 1 KB.
+
+From here, capacity math is quick: 333 events/sec x 1 KB ~ 333 KB/sec of raw producer traffic, and with 3 independent consumer groups each reading the full stream, total read bandwidth is roughly 3x that ~ 1 MB/sec — trivial for a handful of broker nodes. The binding constraint isn't throughput here, it's partitioning by `orderId` so each order's events land in one partition and stay ordered, and replicating each partition across at least 3 brokers so a single failure doesn't lose an acknowledged publish. Those two decisions, both traceable to requirements stated above, are exactly the inputs the ordering and storage lessons later in this module build on.
+
+## Putting the requirements list together
+
+A solid requirements pass for a messaging queue interview question leaves you able to state, in a few sentences: the delivery model (point-to-point vs. pub/sub), the durability guarantee, the delivery-guarantee target (at-most/at-least/exactly-once-in-effect), the ordering scope (per-key vs. global vs. none), and rough throughput/message-size numbers. Every later lesson in this module — how duplicates get handled, how messages are stored and expired, how the broker cluster is actually structured, and how consumer groups scale — is engineering in service of the answers you write down here.
+
+<Quiz
+  lessonId="mq-requirements-of-a-messaging-queue"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Three independent services (inventory, email, analytics) each need their own copy of every order-placed event. Which delivery model does this require?',
+      options: [
+        { id: 'a', text: 'Point-to-point, where each message goes to exactly one consumer', correct: false, explanation: 'Point-to-point delivers each message to only one consumer — that would mean only one of the three services ever sees a given event, which does not satisfy the requirement.' },
+        { id: 'b', text: 'Publish/subscribe, where each subscribed consumer group receives its own copy of every message', correct: true, explanation: 'Correct. When multiple independent services each need every event, that is the publish/subscribe (topic) model, not point-to-point.' },
+        { id: 'c', text: 'Exactly-once delivery', correct: false, explanation: 'Exactly-once is a delivery-guarantee concern (how many times a message is processed), not about whether multiple independent consumers each get a copy.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are non-functional requirements that should be pinned down before designing partitioning and replication for a messaging queue? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Whether an acknowledged message can ever be lost (durability)', correct: true, explanation: 'Durability determines whether messages must be written to disk and replicated before acknowledging a publish, or can be held in memory only.' },
+        { id: 'b', text: 'Whether messages need ordering within a key, globally, or not at all', correct: true, explanation: 'Ordering scope directly determines how partitioning can be designed — per-key ordering allows parallel partitions; global ordering forces a bottleneck.' },
+        { id: 'c', text: 'The specific serialization format used to encode message bytes on the wire', correct: false, explanation: 'That is an implementation detail decided later, not a requirement that shapes the distributed-systems design of the queue itself.' },
+        { id: 'd', text: 'Sustained throughput and average message size', correct: true, explanation: 'These numbers drive partition count and broker sizing directly, similar to how QPS and data size drive capacity planning in any distributed system.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A messaging queue that guarantees no message is ever lost after being acknowledged must also guarantee messages are never delivered more than once.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'These are independent requirements. Durability (no loss) is commonly paired with at-least-once delivery, which explicitly allows duplicate deliveries on retries — the two are not the same guarantee.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Durability (never losing an acknowledged message) and delivery guarantee (at-most/at-least/exactly-once) are separate requirements; a durable, at-least-once queue can still redeliver a message.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A queue needs to guarantee that all events for a single orderId are processed in the order they were published, but ordering across different orders does not matter. What does this imply for partitioning?',
+      options: [
+        { id: 'a', text: 'All messages must go through a single global partition to preserve order', correct: false, explanation: 'That would preserve global ordering, which is not required here, and it would create a throughput bottleneck for no benefit.' },
+        { id: 'b', text: 'Messages can be partitioned by orderId, since ordering only needs to hold within each key, not across keys', correct: true, explanation: 'Correct. Routing all of one orderId\'s events to the same partition preserves per-key order while still allowing many partitions to run in parallel for throughput.' },
+        { id: 'c', text: 'Ordering cannot be guaranteed unless there is only one consumer', correct: false, explanation: 'Ordering is a property of how messages are partitioned and consumed per partition, not of how many consumers exist overall across different partitions.' },
+      ],
+    },
+  ]}
+/>

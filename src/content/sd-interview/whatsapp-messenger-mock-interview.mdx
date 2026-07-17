@@ -1,0 +1,140 @@
+---
+title: "Messenger: Mock Interview"
+module: "Design WhatsApp"
+moduleOrder: 11
+order: 6
+track: "interview"
+summary: "A full timed mock interview that pulls together requirements, delivery guarantees, presence, and encryption from the earlier WhatsApp lessons into one end-to-end design session."
+tags: ["messaging", "mock-interview", "real-time", "system-design", "whatsapp"]
+estMinutes: 14
+cheatsheet:
+  - "Budget roughly 5 minutes for requirements, 10 for high-level architecture, 15-20 for one or two deep dives, 5-10 for scaling/failure modes, and 5 for wrap-up — in a 45-60 minute slot."
+  - "Say the storage-vs-delivery split out loud early: a durable message store (source of truth) plus a delivery/fan-out path (chat servers, connection registry) are two different concerns with two different failure modes."
+  - "Pick ONE deep dive and go deep rather than surveying five topics shallowly — interviewers reward depth over breadth once the skeleton is on the board."
+  - "Always state your consistency and ordering guarantee explicitly per chat (e.g. per-conversation monotonic sequence number) — vague answers like 'eventually consistent' without a mechanism read as a red flag."
+  - "Multi-device sync is the detail most candidates forget; mention it even briefly — each device needs its own delivery cursor against the same per-user message log."
+  - "When asked about scale, convert to concrete numbers on the spot (messages/sec, storage/day) rather than staying qualitative — it signals you can actually estimate, not just recite terms."
+  - "If you don't know an exact technology's internals, say what property you need from it (ordered log, low-latency KV lookup, at-least-once delivery) instead of guessing implementation details."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+import MockInterview from '../../components/MockInterview';
+
+You've now covered requirements and estimation, the high-level architecture, message delivery and ordering, presence/groups/notifications, and media plus end-to-end encryption for a WhatsApp-style system. None of that matters in an actual interview unless you can assemble it live, under time pressure, in response to a single open-ended prompt and a series of follow-ups you can't predict in advance.
+
+That's the skill this lesson drills. A real system design interview isn't a quiz on facts — it's a 45-60 minute conversation where the interviewer is watching how you structure ambiguity, what you choose to clarify versus assume, and whether you can go deep on the one or two things they probe without losing the rest of the design. This lesson gives you a realistic prompt, a time budget, and a rubric so you can run the exercise yourself before doing it live with another person.
+
+## How to run this mock interview
+
+Treat it like the real thing:
+
+1. Set a timer for 45 minutes.
+2. Read only the prompt in the `<MockInterview>` block below — resist the urge to peek at the rubric first.
+3. Talk out loud (or write notes as if explaining to an interviewer) as you work through requirements, architecture, and at least one deep dive.
+4. Only after you've produced an answer, reveal the rubric and self-score honestly against each point.
+
+The value comes from doing the thinking cold, the same way you will in the actual interview — not from reading a model answer passively.
+
+## A time budget that works for most chat-system prompts
+
+Interviewers don't grade on a stopwatch, but candidates who blow the whole session on requirements, or jump straight to Kafka and Cassandra without any structure, run out of time before the design is complete. A workable allocation for a 45-60 minute slot:
+
+- **5 minutes — requirements and scale.** 1:1 and group chat? Media? Presence and read receipts? Roughly how many users, messages/day, group size cap? Online vs offline delivery expectations.
+- **10 minutes — high-level architecture.** Clients, a stateful gateway/chat-server tier holding WebSocket connections, a durable message store, a connection/presence registry, and a push-notification path for offline devices.
+- **15-20 minutes — one or two deep dives.** The interviewer usually steers this: message ordering and deduplication, multi-device sync, group fan-out at scale, or how encryption changes server-side search and backup. Go deep on what's asked rather than re-explaining the whole system.
+- **5-10 minutes — scaling and failure modes.** What happens when a chat server crashes mid-connection? How do you shard the message store? What if a user has 200 groups?
+- **5 minutes — wrap-up.** Summarize the design, name the trade-offs you made explicitly, and mention what you'd do differently with more time.
+
+## What a strong candidate actually sounds like
+
+The difference between a pass and a borderline result is rarely knowledge of a specific technology — it's whether the candidate reasons about trade-offs out loud. Concretely, listen for (and produce) these habits:
+
+- **States assumptions before designing.** "I'll assume group size caps around 256 members and we need at-least-once delivery with client-side dedup — let me know if that's off" beats silently assuming and building on shaky ground.
+- **Separates concerns clearly.** The message store (durable, append-only per conversation) is a different component with different guarantees than the delivery path (chat servers routing to currently-connected sockets). Conflating them is the single most common architectural muddle in this design.
+- **Names the hard part before being asked.** A strong candidate volunteers "the interesting part here is ordering when a sender is on two devices and the recipient is offline" rather than waiting to be steered there.
+- **Quantifies instead of hand-waving.** "With 2 billion messages/day that's roughly 23,000 messages/sec average, so we need to plan for maybe 5-10x that at peak" is a concrete, checkable claim.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    C1[Sender client] -->|send msg, per-convo seq #| GW1[Chat server / gateway]
+    GW1 --> MQ[Ordering + dedup layer]
+    MQ --> STORE[(Durable message store\nper-conversation log)]
+    MQ --> ROUTE{Recipient online?}
+    ROUTE -->|yes, socket open| GW2[Chat server holding recipient's connection]
+    GW2 --> C2[Recipient client]
+    ROUTE -->|no| PUSH[Push notification service]
+    PUSH --> C2
+    STORE --> SYNC[Multi-device sync: per-device cursor]
+    SYNC --> C2
+`} />
+
+This is the same skeleton from the high-level design lesson, redrawn to emphasize the split that matters most in an interview: the store is the durable source of truth, and delivery (live socket or push) is a separate, retryable concern layered on top of it. Multi-device sync reads from the same per-conversation log, just tracking its own cursor per device.
+
+## Worked example: handling a follow-up mid-interview
+
+Suppose you've drawn the skeleton above and the interviewer asks: "A user is signed into both their phone and laptop. How do you guarantee they see the same messages in the same order on both?"
+
+A strong live answer sounds like this: "Each conversation has its own durable, append-only log with a monotonically increasing sequence number per message. Every device the user owns keeps its own delivery cursor — the last sequence number it has acknowledged — against that same log, not against each other. When a device reconnects, it asks the store for everything after its cursor, so a laptop that was closed for two days just replays from where it left off. Because ordering comes from the log's sequence number rather than from wall-clock arrival time, both devices converge on the identical order even if push delivery to one of them was delayed or retried."
+
+That answer works because it names the mechanism (per-conversation sequence number, per-device cursor) instead of just the property ("they'll be consistent"). If pressed further — "what if the phone is offline for a month?" — the next layer is pagination/backfill limits and possibly a compaction or summarization strategy for very old backlogs, which you can mention as a known extension without designing it fully unless asked.
+
+<Callout type="warning">
+  The most common mock-interview failure in this module isn't a wrong answer — it's an incomplete one delivered as if it were complete. Candidates draw chat servers and a message queue, say "and then we use Kafka for ordering," and move on without explaining what "ordering" actually means here: ordering per conversation, not globally; a defined sequence source (not just "the queue handles it"); and an explicit dedup key so retries don't create duplicate messages on the recipient's screen. If you can't say the sentence "ordering is scoped to X and guaranteed by Y," you haven't actually designed ordering — you've named a technology and hoped it covers the gap.
+</Callout>
+
+## Self-check before you start
+
+<Quiz
+  lessonId="whatsapp-messenger-mock-interview"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'In a 45-60 minute chat-system interview, what is the biggest risk to a strong outcome?',
+      options: [
+        { id: 'a', text: 'Spending too much time on requirements and scale estimation up front', correct: false, explanation: 'A quick, focused 5 minutes on requirements is expected and valuable — the risk is spending too little structure time, or too much (10+ minutes), not a well-timed 5.' },
+        { id: 'b', text: 'Surveying many topics shallowly instead of going deep on what the interviewer probes', correct: true, explanation: 'Interviewers reward depth on the one or two areas they steer toward (ordering, multi-device sync, scaling) far more than a shallow tour of every possible chat-system feature.' },
+        { id: 'c', text: 'Drawing a diagram at all', correct: false, explanation: 'A diagram is a strong signal of clear thinking, not a risk — the worked example and high-level design lesson both use one for exactly this reason.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements describe good practice for the multi-device sync deep dive? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Each device tracks its own delivery cursor against the same per-conversation log', correct: true, explanation: 'This is exactly the mechanism that lets independent devices converge on the same order without talking to each other directly.' },
+        { id: 'b', text: 'Ordering should be derived from wall-clock arrival time at each device', correct: false, explanation: 'Wall-clock arrival time differs by device and network path; a per-conversation sequence number from the durable log is what guarantees a consistent order across devices.' },
+        { id: 'c', text: 'A reconnecting device should request everything after its last acknowledged sequence number, not the full history', correct: true, explanation: 'This is the backfill mechanism that makes reconnection efficient and correct after any offline period.' },
+        { id: 'd', text: 'Only one device per account should ever be allowed to reduce complexity', correct: false, explanation: 'Multi-device support is one of the requirements this module assumes and a common interview probe — avoiding it by restricting to one device sidesteps the actual design problem.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Saying "we will use Kafka for ordering" is, by itself, a sufficient answer to "how do you guarantee message ordering?" in this interview.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Naming a technology without stating the ordering scope (per conversation) and the sequence mechanism (a monotonic key, dedup handling) is treated as an incomplete answer — see the pitfalls callout above.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. A complete answer states what is ordered (per-conversation), how (a sequence number or equivalent), and how duplicates from retries are handled.' },
+      ],
+    },
+  ]}
+/>
+
+## Run the full mock interview
+
+<MockInterview
+  lessonId="whatsapp-messenger-mock-interview"
+  client:visible
+  prompt="Design a WhatsApp-style messaging system supporting one-to-one chat, group chat up to a few hundred members, presence/last-seen, push notifications for offline users, and media sharing, for roughly 500 million daily active users worldwide. Walk through your requirements, high-level architecture, and at least one area in depth, and be ready to discuss how your design handles scale and failure."
+  rubric={[
+    { point: 'Clarifies requirements before designing', detail: 'Confirms 1:1 vs group scope, group size limits, offline/multi-device expectations, media types, and rough scale (DAU, messages/day) before drawing any boxes.' },
+    { point: 'Separates the durable store from the delivery path', detail: 'Explicitly distinguishes a per-conversation append-only message store (source of truth) from the chat-server/connection layer that routes live delivery, rather than treating them as one component.' },
+    { point: 'Gives a concrete, mechanism-based ordering and dedup story', detail: 'States that ordering is scoped per conversation via a monotonic sequence number (or equivalent) and that a dedup key or idempotency check prevents duplicate delivery on retries.' },
+    { point: 'Covers offline delivery and multi-device sync', detail: 'Explains push notifications as the offline path and per-device delivery cursors against the same log as the multi-device sync mechanism, without conflating the two.' },
+    { point: 'Handles at least one scaling or failure scenario concretely', detail: 'Discusses sharding the message store (e.g. by conversation ID), what happens when a chat server crashes mid-connection, or fan-out cost for large groups, with a specific mitigation rather than a vague "we would scale horizontally."' },
+    { point: 'Names trade-offs explicitly rather than presenting one true answer', detail: 'Acknowledges alternatives it rejected (e.g. server-side fan-out vs client-side fan-out for groups, or strict vs relaxed ordering) and why the chosen option fits the stated requirements.' },
+  ]}
+/>

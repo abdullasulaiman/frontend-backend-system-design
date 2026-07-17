@@ -1,0 +1,130 @@
+---
+title: "Consistent Hashing and Data Partitioning"
+module: "Key-Value Store"
+moduleOrder: 10
+order: 2
+track: "concept"
+summary: "Explains why naive modulo-based sharding falls apart at scale and how consistent hashing with virtual nodes lets a key-value store add or remove servers while moving only a small fraction of its data."
+tags: ["consistent-hashing", "partitioning", "sharding", "key-value-store", "scalability"]
+estMinutes: 12
+cheatsheet:
+  - "Naive sharding (`hash(key) % N`) remaps almost every key when N changes — that's why it doesn't survive scaling events or node failures."
+  - "Consistent hashing places both nodes and keys on a hash ring; a key is owned by the first node found walking clockwise from the key's position."
+  - "Adding or removing one node only reassigns the keys that fell in that node's arc — roughly `1/N` of the keyspace, not all of it."
+  - "Virtual nodes (multiple ring positions per physical server) fix the uneven-load problem a small number of real nodes creates on a random ring."
+  - "More virtual nodes per server means smoother load distribution but a bigger ring to maintain and search — it's a tunable trade-off, not free."
+  - "Consistent hashing decides key ownership; it does not by itself provide replication — pick the next N-1 distinct physical nodes clockwise for that (covered in the next lesson)."
+  - "Weighted virtual-node counts let you partition across heterogeneous hardware (a bigger box gets proportionally more ring positions)."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson established the requirements: a key-value store that scales horizontally, stays available during node failures, and serves single-key reads and writes with low latency. None of that works unless you can answer one deceptively simple question well: given a key, which server holds it?
+
+Get this wrong and every other design decision downstream is on shaky ground. Get it wrong specifically by picking a partitioning scheme that reshuffles most of your data every time you add a server, and "horizontally scalable" becomes a lie you tell in the interview but can't back up — scaling out becomes an event, not a background operation.
+
+## The naive approach and why it breaks
+
+The obvious first idea is modulo hashing: compute `hash(key) % N` where `N` is the number of servers, and route the key to that server. It's simple, it distributes keys uniformly (assuming a decent hash function), and it works fine — right up until `N` changes.
+
+Say you have 4 servers and a key with `hash(key) = 37`. `37 % 4 = 1`, so server 1 owns it. Now add a 5th server because you're running low on capacity: `37 % 5 = 2`. The key just moved to a different server. This isn't a one-off — changing `N` from 4 to 5 relocates roughly `(N-1)/N` of *all* keys, not just enough to rebalance the load onto the new server. For a 4-to-5 change that's about 80% of your entire dataset getting invalidated or shipped across the network at once.
+
+In a system designed to scale by adding nodes, and to survive nodes disappearing (crashes, deploys, autoscaling), that's a non-starter. You'd trigger a data migration storm on every topology change, during which cache hit rates collapse and databases behind the cache get hammered.
+
+## Consistent hashing: keys and nodes on the same ring
+
+Consistent hashing solves this by hashing servers *and* keys into the same space, and defining ownership by position rather than by count.
+
+Picture a ring representing all possible hash outputs, from `0` up to some maximum (say `2^32 - 1`) and wrapping back around to `0`. Every server is hashed (typically on its ID or IP) to get a position on that ring. Every key is hashed the same way. A key belongs to whichever server's position is the first one encountered walking clockwise from the key's position.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  subgraph Ring["Hash ring, positions 0 to 100, clockwise"]
+    A["Node A (pos 10)"] --> B["Node B (pos 35)"]
+    B --> C["Node C (pos 60)"]
+    C --> D["Node D (pos 85)"]
+    D --> A
+  end
+  K1["key: user:42 (hash 15)"] -.->|owned by next clockwise node| B
+  K2["key: order:99 (hash 70)"] -.->|owned by next clockwise node| D
+`} />
+
+The payoff shows up when the topology changes. Add a new node E at position 50: it only intercepts keys that hash between node B's position and its own — the arc it now owns. Every key outside that arc still resolves to exactly the same node it did before, because their "next clockwise node" hasn't changed. Removing a node works the same way in reverse: its keys fall to whatever node is next clockwise, and nothing else moves.
+
+That's the core property that makes this worth the added complexity: adding or removing one node touches roughly `K/N` keys (`K` total keys, `N` nodes) instead of nearly all of them.
+
+## Virtual nodes: fixing uneven load
+
+Hashing 4-5 physical servers directly onto a ring has a practical problem: with so few points, their spacing is essentially random. One server might land on a huge arc and take 40% of the traffic while its neighbor takes 5%. Adding a server doesn't reliably fix this either, since its one ring position is still just as random.
+
+The standard fix is virtual nodes: each physical server is hashed onto the ring many times (100-300 virtual positions is a common range) under different labels ("server-A-vnode-1", "server-A-vnode-2", ...). Ownership of the arc preceding each virtual position still maps back to the same physical server, but now every server's *total* share of the ring is the sum of many small, independently-random arcs instead of one large one. By the law of large numbers, those sums even out — load distribution gets much closer to uniform as you increase the vnode count.
+
+Virtual nodes have a second benefit: they let you weight servers unevenly on purpose. A server with twice the disk and RAM of its peers can be given twice as many virtual nodes, so it takes roughly twice the share of keys and traffic — useful when your fleet isn't perfectly homogeneous, which in practice it never stays for long.
+
+The trade-off is real, though: more virtual nodes means a bigger ring to store and binary-search on every lookup, and more bookkeeping when nodes join or leave. Most production systems land somewhere in the 100-300 vnodes-per-physical-node range as a balance between smoothness and overhead.
+
+## Worked example: sizing the ring
+
+Say you're partitioning a key-value store across 8 physical nodes, holding 80 million keys, using 150 virtual nodes each.
+
+- Total ring positions: `8 * 150 = 1200`.
+- Expected keys per physical node: `80,000,000 / 8 = 10,000,000`, and because load is now the sum of 150 independently-placed arcs per node rather than 1, you'd typically see real-world distribution within a few percent of that average rather than the 2-3x skew you'd risk with only 8 raw positions.
+- Now add a 9th node (same 150 vnodes). Expected reassignment: roughly `80,000,000 / 9 ≈ 8.9 million` keys move to the new node, and the remaining ~71 million stay exactly where they were — no ring-wide reshuffle, no cache-wide invalidation.
+- Compare that to modulo hashing on the same change: going from `N=8` to `N=9` remaps `(N-1)/N ≈ 89%` of all 80 million keys, because almost every key's `hash % N` result changes even though only one node was added.
+
+That gap — `~11%` of keys moved versus `~89%` — is the entire argument for consistent hashing in one comparison, and it's the number worth having ready if an interviewer asks you to justify the choice.
+
+<Callout type="warning">
+  A common mistake is treating consistent hashing as a complete answer to "how do I place data" when it only answers "who owns this key." It says nothing about replication (how many *other* nodes should also hold a copy) or about failure handling (what happens to reads while a node is down). Teams that skip virtual nodes entirely, expecting a handful of raw server positions to distribute load evenly, also routinely get burned by one node running hot — always vnode it in a real design, and say so explicitly in an interview even if you don't derive the ring math live.
+</Callout>
+
+Consistent hashing gives you the placement primitive; the next lesson builds replication and quorum reads/writes on top of it, using this same ring to pick which additional nodes hold copies of each key.
+
+<Quiz
+  lessonId="kv-consistent-hashing-and-data-partitioning"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A cluster grows from 6 to 7 nodes. Under plain modulo hashing (`hash(key) % N`), roughly what fraction of keys get remapped to a different node?',
+      options: [
+        { id: 'a', text: 'About 1/7', correct: false, explanation: 'That would be the fraction moved under consistent hashing, not modulo hashing — modulo hashing has no such locality guarantee.' },
+        { id: 'b', text: 'About 6/7', correct: true, explanation: 'Changing the divisor in `hash(key) % N` changes the result for almost every key whose hash isn’t a multiple of both old and new N — roughly `(N-1)/N` of keys move, here about 6/7 (~86%).' },
+        { id: 'c', text: 'None — modulo hashing is stable across resizes', correct: false, explanation: 'The opposite is true; this instability under resizing is exactly why modulo hashing is a poor fit for elastic clusters.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine benefits of using virtual nodes (multiple ring positions per physical server) in consistent hashing? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Smoother, more even key/load distribution across physical servers', correct: true, explanation: 'Summing many small, independently-placed arcs per server averages out the randomness that a single raw ring position would otherwise leave uneven.' },
+        { id: 'b', text: 'Ability to give a beefier server a proportionally larger share of the keyspace by assigning it more virtual nodes', correct: true, explanation: 'Weighting virtual-node counts per server is a standard way to handle heterogeneous hardware in a partitioned cluster.' },
+        { id: 'c', text: 'Eliminating the need to replicate data across multiple nodes', correct: false, explanation: 'Virtual nodes are about load distribution and key ownership, not replication — a separate concern covered by picking additional nodes clockwise for copies.' },
+        { id: 'd', text: 'Reducing the number of positions the ring needs to store', correct: false, explanation: 'It’s the opposite: virtual nodes increase the number of ring positions (more entries to store and search), trading some overhead for better balance.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In consistent hashing, removing one node from the ring only requires reassigning that node’s own keys to its clockwise neighbor — no other node’s keys move.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Every other node still owns the same arc it did before; only the departing node’s arc gets absorbed by the next node clockwise, so the rest of the ring is untouched.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This is actually the key property of consistent hashing — removals (and additions) are local to the affected arc, unlike modulo hashing where a size change can disturb the whole keyspace.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'What does consistent hashing, by itself, determine in a key-value store’s design?',
+      options: [
+        { id: 'a', text: 'Which single node is the primary owner of a given key', correct: true, explanation: 'That’s exactly its job: mapping a key to the first node found walking clockwise from the key’s ring position.' },
+        { id: 'b', text: 'How many replicas of a key should exist and how quorum reads/writes are counted', correct: false, explanation: 'That’s replication and quorum policy, layered on top of the ring in the next lesson — consistent hashing only decides ownership/placement.' },
+        { id: 'c', text: 'How conflicting concurrent writes to the same key get resolved', correct: false, explanation: 'That’s versioning/conflict resolution (e.g. vector clocks, last-write-wins), a separate concern from where a key is placed.' },
+      ],
+    },
+  ]}
+/>

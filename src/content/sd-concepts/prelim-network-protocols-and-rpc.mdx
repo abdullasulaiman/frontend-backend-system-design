@@ -1,0 +1,141 @@
+---
+title: "Network Protocols and RPC"
+module: "Preliminary Concepts"
+moduleOrder: 3
+order: 2
+track: "concept"
+summary: "Explains how TCP, HTTP, and RPC frameworks each trade off control, speed, and simplicity when services talk to each other over an unreliable network."
+tags: ["networking", "rpc", "http", "grpc", "protocols"]
+estMinutes: 13
+cheatsheet:
+  - "TCP gives you reliable, ordered bytes but not message boundaries or meaning — every protocol above it (HTTP, gRPC) exists to add structure back."
+  - "HTTP/1.1 is simple and cacheable but head-of-line blocks per connection; HTTP/2 multiplexes streams over one connection; gRPC layers typed RPC + streaming on top of HTTP/2."
+  - "REST over HTTP optimizes for resource-oriented, cacheable, loosely-coupled APIs; RPC (gRPC, Thrift) optimizes for low-latency, strongly-typed internal service calls."
+  - "A network call can fail three ways: request lost, response lost, or just slow — and the caller cannot tell which from a timeout alone. Design for that ambiguity."
+  - "Idempotency is what makes retries safe. Without it, a retried write can double-charge a card or double-send a message."
+  - "gRPC's protobuf schemas and streaming make it a strong default for service-to-service calls; REST/JSON remains the better default for public, browser-facing, or human-debuggable APIs."
+  - "Timeouts and retries with backoff are not optional extras — every RPC call needs both, or a single slow dependency can cascade into a full outage."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every distributed system diagram is full of boxes and arrows, and the arrows are the part most candidates gloss over. An arrow from the API gateway to the order service isn't a free, instantaneous function call — it's a message that has to cross a network, survive being dropped or delayed, get parsed by a different process (maybe written in a different language), and come back. Whatever protocol and framework you pick for that arrow decides how much of that complexity you have to reason about by hand versus how much gets handled for you.
+
+This lesson covers the protocol stack you'll actually reach for when two services talk: TCP and UDP underneath, HTTP as the dominant application protocol, and RPC frameworks like gRPC that sit on top of HTTP to make remote calls feel almost like local ones. The previous lesson covered a system's layered abstractions in general; this one goes one layer deeper into the mechanics of the "network" arrow itself, since almost every interview design has several service-to-service calls that need a real answer, not just a label.
+
+## TCP and UDP: the two building blocks
+
+Nearly everything in this lesson sits on top of one of two transport protocols.
+
+**TCP (Transmission Control Protocol)** gives you a reliable, ordered, byte-stream connection between two endpoints. It retransmits lost packets, reorders ones that arrive out of sequence, and applies flow control so a fast sender doesn't overwhelm a slow receiver. The cost is a connection setup handshake (multiple round trips before TLS is even considered) and per-connection state on both ends. TCP is the default choice whenever correctness matters more than raw speed — which is most request/response traffic between services.
+
+**UDP (User Datagram Protocol)** sends individual packets with no guarantee of delivery, ordering, or duplicate suppression. In exchange, there's no handshake and no retransmission overhead. It shows up where an application can tolerate loss and build its own delivery semantics on top: DNS lookups, video/voice streaming, and QUIC (the transport HTTP/3 is built on).
+
+The practical takeaway for design interviews: if you say "the client sends a request to the service," the interviewer may reasonably ask "over what?" TCP is almost always the safe answer for request/response APIs; UDP only comes up when you're explicitly discussing real-time media or QUIC.
+
+## HTTP: the common application-layer protocol
+
+HTTP sits on top of TCP (or, in HTTP/3, on top of QUIC over UDP) and adds the request/response semantics almost every web-facing and many internal APIs use: methods (`GET`, `POST`, `PUT`, `DELETE`), status codes, headers, and a body.
+
+- **HTTP/1.1** opens one TCP connection and sends requests one at a time per connection by default (pipelining exists but is rarely used). Browsers work around this by opening several connections in parallel, but that's a workaround, not a fix — one slow request can still block others queued behind it on the same connection ("head-of-line blocking" at the application layer).
+- **HTTP/2** multiplexes many logical streams over a single TCP connection, so a slow response on one stream doesn't block others sharing it. It also compresses headers, which matters when the same cookie/auth headers ride on every request.
+- **HTTP/3** replaces TCP with QUIC over UDP, fixing TCP-level head-of-line blocking (one lost packet no longer stalls every stream on the connection) at the cost of a newer, less universally supported stack.
+
+REST is a design style layered on HTTP, not a protocol itself: resources identified by URLs, verbs mapped to CRUD-ish operations, and (ideally) statelessness and cacheability. REST's real strength in an interview is that it maps cleanly onto resource-oriented thinking ("a user", "an order") and plays well with HTTP caching, CDNs, and browser tooling — which is why it's still the default for public and browser-facing APIs.
+
+## RPC: making a remote call look local
+
+RPC (Remote Procedure Call) is a pattern, not a specific protocol: the client calls what looks like a normal function, and a generated stub handles serializing the arguments, sending them over the network, and deserializing the response. The goal is to hide the network behind a familiar function-call interface.
+
+**gRPC**, the most common modern RPC framework, runs on top of HTTP/2 and uses Protocol Buffers (protobuf) to define a strongly-typed schema for requests and responses. That schema buys you a few concrete things REST-over-JSON doesn't give you for free:
+
+- **Compact, typed binary encoding** — smaller payloads and faster serialization than JSON, which matters at high internal call volumes.
+- **Generated client/server code** in multiple languages from one `.proto` file, so a Java service and a Go service agree on the wire format by construction, not by convention.
+- **Native streaming** — client-streaming, server-streaming, and bidirectional streaming are first-class, which is awkward to bolt onto plain REST.
+
+The trade-off is what you'd expect: gRPC payloads aren't human-readable on the wire, browsers historically needed a proxy layer (gRPC-Web), and every caller is coupled to a shared schema file that must be versioned carefully. That's a fine trade for internal service-to-service calls inside one team's infrastructure; it's a worse fit for a public API consumed by unknown third parties who benefit from HTTP's ubiquity and human-debuggability.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Client calls orderService.getOrder id] --> B[Client stub serializes request to protobuf]
+  B --> C[HTTP2 stream carries bytes over TCP]
+  C --> D[Server stub deserializes into typed object]
+  D --> E[Server handler runs, returns typed response]
+  E --> F[Response serialized and streamed back]
+  F --> G[Client stub deserializes, returns to caller]
+`} />
+
+## What the network actually guarantees you (not much)
+
+The single hardest-earned lesson in distributed systems: a network call has three possible outcomes, and the caller often cannot distinguish between them just by watching a timeout expire.
+
+1. The request never reached the server (lost in flight, or the server was down).
+2. The request reached the server, was processed, but the *response* was lost on the way back.
+3. The request is just slow, and a response is still coming.
+
+From the caller's point of view, cases 1 and 2 and 3 can all look identical: no response yet. This is why "just retry on timeout" is dangerous by default — in case 2, the server already did the work (say, charged a card or sent an email), and a naive retry does it again.
+
+The fix is **idempotency**: designing the operation so that performing it more than once has the same effect as performing it once. A common pattern is an idempotency key generated by the client and attached to the request; the server records which keys it has already processed and returns the original result for a repeat, rather than redoing the side effect. `PUT /users/42 name=Alice` is naturally idempotent (setting the name twice leaves the same result); `POST /orders` that creates a new order each time it's called is not, unless you add an idempotency key.
+
+## Worked example: choosing a protocol for a checkout flow
+
+Say you're designing an e-commerce checkout: a public-facing API gateway, and behind it an `order-service`, `payment-service`, and `inventory-service` that need to talk to each other.
+
+- **Client to API gateway**: HTTP/REST over TLS. The client is a browser or mobile app, cacheability and debuggability matter, and call volume per user is low. There's no reason to pay gRPC's tooling cost here.
+- **API gateway to `order-service`, and between the internal services**: gRPC is a strong default. These are high-volume, internal, typed calls where a shared protobuf schema keeps three teams' services in sync, and streaming is useful if, say, `inventory-service` needs to push stock-level updates rather than be polled.
+- **`payment-service` charge call specifically**: this is the one call in the whole flow that must be idempotent no matter which transport carries it — a client-generated idempotency key attached to the charge request, checked server-side before any card is touched, protects against exactly the "did my retry double-charge me" failure mode described above.
+- **Timeouts and retries**: `order-service` calling `payment-service` should have an aggressive timeout (say, 2-3 seconds) with a small number of retries using exponential backoff plus jitter — not because 3 seconds is inherently right, but because without *some* bound, a slow `payment-service` ties up `order-service`'s threads/connections until it runs out of capacity too, turning one slow dependency into a full outage.
+
+<Callout type="warning">
+  A common mistake is treating "add retries" as a strictly safety-improving change without checking idempotency first. Retrying a non-idempotent write (an unprotected `POST /charge` or `POST /sendEmail`) on a timeout can silently double-charge a customer or double-send a notification — and because the original request often *did* succeed server-side, the bug won't show up in your happy-path tests, only in production under real network jitter. Always pair retries with an idempotency mechanism for any operation with a side effect.
+</Callout>
+
+This lesson focused on the mechanics of a single call between two services. The next lesson, on storage fundamentals, covers what happens once a call like that reaches a database. The consistency and availability lesson after that revisits "the request might be lost or slow" at a system-wide level, once you have multiple replicas and have to reason about what a client sees when they don't all agree.
+
+<Quiz
+  lessonId="prelim-network-protocols-and-rpc"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does HTTP/2 reduce head-of-line blocking at the application layer compared to HTTP/1.1?',
+      options: [
+        { id: 'a', text: 'It switches the transport from TCP to UDP', correct: false, explanation: 'HTTP/2 still runs over TCP; switching the transport to UDP is what HTTP/3 (via QUIC) does, and that addresses a different, transport-level head-of-line blocking issue.' },
+        { id: 'b', text: 'It multiplexes multiple independent streams over a single TCP connection', correct: true, explanation: 'Multiplexing lets many requests/responses interleave on one connection, so a slow response on one stream no longer blocks others queued behind it, unlike HTTP/1.1\'s effectively one-request-at-a-time-per-connection model.' },
+        { id: 'c', text: 'It compresses the response body more aggressively than HTTP/1.1', correct: false, explanation: 'HTTP/2 does add header compression, but body compression is not what solves head-of-line blocking — multiplexing streams is.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are real trade-offs of choosing gRPC over REST/JSON for service-to-service calls? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'gRPC payloads are binary and not human-readable on the wire, making ad hoc debugging harder', correct: true, explanation: 'Protobuf\'s compact binary encoding is a big part of gRPC\'s performance win, but it means you cannot just eyeball a request in a browser network tab the way you can with JSON.' },
+        { id: 'b', text: 'gRPC requires every caller and server to share a schema (.proto file) that must be versioned carefully', correct: true, explanation: 'The generated-stub, strongly-typed model is gRPC\'s strength for internal consistency, but it does couple services to a shared schema file that needs a compatibility strategy as it evolves.' },
+        { id: 'c', text: 'gRPC cannot support streaming responses, only single request/response calls', correct: false, explanation: 'The opposite is true — gRPC has first-class support for client-streaming, server-streaming, and bidirectional streaming, which is one of its advantages over plain REST.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'If a client times out waiting for a response, it can safely conclude the server never received or processed the request.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A timeout is ambiguous: the request could have been lost before reaching the server, the server could have processed it but lost the response on the way back, or the server could simply still be working. The client cannot tell which from the timeout alone.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — this ambiguity is exactly why idempotency matters: since the client cannot distinguish "never processed" from "processed but response lost," any retry logic must assume the request may have already taken effect.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A payment charge endpoint currently does `POST /charge` with no idempotency key, and the caller retries on timeout. What is the main risk?',
+      options: [
+        { id: 'a', text: 'The retry will always be rejected by the server, so no charge ever completes', correct: false, explanation: 'Without an idempotency mechanism, the server has no way to recognize the retry as a duplicate — it will typically process it as a brand-new charge, not reject it.' },
+        { id: 'b', text: 'The customer could be charged twice if the original request actually succeeded server-side before the timeout', correct: true, explanation: 'This is the classic non-idempotent-retry bug: the first charge went through, the response was just lost or slow, and the blind retry creates a second, separate charge.' },
+        { id: 'c', text: 'There is no risk, because TCP guarantees a request is only ever processed once', correct: false, explanation: 'TCP guarantees reliable delivery of bytes on a given connection, but it says nothing about application-level semantics like "this logical operation runs exactly once" — that has to be built by the application (e.g., idempotency keys).' },
+      ],
+    },
+  ]}
+/>

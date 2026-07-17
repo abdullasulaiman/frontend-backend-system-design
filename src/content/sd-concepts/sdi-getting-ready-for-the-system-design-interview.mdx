@@ -1,0 +1,217 @@
+---
+title: "Getting Ready for the System Design Interview"
+module: "System Design Interviews"
+moduleOrder: 2
+order: 1
+track: "concept"
+summary: "Explains what the system design interview is actually evaluating and how to orient your prep so you build the right skills instead of memorizing architectures."
+tags: ["system-design-interview", "interview-prep", "career", "process"]
+estMinutes: 10
+cheatsheet:
+  - "The interview evaluates your process (requirements, trade-offs, communication), not whether you reproduce a specific company's real architecture."
+  - "There's no single correct answer to 'design X' — the interviewer is scoring how you reason under ambiguity, not pattern-matching your diagram to one in a book."
+  - "Requirements come from you asking questions, not from the prompt handing them to you — 'design a URL shortener' is deliberately underspecified."
+  - "Depth beats breadth: going shallow on ten components loses to going deep on the two or three that actually matter for this system's bottleneck."
+  - "Level changes the bar — a staff-level answer is judged on justified trade-offs and awareness of failure modes, not on knowing more buzzwords."
+  - "Prep in this order: core building blocks (databases, caching, queues, load balancing) before named case studies — the case studies are just building blocks recombined."
+  - "A quiet 10-second pause to think is fine; a silent 3-minute pause while you draw alone is not — narrate as you go."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Most candidates walk into a system design interview expecting a knowledge
+test — as if there's a "correct" architecture for a URL shortener or a
+chat app that they either know or don't. That framing sets you up to fail,
+because it's not what's being measured. A system design interview is an
+observation of how you think when a problem is deliberately underspecified,
+the scope is too large to fully solve in 45 minutes, and there's no single
+right answer. Understanding that up front changes how you should prepare —
+and it's the reason two candidates who both "know" load balancers and
+databases can walk out with completely different scores.
+
+This lesson sets the frame for the rest of the module: what the interview
+is actually for, what a bar-raising performance looks like at different
+levels, and how to structure your prep so the hours you put in actually
+move the needle.
+
+## What the interview is really testing
+
+Strip away the whiteboard and the buzzwords, and a system design interview
+is testing four things:
+
+1. **Requirements gathering.** Can you take a vague prompt ("design a
+   ride-sharing app") and turn it into a scoped, concrete problem by asking
+   the right questions — What's the scale? Read-heavy or write-heavy? What's
+   explicitly out of scope? Consistency or availability priority?
+2. **Structured reasoning under ambiguity.** Can you break a huge problem
+   into components, and reason about each one's job, interface, and
+   failure modes, instead of freezing or rambling?
+3. **Trade-off judgment.** Every real design decision (SQL vs NoSQL, push vs
+   pull, strong vs eventual consistency) has a cost. Can you name the cost
+   and justify why you're paying it for *this* system, not recite that
+   "NoSQL scales better" as a slogan?
+4. **Communication under time pressure.** Can you drive a 45-minute
+   conversation, narrate your thinking, adapt when the interviewer pokes a
+   hole in your design, and land on something coherent — not necessarily
+   "complete" — by the end?
+
+None of these are "memorize the architecture of a famous system." That's
+why two candidates who both know what a consistent-hash ring is can score
+completely differently: one uses it because it's actually the right
+answer to *this* system's rebalancing problem, the other drops it in
+because they saw it in a prep video and it sounds impressive.
+
+<Callout type="note">
+  If you take one thing from this lesson, take this: prep that only builds
+  *recall* (memorizing that "Netflix uses CDNs") doesn't transfer to a novel
+  prompt. Prep that builds *reasoning* (why would a CDN help here, and when
+  would it not) transfers to any prompt you haven't seen before.
+</Callout>
+
+## How the bar changes with level
+
+The same prompt — say, "design a notification system" — gets a very
+different bar depending on the role:
+
+- **Mid-level:** expected to design a reasonable end-to-end system with
+  the interviewer's help steering scope. Correctness and basic trade-off
+  awareness (e.g., "I'd use a queue here so a slow downstream service
+  doesn't block the API") matter more than depth.
+- **Senior:** expected to drive the conversation themselves, proactively
+  surface trade-offs without being asked, and go deep on at least one or
+  two components that matter (e.g., how retries and idempotency keys
+  prevent duplicate notifications).
+- **Staff/principal:** expected to also reason about organizational and
+  operational concerns — rollout strategy, how the system degrades under
+  partial failure, cost, and how the design would evolve if traffic grew
+  10x. The interviewer is listening for judgment about *what not to build*
+  as much as what to build.
+
+Knowing your target level tells you where to spend prep hours: a mid-level
+candidate over-indexing on staff-level concerns (multi-region failover
+runbooks) is prepping for the wrong bar just as much as a staff candidate
+who stops at "and then we'd add a cache."
+
+## The shape of a 45-minute interview
+
+Most system design interviews follow a similar rhythm, even though the
+prompt changes every time. Seeing the shape in advance helps you allocate
+time instead of running out of it mid-design.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Clarify requirements<br/>~5-8 min] --> B[Estimate scale<br/>~3-5 min]
+  B --> C[High-level design<br/>~10-15 min]
+  C --> D[Deep dive on 1-2<br/>bottleneck components<br/>~10-15 min]
+  D --> E[Trade-offs, failure modes,<br/>wrap-up<br/>~5 min]
+`} />
+
+The most common failure mode isn't in any single box — it's spending too
+long in one box and running out of runway for the rest. A candidate who
+spends 20 minutes gold-plating the high-level diagram often never gets to
+the deep dive that would've shown their real depth. (The module's later
+lesson on a repeatable method walks through each stage in detail; this
+lesson is about the mindset you bring into all of them.)
+
+## How to actually prepare
+
+Preparation that works has a specific order, because each layer depends on
+the one below it:
+
+1. **Core building blocks first.** Load balancing, caching, database
+   indexing and replication, message queues, consistent hashing, CAP
+   trade-offs. If you don't know what a queue buys you, no amount of
+   "practiced" case studies will help — you'll just be reciting a
+   memorized diagram when the interviewer changes one constraint.
+2. **Back-of-envelope estimation.** Practice converting "500 million daily
+   active users" into requests per second, storage per day, and bandwidth,
+   quickly and roughly. This is a skill you can only build by doing it
+   repeatedly, not by reading about it once.
+3. **Case studies, as recombination practice.** Once the building blocks
+   are solid, work through named systems (a URL shortener, a rate limiter,
+   a chat app) not to memorize their diagrams, but to see the building
+   blocks get reused in different combinations under different constraints.
+4. **Talking out loud, from day one.** Design silently in your head and
+   you're practicing the wrong skill. Say your reasoning as you go, even in
+   solo practice — record yourself if you have to. The interview is a
+   conversation, not a take-home.
+
+## Worked example: same prompt, two different preparations
+
+Say the prompt is "design a system that shows a user's unread notification
+count across devices." Candidate A spent prep time memorizing that
+"notification systems use fan-out and push." Candidate B spent prep time
+on building blocks and estimation.
+
+Candidate A opens with "I'll use fan-out-on-write with a push
+notification service" — jumping straight to an answer without knowing if
+this user has 200 followers or 20 million, whether "unread count" needs to
+be exactly correct or approximately correct, or whether it needs to update
+in real time or can tolerate a few seconds of staleness. When the
+interviewer asks "what if the count needs to work correctly even if a
+device was offline for a week," Candidate A stalls — that scenario wasn't
+in their memorized diagram.
+
+Candidate B starts by asking: is this single-user counts (like a badge on
+a mobile icon) or fan-out counts (a celebrity's post reaching millions)?
+Is exact correctness required, or is "at least roughly right, refreshed on
+open" acceptable? What's the read:write ratio? From the answers, Candidate
+B reasons toward a per-user counter stored in a fast key-value store,
+updated on write and reconciled periodically, with sync-on-reconnect
+logic for the offline-device case — deriving the design from the
+constraints instead of recalling it. When the interviewer changes a
+constraint, Candidate B adjusts the same reasoning instead of freezing.
+
+Same prompt, same 45 minutes, very different outcome — and the difference
+was in *how* they prepared, not how many systems they'd read about.
+
+<Callout type="warning">
+  A common and expensive prep mistake: watching dozens of "design X" videos
+  or reading solution write-ups back-to-back without ever practicing the
+  requirements-gathering and trade-off-narration part yourself. This builds
+  recognition ("oh, this is the URL shortener pattern") without building
+  the transferable skill the interview actually scores. If your prep time
+  is 90% consuming solutions and 10% practicing out loud under a timer,
+  flip that ratio.
+</Callout>
+
+## Quick check
+
+<Quiz
+  lessonId="sdi-getting-ready-for-the-system-design-interview"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A candidate memorizes that "chat apps use WebSockets and message queues" and recites this whenever a chat-like prompt appears, without adapting to the specific constraints given. What is this candidate most likely missing?',
+      options: [
+        { id: 'a', text: 'Structured reasoning and trade-off judgment tied to the specific prompt’s constraints', correct: true, explanation: 'Reciting a memorized pattern skips the requirements-gathering and justification steps the interview is actually scoring — it looks right until a constraint changes.' },
+        { id: 'b', text: 'Knowledge of what a WebSocket is', correct: false, explanation: 'The candidate clearly knows the term — the gap is applying it to this problem’s actual constraints, not knowing the term itself.' },
+        { id: 'c', text: 'Whiteboard drawing speed', correct: false, explanation: 'Drawing speed is a minor factor at best; it is not what distinguishes a memorized answer from a reasoned one.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of the following are core things a system design interview is evaluating? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Ability to turn a vague prompt into scoped requirements by asking questions', correct: true, explanation: 'Requirements gathering is one of the primary skills being scored — prompts are deliberately underspecified.' },
+        { id: 'b', text: 'Trade-off judgment — naming the cost of a decision and justifying it for this system', correct: true, explanation: 'Justified trade-offs (not slogans) are exactly what separates a strong answer from a shallow one.' },
+        { id: 'c', text: 'Whether the candidate’s diagram exactly matches a specific well-known company’s real production architecture', correct: false, explanation: 'There is no single correct architecture being checked against — the interview scores the reasoning process, not a match to a real system.' },
+        { id: 'd', text: 'Communication and adapting the design when the interviewer changes a constraint', correct: true, explanation: 'The interview is a live conversation; adapting to follow-up constraints under time pressure is a core evaluated skill.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'The bar for what counts as a strong answer is the same regardless of whether the candidate is interviewing for a mid-level or staff-level role.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The bar scales with level — staff-level answers are expected to show judgment about organizational/operational concerns and what not to build, which isn’t expected at mid-level.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Expectations scale with seniority: mid-level focuses on a reasonable end-to-end design with guidance, while staff-level is judged on proactive trade-offs, depth, and operational judgment.' },
+      ],
+    },
+  ]}
+/>

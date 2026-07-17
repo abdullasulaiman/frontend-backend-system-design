@@ -1,0 +1,141 @@
+---
+title: "Introduction to Building Blocks for System Design"
+module: "Building Blocks: Introduction"
+moduleOrder: 6
+order: 1
+track: "concept"
+summary: "Introduces the recurring set of components — load balancers, caches, queues, databases, and the like — that every distributed system is assembled from, and previews how the rest of this module treats each one."
+tags: ["building-blocks", "architecture", "distributed-systems", "system-design-basics"]
+estMinutes: 10
+cheatsheet:
+  - "Almost every system design interview answer is the same ~10 building blocks wired together differently — the skill is picking the right combination and justifying it, not memorizing an exotic architecture."
+  - "A building block is a component with a narrow job and a known set of trade-offs (e.g. a cache trades staleness for latency); learn each one's job and failure mode, not just its name."
+  - "Building blocks compose in layers: client to edge (DNS, CDN, load balancer) to application (services, queues) to data (databases, caches, object storage) to cross-cutting concerns (monitoring, config, coordination)."
+  - "Every block you add is also a new failure mode and an operational cost — justify each one against the requirements instead of adding it because it 'sounds scalable.'"
+  - "The requirements (read/write ratio, consistency needs, latency budget, data size) determine which blocks you actually need — don't design the components before you know what's driving them."
+  - "This module walks each block in isolation (load balancers, caching, queues, databases, etc.); later modules show how to assemble them into full designs like a URL shortener or a chat system."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Open the "system design" section of almost any engineering interview and you'll be asked to design something with a specific-sounding name: a URL shortener, a ride-sharing dispatch system, a news-feed service. It's tempting to think each of these needs a bespoke architecture invented from scratch. It doesn't. Underneath the specific business logic, essentially every large-scale system is built from the same small set of reusable parts: something to spread load across servers, something to cache hot data, something to queue work for later, something to store data durably, something to break a monolith into independently-scalable services. The interview isn't testing whether you know an obscure trick for ride-sharing — it's testing whether you know these building blocks well enough to pick the right subset and connect them correctly for the problem in front of you.
+
+This lesson is the front door to the "Building Blocks" section of this course. It doesn't teach any one block in depth — that's what the following lessons (load balancing, caching, message queues, databases, CDNs, and so on) are for. Instead it gives you the map: what a "building block" actually is, how they typically layer together in a real request path, and how to think about picking them, so the deep-dive lessons that follow slot into a structure you already understand.
+
+## What counts as a building block
+
+A building block is a component with a narrow, well-defined job and a known, teachable set of trade-offs. It's not "a database" in the abstract — it's "a key-value store trades flexible querying for O(1) lookups by key," or "a message queue trades immediate processing for durability and load-leveling." Each block in this module has:
+
+- **A specific job.** A load balancer distributes incoming requests; it doesn't store data or run business logic.
+- **A set of trade-offs.** A cache buys you lower latency and less load on your database, at the cost of potentially serving stale data.
+- **A failure mode.** A queue can back up if consumers fall behind; a cache can be invalidated incorrectly and serve wrong data forever until it's fixed.
+
+Learning a building block means learning all three of those, not just the name. "I'd add a cache" is not an answer an interviewer wants — "I'd add a cache in front of the user-profile reads because they're read 100x more than they're written, accepting a few seconds of staleness on profile updates" is.
+
+## The recurring inventory
+
+You'll meet dozens of specific technologies across a system design career (Redis, Kafka, Cassandra, Nginx, DynamoDB...), but they map onto a much smaller number of *roles*. The building blocks this module covers, grouped by the role they play:
+
+- **Traffic entry and distribution** — DNS, load balancers, API gateways: how a request finds and gets routed to the right server.
+- **Compute and application structure** — stateless services, microservices vs. monoliths: where your business logic actually runs.
+- **Data storage** — relational databases, NoSQL stores, object storage: where data lives durably and how it's modeled.
+- **Speed layers** — caches and CDNs: how you serve hot data fast without hitting the source of truth every time.
+- **Asynchrony and decoupling** — message queues and event streams: how you let one part of the system do work without blocking another.
+- **Cross-cutting concerns** — rate limiting, monitoring/observability, and coordination services: the plumbing that keeps everything else honest and debuggable.
+
+Every named "design X" interview question is really an exercise in picking a subset of this inventory and wiring it to the specific requirements of X.
+
+## How the blocks typically layer together
+
+A request in a real system passes through these blocks roughly in the same order, regardless of what the system does. Seeing that shape once makes every individual lesson easier to place.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    U[Client] --> DNS[DNS]
+    DNS --> CDN[CDN / edge cache]
+    CDN --> LB[Load balancer]
+    LB --> S1[App service]
+    LB --> S2[App service]
+    S1 --> Cache[(Cache)]
+    S1 --> Q[[Message queue]]
+    S1 --> DB[(Database)]
+    Q --> W[Background worker]
+    W --> DB
+`} />
+
+A client resolves a hostname through DNS, static or cacheable content is served straight from a CDN without touching your servers at all, a load balancer spreads the remaining requests across stateless app instances, each instance checks a cache before falling back to the database, and anything that doesn't need to happen synchronously (sending an email, generating a report, transcoding a video) gets pushed onto a queue for a worker to pick up later. Not every system needs every layer — a low-traffic internal tool might skip the CDN and queue entirely — but this is the default shape you reach for and then subtract from, rather than build up from nothing each time.
+
+## Picking blocks from requirements, not habit
+
+The single biggest mistake at this stage is treating building blocks like a checklist to sprinkle onto any design ("every good design has a cache and a queue"). The right question is always: what does *this* system's requirements demand?
+
+- High read-to-write ratio (a social feed, a product catalog) pushes you toward caching and read replicas.
+- Bursty or spiky write patterns (ticket sales, flash sales) push you toward queues and admission control, not just "a bigger database."
+- Strict consistency needs (a bank balance) push you away from caching and eventual-consistency stores for that specific piece of data, even if the rest of the system uses them freely.
+- Large binary payloads (video, images) push you toward object storage plus a CDN, not a relational database's row storage.
+
+Each of the deep-dive lessons in this module explains a block's trade-offs precisely so that this mapping — requirement to block — becomes a reflex rather than a guess.
+
+## Worked example: mapping a simple app to blocks
+
+Take a basic photo-sharing app: users upload photos, other users view a feed of recent photos from people they follow. Walking the request types through the building-block inventory:
+
+- **Uploads** are infrequent, large, and need durability — that's **object storage** (not a database row) for the photo bytes, plus a small database row for metadata (uploader, timestamp, caption).
+- **Feed reads** are frequent, read-heavy, and tolerate a few seconds of staleness — that's a **cache** in front of the feed-generation logic, backed by a **database** for the underlying follow-graph and post data.
+- **Thumbnail generation** after an upload doesn't need to block the upload response — that's a **queue** feeding a **background worker** that generates thumbnails asynchronously.
+- **Serving the actual photo bytes** to viewers is a classic **CDN** case — same bytes, requested repeatedly, cacheable at the edge close to the viewer.
+- Underneath all of it, a **load balancer** spreads API traffic across app instances, and monitoring/observability tracks error rates and latency so you notice when any of the above starts misbehaving.
+
+Notice that no single "photo app database" or "photo app cache" technology was invented — five ordinary building blocks, each doing the job they're good at, is the entire architecture.
+
+<Callout type="warning">
+  A common interview mistake: naming a building block as the *answer* to a requirement without saying why it fits ("I'll use a NoSQL database because it scales better"). Scaling better than what, for which access pattern? A relational database with proper indexes and replicas scales plenty well for most workloads; the actual deciding factor is usually the shape of the data and the queries you need to run (flexible ad-hoc queries and strong consistency point toward relational; huge scale with simple key-based access and a flexible schema point toward NoSQL). State the requirement that's driving the choice, not just the component's marketing pitch.
+</Callout>
+
+<Quiz
+  lessonId="bb-intro-introduction-to-building-blocks-for-system-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What best describes what a "building block" means in the context of system design interviews?',
+      options: [
+        { id: 'a', text: 'A specific vendor product (like a particular cloud provider\'s managed database) that must be named in every answer', correct: false, explanation: 'Building blocks are roles/components (e.g. "a cache"), not specific vendor products — the concept is technology-agnostic.' },
+        { id: 'b', text: 'A reusable component with a narrow job, a known set of trade-offs, and a typical failure mode', correct: true, explanation: 'That is exactly the definition used in this lesson: a component defined by its job, its trade-offs, and how it fails, independent of any specific vendor implementation.' },
+        { id: 'c', text: 'Any diagram box drawn during a system design interview, regardless of whether it represents a distinct component', correct: false, explanation: 'Not every box in a diagram is a distinct building block — the term refers to a specific, well-understood component with its own job and trade-offs, not an arbitrary label.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are examples of picking a building block based on a specific requirement rather than habit? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Adding object storage plus a CDN for a system that serves large video files repeatedly to many viewers', correct: true, explanation: 'Large binary payloads served repeatedly are exactly the case object storage and a CDN are built for — driven by the payload size and access pattern, not habit.' },
+        { id: 'b', text: 'Adding a cache in front of data that changes every request and must always be perfectly up to date', correct: false, explanation: 'Caching is a poor fit here — data that changes every request and needs strict freshness gets little benefit from a cache and risks serving stale results, so this is the wrong block for the requirement.' },
+        { id: 'c', text: 'Adding a message queue so an email-sending step does not block the user-facing request that triggered it', correct: true, explanation: 'Decoupling a slow, non-critical-path step (sending an email) from the synchronous request is a textbook reason to introduce a queue.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A strong system design answer typically includes every major building block (cache, queue, CDN, load balancer, etc.) regardless of the system\'s specific requirements, since more components signal a more scalable design.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Adding blocks the requirements don\'t call for adds failure modes and operational cost without benefit — interviewers want justified choices, not maximal component counts.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Each building block should be justified by a specific requirement (read/write pattern, consistency need, payload size, latency budget); unjustified components are a red flag, not a strength.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the typical request path (client to DNS to CDN to load balancer to app services to cache/database), what is the main purpose of checking a cache before the database?',
+      options: [
+        { id: 'a', text: 'To permanently replace the database once enough data has been cached', correct: false, explanation: 'A cache is not a replacement for durable storage — it holds a subset of data for fast access and is expected to be rebuilt or invalidated; the database remains the source of truth.' },
+        { id: 'b', text: 'To serve frequently-requested data faster and reduce load on the database, at the cost of potential staleness', correct: true, explanation: 'That is the core trade-off of a cache: lower latency and less database load in exchange for the data possibly being slightly out of date.' },
+        { id: 'c', text: 'To guarantee strong consistency for every read in the system', correct: false, explanation: 'Caches generally make consistency guarantees weaker, not stronger, since cached data can lag behind the underlying source until invalidated or refreshed.' },
+      ],
+    },
+  ]}
+/>

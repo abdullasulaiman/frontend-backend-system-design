@@ -1,0 +1,216 @@
+---
+title: "Push vs. Pull CDNs"
+module: "Content Delivery Network"
+moduleOrder: 11
+order: 2
+track: "concept"
+summary: "Compares push and pull CDN population strategies and explains which one to choose based on content volatility, catalog size, and origin load tolerance."
+tags: ["cdn", "caching", "origin-server", "architecture", "trade-offs"]
+estMinutes: 11
+cheatsheet:
+  - "Push CDN: you upload content to edge nodes ahead of time. Pull CDN: edge nodes fetch from origin on a cache miss and cache the result."
+  - "Push suits small, slow-changing catalogs (site assets, a handful of video renditions); pull suits large or unpredictable catalogs (user uploads, long-tail content) where pre-populating everywhere is wasteful."
+  - "Pull CDNs have a built-in cold-start cost: the first request per edge node per object is a full-latency origin round trip (a cache miss) before it's fast for everyone else behind that node."
+  - "Push CDNs need an explicit re-upload or purge on every content change; pull CDNs just need correct TTLs/cache-control headers and let expiry handle staleness."
+  - "Pull CDNs can accidentally overload origin during a flash-crowd cache miss on a hot key across many edge nodes at once — mitigate with request collapsing and origin shielding."
+  - "Storage cost trades against origin load: push pays for storage everywhere upfront; pull pays only for what's actually requested, but repeats origin fetches per region."
+  - "Most real CDNs (Cloudflare, Akamai, Fastly, CloudFront) default to pull-through caching and only offer push-style pre-warming as an optional feature, not the primary model."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Once you've decided a CDN belongs in your architecture, the next real design
+decision is how content actually gets onto the edge servers. Two strategies
+dominate: **push**, where you proactively upload content to edge nodes ahead
+of demand, and **pull**, where edge nodes fetch content from your origin the
+first time someone asks for it, then cache it locally. Interviewers ask
+"push or pull?" specifically to see whether you can reason about a
+trade-off from first principles rather than name-drop a vendor. The right
+answer depends on how big your content catalog is, how often it changes,
+and how much cold-start latency and origin load you can tolerate.
+
+## Push CDNs: you control when content arrives at the edge
+
+In a push model, you (the content owner) explicitly copy files to the CDN's
+edge storage — usually via an API call or a sync job — before any user
+requests them. The edge node already has the object sitting in local
+storage when the first request for it arrives, so that request is a local
+hit with no origin round trip.
+
+This works well when:
+
+- **The catalog is small and finite.** A marketing site's JS/CSS bundles, a
+  handful of hero images, or a fixed set of transcoded video renditions are
+  all things you can enumerate and push everywhere.
+- **Content changes are known events you control.** You deploy a new build,
+  you push the new files, done — no need for the edge to "discover" that
+  something changed.
+- **You want every edge node warm before traffic arrives.** A product
+  launch or a livestream you know is coming can be pre-staged across every
+  region so the very first viewer in Tokyo gets the same latency as one in
+  Ohio.
+
+The cost is that you're paying storage (and possibly egress) for every
+region whether or not anyone in that region ever requests the content, and
+every content change requires you to actively re-push or purge — there's no
+"the edge will just notice and refetch" safety net.
+
+## Pull CDNs: the edge fetches on demand
+
+In a pull model, the edge node does nothing until a user requests an object
+it doesn't have cached. On that first request — a **cache miss** — the edge
+node fetches the object from your origin (or from a nearer upstream tier),
+serves it to the user, and stores a copy locally according to a TTL or
+cache-control header. Every subsequent request to that same edge node for
+the same object is a **cache hit** served straight from the edge, no origin
+involved, until the cached copy expires or is evicted.
+
+This works well when:
+
+- **The catalog is large or unbounded.** User-uploaded photos, a long tail
+  of product images, or per-user generated content aren't things you can
+  reasonably pre-push everywhere — most of it will never be requested from
+  most regions.
+- **Demand is unpredictable or long-tail-shaped.** Pulling means you only
+  ever cache what's actually being asked for in each region, so you don't
+  waste storage on objects nobody near that edge node cares about.
+- **You'd rather manage staleness with TTLs than with active pushes.** Set
+  `Cache-Control: max-age=3600` once and let expiry do the work instead of
+  wiring up a purge pipeline for every change.
+
+The cost is the mirror image of push's benefit: the very first request for
+any object at any given edge node pays full origin latency, and if that
+object is genuinely hot (a viral post, a flash-sale product page) many edge
+nodes can all miss at once and all hammer the origin simultaneously — the
+classic **thundering herd** or **flash-crowd** problem pull CDNs must guard
+against.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph Push["Push CDN"]
+        O1[Origin] -->|upload ahead of demand| E1[Edge Node]
+        U1[User] -->|request| E1
+        E1 -->|always a hit| U1
+    end
+    subgraph Pull["Pull CDN"]
+        U2[User] -->|request| E2[Edge Node]
+        E2 -->|cache miss: fetch| O2[Origin]
+        O2 -->|response, cached with TTL| E2
+        E2 -->|serve + cache| U2
+    end
+`} />
+
+## Guarding pull CDNs against origin overload
+
+Because pull CDNs fetch on miss, two techniques matter in practice, and
+interviewers like hearing you name them:
+
+- **Request collapsing (a.k.a. request coalescing).** If ten thousand
+  requests for the same missing object arrive at an edge node within the
+  same few milliseconds, the edge should send exactly one request to origin
+  and hold the other 9,999 waiting for that single response, rather than
+  forwarding all ten thousand. Most CDN providers do this automatically.
+- **Origin shielding.** Instead of every regional edge node independently
+  falling back to origin on a miss, route all misses through one
+  designated "shield" cache layer sitting between the edge tier and origin.
+  The shield absorbs the fan-in from many edge nodes so origin only ever
+  sees one miss per object, not one miss per edge location.
+
+Neither technique exists in a pure push model, because push never has
+cache misses at request time — it front-loads all the cost into the
+upload step instead.
+
+## Worked example: rolling out a new product catalog image set
+
+Say you run an e-commerce site with 2 million product images and you're
+launching a redesign that replaces every product's primary image.
+
+**If you push:** you'd need to upload all 2 million new images to every one
+of, say, 30 global edge regions before launch — 60 million file copies,
+most of which (any product with low traffic in a given region) will sit
+unused. Storage cost scales with `regions × catalog size`, and you've
+built an active re-upload pipeline that must run correctly on every future
+catalog update.
+
+**If you pull:** you deploy the new images to origin, set a sensible
+`Cache-Control` TTL, and optionally issue purges for the old URLs. Each
+edge region only ever caches the products actually browsed by users near
+it — a small, regional retailer's storefront in one country might only
+ever pull the 5,000 products popular there, not all 2 million. The
+trade-off: the first shopper to view any given product in a freshly
+deployed region pays one origin round trip; every shopper after that in
+that region is fast. For a catalog this large and this regionally skewed
+in popularity, pull is the clear choice — pushing 60 million mostly-unused
+copies is paying for storage you'll never use.
+
+Contrast that with pushing the redesign's shared CSS/JS bundle: that's one
+small file every visitor needs regardless of region, so pushing it
+everywhere ahead of launch avoids any cold-start penalty at all — a case
+where push is strictly better.
+
+<Callout type="warning">
+  A common mistake in interviews: treating "push vs. pull" as a single
+  binary choice for the whole system. Real systems mix both — push the
+  small, universal, slow-changing assets (app shell, shared images) and
+  pull the large, long-tail, unpredictable content (user uploads, product
+  catalogs). Presenting only one model for every asset type signals you
+  haven't thought about content shape, and it's an easy thing for an
+  interviewer to probe by asking "would you push *that* too?"
+</Callout>
+
+## How this fits with the rest of the module
+
+This lesson covered *how* content gets onto edge nodes. The next lesson,
+Caching and Invalidation, goes deeper on what happens after that first
+copy lands at the edge — TTLs, purges, and staleness — which applies to
+both push and pull content once it's cached. The following lesson then
+folds push/pull and caching into the fuller CDN design picture, including
+consistency and security concerns.
+
+<Quiz
+  lessonId="cdn-push-vs-pull-cdns"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A photo-sharing app has 500 million user-uploaded images, most of which are viewed only a handful of times by people in one region. Which CDN population strategy fits best?',
+      options: [
+        { id: 'a', text: 'Push — upload every image to every edge region ahead of time', correct: false, explanation: 'With 500 million mostly low-traffic images, pre-pushing everywhere wastes enormous storage on copies that will rarely or never be requested in most regions.' },
+        { id: 'b', text: 'Pull — let each edge node fetch and cache images on first request', correct: true, explanation: 'Pull only caches what a region actually requests, which matches a huge, long-tail, regionally skewed catalog far better than pre-pushing everything everywhere.' },
+        { id: 'c', text: 'Neither — serve all images directly from origin with no CDN', correct: false, explanation: 'Skipping the CDN entirely throws away the latency and origin-offload benefits a CDN provides; the question is which population strategy to use, not whether to use one.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of the following are genuine downsides of a pull CDN model? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The first request per object per edge node pays full origin latency', correct: true, explanation: 'This is the cache-miss cold start inherent to pull — there is no way around it without pre-warming.' },
+        { id: 'b', text: 'A sudden spike in demand for one object can cause many edge nodes to hit origin simultaneously', correct: true, explanation: 'This is the flash-crowd / thundering-herd risk pull CDNs must mitigate with techniques like request collapsing and origin shielding.' },
+        { id: 'c', text: 'It requires paying storage cost for content in regions where nobody ever requests it', correct: false, explanation: 'This is a push CDN downside, not a pull one — pull only stores what a region actually requested, which is the opposite problem.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Request collapsing and origin shielding are techniques used to reduce origin load specifically in pull CDN architectures.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Both techniques address the fan-in of cache misses that only happens in a pull model, where many edge nodes can independently miss on the same hot object at once.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'These techniques exist precisely because pull CDNs have cache misses at request time; a pure push model has no request-time misses to collapse or shield against.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: "You're launching a small marketing site with five images and one shared CSS/JS bundle, all known in advance and rarely changing. Which strategy minimizes cold-start latency for every visitor everywhere?",
+      options: [
+        { id: 'a', text: 'Push all assets to every edge region before launch', correct: true, explanation: 'A small, fixed, slow-changing set of assets is exactly the case where push wins: every edge node is warm before the first real visitor arrives, so nobody pays a cache-miss penalty.' },
+        { id: 'b', text: 'Pull assets on first request per region', correct: false, explanation: 'This works too, but it means the first visitor in each region pays a full origin round trip that push would have avoided entirely for a catalog this small.' },
+        { id: 'c', text: 'Store assets only at a single central origin with no CDN', correct: false, explanation: 'This forgoes edge caching altogether, giving every visitor origin-distance latency regardless of catalog size.' },
+      ],
+    },
+  ]}
+/>

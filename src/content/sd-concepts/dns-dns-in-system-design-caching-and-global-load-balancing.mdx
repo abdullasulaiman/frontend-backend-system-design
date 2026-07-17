@@ -1,0 +1,123 @@
+---
+title: "DNS in System Design: Caching and Global Load Balancing"
+module: "Domain Name System"
+moduleOrder: 7
+order: 2
+track: "concept"
+summary: "Explains how DNS caching (TTLs, resolver layers, negative caching) and DNS-based traffic steering (GeoDNS, latency routing, weighted records, health checks) turn plain name resolution into a load-balancing and failover tool at global scale."
+tags: ["dns", "caching", "load-balancing", "high-availability", "latency"]
+estMinutes: 11
+cheatsheet:
+  - "TTL is the lever for the propagation-vs-load tradeoff: long TTL means fewer lookups and cheaper resolvers but slow rollout of changes; short TTL means fast failover/rollout but more query volume hitting your authoritative servers."
+  - "Before any incident that needs fast DNS-based failover, drop the TTL on the affected record hours ahead of time — caches already holding the old, long TTL won't re-check until it expires, no matter what you change now."
+  - "Negative caching (NXDOMAIN/NODATA responses) is controlled by the zone's SOA minimum/negative-TTL, not the record's own TTL — a wrongly-configured domain can stay 'not found' in resolver caches long after you fix it."
+  - "GeoDNS/latency-based routing answers 'which region should this client talk to' at the DNS layer, cheaply and before any connection opens — but it routes on the resolver's location, not the end user's, which breaks down with third-party public resolvers."
+  - "DNS health checks typically probe every 10-30 seconds and pull an unhealthy region's record out of rotation, but existing cached answers held by resolvers worldwide keep sending traffic there until their TTL expires — DNS failover is not instant."
+  - "DNS load balancing only distributes which server a client starts talking to; it has no visibility into an individual connection afterward, so pair it with a real load balancer or anycast for per-request steering within a region."
+  - "Weighted round-robin DNS is good for coarse-grained canary rollouts (e.g. 5% of traffic to a new region) but resolver-side caching means the actual split seen by end users is noisier than the configured weights."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson covered how a single DNS lookup resolves a name to an IP address, step by step. That mechanism alone doesn't explain why DNS shows up constantly in system design interviews and in real production incident reviews. The reason is that two side effects of how DNS works — aggressive caching and the ability to hand different clients different answers to the same question — turn a naming system into a cheap, global load balancer and failover switch. When someone asks "how do you route users to the nearest data center?" or "how do you take a broken region out of rotation without a code deploy," DNS is usually the first layer of the answer, and it's also the layer most people get wrong under interview pressure because they assume it reacts instantly. It doesn't, and understanding why is the point of this lesson.
+
+## Caching: why DNS resolution is fast at scale
+
+Every DNS record carries a **TTL (time-to-live)**, in seconds, telling any resolver how long it may reuse a cached answer before asking again. This is what keeps the DNS hierarchy from collapsing under load: without caching, every single HTTP request anywhere would trigger a fresh root-to-authoritative walk. With caching, a busy ISP resolver answers millions of lookups for popular domains straight from memory, and your authoritative servers only see a trickle of "cache expired, please refresh" queries.
+
+Caching happens at multiple layers, each with its own effective TTL:
+
+- **OS / stub resolver cache** — the client machine itself, often for seconds to minutes.
+- **Recursive resolver cache** — the ISP or public resolver (like a major cloud DNS provider), typically the layer doing the most caching work since it's shared across thousands of clients.
+- **Application-level cache** — some HTTP clients and connection pools cache a resolved IP for the lifetime of a connection or pool, independent of the DNS TTL, which can outlast the DNS record's own expiry.
+
+TTL is a direct tradeoff you control as the record owner. A 24-hour TTL means resolvers barely bother you and clients get answers instantly from cache — but if you need to move traffic away from a failing server, it takes up to 24 hours for the world's caches to notice. A 30-second TTL means you can redirect traffic in under a minute, but every resolver has to re-query far more often, pushing real query volume onto your authoritative DNS infrastructure.
+
+### Negative caching
+
+DNS also caches the absence of an answer. If a name doesn't exist (`NXDOMAIN`) or exists but has no record of the requested type (`NODATA`), resolvers cache that negative result too — controlled by the **minimum TTL field in the zone's SOA record**, not by any individual record's TTL. This matters operationally: if a domain is briefly misconfigured and returns NXDOMAIN, fixing the configuration doesn't immediately fix client experience — resolvers that already cached the negative answer keep returning "does not exist" until that negative-cache window expires.
+
+## Using DNS as a load balancer
+
+Because a resolver just returns whatever the authoritative server says, and nothing forces that answer to be the same for every asker, DNS becomes a natural place to steer traffic. Three common patterns:
+
+- **Round-robin DNS** — the simplest form: a name has multiple `A`/`AAAA` records, and the authoritative server rotates the order (or picks one) per query, spreading traffic roughly evenly across servers. It's coarse — it can't account for server load or health on its own — but it's nearly free to set up.
+- **Weighted records** — assign different proportions of answers to different targets, useful for canary releases (send 5% of resolutions to a new region's servers) or gradual migrations.
+- **GeoDNS / latency-based routing** — the authoritative server looks at *where the querying resolver is* and returns the IP of the nearest (or lowest-latency) data center. This is how a single hostname like `api.example.com` can send someone in Singapore to an APAC region and someone in Frankfurt to an EU region, without either client doing anything special.
+
+The catch with GeoDNS: it routes based on the **resolver's** location, not the end user's. Most of the time these are close (an ISP's resolver is near its subscribers), but a user manually configured to use a distant public resolver can get routed to a suboptimal region. Many DNS providers mitigate this with the EDNS Client Subnet extension, which lets a resolver forward a truncated version of the client's IP prefix to the authoritative server for a better routing decision — but it's opt-in, not universal.
+
+### Health checks and failover
+
+Authoritative DNS providers built for high availability run active health checks against each candidate endpoint (HTTP probes, TCP connects) every 10-30 seconds, and stop handing out records for anything unhealthy. This is real, useful automated failover — but it operates entirely at the "which IP do new lookups get" layer. It cannot pull an existing client away from a bad server it already connected to, and it cannot fix anything faster than the TTL lets caches expire. A 300-second TTL means an outage can keep sending a meaningful fraction of new traffic to a dead region for up to five minutes after the health check first detects the problem, purely because caches out in the world haven't refreshed yet.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    U1[User - Singapore] -->|query api.example.com| R1[Nearby Resolver]
+    U2[User - Frankfurt] -->|query api.example.com| R2[Nearby Resolver]
+    R1 -->|cache miss| AUTH[Authoritative DNS<br/>with health checks]
+    R2 -->|cache miss| AUTH
+    AUTH -->|nearest healthy region| APAC[APAC Region IP]
+    AUTH -->|nearest healthy region| EU[EU Region IP]
+    R1 -->|cached TTL seconds| U1
+    R2 -->|cached TTL seconds| U2
+`} />
+
+## Worked example: cutting over a failing region
+
+Say `checkout.example.com` currently resolves to a US-East region with a 3600-second (1 hour) TTL, and US-East starts failing. Here's how the timeline actually plays out:
+
+1. **T+0**: Your monitoring detects the failure. You update the DNS record to point only to US-West and EU regions.
+2. **T+0 to T+~3600s**: Any resolver that already cached the old US-East answer within the last hour keeps serving it, unaware anything changed, sending some fraction of users to a dead region for up to an hour.
+3. **New resolvers** (nothing cached yet) get the corrected answer immediately.
+
+If you'd set the TTL to 60 seconds ahead of time, step 2 would resolve in at most a minute instead of an hour — but you'd have been paying for roughly 60x more DNS query volume against that record the entire time leading up to the incident, for a benefit you only needed during the one hour it actually failed. This is exactly the tradeoff system design interviews probe: there's no free way to get "fast failover" and "low steady-state query load" simultaneously from TTL alone. The practical answer most production systems land on is a moderate TTL (60-300 seconds) for anything that's a realistic failover target, combined with a real load balancer or anycast layer *within* each region so DNS only needs to make the coarse "which region" decision, not the fine-grained "which of these 200 servers" decision.
+
+<Callout type="warning">
+  A common interview and on-call mistake: assuming that changing a DNS record is equivalent to an instant traffic cutover. It is not — every resolver that cached the previous answer keeps using it until its copy's TTL expires, and you cannot force-expire caches you don't control (other companies' resolvers, ISPs, end-user devices). If a failover plan depends on DNS changing behavior within seconds, either the TTL must already be short *before* the incident, or the traffic decision needs to live at a layer you fully control — a global load balancer, anycast IP, or client-side retry logic — not in a DNS record you only touch once you're already in the incident.
+</Callout>
+
+## Where DNS load balancing stops
+
+DNS-based routing decides which server (or region) a client's connection attempt is aimed at — it has no idea what happens after that. It can't rebalance an already-open connection, can't see per-request load, and can't do anything finer-grained than "which record did this particular resolver ask for." That's why production systems layer it: DNS/GeoDNS for coarse region selection, then a real load balancer (L4 or L7) or anycast routing once traffic lands in a region, handling the per-connection and per-request decisions DNS structurally can't make.
+
+## Quiz
+
+<Quiz
+  lessonId="dns-dns-in-system-design-caching-and-global-load-balancing"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A team wants to be able to redirect traffic away from a failing region within about a minute if an incident happens. What should they do ahead of time?',
+      options: [
+        { id: 'a', text: 'Keep the TTL on the record long (e.g. an hour) so resolvers cache efficiently, and just update the record during the incident', correct: false, explanation: 'A long TTL means resolvers that already cached the old answer keep using it for up to that TTL after you change the record - the change during the incident will not propagate in a minute.' },
+        { id: 'b', text: 'Lower the TTL on the record to something like 60 seconds well before any incident occurs', correct: true, explanation: 'TTL controls how long caches hold an answer before re-checking. It has to already be short before the incident, because you cannot retroactively shrink the TTL on answers already cached elsewhere.' },
+        { id: 'c', text: 'Add more A records to the domain so there are more servers to fail over to', correct: false, explanation: 'More records helps spread load across healthy servers but does not change how quickly caches notice a record change - that is purely a TTL question.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine limitations of DNS-based load balancing? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It cannot move an already-established client connection to a different server', correct: true, explanation: 'DNS only influences which IP a new lookup returns; it has no mechanism to affect a connection the client already opened.' },
+        { id: 'b', text: 'GeoDNS routes based on the resolver location, which is not always the same as the end user location', correct: true, explanation: 'This is a real gap - a user on a distant public resolver can get routed to a suboptimal region unless extensions like EDNS Client Subnet are used and supported.' },
+        { id: 'c', text: 'DNS cannot return different answers to different clients for the same name', correct: false, explanation: 'This is false - GeoDNS, weighted records, and round-robin all rely on returning different answers to different queries for the same name.' },
+        { id: 'd', text: 'DNS-based failover can take effect only after cached answers elsewhere expire', correct: true, explanation: 'Correct - health checks can update what the authoritative server hands out immediately, but caches holding an older answer will keep using it until their TTL runs out.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A negative DNS response (NXDOMAIN) for a misconfigured domain is controlled by the same TTL field as a normal successful answer for that record.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Negative caching duration comes from the minimum/negative-TTL field in the zone SOA record, not from an individual record’s own TTL.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct - negative responses are cached according to the SOA record’s negative-TTL setting, which is a separate, zone-wide value.' },
+      ],
+    },
+  ]}
+/>

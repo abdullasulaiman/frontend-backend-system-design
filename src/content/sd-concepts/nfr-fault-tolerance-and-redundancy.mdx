@@ -1,0 +1,239 @@
+---
+title: "Fault Tolerance and Redundancy"
+module: "Non-Functional Characteristics"
+moduleOrder: 4
+order: 5
+track: "concept"
+summary: "Explains how fault tolerance and redundancy let a system keep serving correct results while individual components fail, and the specific techniques (replication, failover, quorum, bulkheads) that get you there."
+tags: ["fault-tolerance", "redundancy", "replication", "failover", "resilience"]
+estMinutes: 12
+cheatsheet:
+  - "Fault tolerance is a design property (the system absorbs failures); availability/reliability are the measured outcomes of having it. Redundancy is the main mechanism you use to buy fault tolerance."
+  - "Active-active redundancy gives near-zero failover time but costs more and requires idempotent/conflict-aware writes; active-passive is cheaper but has a failover gap and a standby that can silently rot."
+  - "To tolerate `f` simultaneous failures with majority-quorum replication you need `2f + 1` replicas, not `f + 1` — a 3-node cluster tolerates exactly 1 failure, a 5-node cluster tolerates 2."
+  - "Redundant instances that share a rack, power feed, AZ, or network path aren't redundant against the failure that takes out that shared resource — spread replicas across real failure domains."
+  - "Bulkheads (isolating pools of threads/connections/capacity per dependency) stop one failing downstream from exhausting shared resources and taking the whole service down with it."
+  - "A failover path you haven't exercised recently is a hypothesis, not a capability — untested standbys and DR regions are the most common cause of failed failovers in real incidents."
+  - "Redundancy defends against failures you can enumerate; graceful degradation (shedding non-critical work) defends against the ones you can't."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every piece of hardware and every network link you depend on will eventually
+fail — a disk wears out, a process gets OOM-killed, a top-of-rack switch
+drops, a whole availability zone loses power. Fault tolerance is the design
+property that decides what happens next: does the system keep serving
+correct responses through the failure, or does the failure become an
+incident? Redundancy — having more than one of the thing that can fail — is
+the primary tool you reach for to get there, but simply "having two of
+something" is not the same as being fault tolerant, and this lesson is about
+the gap between those two ideas.
+
+This sits next to [Availability](/system-design/nfr-availability) and
+[Reliability and Durability](/system-design/nfr-reliability-and-durability) in
+this module for a reason: fault tolerance is the *mechanism*, and
+availability/reliability are the *measurements* you get when that mechanism
+works. A system can be highly available on paper and still fail badly the
+first time a real fault hits it, if the redundancy behind that number was
+never actually independent or never actually tested.
+
+## Fault, error, failure — and why the distinction matters
+
+A useful mental model borrowed from reliability engineering: a **fault** is
+the underlying defect (a bad disk sector, a bug), an **error** is the
+incorrect internal state it causes (a corrupted in-memory value, a stuck
+connection), and a **failure** is the externally visible consequence (the
+user gets a 500, or gets stale data). Fault tolerance means containing
+faults so they never escalate into errors, and containing errors so they
+never escalate into user-visible failures. Every redundancy technique below
+is really a strategy for cutting that escalation chain at a different link.
+
+## Redundancy patterns
+
+### Active-active
+
+Multiple instances handle live traffic simultaneously, and a load balancer
+or client-side router spreads requests across them. If one instance dies,
+the others absorb its share with no failover delay — the system was already
+running without it. The cost: every instance must be able to serve any
+request, which usually means shared or replicated state, and if that state
+is writable, you now have to reason about conflicting concurrent writes
+(see the consistency lesson later in this module for the trade-offs that
+creates).
+
+### Active-passive (hot / warm / cold standby)
+
+One instance (or region) serves traffic; one or more standbys sit ready to
+take over. They differ by how "ready":
+
+- **Hot standby** — already running, already has near-current data
+  (typically via continuous replication), can take over in seconds.
+- **Warm standby** — running but scaled down or with stale-ish data; needs
+  a short scale-up or catch-up before it's fully load-bearing.
+- **Cold standby** — infrastructure defined but not running; provisioning
+  from scratch takes minutes to hours.
+
+Active-passive is cheaper than active-active (the standby isn't burning
+full capacity for nothing), but it introduces a **failover gap** — the time
+between the primary failing and the standby serving traffic — during which
+you're down or degraded. That gap is driven by detection time plus promotion
+time, both of which you should measure, not assume.
+
+### N+1, N+2, and quorum math
+
+"N+1 redundancy" means running one more unit than the minimum needed to
+handle load, so a single failure doesn't cause an overload cascade in the
+survivors. This is simple capacity headroom, not consensus.
+
+It's different from **quorum-based** replication, where a write (or read)
+must be acknowledged by a majority of replicas before it counts as durable.
+To tolerate `f` simultaneous replica failures under majority quorum you need
+`2f + 1` replicas — a 3-node group tolerates exactly 1 failure (2 of 3 still
+form a majority), a 5-node group tolerates 2. People often assume "3
+replicas means I can lose 2 and be fine" — you can't, under majority quorum,
+without losing write availability.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph AZ1["Availability Zone 1"]
+      P["Primary\n(serving traffic)"]
+    end
+    subgraph AZ2["Availability Zone 2"]
+      S1["Hot standby\n(replicating)"]
+    end
+    subgraph AZ3["Availability Zone 3"]
+      S2["Hot standby\n(replicating)"]
+    end
+    LB["Load balancer / router"] --> P
+    P -. async or quorum replication .-> S1
+    P -. async or quorum replication .-> S2
+    P -- "health check fails" --> D["Failure detector"]
+    D -- "promote" --> S1
+    S1 -. "becomes primary" .-> LB
+`} />
+
+## Failure detection and failover mechanics
+
+Redundancy only helps if the system notices a failure and reacts fast
+enough. That's usually built from:
+
+- **Health checks / heartbeats** — a liveness probe polled on an interval;
+  miss `k` consecutive checks and the instance is marked down. Too
+  aggressive a threshold causes flapping on transient blips; too lenient
+  extends your failover gap.
+- **Consensus on "who's primary"** — in active-passive setups, something
+  (a coordination service like a Raft/Paxos-backed store, or a managed
+  control plane) has to agree on promotion so you don't get two nodes
+  both believing they're primary at once — a **split-brain** scenario that
+  can cause divergent, unreconcilable writes.
+- **Client-side retries and backoff** — the requesting side needs to detect
+  a failed call and retry against a healthy replica, ideally with jitter so
+  a mass failure doesn't produce a synchronized retry storm against the
+  survivors.
+
+## Bulkheads and blast radius
+
+Redundancy at the instance level doesn't help if a single failing dependency
+can exhaust a resource pool shared by everything else — one slow downstream
+call holding every thread in a shared pool starves unrelated requests too.
+**Bulkheading** (named for ship compartments that stop one hull breach from
+sinking the whole vessel) means giving each dependency its own bounded pool
+of threads, connections, or concurrency budget, so a failure in one is
+contained to the requests that actually needed it. Combine this with
+timeouts and circuit breakers and a failing dependency degrades one feature
+instead of taking down the service.
+
+## Worked example: sizing redundancy for a payment-authorization service
+
+Say you run a payment-authorization service that must keep authorizing
+transactions even if an entire AWS availability zone goes dark, and you
+want to tolerate one full AZ loss without dropping write availability.
+
+- **Compute**: run active-active behind a load balancer across 3 AZs, sized
+  at N+1 per AZ so that losing one AZ's third of capacity still leaves the
+  remaining two-thirds able to absorb the full load (this is capacity
+  headroom, decided by your peak QPS and per-instance throughput).
+- **Data**: use a replicated store with 5 replicas spread one-per-AZ across
+  3 AZs (at least two AZs hosting 2 each), using majority-quorum writes.
+  With `2f + 1 = 5`, you tolerate 2 simultaneous replica failures — enough
+  to survive a full AZ loss (2 replicas) plus one unrelated node failure
+  elsewhere, while still having a majority (3 of 5) to accept writes.
+- **Failover time budget**: if your health checks flag a dead node after 3
+  missed 5-second heartbeats (15s) and promotion/re-routing takes another
+  10s, your realistic failover gap is ~25s — that number, not "we have
+  redundancy," is what you'd quote in an interview or a postmortem.
+
+<Callout type="warning">
+  The most common redundancy mistake isn't skipping redundancy — it's
+  redundancy that isn't actually independent. Two "redundant" app servers
+  plugged into the same power strip, two database replicas in the same
+  rack, or a disaster-recovery region that's never been failed over to in
+  practice are all single points of failure wearing a fault-tolerant
+  costume. Draw out your actual failure domains (rack, AZ, region, cloud
+  account, DNS provider, certificate authority) and check that your
+  redundant copies don't share one, and periodically exercise the failover
+  path for real — a standby you've never promoted is a hypothesis, not a
+  capability.
+</Callout>
+
+## Graceful degradation: the fallback for the unenumerated case
+
+Redundancy defends against failures you anticipated and built extra
+capacity for. It can't cover every failure mode you didn't think of. The
+complementary technique is **graceful degradation** — designing the system
+so that when things go wrong in an unanticipated way, it sheds non-critical
+work and keeps the core function alive rather than failing everything at
+once. A product page that can't reach the recommendations service should
+render without recommendations, not 500 the whole page. This is cheaper
+than redundancy (no extra replicas needed) and catches failures that
+redundancy, by definition, wasn't built to anticipate.
+
+<Quiz
+  lessonId="nfr-fault-tolerance-and-redundancy"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A replicated data store uses majority-quorum writes across 5 replicas. How many simultaneous replica failures can it tolerate while still accepting writes?',
+      options: [
+        { id: 'a', text: '4', correct: false, explanation: 'That would leave only 1 replica, which cannot form a majority of 5 (needs 3).' },
+        { id: 'b', text: '2', correct: true, explanation: 'With 5 replicas, a majority is 3. Losing 2 still leaves 3 available to form quorum — the formula is 2f + 1, so f = 2 for 5 replicas.' },
+        { id: 'c', text: '1', correct: false, explanation: 'That underestimates it — 5 replicas under majority quorum tolerate 2 failures, not 1 (that would be the case for a 3-replica group).' },
+        { id: 'd', text: '5', correct: false, explanation: 'Losing all 5 leaves nothing to form a majority — quorum systems cannot tolerate every replica failing.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these actually reduce a failover gap or the blast radius of a failure? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Bulkheading a slow downstream dependency into its own bounded connection pool', correct: true, explanation: 'This stops one failing dependency from exhausting a resource pool shared by unrelated requests, containing the blast radius.' },
+        { id: 'b', text: 'Running two "redundant" replicas in the same rack on the same power feed', correct: false, explanation: 'This is a single point of failure in disguise — a rack or power failure takes out both replicas at once, so it does not actually reduce risk.' },
+        { id: 'c', text: 'Lowering the health-check miss threshold from 10 consecutive misses to 3, with an appropriate interval', correct: true, explanation: 'Detecting failure sooner (without causing flapping) directly shortens the failover gap, since promotion cannot start until failure is detected.' },
+        { id: 'd', text: 'Adding more read replicas to a store that already has enough for its read load', correct: false, explanation: 'Extra read capacity does not by itself change failover time or blast radius unless it also changes your failure-domain spread or quorum size.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Active-active redundancy generally has a shorter failover gap than active-passive redundancy, because there is no separate promotion step.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — in active-active, all instances are already serving traffic, so losing one just means the load balancer stops routing to it; there is no standby to detect failure, promote, and warm up.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Active-active removes the detect-then-promote sequence that active-passive requires, which is precisely why its failover gap is typically shorter.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A product page fails to reach its recommendations service but still renders the rest of the page normally, without recommendations. What technique is this?',
+      options: [
+        { id: 'a', text: 'Graceful degradation', correct: true, explanation: 'Shedding a non-critical feature while keeping the core page functional is the definition of graceful degradation — it handles failure modes that redundancy was never specifically built for.' },
+        { id: 'b', text: 'Active-active redundancy', correct: false, explanation: 'This scenario has no mention of a second instance serving traffic simultaneously — it is about the page tolerating a missing feature, not routing across duplicate capacity.' },
+        { id: 'c', text: 'Quorum replication', correct: false, explanation: 'Quorum replication is about acknowledging writes across a majority of data replicas, unrelated to a page rendering without an optional widget.' },
+      ],
+    },
+  ]}
+/>

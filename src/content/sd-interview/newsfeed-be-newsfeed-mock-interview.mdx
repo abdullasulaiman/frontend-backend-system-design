@@ -1,0 +1,220 @@
+---
+title: "Newsfeed: Mock Interview"
+module: "Design a Newsfeed System"
+moduleOrder: 7
+order: 2
+track: "interview"
+summary: "A timed mock-interview exercise that runs the full newsfeed design end to end, from requirements through fan-out and ranking trade-offs, against a scoring rubric."
+tags: ["mock-interview", "newsfeed", "fan-out", "ranking", "feed-generation"]
+estMinutes: 14
+cheatsheet:
+  - "Open by pinning down feed type (chronological vs. ranked), real-time expectations, and whether celebrities/high-fanout accounts are in scope — these three answers reshape the whole architecture."
+  - "State the fan-out trade-off explicitly: fan-out-on-write is fast to read but breaks down for accounts with millions of followers; fan-out-on-read avoids that but makes every feed load expensive. Most production systems use both, split by follower count."
+  - "Size the write amplification, not just storage: one post from a 10-million-follower account times a naive fan-out-on-write is 10 million feed-list writes for a single post."
+  - "Ranking and generation are separable concerns — candidate generation narrows a huge pool cheaply, a ranking pass scores the smaller candidate set. Don't design one giant service that does both in one step."
+  - "Freshness is allowed to be eventually consistent (a feed that's a few seconds or minutes stale is fine); the underlying post store and follow graph are not — losing a post or a follow edge is a real failure, not just a UX blip."
+  - "Budget your talk time up front and say so out loud — interviewers read silent time-management as much as they read the design itself."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+import MockInterview from '../../components/MockInterview';
+
+The previous lesson in this module walked through designing a newsfeed
+system piece by piece: requirements, data model, fan-out strategy, and
+ranking. That's how you *learn* the material. It is not how an interview
+actually goes — in a real 45-minute session nobody hands you the pieces in
+order, nobody tells you when to move from requirements to architecture, and
+nobody stops you from burning 20 minutes on a diagram that doesn't matter.
+This lesson is that pressure test: one prompt, one clock, one rubric, no
+scaffolding.
+
+Treat it like the real thing. Set a timer, talk out loud or write your
+reasoning as you go, and only look at the rubric after you've made an
+honest attempt. The value of a mock interview evaporates if you peek early.
+
+## Why a dedicated mock-interview pass matters
+
+Knowing the concepts and performing them under time pressure are different
+skills. A newsfeed prompt is popular specifically because it rewards
+structure: it has enough moving parts (post storage, follow graph, fan-out,
+ranking, delivery) that a candidate who dives straight into whiteboarding
+microservices without first agreeing scope with the interviewer will run
+out of time before reaching the parts that actually differentiate a strong
+answer — the fan-out trade-off and the ranking pipeline.
+
+The goal of this run-through is to practice the *shape* of a good answer,
+not just recall the facts: clarify, size, design broad-to-narrow, deep-dive
+on the one or two hardest problems, then discuss trade-offs and failure
+modes. That shape transfers to almost every system design prompt you'll
+get, not just this one.
+
+## Suggested time budget
+
+A realistic 45-minute slot:
+
+- **5 min** — clarify requirements: ranked or chronological feed, real-time
+  push or pull-on-refresh, whether "celebrity" accounts with huge follower
+  counts are in scope, read-heavy vs. write-heavy assumption.
+- **5 min** — back-of-envelope estimate: daily active users, posts per day,
+  average follower count, read:write ratio.
+- **15 min** — high-level architecture: post service, follow-graph service,
+  fan-out/feed-assembly path, ranking service, delivery to the client.
+- **12 min** — deep dive on the fan-out strategy for high-follower accounts
+  and how ranking fits into feed assembly — this is where most candidates
+  either shine or stall.
+- **remaining time** — trade-offs, consistency model, and at least one
+  failure mode (a fan-out worker falling behind, a celebrity post going
+  viral, a follow-graph write racing a feed read).
+
+## The core architectural decision: where does fan-out happen?
+
+Almost every newsfeed design question converges on the same fork in the
+road, so it's worth having a crisp mental model of it before you sit the
+real interview.
+
+**Fan-out-on-write** (push model): when a user posts, a worker immediately
+writes that post's ID into the precomputed feed list of every follower.
+Reading a feed is then a cheap lookup of an already-assembled list. This is
+fast for readers but the write cost scales with follower count — a post
+from an account with 10 million followers means 10 million writes, and
+those writes have to land before the post is "in" everyone's feed.
+
+**Fan-out-on-read** (pull model): nothing happens at post time beyond
+saving the post itself. When a user opens their feed, the service fetches
+recent posts from everyone they follow and merges them on the fly. Writes
+stay cheap and constant-cost regardless of follower count, but every feed
+read now does real work proportional to how many people that user follows.
+
+Production systems almost always use a **hybrid**: fan-out-on-write for
+the common case (accounts with a normal follower count), and
+fan-out-on-read for a small set of very-high-follower accounts, merging
+the pulled results into the recipient's read path at request time. Naming
+this hybrid unprompted, and explaining *why* the split exists, is one of
+the highest-signal things you can do in this exercise.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    A[User creates post] --> B{Author's follower count}
+    B -->|Normal account| C[Fan-out worker pushes post ID to follower feed lists]
+    B -->|High-follower celebrity account| D[Post stored, no fan-out]
+    C --> E[Feed Service]
+    D --> E
+    E --> F[On feed read: merge precomputed list + pulled celebrity posts]
+    F --> G[Ranking pass scores merged candidates]
+    G --> H[Client receives ordered feed page]
+`} />
+
+A few points worth stating explicitly if the interviewer probes this
+diagram:
+
+- **Ranking happens after fan-out, not instead of it.** Fan-out decides
+  *which posts are candidates*; ranking decides *what order they appear
+  in*. Conflating the two into one step is a common design smell.
+- **The fan-out worker is asynchronous and can lag.** A design that
+  requires fan-out to complete synchronously before the post "exists"
+  couples post latency to follower count, which defeats the point of the
+  push model.
+- **Feed staleness of a few seconds is an acceptable trade**, but losing
+  the underlying post or a follow-graph edge is not. Say this distinction
+  out loud — it shows you understand which parts of the system tolerate
+  eventual consistency and which don't.
+
+## Worked example: sizing the fan-out problem
+
+Say the product has 100 million daily active users, posting an average of
+2 posts per user per day, with an average follower count of 300. That's
+200 million posts a day generating, at 300 followers each, roughly 60
+billion feed-list writes a day from fan-out-on-write alone — about 700,000
+writes per second sustained, well before accounting for peak multipliers.
+
+Now isolate the tail: if 0.01% of those 100 million users are
+"celebrity"-tier accounts averaging 5 million followers each, that's
+10,000 accounts. Even one post per day from each of those, fanned out
+naively, adds 10,000 times 5 million, or 50 billion additional writes a
+day — comparable to the entire rest of the platform's fan-out volume from
+a tiny sliver of accounts. That's the concrete number that justifies
+routing celebrity accounts to a fan-out-on-read path instead: without the
+split, a handful of accounts would dominate total write load.
+
+<Callout type="interview">
+  A common mistake in this exercise is treating "how do we scale the
+  database" as the hard problem and racing to talk about sharding and
+  replication. The database layer is largely a solved, standard problem
+  once you've chosen a data model — the interviewer already expects you
+  know how to shard a table. The actual hard problem, and where this
+  prompt wants your attention, is the fan-out strategy and how ranking
+  interacts with it. Spend your deep-dive minutes there, not on generic
+  database scaling advice you could give for any system.
+</Callout>
+
+## Run the mock interview
+
+Set a timer for about 40-45 minutes. Read the prompt once, jot a quick
+plan, then talk through it end to end: clarify, estimate, design,
+deep-dive, discuss trade-offs. Only open the rubric once you've finished
+or the clock runs out.
+
+<MockInterview
+  lessonId="newsfeed-be-newsfeed-mock-interview"
+  client:visible
+  prompt="Design the backend for a generic social newsfeed, similar to what you'd see on a platform like Twitter/X or Instagram's home feed: users follow other users, create posts, and see a feed aggregating posts from everyone they follow, refreshed as new posts arrive. Cover requirements and scale, the data model, the fan-out strategy for delivering new posts into feeds, how ranking fits into feed assembly, and at least one failure mode or edge case (a fan-out worker falling behind, a viral post from a high-follower account, or a follow-graph change racing a feed read)."
+  rubric={[
+    { point: 'Clarifies requirements and scope first', detail: 'Asks whether the feed is chronological or ranked, whether celebrity/high-follower accounts need special handling, and the expected read:write ratio, before drawing any boxes.' },
+    { point: 'Produces a reasonable capacity estimate', detail: 'Derives posts/day, average fan-out writes per post, and read QPS from stated DAU and follower assumptions, and calls out that the numbers - not intuition - justify later design choices.' },
+    { point: 'Names and justifies the fan-out strategy', detail: 'Explains fan-out-on-write vs. fan-out-on-read, states their respective cost profiles, and proposes a hybrid split (e.g. by follower-count threshold) rather than picking just one for every account.' },
+    { point: 'Separates feed assembly from ranking', detail: 'Treats candidate collection (via fan-out) and scoring/ordering (ranking) as distinct pipeline stages rather than one combined step, and explains what ranking optimizes for.' },
+    { point: 'Reasons about consistency and staleness explicitly', detail: 'States which parts of the system can be eventually consistent (feed contents, ranking freshness) versus which must not lose data (the post store, the follow graph), rather than treating the whole system as one consistency model.' },
+    { point: 'Handles at least one concrete failure mode', detail: 'Walks through what happens when a fan-out worker lags behind, a single post goes viral and floods normal fan-out paths, or a follow/unfollow races a feed read - and proposes a concrete mitigation, not just "add more workers".' },
+  ]}
+/>
+
+<Quiz
+  lessonId="newsfeed-be-newsfeed-mock-interview"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why do most production newsfeed systems use a hybrid of fan-out-on-write and fan-out-on-read instead of picking just one?',
+      options: [
+        { id: 'a', text: 'Fan-out-on-write is deprecated technology that no modern system uses', correct: false, explanation: 'Fan-out-on-write is still the standard approach for the vast majority of accounts; it is not deprecated, just insufficient on its own for extreme-follower-count accounts.' },
+        { id: 'b', text: 'Fan-out-on-write scales poorly for accounts with huge follower counts, so those accounts are handled with fan-out-on-read instead', correct: true, explanation: 'A post from a multi-million-follower account would require millions of feed-list writes under pure fan-out-on-write; routing just those accounts to a pull-based read path avoids that write spike.' },
+        { id: 'c', text: 'Fan-out-on-read is always faster for every account regardless of follower count', correct: false, explanation: 'Fan-out-on-read is slower per feed read for typical accounts since it does work at read time; it is only preferable for the small set of accounts where write-time fan-out would be too expensive.' },
+        { id: 'd', text: 'Ranking requires fan-out-on-read to function at all', correct: false, explanation: 'Ranking operates on whatever candidate set fan-out produces, whether that set came from a push or pull path - it does not require one specific fan-out strategy.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these should stay strongly consistent (no data loss tolerated) in a newsfeed system, even though the feed itself can be eventually consistent? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The underlying post store', correct: true, explanation: 'Losing a post the author actually created is a real data-loss failure, unlike a feed simply being a few seconds stale.' },
+        { id: 'b', text: 'The follow graph (who follows whom)', correct: true, explanation: 'A lost or corrupted follow edge silently breaks feed delivery for that relationship; this needs durable, consistent storage even if feed reads themselves tolerate staleness.' },
+        { id: 'c', text: 'The exact ordering of posts within a single feed page load', correct: false, explanation: 'Ranking order is a UX and relevance concern, not a correctness one - a slightly different order on retry is not data loss.' },
+        { id: 'd', text: 'The precomputed feed list cache used for fast reads', correct: false, explanation: 'The feed list is a derived, rebuildable cache of candidates; it can lag or be regenerated from the post store and follow graph without permanent data loss.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In a well-designed newsfeed pipeline, the fan-out step and the ranking step are the same operation performed once per post.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Fan-out determines which posts are candidates for a given feed; ranking is a separate scoring/ordering pass applied to that candidate set at (or near) read time. Merging them into one step makes it hard to change ranking logic without redoing fan-out.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct - fan-out (write-time push or read-time pull) produces the candidate pool, and ranking is a distinct stage that scores and orders that pool, typically closer to read time so it can reflect the freshest signals.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A single post from an account with 8 million followers is about to be fanned out. What is the main risk of handling it identically to a normal 300-follower post?',
+      options: [
+        { id: 'a', text: 'The post itself will be stored with lower durability guarantees', correct: false, explanation: 'Storage durability for the post is independent of follower count; this is not the risk that scales with follower count.' },
+        { id: 'b', text: 'It creates a write spike of millions of feed-list updates from a single event, which can overwhelm fan-out workers and delay delivery for everyone', correct: true, explanation: 'Fan-out-on-write cost scales with follower count, so one viral post from a huge account can generate a disproportionate burst of writes that backs up the queue for unrelated posts too.' },
+        { id: 'c', text: 'The follow graph will become inconsistent', correct: false, explanation: 'Fanning out a post does not modify the follow graph; the follow graph is a separate data structure updated only by follow/unfollow actions.' },
+        { id: 'd', text: 'Ranking will be unable to score the post', correct: false, explanation: 'Ranking scores whatever candidates reach it regardless of the fan-out volume that produced them; it is not blocked by a large fan-out.' },
+      ],
+    },
+  ]}
+/>

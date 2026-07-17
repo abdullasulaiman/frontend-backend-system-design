@@ -1,0 +1,217 @@
+---
+title: "Scaling"
+module: "Design Quora"
+moduleOrder: 2
+order: 5
+track: "interview"
+summary: "Covers how a Quora-style Q&A platform scales its read-heavy question/answer traffic, write-heavy voting and ranking pipelines, and search index as usage grows past a single database."
+tags: ["scalability", "caching", "sharding", "system-design", "read-heavy"]
+estMinutes: 13
+cheatsheet:
+  - "Quora's traffic is overwhelmingly read-heavy (question and answer pages) with a much smaller but very bursty write path (votes, answers, edits) — scale the two independently."
+  - "Cache rendered question pages and hot answer lists at the edge/CDN and in an application cache; invalidate on new answer or edit, not on every vote."
+  - "Shard questions and answers by question ID so all answers to a question live together — this keeps the common 'load a question's answer thread' query a single-shard read."
+  - "Votes are the highest-QPS write; batch and aggregate them asynchronously through a queue instead of updating a hot vote-count row synchronously on every request."
+  - "Fan-out ranking work (recomputing an answer's rank on a question) to a background job, not the request path — a vote should return fast even if re-ranking happens a second later."
+  - "Search (full-text over questions) belongs in a dedicated index like an inverted-index search service, not as `LIKE` queries against the primary database."
+  - "Celebrity questions (a viral question attracting thousands of answers and votes per minute) are the classic hot-shard/hot-key case — plan a read-replica or cache-only path for them before they happen."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+By this point in the interview you've nailed the requirements, sketched a
+high-level design, defined the data model and API, and worked through how
+answers get ranked into a feed. The last thing an interviewer wants to see
+is whether you understand what breaks first as traffic grows, and how you'd
+fix it — not by waving at "add more servers," but by naming the specific
+bottleneck and the specific technique that relieves it. Quora-style
+platforms have a distinctive traffic shape (huge read volume, a much smaller
+but spiky write volume, and a ranking layer that recomputes constantly) and
+that shape drives every scaling decision below.
+
+## Start from the read/write asymmetry
+
+A question page might get viewed thousands of times for every one new
+answer or vote it receives. That asymmetry is the single most important
+fact for this system, because it means:
+
+- **Reads should be served almost entirely from cache**, not the primary
+  database. A popular question's rendered answer list barely changes
+  minute to minute even while votes trickle in.
+- **Writes are rare relative to reads but need care anyway**, because votes
+  and new answers are exactly what makes a question's cached view stale,
+  and a single viral question can generate a write spike that dwarfs its
+  normal rate.
+
+Treat the read path and the write path as two problems with different
+scaling levers, the same way the ranking lesson treated scoring and
+retrieval as separate concerns.
+
+## Scaling the read path
+
+**CDN and edge caching.** Question pages for anonymous or logged-out
+traffic (a huge share of Quora's actual load, since most visitors arrive
+from search engines) can be cached at the CDN almost like static content,
+with a short TTL or invalidation on new answers.
+
+**Application-level caching.** For logged-in views that need
+personalization (has this user upvoted this answer, is this a followed
+topic), cache the expensive, shared part — the ranked answer list and
+answer bodies — in something like Redis, and layer per-user state on top
+at render time. This avoids recomputing ranking or re-fetching answer text
+per user.
+
+**Read replicas.** The primary database should take writes and a small
+slice of strongly-consistent reads (e.g. "did my vote register"); the bulk
+of read traffic — question search results, related questions, a user's
+answer history — goes to read replicas that can lag by a second or two
+without anyone noticing.
+
+**Sharding for scale beyond one database.** Once a single primary can't
+hold the write throughput or data volume, shard by question ID (or a hash
+of it). This keeps the most common query — "give me all answers to
+question X" — inside one shard instead of scattering it across the
+cluster. Sharding by answer ID instead would scatter every question's
+answers randomly and turn every page load into a scatter-gather query,
+which is worse for both latency and cost.
+
+## Scaling the write path
+
+Votes are the write you'll get asked about most, because they look
+deceptively simple ("just increment a counter") but at scale they're a hot
+row problem: a viral question can receive hundreds of votes per second on
+the same answer, and updating one row that fast serializes writes and
+creates lock contention.
+
+The fix is to decouple "the vote happened" from "the count is updated":
+
+1. The vote request appends an event (`answer_id`, `user_id`, `direction`,
+   `timestamp`) to a queue and returns immediately — the user sees their
+   vote register in the UI optimistically.
+2. A stream consumer aggregates vote events per answer over a short window
+   (say, one second) and applies a single batched increment to the
+   database instead of one write per vote.
+3. The same consumer (or a downstream one) triggers re-ranking for the
+   affected question, recomputing scores using the scoring function from
+   the ranking lesson, asynchronously rather than on the request path.
+
+This turns an O(votes) write rate against the database into an O(unique
+answers touched per window) write rate — a huge reduction under a traffic
+spike, at the cost of the displayed vote count lagging real time by up to
+a window's worth of delay, which is an acceptable trade for a vote counter.
+
+New answers and edits are lower volume than votes, so they can usually hit
+the primary directly — but should still invalidate the relevant cache
+entries (the question's answer list, any feed entries referencing it)
+rather than let stale reads linger.
+
+## Scaling search
+
+Full-text search over millions of questions doesn't belong in the primary
+relational store — pattern-matching queries against a large text column
+don't use indexes well and will bring a shared database to its knees under
+concurrent search load. Route search through a dedicated inverted-index
+search service (the kind of role Elasticsearch or a similar system plays),
+fed by a change stream from the primary database so the index stays
+eventually consistent with new/edited questions. Search traffic then scales
+independently, and a spike in search load never competes with vote or
+answer writes for the same database connections.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    Client[Client] --> Edge[CDN / Edge Cache]
+    Edge -->|cache miss| API[API Layer]
+    API -->|read| AppCache[Redis: ranked answers, hot pages]
+    API -->|read replica| ReplicaDB[(Read Replicas)]
+    API -->|vote write| Queue[Vote Event Queue]
+    API -->|search| SearchIdx[(Search Index)]
+    Queue --> Aggregator[Batch Aggregator]
+    Aggregator -->|batched update| PrimaryDB[(Primary DB, sharded by question_id)]
+    Aggregator -->|trigger| Ranker[Async Re-ranking Job]
+    Ranker --> AppCache
+    PrimaryDB -->|change stream| SearchIdx
+    PrimaryDB --> ReplicaDB
+`} />
+
+## Worked example: a question goes viral
+
+Suppose a question sits quietly at 20 answers and a few hundred views a
+day, then gets linked from a large social feed. Within minutes it's
+getting 5,000 views/second and 200 new votes/second across its answers.
+
+Without the design above, every view would hit the primary database to
+fetch and re-rank the answer list, and every vote would update a row
+directly — the primary would fall over well before 200 votes/second, since
+that's 200 serialized writes/second to a handful of hot rows plus lock
+contention from concurrent readers.
+
+With it: the first few requests populate the CDN and Redis cache with the
+current ranked list; the next 4,999 views/second on that question are
+served from cache with no database hit at all. Votes flow into the queue
+and get aggregated — instead of 200 writes/second, the aggregator issues
+maybe 5-10 batched updates/second (one per unique answer receiving votes),
+each updating one row once with a summed delta. Re-ranking runs once per
+aggregation window, not once per vote, and pushes a refreshed ranked list
+into the cache that the next viewer's cache-hit request picks up. The
+primary database's load barely moves; the system that scaled is the cache
+and queue layer in front of it.
+
+<Callout type="warning">
+  A common mistake: treating "add a cache" as the whole answer without
+  thinking through invalidation. If you cache a question's ranked answer
+  list but invalidate it on every vote, you've reintroduced the exact
+  write-amplification problem caching was meant to solve — a hot question
+  would invalidate its own cache entry hundreds of times a second, forcing
+  a full recompute-and-repopulate on nearly every read. Invalidate (or
+  refresh) on the aggregation/re-ranking cadence instead — every second or
+  few seconds — not on each individual vote event.
+</Callout>
+
+<Quiz
+  lessonId="quora-scaling"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'When sharding questions and answers for a Quora-style platform, which sharding key keeps the common "load all answers for a question" query within a single shard?',
+      options: [
+        { id: 'a', text: 'Shard by question_id', correct: true, explanation: 'Sharding by question_id keeps every answer to the same question in the same shard, so fetching a question\'s full answer thread is a single-shard read.' },
+        { id: 'b', text: 'Shard by answer_id', correct: false, explanation: 'Sharding by answer_id scatters a single question\'s answers randomly across shards, turning a common read into a scatter-gather query across the cluster.' },
+        { id: 'c', text: 'Shard by user_id of the answerer', correct: false, explanation: 'This would group each user\'s answers together, not a question\'s answers, which does not help the page-load query and still scatters a question\'s answer thread.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which techniques reduce write pressure from a burst of votes on a viral answer? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Queue vote events and aggregate them into batched database updates', correct: true, explanation: 'Batching turns many small writes into far fewer, larger updates, which is exactly what relieves hot-row contention.' },
+        { id: 'b', text: 'Recompute the answer\'s rank synchronously on every vote request', correct: false, explanation: 'This adds work to the request path proportional to vote volume — the opposite of relieving write pressure; re-ranking should run asynchronously on a batch cadence.' },
+        { id: 'c', text: 'Run re-ranking as an asynchronous job triggered after an aggregation window', correct: true, explanation: 'Decoupling ranking from the individual vote request means ranking cost scales with aggregation windows, not raw vote count.' },
+        { id: 'd', text: 'Route every vote write directly to the primary database with no queue', correct: false, explanation: 'This is the naive approach that causes lock contention and serialized writes on hot rows during a spike — it is the problem, not the fix.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'It is a good practice to invalidate a question\'s cached answer list on every individual vote so the displayed count is always exact.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Invalidating on every vote reintroduces write amplification — a hot question could invalidate its cache hundreds of times a second, forcing constant recomputation.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Invalidate or refresh on the aggregation/re-ranking cadence (e.g. once per window) instead of per vote; a small display lag on vote counts is an acceptable trade-off.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why should full-text question search be routed to a dedicated search index rather than run as pattern-matching queries against the primary relational database?',
+      options: [
+        { id: 'a', text: 'The primary database cannot store text data at all', correct: false, explanation: 'Relational databases can absolutely store text columns; the issue is query efficiency and resource contention, not storage capability.' },
+        { id: 'b', text: 'Pattern-matching text queries scale poorly and would compete with vote/answer writes for the same database resources', correct: true, explanation: 'Full-text search needs index structures a relational primary is not built for, and running it there means search load contends with the transactional write path for the same connections and CPU.' },
+        { id: 'c', text: 'Search indexes are only needed once the platform exceeds a billion questions', correct: false, explanation: 'The scaling problem shows up well before that scale — any meaningful concurrent search load against unindexed text columns degrades a shared primary.' },
+      ],
+    },
+  ]}
+/>

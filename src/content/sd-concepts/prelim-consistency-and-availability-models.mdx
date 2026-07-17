@@ -1,0 +1,133 @@
+---
+title: "Consistency and Availability Models"
+module: "Preliminary Concepts"
+moduleOrder: 3
+order: 4
+track: "concept"
+summary: "Explains what consistency and availability actually mean in a distributed system, why CAP forces a choice only during a network partition, and how to reason about the spectrum between strong and eventual consistency."
+tags: ["consistency", "availability", "distributed-systems", "cap-theorem", "replication"]
+estMinutes: 13
+cheatsheet:
+  - "CAP only forces a trade-off during an actual network partition — the rest of the time a well-built system can be both consistent and available. The choice is 'what do we sacrifice when the network breaks,' not a permanent architectural stance."
+  - "Strong consistency (linearizability) means every read sees the latest completed write, system-wide, as if there were only one copy of the data. It costs coordination latency and reduced availability during faults."
+  - "Eventual consistency means replicas converge *given no new writes*, with no bound on when. It's cheap and highly available, but callers can observe stale or even out-of-order-looking data in the meantime."
+  - "Read-your-writes, monotonic reads, and bounded-staleness are 'consistency in between' — practical middle grounds that are usually what an interview answer should reach for, not the two textbook extremes."
+  - "PACELC extends CAP: even with no partition (E), you still trade Latency against Consistency. That trade-off is why every non-trivial distributed system has a consistency setting, not a single fixed answer."
+  - "Availability in CAP means 'every request that reaches a non-failed node gets a response' — it does not mean uptime, and it does not mean the response is correct."
+  - "Pick consistency per operation, not per system: a payment write wants strong consistency; a like-counter or a news feed usually doesn't need it and shouldn't pay for it."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every distributed system that replicates data — which is nearly all of them, since a single machine is a single point of failure — has to answer one question over and over: when a write happens on one node, what should a read on a different node see right now? Answer "the exact same thing, always" and you've committed to coordination that costs latency and can stall under failure. Answer "eventually the same thing, don't worry about right now" and you've bought speed and resilience at the cost of callers sometimes seeing stale or contradictory data. There's no universally correct answer — the right one depends on what the data is for — and naming the trade-off precisely is one of the most reliable signals of a strong system design interview answer.
+
+This lesson builds on the storage models from "Storage Fundamentals and Data Models" and sets up the replication and failure-handling lessons later in the course. Here the focus is the vocabulary and the theorem: what consistency and availability mean formally, what CAP actually claims (and the two things it's commonly misquoted as claiming), and where the practical middle ground lives.
+
+## Consistency: what a read is allowed to see
+
+"Consistency" gets used loosely, so pin down the strong end of the spectrum first. **Linearizability** (what most engineers mean by "strong consistency") means: once a write completes, every subsequent read — from any client, against any replica — returns that write's value or a later one. The system behaves as if there's exactly one copy of the data and every operation happens at some single, unambiguous instant. No stale reads, no reads racing ahead of each other in inconsistent orders.
+
+Achieving that requires coordination: a write generally can't be acknowledged as "done" until enough replicas agree they have it, and a read often has to check with a quorum of replicas (or a single elected leader) rather than trusting whatever a nearby replica happens to hold locally. That coordination is exactly where the latency and availability cost comes from — it's synchronous work on the critical path of every operation, and it needs enough of the system reachable to complete.
+
+**Eventual consistency** relaxes the guarantee: if writes stop, replicas will converge to the same value *eventually*, with no promise about how long that takes. In exchange, a read can be answered by whatever replica is closest or fastest, with no coordination at all. This is why a friend's comment can show up for you before it shows up for someone else refreshing the same page a moment later — both reads are "correct" under eventual consistency, they're just reading different points in an unsynchronized convergence process.
+
+### The useful middle ground
+
+Pure strong consistency and pure eventual consistency are the two ends of a spectrum, not the only two options. Interview answers that only know those two extremes miss the models that show up constantly in real systems:
+
+- **Read-your-writes**: a user always sees their own writes immediately, even if other users' reads might lag. Solves the classic "I just posted a comment and it disappeared" complaint cheaply, usually by routing a user's own reads to the replica (or leader) that just accepted their write.
+- **Monotonic reads**: once a client has seen a value, it never sees an older one on a later read — no "the count went from 10 to 12 back down to 10" flicker, even though other clients might still be behind.
+- **Bounded staleness**: replicas may lag, but never by more than some limit (e.g. 2 seconds or 100 writes) — useful when "eventually" alone isn't a strong enough SLA for the business.
+
+These are the answers that read as senior in an interview: naming that the feature needs read-your-writes, not "strong consistency" as a blanket requirement, shows you're picking the cheapest guarantee that actually satisfies the use case rather than defaulting to the most expensive one.
+
+## Availability: what it does and doesn't promise
+
+In the formal (CAP) sense, **availability** means every request that reaches a non-failed node receives a response — not an error, not a timeout, not silence. Two things this deliberately does *not* mean, because they trip people up:
+
+1. It doesn't mean the response is *correct* or *current* — an available system can hand back stale data and still satisfy the definition.
+2. It isn't the same as "high uptime" in the SRE/SLA sense. A system can be "available" per CAP (every reachable node answers something) while still having poor real-world uptime for other reasons — bad deploys, resource exhaustion, cascading retries. CAP-availability is specifically about *not refusing to answer during a partition*.
+
+## The CAP theorem, stated precisely
+
+CAP (Consistency, Availability, Partition tolerance) says: when a network partition occurs — some nodes can't talk to others — you must choose between staying consistent (nodes that can't confirm the latest write refuse to answer) and staying available (nodes answer anyway, possibly with stale data). You cannot have both *during that partition*.
+
+The most common misreading is "pick 2 of 3, forever." That's wrong for two reasons. First, partition tolerance isn't really optional to "give up" — any system whose nodes talk over a real network can experience a partition, so realistically you're always partition-tolerant; the actual choice is CP vs. AP. Second, and more importantly, the trade-off only applies *while a partition is happening*. Outside of a partition, a well-designed system can be fully consistent and fully available at the same time — CAP says nothing about the 99.9% of the time the network is behaving. The theorem is a statement about a specific failure mode, not a permanent identity for your architecture.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  P{Network partition\nbetween replicas?}
+  P -- No --> Both[System can be\nconsistent AND available]
+  P -- Yes --> Choice{On the minority side,\nwhat do you do?}
+  Choice -- Refuse / block --> CP[CP: stay consistent,\nlose availability there]
+  Choice -- Answer anyway --> AP[AP: stay available,\nrisk stale reads]
+`} />
+
+### PACELC: the trade-off that's always there
+
+CAP only covers the partition case, but there's a second trade-off that applies even when the network is perfectly healthy: **PACELC** — if Partitioned, choose Availability or Consistency; Else (normal operation), choose Latency or Consistency. Even with zero partitions, a system that wants strong consistency has to pay coordination latency on every write (and often every read), because confirming "everyone agrees" takes round trips. A system that wants low latency has to skip some of that coordination, which reintroduces staleness risk. This is why practically every replicated datastore ships a tunable consistency level (e.g. quorum reads/writes, read replicas with configurable lag) instead of a single hardcoded answer — the "else" branch of PACELC is live every single day, not just during rare partitions.
+
+## Worked example: designing a ride-hailing dispatch write path
+
+Say you're designing the backend for a ride-hailing app and need to decide the consistency model for two different writes:
+
+**Driver location updates** (published every few seconds): eventual consistency is not just acceptable here, it's correct. If a rider's map shows the driver's position from 2 seconds ago, nothing breaks — the next update corrects it. Forcing every location ping through a strongly consistent quorum write would add latency and load for a value that's already stale the moment it's replaced. This is an AP-leaning choice made deliberately, not a compromise.
+
+**"Accept this ride request"** (a driver claiming a trip): this needs strong consistency on the specific row being written. If two drivers tap "accept" within the same 50ms window, the system must guarantee exactly one of them wins — a race here means two drivers show up for one rider, or a phantom booking. This is worth the coordination cost of a consensus-backed write (e.g. a compare-and-swap through a single leader, or a quorum write with a strict ordering guarantee) because correctness here is the whole point of the feature.
+
+The lesson: consistency is a per-operation decision baked into the data model, not a single label you pin on "the database." A well-designed system mixes strongly consistent writes for the operations where correctness is the product, and eventually consistent writes for high-volume, low-stakes data — usually within the *same* system, sometimes even the same database with different consistency levels per query.
+
+<Callout type="warning">
+  A common interview mistake is treating "CAP theorem" as a slogan to recite ("we picked AP for availability") without saying what actually happens to the user during a partition. That's not an answer — it's a label. State the concrete behavior: which requests get rejected or delayed, what a client sees if it reads a stale replica, and how the system reconciles state once the partition heals (last-write-wins? vector clocks? manual conflict resolution?). Interviewers are listening for the mechanism, not the acronym.
+</Callout>
+
+<Quiz
+  lessonId="prelim-consistency-and-availability-models"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'According to the CAP theorem, when does a distributed system actually have to choose between consistency and availability?',
+      options: [
+        { id: 'a', text: 'At all times, as a fixed architectural property of the system', correct: false, explanation: 'This is the classic misreading. Outside of a partition, a system can be both consistent and available — CAP is silent about normal operation.' },
+        { id: 'b', text: 'Only during an active network partition between nodes', correct: true, explanation: 'CAP specifically describes what happens when a partition prevents nodes from confirming they agree — that is the only moment the trade-off is forced.' },
+        { id: 'c', text: 'Only when the system is under heavy read load', correct: false, explanation: 'Load affects latency and throughput, but CAP\'s forced trade-off is specifically about network partitions, not load.' },
+        { id: 'd', text: 'Never — CAP is a theoretical result with no practical bearing', correct: false, explanation: 'CAP has real practical bearing: it explains exactly what tunable "consistency level" settings in real databases are trading off during partitions.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are accurate descriptions of "availability" as CAP defines it? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Every request reaching a non-failed node gets a response', correct: true, explanation: 'This is exactly the CAP definition of availability.' },
+        { id: 'b', text: 'The response returned is guaranteed to reflect the most recent write', correct: false, explanation: 'That is a consistency guarantee, not an availability one. An available node can answer with stale data and still satisfy CAP-availability.' },
+        { id: 'c', text: 'It is the same thing as a high uptime SLA', correct: false, explanation: 'CAP-availability is narrowly about not refusing to answer during a partition. Real-world uptime also depends on things like deploys and capacity that CAP does not address.' },
+        { id: 'd', text: 'A node can satisfy it by responding with stale data instead of an error', correct: true, explanation: 'Correct — CAP-availability only requires a response, not a fresh one, which is exactly how AP systems stay available during a partition.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'mcq',
+      prompt: 'A ride-hailing app needs two different writes: streaming a driver\'s GPS location every few seconds, and recording which driver accepted a specific ride request. Which pairing best fits each?',
+      options: [
+        { id: 'a', text: 'Strong consistency for location updates, eventual consistency for ride acceptance', correct: false, explanation: 'This is backwards. Location updates tolerate staleness fine; ride acceptance needs a guaranteed single winner to avoid double-booking a trip.' },
+        { id: 'b', text: 'Eventual consistency for location updates, strong consistency for ride acceptance', correct: true, explanation: 'Correct — location pings are frequent and tolerate a couple of seconds of staleness, while ride acceptance is a rare, high-stakes write where a race condition causes a real-world double-booking.' },
+        { id: 'c', text: 'Strong consistency for both, since it is always the safer default', correct: false, explanation: 'Applying strong consistency everywhere adds coordination latency to the high-volume location updates for no correctness benefit — it is not "safer," just more expensive.' },
+        { id: 'd', text: 'Eventual consistency for both, since ride-hailing systems favor availability', correct: false, explanation: 'Favoring availability for location data does not mean every write in the system should — the ride-acceptance write specifically needs a correctness guarantee eventual consistency cannot provide.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'boolean',
+      prompt: 'Read-your-writes and bounded staleness are examples of consistency models that sit between strict linearizability and unbounded eventual consistency.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — both give stronger guarantees than plain eventual consistency (a specific promise about what a client will see) without paying for full linearizability across every client.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'These are exactly the practical middle-ground models the lesson describes — they are real, commonly used consistency levels, not a false dichotomy.' },
+      ],
+    },
+  ]}
+/>

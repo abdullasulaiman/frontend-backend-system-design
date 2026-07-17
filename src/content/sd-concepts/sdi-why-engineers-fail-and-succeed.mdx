@@ -1,0 +1,127 @@
+---
+title: "Why Engineers Fail and Succeed"
+module: "System Design Interviews"
+moduleOrder: 2
+order: 3
+track: "concept"
+summary: "Breaks down the recurring, predictable reasons candidates fail system design interviews and the habits that separate strong performances from weak ones."
+tags: ["system-design-interview", "interview-prep", "failure-modes", "communication"]
+estMinutes: 11
+cheatsheet:
+  - "Most failures are not knowledge gaps — they're process gaps: skipping requirements, silence while thinking, or never landing on one architecture."
+  - "Ambiguity is a feature of the exercise, not a flaw in the question — treat an unscoped prompt as an invitation to ask, not a trap to guess around."
+  - "Depth beats breadth: interviewers weight one well-justified deep dive far higher than five shallow component names."
+  - "Numbers are a forcing function — estimating QPS/storage/bandwidth early prevents both under-building (falls over at scale) and over-building (wasted complexity)."
+  - "Narrate your thinking constantly; a wrong idea said out loud and corrected reads better than silence, because the interviewer is grading the reasoning process, not just the final diagram."
+  - "Treat interviewer questions as signal, not attack — they usually mean 'go deeper here,' rarely 'you're wrong.'"
+  - "The strongest recovery skill is naming your own trade-off out loud before being asked: 'I'm choosing eventual consistency here because availability matters more for this feature.'"
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Two candidates can walk into the same system design interview, both knowing roughly the same amount about caching, sharding, and load balancers, and come out with wildly different results. That's confusing the first time you see it — if the "knowledge" is equal, what decided the outcome? The answer is that system design interviews rarely fail on knowledge. They fail on *process*: how you handle ambiguity, how you allocate your 45 minutes, and how visibly you think out loud. This lesson names the specific, recurring failure patterns and their counterparts — the habits that predict a pass — so you know exactly what to practice, not just what to study.
+
+## The failure patterns that show up again and again
+
+If you watch enough system design interviews (as an interviewer or through mocks), the same handful of failure modes account for the vast majority of "no hire" outcomes. None of them require an exotic architecture to trigger.
+
+### 1. Diving into components before requirements
+
+The single most common failure: hearing "design a ride-sharing app" and immediately sketching a load balancer, an API gateway, and a database, without first asking what the system actually needs to do. Does it need to match drivers in real time? Support scheduled rides? Handle surge pricing? Each answer changes the design meaningfully. A candidate who skips this step is designing *a* system, not *the* system the interviewer asked for — and everything built on that shaky foundation looks less credible no matter how correct the individual pieces are.
+
+### 2. Treating ambiguity as a problem instead of the point
+
+Real prompts are deliberately underspecified ("design a notification system") because handling ambiguity is exactly what's being tested. Candidates who freeze or silently guess at scope are failing the actual test, even if their guess happens to be reasonable. The fix isn't cleverness — it's just asking: "Are we talking push notifications, email, both? What's the expected volume? Does delivery order matter?"
+
+### 3. Going wide instead of deep
+
+A design that lists twelve components in the first ten minutes and never returns to any of them in detail feels impressive at a glance but tells the interviewer nothing about how you actually reason. Interviewers consistently rate one deep, well-justified dive (e.g., "here's exactly how we detect and handle a duplicate payment") far above a wall of correctly-named boxes with no follow-through.
+
+### 4. Skipping numbers entirely
+
+"We'll use a cache" and "we'll use a cache sized for roughly 50M active users, ~2KB per session, so about 100GB, which fits comfortably in a sharded Redis cluster" are not the same answer, even though both mention a cache. Numbers force you to notice problems early — a design that "sounds fine" in prose can collapse the moment you estimate that a single database would need 200,000 writes/second it can't possibly sustain.
+
+### 5. Going silent while thinking
+
+Interviewers can't grade a thought they can't hear. A candidate who stops talking for two minutes to work something out in their head, then presents a polished answer, has given the interviewer nothing to evaluate in between — and often looks stuck even when they aren't. Thinking out loud, including false starts, is part of the deliverable, not an embarrassing tangent.
+
+### 6. Treating pushback as failure
+
+When an interviewer asks "what happens if that service goes down?", plenty of candidates hear "you got something wrong" and become defensive or start second-guessing their whole design. Almost always, the question means "I want to see you reason about this specific failure mode" — it's an invitation to go deeper, not a verdict.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Prompt given] --> B{Clarify requirements first?}
+  B -- No --> F1[Design built on guessed scope]
+  B -- Yes --> C{Estimate scale numbers?}
+  C -- No --> F2[Design that sounds fine, breaks under real load]
+  C -- Yes --> D{Go deep on one area?}
+  D -- No --> F3[Wide but shallow, no real signal given]
+  D -- Yes --> E{Narrate reasoning aloud?}
+  E -- No --> F4[Silent thinking, ungraded process]
+  E -- Yes --> G[Strong, evaluable performance]
+`} />
+
+## What success actually looks like
+
+Flip each failure mode and you get the success pattern — but a few habits deserve their own emphasis because they're the ones candidates underrate most.
+
+- **Narrating trade-offs unprompted.** The strongest signal in an interview is a candidate who says "I'm picking a message queue here instead of a direct call because I want the write to survive the downstream service being briefly unavailable — the cost is added latency and eventual, not immediate, delivery" without being asked. That single sentence demonstrates requirements-gathering, trade-off awareness, and technical depth simultaneously.
+- **Managing time like a resource, not an afterthought.** A 45-minute interview spent entirely on requirements, or entirely on one component, both fail — not because the content was wrong, but because time is itself part of what's being evaluated. Strong candidates checkpoint themselves out loud: "Let's spend a couple more minutes on requirements, then move to high-level design so we have time for a deep dive."
+- **Being willing to revise in front of the interviewer.** Committing to an architecture at minute 10 and refusing to adjust it when new information surfaces at minute 30 (e.g., "actually, writes need to be strongly consistent") reads as inflexibility. Redrawing part of the design and explaining why is a strength, not a confession of earlier error.
+- **Closing the loop.** Ending with a quick "here's what we built, here's what I'd reconsider with more time, here's the biggest risk" gives the interviewer a clean summary to grade against — many strong technical designs lose points simply because time ran out mid-thought with no wrap-up.
+
+## Worked example: same prompt, two outcomes
+
+Both candidates get: "Design a system that lets users upload a photo and see it appear in their friends' feeds."
+
+**Candidate A** starts sketching immediately: client, upload service, a database for photos, a feed service reading from it. Ten minutes in, the interviewer asks "how fresh does the feed need to be?" and the candidate hasn't considered it — there's no notion of fan-out, no discussion of push vs. pull feed generation, and the rest of the interview is spent retrofitting an answer to a question that should have shaped the design from the start.
+
+**Candidate B** opens with two minutes of scoping: "Are we talking close friends only, or public followers too? Is near-real-time freshness required, or is a short delay acceptable? Roughly how many photo uploads and feed reads per second?" Told it's closer to Instagram-scale with a large follower/followee skew, Candidate B explicitly picks a hybrid fan-out approach — push for typical users, pull-on-read for celebrities with huge follower counts — and states the trade-off out loud: extra write amplification for most users in exchange for not overwhelming the write path when a celebrity posts. When asked "what if the fan-out service crashes mid-write?", Candidate B talks through idempotent retries rather than treating the question as a gotcha.
+
+Same prompt, same rough knowledge of feeds and fan-out. Candidate A fails on process — no scoping, reactive instead of proactive trade-off discussion. Candidate B passes on process, not on knowing a fact Candidate A didn't.
+
+<Callout type="warning">
+  A subtle version of the "going wide" failure: candidates who over-correct after being told to "ask more questions" and spend eight or nine minutes clarifying every conceivable edge case before drawing a single box. Clarifying questions should converge quickly — three to five sharp questions that materially change the design, then move. Endless clarification is its own stall tactic and reads as avoidance of the harder work of actually designing something.
+</Callout>
+
+The next lesson in this module covers how long realistic preparation takes given these failure modes — because the fix for most of them is deliberate practice of the *process*, not memorizing more architectures. See also "The Do's and Don'ts of the Interview" for the tactical checklist version of these same ideas.
+
+<Quiz
+  lessonId="sdi-why-engineers-fail-and-succeed"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A candidate is asked to "design a notification system" and immediately begins drawing a queue, a delivery service, and a database without asking any questions. What failure mode does this best illustrate?',
+      options: [
+        { id: 'a', text: 'Going too deep on one component', correct: false, explanation: 'The opposite is closer to the issue here — there is no depth yet at all, just an immediate jump to components.' },
+        { id: 'b', text: 'Treating ambiguity as something to guess past instead of resolve', correct: true, explanation: 'The prompt is deliberately underspecified (push vs. email, volume, ordering guarantees). Skipping clarification means designing for a scope the candidate invented, not the one being tested.' },
+        { id: 'c', text: 'Poor time management late in the interview', correct: false, explanation: 'This happens at the very start of the interview, before time management late in the session becomes relevant.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of the following are described as habits of strong-performing candidates? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Stating a trade-off out loud before the interviewer asks about it', correct: true, explanation: 'Unprompted trade-off narration is called out as one of the strongest signals a candidate can give.' },
+        { id: 'b', text: 'Committing to the first architecture drawn and defending it unchanged regardless of new information', correct: false, explanation: 'The lesson describes revising the design when new information surfaces as a strength; refusing to adjust reads as inflexibility.' },
+        { id: 'c', text: 'Estimating rough scale numbers (like QPS or storage size) before finalizing component choices', correct: true, explanation: 'Numbers are described as a forcing function that surfaces problems (like an overloaded database) before they get baked into the design.' },
+        { id: 'd', text: 'Working out the hardest part silently to present a clean, polished answer', correct: false, explanation: 'The lesson explicitly flags silent thinking as a failure mode — the interviewer can only grade reasoning they can hear.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'According to this lesson, when an interviewer asks a follow-up question like "what happens if that service goes down?", it usually signals that the candidate\'s design is wrong.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The lesson explicitly frames follow-up questions as an invitation to go deeper on a specific failure mode, not a verdict that the design is incorrect.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — treating pushback as an attack rather than a prompt to elaborate is named as its own failure mode; most follow-ups are just requests for more depth.' },
+      ],
+    },
+  ]}
+/>

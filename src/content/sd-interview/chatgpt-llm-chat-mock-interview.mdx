@@ -1,0 +1,137 @@
+---
+title: "LLM Chat: Mock Interview"
+module: "Design a ChatGPT-Style System"
+moduleOrder: 16
+order: 3
+track: "interview"
+summary: "A full mock interview that extends the ChatGPT-style chat design with retrieval-augmented answers and human escalation, then grades your answer against a concrete rubric."
+tags: ["mock-interview", "llm-serving", "rag", "system-design", "interview-framework"]
+estMinutes: 13
+cheatsheet:
+  - "Grounding (RAG) changes the request path: retrieve relevant context before you call the model, and the retrieval step's latency and recall now gate answer quality, not just the model itself."
+  - "Session/context state (conversation history, retrieved chunks, system prompt) has to travel with every request to a stateless inference fleet — treat it as an explicit input, not ambient state."
+  - "A confidence or groundedness check before streaming to the user is what makes escalation to a human possible; without it you can only escalate after the user complains."
+  - "Token-budget math is a first-class design constraint here: history + retrieved chunks + system prompt + response all share one context window, and truncation policy is a real design decision, not an implementation detail."
+  - "Streaming and safety filtering are in tension — filtering whole responses is easy but kills time-to-first-token; filtering a token stream incrementally is the harder, more interview-worthy answer."
+  - "Name the actual first bottleneck at scale: usually GPU inference capacity during peak concurrency, not the vector store or the chat-history database."
+---
+
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+import MockInterview from '../../components/MockInterview';
+
+The first two lessons in this module built a ChatGPT-style chat system from
+the ground up: the requirements and serving architecture (sessions, streaming
+responses, the split between the stateless inference layer and the stateful
+conversation store), and then how to scale that inference layer with
+batching, KV-cache reuse, and GPU capacity planning. That's the toolkit. The
+real test of whether it's a *transferable* toolkit — not just a memorized
+diagram of "how ChatGPT works" — is whether you can point it at a prompt that
+looks similar on the surface but adds a requirement you haven't designed for
+yet.
+
+This lesson is that test: a full mock interview, a rubric, and a self-graded
+reflection, no walkthrough. Set a timer for 35–40 minutes, talk out loud, and
+only look at the rubric after you've committed to a design.
+
+## What this prompt is actually testing
+
+The prompt below asks you to design an AI support assistant embedded in a
+product: it chats with a customer, answers using the company's own help-center
+content rather than the model's general training data, and hands off to a
+human agent when it isn't confident. That's still a chat system built on an
+LLM — sessions, streaming, an inference fleet — but it adds two things
+neither prior lesson covered in depth:
+
+- **Retrieval-augmented generation (RAG).** The assistant has to answer from
+  a specific, current knowledge base (return policies, product docs), not
+  just whatever the base model memorized during training. That means a
+  retrieval step — typically a vector search over embedded document
+  chunks — has to run *before* the model call, and its output becomes part
+  of the prompt.
+- **Confidence-gated escalation.** Unlike a general-purpose chatbot, wrong
+  answers here have a business cost (a customer told the wrong return
+  window). The design needs a way to decide "this answer isn't grounded
+  enough — route to a human" instead of always answering.
+
+Everything else carries over directly: the stateless request/response
+inference tier from lesson 1, the batching and autoscaling ideas from lesson
+2, and the general pattern of streaming tokens back to the client as they're
+generated rather than waiting for the full response.
+
+## The request path, with retrieval and escalation added
+
+The key structural change versus the base design is where retrieval sits:
+before the model call, not after. The context assembled from conversation
+history plus retrieved chunks becomes the actual prompt sent to inference.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    U[Customer message] --> G[API gateway]
+    G --> S[Session service: loads conversation history]
+    S --> R[Retrieval: vector search over KB embeddings]
+    R --> P[Prompt assembler: history + retrieved chunks + system prompt]
+    P --> I[Inference fleet: batched, streaming tokens]
+    I --> C[Confidence / groundedness check on the response]
+    C -->|confident| Strm[Stream tokens to customer]
+    C -->|low confidence| Esc[Enqueue to human agent, show partial answer as draft]
+`} />
+
+Notice the branch after inference: this is the design's new decision point,
+and it's exactly what separates this system from a plain chatbot. A strong
+answer explains what feeds that confidence signal — commonly some mix of
+retrieval score (did we find chunks that actually match the query), a
+model-reported uncertainty or a lightweight classifier, and simple heuristics
+(e.g., the model asked a clarifying question rather than committing to an
+answer).
+
+## Token budget: the constraint everyone underestimates
+
+Say the model's context window is 8,000 tokens and the system prompt (tone,
+policies, output format) takes a fixed 400 tokens. A support conversation
+might carry 1,500 tokens of prior turns by message six or seven. If the
+retrieval step returns five chunks at ~300 tokens each, that's another 1,500
+tokens — total so far: 3,400 tokens of input before the model has generated a
+single word of the response, leaving roughly 4,600 tokens for retrieved
+context growth, longer conversation history, and the response itself.
+
+This is where truncation policy becomes a real design decision, not a detail
+to wave past: do you drop the oldest conversation turns first, cap the
+number of retrieved chunks and keep only the highest-scoring ones, or
+summarize older history into a shorter running summary? Each answer trades
+off differently — dropping old turns loses continuity, summarizing costs an
+extra model call (and thus latency and money) but preserves more information
+per token. Naming this trade-off explicitly, with real numbers like the ones
+above, is a stronger answer than saying "we manage the context window."
+
+<Callout type="warning">
+  A common mistake in this interview: describing retrieval and generation as
+  two independent, parallel systems ("the vector DB team owns search, the
+  LLM team owns chat") without addressing that they share one token budget
+  and one latency budget. If retrieval alone takes 400ms and the interviewer
+  asks for a 2-second time-to-first-token, you've already spent 20% of the
+  budget before the model has processed a single token — say so, and explain
+  how you'd keep retrieval fast (approximate nearest-neighbor search, a
+  small pre-filter on document metadata) rather than treating it as free.
+</Callout>
+
+## Your turn
+
+Write your notes before you look at the rubric — the self-scoring is far
+more useful if you commit to an approach first, including where retrieval
+sits in the request path, how you gate escalation, and what you'd cut for a
+first version.
+
+<MockInterview
+  lessonId="chatgpt-llm-chat-mock-interview"
+  client:visible
+  prompt="Design an AI-powered customer support chat assistant embedded in a product (think a support widget that answers using the company's own help-center articles and policies, and hands off to a human agent when it isn't confident). Cover requirements and scale, how retrieval over the knowledge base fits into the request path, how you manage the token budget across conversation history and retrieved context, how you decide when to escalate to a human, and what changes about scaling inference versus a plain general-purpose chatbot."
+  rubric={[
+    { point: 'Scopes requirements beyond a generic chatbot', detail: 'States explicitly that answers must be grounded in a specific, updatable knowledge base rather than the model general training data, and that wrong answers carry a business cost, before describing any architecture.' },
+    { point: 'Places retrieval correctly in the request path', detail: 'Describes retrieval (vector search over embedded document chunks) as a step before the model call whose output is injected into the prompt, not as an unrelated add-on service.' },
+    { point: 'Reasons concretely about the shared token budget', detail: 'Names the context window as a shared resource across system prompt, conversation history, and retrieved chunks, and proposes a specific truncation or summarization policy with a stated trade-off.' },
+    { point: 'Designs an explicit escalation/confidence gate', detail: 'Describes a concrete signal (retrieval score, model uncertainty, a classifier, or an explicit "I am not sure" heuristic) that routes low-confidence responses to a human agent instead of always answering.' },
+    { point: 'Reuses the inference-scaling toolkit from the prior lessons correctly', detail: 'Applies batching, KV-cache reuse, and autoscaling for the LLM tier from the earlier lessons, and explains how retrieval latency composes with model latency under the same overall response-time budget.' },
+    { point: 'Names the real first bottleneck and a sensible v1 cut', detail: 'Identifies GPU inference capacity under peak concurrency (not the vector store or chat-history DB) as the likely first scaling limit, and states one thing they would cut for a first version (e.g., no summarization of old history, a single fixed retrieval size).' },
+  ]}
+/>

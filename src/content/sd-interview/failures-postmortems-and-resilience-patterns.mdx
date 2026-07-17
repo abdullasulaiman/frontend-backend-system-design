@@ -1,0 +1,116 @@
+---
+title: "Postmortems and Resilience Patterns"
+module: "Lessons from System Failures"
+moduleOrder: 20
+order: 3
+track: "interview"
+summary: "Explains how a good postmortem turns an outage into durable resilience patterns — timeouts, retries with jitter, circuit breakers, bulkheads, and graceful degradation — instead of a vague promise to be more careful."
+tags: ["postmortems", "resilience", "reliability", "sre", "incident-response"]
+estMinutes: 13
+cheatsheet:
+  - "A postmortem's output is corrective actions with owners and dates, not a narrative — no action items means the incident will recur."
+  - "Blameless postmortems get more honest timelines: people describe what they actually saw, not what protects them, only when they aren't afraid of being blamed."
+  - "Timeouts must be set on every network call, including ones a caller thinks are 'trusted' — the alternative is a thread pool slowly filling with stuck calls."
+  - "Retries need capped exponential backoff plus jitter, or synchronized retries turn a blip into a self-inflicted thundering herd."
+  - "Circuit breakers stop calling a failing dependency; bulkheads stop one dependency's failure from starving resources needed by everything else — they solve different problems and are often used together."
+  - "Load shedding and graceful degradation trade a little correctness or completeness for staying up — deciding what's droppable is a product decision, not just an engineering one."
+  - "Chaos engineering is how you find out whether your resilience patterns actually work, on your schedule, instead of during the next real outage."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The lesson on Common Failure Modes covered what breaks, and Cascading Failures and Backpressure covered how one broken piece takes down the whole system. This lesson is about what you do next: how a team turns "the payments service was down for 40 minutes" into changes that make the *next* outage smaller, shorter, or nonexistent. That conversion happens in two places — the postmortem process that decides what to fix, and the resilience patterns that are actually fixed into the code.
+
+Interviewers ask about this because it separates candidates who've only read about outages from candidates who've owned one. "What would you do after this incident?" is a very different question from "how would you design this system," and a strong answer names specific mechanisms — not "add more monitoring" but "add a circuit breaker in front of the recommendation service so its timeouts don't exhaust the checkout service's thread pool."
+
+## What a postmortem is actually for
+
+A postmortem (also called an incident review or a retro) is a structured write-up produced after an incident, with one job: make sure the organization *learns* something durable, not just that the on-call engineer feels bad for a week.
+
+A postmortem worth writing has:
+
+- **A timeline** — what happened, in order, with timestamps: when the first symptom appeared, when it was detected, when someone paged in, when mitigation started, when it was fully resolved. Gaps in this timeline (a 20-minute silence between "alert fired" and "someone looked at it") are often the most actionable finding.
+- **Impact** — concretely: how many requests failed, how many users affected, revenue or SLA impact if measurable. Vague impact ("some users had a bad experience") makes it impossible to prioritize the fix against other work.
+- **Root cause and contributing factors** — the proximate trigger (a bad deploy, a traffic spike, a dependency outage) plus the conditions that let it cascade (no timeout on that call, no circuit breaker, an autoscaler that couldn't react fast enough). Most real incidents have several contributing factors, not one root cause — resist the urge to stop at the first plausible explanation.
+- **Corrective actions** — a short list of concrete changes, each with an owner and a target date. This is the part teams skip under time pressure, and it's the part that actually prevents recurrence.
+
+<Callout type="warning">
+  The most common postmortem failure is producing a well-written timeline and zero durable action items — or action items like "be more careful during deploys" that no one can actually execute or verify. If a corrective action can't be assigned to a person, given a deadline, and closed out like a ticket, it isn't a real action item; it's a hope.
+</Callout>
+
+## Blameless, not toothless
+
+"Blameless" postmortems are a specific practice: the write-up focuses on the system and process conditions that allowed an incident, not on which individual made a mistake. The reasoning is pragmatic, not sentimental — if engineers expect to be blamed for an outage, they describe events defensively, which produces a *less* accurate timeline, and a less accurate timeline produces worse fixes.
+
+Blameless does not mean consequence-free. If a corrective action is "we need a review step before deploys to this service," that's a real process change, decided on the merits, that happens to follow from what someone did. The distinction is between fixing the system so the mistake is harder to make (blameless) and fixing the person by punishing them for making it (blame) — the former scales, the latter just teaches people to hide things next time.
+
+## Resilience patterns: the toolkit corrective actions draw from
+
+Postmortem action items usually resolve into a small set of well-known patterns. Knowing the name and the specific failure each one prevents is what makes an interview answer sound like engineering rather than vibes.
+
+- **Timeouts** — every network call needs an upper bound on how long it will wait. Without one, a slow dependency doesn't just respond slowly; it holds a thread, a connection, or a memory buffer indefinitely, and enough of those exhaust the caller.
+- **Retries with backoff and jitter** — retrying a failed call makes sense, but retrying immediately, or retrying on a fixed schedule, synchronizes every client's retry into the same instant, which is its own denial-of-service attack against a service that's already struggling. Exponential backoff spaces retries out; jitter (randomizing the exact delay) prevents them from re-synchronizing.
+- **Circuit breakers** — after enough consecutive failures to a dependency, stop calling it for a cooldown period and fail fast instead, periodically testing with a trial request to see if it's recovered. This protects the caller from wasting resources on calls that are very likely to fail anyway, and it protects the struggling dependency from being hammered while it's trying to recover.
+- **Bulkheads** — partition resources (thread pools, connection pools, capacity) per dependency so that one slow or failing dependency can't starve resources needed to serve requests that don't depend on it. Named after ship compartments that keep one hull breach from sinking the whole vessel.
+- **Load shedding and graceful degradation** — under overload, deliberately reject some requests (shed load) or serve a cheaper, lower-quality response (degrade) rather than let everything slow down until it collapses. A product feed that falls back to "recently popular" when personalized ranking is unavailable is degrading gracefully; a login service that returns 503 to new sign-in attempts while continuing to serve already-authenticated sessions is shedding load selectively.
+- **Redundancy and failover** — running multiple instances, replicas, or even multiple regions so that the loss of one doesn't take down the service, with automated detection and failover so a human doesn't have to react in the first minute.
+- **Chaos engineering** — deliberately injecting failures (killing instances, adding latency, blocking a dependency) in a controlled way to verify that the resilience patterns above actually work, instead of discovering during a real outage that the circuit breaker's threshold was miscalibrated.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Incident occurs] --> B[Detect and mitigate]
+  B --> C[Blameless postmortem:\ntimeline, impact, root cause]
+  C --> D[Corrective actions\nwith owner + date]
+  D --> E[Resilience pattern implemented:\ntimeout, breaker, bulkhead, shedding]
+  E --> F[Verified via chaos testing]
+  F -.feeds confidence into.-> B
+`} />
+
+## Worked example: a retry storm after a dependency blip
+
+Say a checkout service calls a fraud-scoring service on every order, with a 2-second timeout and up to 3 immediate retries on failure, no backoff. The fraud service has a brief network blip and starts timing out for 90 seconds.
+
+Every checkout request now takes up to 8 seconds (2s times up to 4 attempts) instead of failing fast, and every client that hit a timeout retries immediately, so the fraud service — which was only briefly degraded — now gets hit with roughly 4x its normal load right as it's trying to recover, extending the blip into a 25-minute outage. Checkout's own thread pool fills with requests stuck waiting on fraud scoring, so checkout starts timing out for *unrelated* requests too (a normal card payment, no fraud check needed, still queues behind the stuck threads).
+
+The postmortem's corrective actions, in priority order: add a circuit breaker around the fraud-scoring client so that after, say, 10 consecutive failures, checkout stops calling it for 30 seconds and either fails fast or falls back to a cheaper fraud heuristic; add capped exponential backoff with jitter to the retry logic so retries don't all land in the same instant; and move the fraud-scoring calls to their own bounded thread pool (a bulkhead) so a stuck dependency can't starve threads needed for card processing. Each of those three items has a clear owner and is independently testable — that's what makes them durable, unlike "investigate fraud service reliability," which isn't a change anyone can point to a week later.
+
+## Quiz
+
+<Quiz
+  lessonId="failures-postmortems-and-resilience-patterns"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the primary reason blameless postmortems tend to produce more useful outcomes than blame-focused ones?',
+      options: [
+        { id: 'a', text: 'They take less time to write because no one is defensive', correct: false, explanation: 'Blameless postmortems are not necessarily faster to write — thoroughness still takes time. Speed is not the mechanism at work here.' },
+        { id: 'b', text: 'People give a more accurate account of what happened when they are not worried about being personally blamed', correct: true, explanation: 'Fear of blame causes people to soften or omit details in the timeline. A more accurate timeline leads directly to better root-cause analysis and better corrective actions.' },
+        { id: 'c', text: 'They avoid assigning any corrective actions to specific people', correct: false, explanation: 'The opposite is true for good postmortems: corrective actions still need a specific owner and deadline. Blameless refers to how the incident narrative treats individuals, not to whether follow-up work is assigned.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'A checkout service calls a fraud-scoring dependency with immediate (no-backoff) retries and no circuit breaker. Which resilience patterns would most directly address the retry-storm scenario described in this lesson? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Exponential backoff with jitter on retries', correct: true, explanation: 'This prevents every client from retrying at the exact same instant, which is what turned a brief blip into a sustained overload of the recovering dependency.' },
+        { id: 'b', text: 'A circuit breaker around the fraud-scoring client', correct: true, explanation: 'After enough consecutive failures, a circuit breaker stops sending traffic to the struggling dependency for a cooldown period, letting it recover instead of being hammered by retries.' },
+        { id: 'c', text: 'A bulkhead separating fraud-scoring calls from other checkout work', correct: true, explanation: 'This stops threads stuck waiting on the fraud service from starving capacity needed for unrelated requests, like card payments that do not depend on fraud scoring.' },
+        { id: 'd', text: 'Increasing the per-call timeout from 2 seconds to 10 seconds', correct: false, explanation: 'A longer timeout makes each stuck call hold its thread even longer, worsening resource exhaustion rather than fixing it — this is the wrong direction entirely.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A postmortem whose only corrective action is "the on-call engineer should have noticed the alert sooner" is a complete, actionable postmortem.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'This is not actionable: it names an individual\'s behavior rather than a system or process change, has no owner responsible for implementing anything, and cannot be verified as done. A durable action item would be something like adding a paging escalation policy.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. A real corrective action targets the system or process (better alert routing, an escalation policy, a runbook) with a specific owner and deadline — not an instruction for a person to individually try harder next time.' },
+      ],
+    },
+  ]}
+/>

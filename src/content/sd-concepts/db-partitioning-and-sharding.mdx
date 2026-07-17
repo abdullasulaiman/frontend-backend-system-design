@@ -1,0 +1,246 @@
+---
+title: "Partitioning and Sharding"
+module: "Databases"
+moduleOrder: 9
+order: 3
+track: "concept"
+summary: "Explains why a single database node runs out of room no matter how much you replicate it, and how to split data across nodes using partitioning strategies without wrecking your queries."
+tags: ["partitioning", "sharding", "databases", "scalability", "distributed-systems"]
+estMinutes: 13
+cheatsheet:
+  - "Replication copies the same data to more machines for read scale and durability; partitioning splits different data across machines for write scale and storage capacity. Most systems at scale need both."
+  - "Hash-based sharding spreads writes evenly but kills range queries and makes resharding expensive; range-based sharding keeps ranges queryable but creates hot shards for sequential keys (timestamps, auto-increment IDs)."
+  - "Consistent hashing bounds the amount of data that moves when you add or remove a shard to roughly `1/N` of the keyspace, instead of reshuffling everything."
+  - "A shard key you can't change later is a schema decision, not an infrastructure one — pick it based on your dominant query pattern, not on what's convenient to write first."
+  - "Cross-shard joins and multi-shard transactions are the recurring cost of sharding — design your access patterns to avoid needing them, or accept an application-layer scatter-gather step."
+  - "Watch for hot shards: a shard key that looks uniform in aggregate (like `user_id`) can still concentrate load if one user/tenant is far more active than the rest."
+  - "Sharding is usually the last lever you pull — after query optimization, indexing, caching, and read replicas — because it adds real operational and application complexity."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A single Postgres instance can hold maybe a few terabytes of data and handle
+a few thousand writes per second before it starts to struggle, no matter how
+much RAM or how fast the disks are. Replication (covered in the previous
+lesson) can help you serve more *reads* and survive a node dying, but every
+replica still holds the *entire* dataset and every write still has to land
+on the same primary. If your data or write volume grows past what one
+machine can hold, replication alone doesn't help — you need to split the
+data itself across multiple machines. That's partitioning, and when you do
+it across independent database instances rather than within one, it's
+usually called sharding.
+
+This lesson covers how to split data across nodes, the strategies for
+picking what goes where, and the costs that partitioning imposes on
+everything downstream — queries, transactions, and operations.
+
+## Partitioning vs. sharding vs. replication
+
+These three words get used loosely, so it's worth being precise:
+
+- **Replication**: the same data, copied to multiple nodes. Every replica
+  can (eventually) answer the same query. Solves read scale and durability.
+- **Partitioning**: splitting one logical dataset into disjoint pieces
+  (partitions), each holding a subset of the rows. Solves storage capacity
+  and write scale — each partition only holds and writes a fraction of the
+  data.
+- **Sharding**: partitioning where each partition lives on a separate
+  database instance/node, usually with its own storage, memory, and often
+  its own primary-replica set. "Shard" and "partition" are frequently used
+  interchangeably in interviews; the useful distinction is that a shard
+  usually implies a fully independent node, not just a table split on the
+  same box.
+
+In practice, large systems combine both: each shard is itself replicated
+for durability and read scale, and the shards together partition the full
+dataset for write and storage scale.
+
+## Strategies for choosing what goes where
+
+The central question in sharding is: given a row, which shard does it live
+on? That decision is made by a **shard key** (also called a partition key),
+and how you map that key to a shard determines almost every trade-off that
+follows.
+
+### Range-based partitioning
+
+Assign contiguous ranges of the key to each shard: shard 0 holds user IDs
+1 to 1,000,000, shard 1 holds 1,000,001 to 2,000,000, and so on. This keeps
+range queries (`WHERE user_id BETWEEN x AND y`) fast, since a range maps to
+one or a few shards.
+
+The failure mode is **hot shards**: if the key correlates with time or
+insertion order (auto-incrementing IDs, timestamps), all new writes pile
+onto the last shard while earlier shards go cold. A logging system sharded
+by `created_at` ranges will always have one shard absorbing 100% of live
+write traffic.
+
+### Hash-based partitioning
+
+Run the shard key through a hash function and use the result to pick a
+shard, typically `hash(key) mod N`. This spreads writes evenly across
+shards regardless of key patterns, which fixes the hot-shard problem above.
+
+The cost: range queries no longer map to a small set of shards — a hash
+scatters sequential keys across every shard, so `BETWEEN` queries turn into
+a fan-out across all `N` shards. You also lose easy resharding: with plain
+`mod N`, changing `N` (adding a shard) reshuffles almost every key's target
+shard, because `hash(key) mod 5` and `hash(key) mod 6` disagree for most
+keys.
+
+### Consistent hashing
+
+Consistent hashing fixes the resharding problem. Instead of `mod N`, shards
+and keys are placed on a conceptual ring (the hash output space, e.g. 0 to
+2^32). Each key belongs to the first shard clockwise from its hash position.
+Adding or removing a shard only affects the keys between it and its
+neighbor on the ring — roughly `1/N` of the keyspace moves, not everything.
+Systems like Cassandra and DynamoDB use variants of this (often with
+"virtual nodes" — each physical shard owns many points on the ring — to
+smooth out load distribution further).
+
+### Directory-based (lookup) partitioning
+
+Keep an explicit mapping table (`key -> shard`) instead of computing it. This
+gives you full control — you can rebalance by moving individual keys and
+updating the map, and you can put "hot" keys on their own dedicated shard.
+The cost is that the lookup service/table becomes a new dependency and
+potential bottleneck; it needs its own availability story.
+
+### Choosing a shard key
+
+The shard key is the single highest-leverage decision in sharding, and it's
+hard to change later without a full data migration. Pick it based on your
+dominant access pattern:
+
+- If most queries filter by `tenant_id` or `user_id`, shard on that — it
+  keeps each tenant's data on one shard, so per-tenant queries never fan out.
+- If one entity is much larger or busier than others (a huge enterprise
+  tenant, a celebrity's account), a naive key can still create a hot shard
+  even with hashing, because hashing spreads *keys* evenly, not *load* per
+  key. This needs special-casing — e.g., splitting a single huge tenant's
+  data across multiple shards internally.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    App[Application]
+    Router[Shard router: hash-key to shard]
+    App --> Router
+    Router --> S0[(Shard 0)]
+    Router --> S1[(Shard 1)]
+    Router --> S2[(Shard 2)]
+    S0 --- R0[Replica]
+    S1 --- R1[Replica]
+    S2 --- R2[Replica]
+`} />
+
+## What sharding costs you
+
+Splitting data across nodes isn't free — it changes what your database can
+do for you automatically.
+
+**Cross-shard joins.** A join between rows on different shards can't be
+pushed down to a single SQL engine anymore. The application (or a query
+federation layer) has to fetch from each shard and join in memory, which is
+slower and more code than a single `JOIN`. This is why shard keys are chosen
+to keep related rows (e.g. a user and their orders) on the same shard.
+
+**Cross-shard transactions.** An operation that must atomically update rows
+on two different shards (transfer money between two accounts on different
+shards) can't use a single-node ACID transaction. You need a distributed
+transaction protocol (two-phase commit) or a saga/compensating-action
+pattern, both of which add latency and failure modes a single-node
+transaction never had. (The Transactions and Consistency lesson later in
+this module covers this in depth.)
+
+**Rebalancing.** Adding a shard because one filled up means moving data.
+Even with consistent hashing bounding the *amount* that moves, moving it
+live — without downtime, without losing writes in flight — is an
+operational project, not a config change.
+
+**Global secondary indexes.** An index on a non-shard-key column (e.g. "find
+orders by email" when sharded by `user_id`) either has to scan every shard,
+or you maintain a separate distributed index structure that itself needs
+updating on every write. Neither is as simple as a local B-tree index on a
+single node — see the Indexing lesson for how single-node indexes work,
+which this complicates.
+
+## Worked example: sharding an order-history table
+
+Say you're running an e-commerce platform with 500 million orders and
+growing 40 million a month. A single Postgres primary is at 90% disk and
+write latency is creeping up under load — time to shard.
+
+**Pick the key.** The dominant query is "show me this user's orders,"
+almost always filtered by `user_id`. Sharding by `order_id` would spread
+writes evenly but force every user-order-history query to fan out across
+all shards. Sharding by `user_id` keeps each user's full order history on
+one shard, so the common query hits exactly one shard.
+
+**Pick the strategy.** Plain range partitioning on `user_id` risks hot
+shards if `user_id`s were assigned sequentially at signup and a large
+recent cohort is more active than early users. Hash-based (or consistent
+hashing) on `user_id` spreads accounts evenly regardless of signup order.
+
+**Size it.** At 500M orders averaging \~1KB each, that's \~500GB of raw
+order data — comfortably split across, say, 8 shards of \~65GB each,
+leaving headroom to grow before the next resharding. Each shard gets its
+own primary + 1-2 read replicas for durability, using the replication
+patterns from the previous lesson.
+
+**Accept the cost.** "Show me all orders placed today across the whole
+platform" (an analytics query, not a user-facing one) now has to fan out to
+all 8 shards and merge results — acceptable for an infrequent internal
+report, routed to a separate analytics pipeline instead of the live shards
+in a real system.
+
+<Callout type="warning">
+  A common mistake: choosing a shard key that's convenient for the *first*
+  version of the schema (like an auto-incrementing primary key) instead of
+  the query pattern the application actually runs. Auto-increment keys
+  create sequential, ever-growing values, which produce a hot last shard
+  under range partitioning and, more subtly, still cluster recently-created
+  rows together under many hash schemes if the ID's low bits aren't well
+  mixed. Worse, the shard key is baked into how data is distributed — 
+  changing it later means re-sharding the entire dataset under load, not a
+  config edit. Choose the shard key from the dominant read/write pattern
+  before you write a line of migration code.
+</Callout>
+
+<Quiz
+  lessonId="db-partitioning-and-sharding"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A logging system shards by inserting each event into the shard for the current day, using range partitioning on a timestamp. What problem does this design run into?',
+      options: [
+        { id: 'a', text: 'All shards fill up at the same rate', correct: false, explanation: "The opposite happens: since every new event's timestamp is 'now,' every write lands on the single current-day shard while older shards go cold." },
+        { id: 'b', text: 'A hot shard, since all current writes land on the most recent range', correct: true, explanation: 'Range partitioning on a monotonically increasing key like a timestamp concentrates all live write traffic on the newest shard — the classic hot-shard failure mode.' },
+        { id: 'c', text: 'Cross-shard joins become impossible', correct: false, explanation: 'Range partitioning does not prevent joins; the issue here is write concentration (hot shards), not join capability.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine costs introduced by sharding a previously single-node database? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Joins across rows that now live on different shards require application-level fan-out', correct: true, explanation: 'A single SQL JOIN cannot span independent database instances, so the application (or a federation layer) must fetch from each shard and join in memory.' },
+        { id: 'b', text: 'Atomic updates across two shards need a distributed transaction protocol or saga, not a plain local transaction', correct: true, explanation: 'A single-node ACID transaction only covers one node; coordinating an atomic update across shards needs two-phase commit or a compensating-action (saga) pattern.' },
+        { id: 'c', text: 'Every query automatically becomes faster because it touches less data per shard', correct: false, explanation: 'Only queries that map cleanly to one (or a few) shards get faster. Queries that need data spread across many shards get slower, since they now require a fan-out and merge step that a single node never needed.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Consistent hashing is used specifically to bound the fraction of keys that must move when a shard is added or removed, compared to plain hash mod N.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: "Correct — on a consistent hash ring, adding or removing a shard only remaps the keys between it and its neighbor (roughly 1/N of the keyspace), whereas plain 'hash(key) mod N' remaps nearly all keys whenever N changes." },
+        { id: 'false', text: 'False', correct: false, explanation: 'This is exactly the problem consistent hashing solves: bounding data movement on resharding, unlike plain modulo hashing which reshuffles almost everything when the shard count changes.' },
+      ],
+    },
+  ]}
+/>

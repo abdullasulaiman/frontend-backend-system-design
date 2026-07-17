@@ -1,0 +1,134 @@
+---
+title: "Designing the Blob Store"
+module: "Blob Store"
+moduleOrder: 20
+order: 4
+track: "concept"
+summary: "Traces a single object through the full write and read path of a blob store, showing exactly where chunking, metadata, placement, and replication from earlier lessons come together into one working system."
+tags: ["blob-store", "object-storage", "architecture", "distributed-systems", "system-design"]
+estMinutes: 12
+cheatsheet:
+  - "A blob store is two systems wearing one API: a metadata service (small, strongly consistent, indexes keys to chunk locations) and a chunk store (huge, eventually-consistent-friendly, holds raw bytes)."
+  - "Writes commit in a fixed order: chunk the object, write chunks to storage nodes, confirm durability, then flip the metadata pointer to the new version — never the reverse, or readers can see a half-written object."
+  - "Multipart upload exists because a single PUT can't safely retry a multi-GB object — each part is chunked, placed, and acknowledged independently, and only the final complete-upload call commits the metadata."
+  - "Reads go straight to the chunk store using metadata's chunk map — the metadata service is never on the hot path for bytes, only for the lookup, which is what lets a blob store scale bandwidth independently of lookup volume."
+  - "Deletes are logical first (metadata pointer removed or marked tombstoned) and physical later (a garbage collector reclaims chunks no live pointer references) — this is what makes deletes fast and reference counting safe under concurrent uploads."
+  - "Content-addressing (hashing chunk bytes into the chunk ID) gives you free deduplication across objects, but only if you're comparing hashes of identically-boundaried chunks — dedup rates hinge on the chunking strategy, not just the hash function."
+  - "When asked to design this end to end, narrate the write path and read path as two separate flows through the same components — that's what shows you understand the metadata/data split, not just its existence."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've now covered what a blob store needs to satisfy, how objects are modeled as chunks with metadata, and how those chunks get partitioned, replicated, and kept durable across failures. Each of those lessons looked at one slice of the system in isolation. In an interview, "design a blob store" means showing how those slices bolt together into something a client can actually `PUT` an object into and `GET` it back out of — correctly, even when a node crashes mid-upload. This lesson walks the full write path and read path end to end and points at exactly which component enforces which guarantee from the earlier lessons.
+
+The core idea to hold onto: a blob store is really two systems sharing one API surface. A small, strongly-consistent **metadata service** that knows *where* an object's bytes live, and a massive, horizontally-scaled **chunk store** that holds the bytes themselves and doesn't need to know anything about objects, keys, or users. Almost every design decision in this lesson falls out of keeping those two systems separate and only ever crossing between them in one direction at commit time.
+
+## The two subsystems, and why they're split
+
+- **Metadata service** — stores, per object key: object size, content type, chunk IDs in order, checksums, and version/timestamp. This is a small dataset (kilobytes per object, not gigabytes) so it can live on a strongly-consistent store like a partitioned key-value or SQL cluster with synchronous replication — the earlier requirements lesson's durability bar applies here in its strictest form, because losing metadata orphans otherwise-intact bytes.
+- **Chunk store** — a fleet of storage nodes holding fixed-size (or content-defined) chunks, addressed by chunk ID, replicated or erasure-coded per the partitioning/durability lesson. This tier is enormous (petabytes), append-mostly, and can tolerate eventual consistency on things like replica catch-up because the metadata service is the single source of truth for "which version is current."
+
+Splitting these means you can scale them independently: metadata query volume tracks request rate, chunk storage volume tracks total bytes stored. Coupling them — say, storing chunk locations inline in every storage node's own directory listing — would force you to scale both together even when only one is the bottleneck.
+
+## The write path
+
+Follow one `PUT(key, bytes)` call through the system:
+
+1. **Chunking.** The client (or an ingest gateway in front of it) splits the object into chunks — fixed-size for simplicity, or content-defined for better deduplication, as covered in the data-model lesson.
+2. **Placement.** For each chunk, a placement function (consistent hashing over storage nodes, typically) picks a primary node and its replica set or erasure-coding group.
+3. **Write and durability confirmation.** Chunks are written to their assigned nodes. The write is only considered durable once it meets the replication/erasure policy's threshold — e.g., 2 of 3 replicas acked, or enough erasure shards written to reconstruct the chunk.
+4. **Metadata commit.** Only after every chunk in the object is durably written does the metadata service record the new chunk list under the object's key, as a new version.
+
+That ordering is the whole trick: metadata is the last thing to change, and it changes atomically (a single row/document update, not a multi-step process). A crash at any point *before* step 4 leaves orphaned chunks and no visible object — annoying but harmless, cleaned up later by garbage collection. A crash *after* step 4 means the object is fully committed and durable. There's no window where a reader can see a key that resolves to partially-written chunks, because the metadata pointer simply doesn't exist yet.
+
+## The read path
+
+1. **Metadata lookup.** `GET(key)` resolves to the current version's ordered chunk list from the metadata service.
+2. **Parallel chunk fetch.** The client (or gateway) fetches chunks directly from the storage nodes named in the chunk list — often in parallel, since chunks are independent.
+3. **Reassembly.** Chunks are concatenated in order and checksums verified against the values metadata recorded at write time.
+
+Notice the metadata service never touches a single byte of object data — it only ever returns a chunk map. This is what lets you scale read bandwidth (add more storage nodes, spread reads across replicas) without touching the metadata tier at all, and it's the direct payoff of the two-subsystem split above.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant C as Client
+    participant M as Metadata Service
+    participant S as Storage Nodes
+    C->>C: chunk object into parts
+    C->>S: write chunk 1..N (placed via hashing)
+    S-->>C: durability ack per chunk
+    C->>M: commit new version (chunk list)
+    M-->>C: write acknowledged
+    Note over C,M: --- later, a read ---
+    C->>M: GET(key)
+    M-->>C: chunk list for current version
+    C->>S: fetch chunks in parallel
+    S-->>C: chunk bytes + checksums
+`} />
+
+## Multipart upload and deletes
+
+Large objects (video files, VM images, backups) can't safely go through a single `PUT` — a network blip 40 minutes into a 50GB upload shouldn't mean starting over, and no single connection reliably streams that much data anyway. Multipart upload is the write path above, split so each part is chunked, placed, and acknowledged independently and can be retried alone. The client tracks part completions and issues a final "complete multipart upload" call, which is exactly the metadata-commit step from above — the object doesn't exist as far as any reader is concerned until that call lands.
+
+Deletes mirror this asymmetry. A `DELETE(key)` only needs to remove or tombstone the metadata pointer — an O(1), fast, strongly-consistent operation. The chunks themselves are reclaimed later by a background garbage collector that scans for chunk IDs no live metadata entry references anymore, then frees that storage. Doing physical deletion synchronously on the `DELETE` call would make deletes as slow as the object is large, and would race unsafely against any concurrent read still holding an in-flight chunk list.
+
+## Worked example: a video-upload service
+
+Say you're designing the storage layer behind a video platform: users upload files up to 4GB, uploads must survive a mid-transfer network drop, and reads need to serve range requests (a player scrubbing "the video, starting at 08:30") without pulling the whole file.
+
+- **Chunk size: 8MB, content-defined boundaries off.** Fixed 8MB chunks keep placement and range-read math simple: to serve a byte-range request, compute which chunk indices cover that range and fetch only those, instead of reassembling the whole object.
+- **Multipart upload, 8MB parts uploaded in parallel** across up to 4 connections — matches the chunk size exactly, so each part maps 1:1 to a chunk, and a dropped connection only costs one 8MB retry, not the whole 4GB file.
+- **Metadata commit only on "complete multipart upload."** Until then, an aborted upload leaves orphaned chunks that a nightly garbage-collection pass reclaims — no explicit cleanup logic is needed in the upload client itself.
+- **Range reads served from the chunk store directly**, using the metadata chunk list to translate "give me bytes 800MB–820MB" into "fetch chunk 100 and chunk 101" — exactly the read path's parallel-fetch step, just restricted to a subset of chunks instead of all of them.
+
+<Callout type="warning">
+  A common mistake: designing the metadata service and the chunk store as one tightly coupled unit — for example, having storage nodes themselves own the "is this the current version" logic, or having every read go through a service that both resolves the key and streams the bytes. That collapses the two systems' very different scaling profiles (metadata: low volume, needs strong consistency; chunk store: huge volume, can tolerate more relaxed consistency internally) into one, and it makes it much harder to reason about crash safety — you lose the clean "metadata commit is the single atomic moment an object becomes visible" property that makes partial-write failures harmless instead of corrupting.
+</Callout>
+
+<Quiz
+  lessonId="blob-designing-the-blob-store"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'During a write, all chunks are durably stored on storage nodes, but the process crashes before the metadata service records the new chunk list. What is the correct outcome?',
+      options: [
+        { id: 'a', text: 'The object is not visible to any reader, and the orphaned chunks are eventually reclaimed by garbage collection', correct: true, explanation: 'Metadata commit is the single moment an object becomes visible. Without it, readers cannot resolve the key, and the unreferenced chunks get cleaned up later — a harmless outcome by design.' },
+        { id: 'b', text: 'The object is visible but returns a checksum error on read', correct: false, explanation: 'There is no metadata entry pointing at these chunks at all, so a reader cannot even discover them — this is not a corrupted read, it is a nonexistent object.' },
+        { id: 'c', text: 'The chunk store automatically promotes the chunks to a valid object once durability is confirmed', correct: false, explanation: 'The chunk store has no concept of "object" — only the metadata service\'s chunk-list commit turns a set of chunks into a readable object.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which properties are true of the metadata service in a blob store, as distinct from the chunk store? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It is on the hot path for every metadata lookup, but never on the hot path for streaming object bytes', correct: true, explanation: 'The read path resolves a chunk list from metadata, then fetches bytes directly from storage nodes — metadata never proxies the actual data.' },
+        { id: 'b', text: 'It typically needs stronger consistency than the chunk store, because it is the single source of truth for which version is current', correct: true, explanation: 'A small, strongly-consistent metadata tier is what makes "the object is either fully committed or not visible at all" a reliable guarantee, even while chunk replicas catch up more loosely.' },
+        { id: 'c', text: 'It scales in proportion to total bytes stored, the same way the chunk store does', correct: false, explanation: 'Metadata volume tracks the number of objects and request rate, not total byte volume — this is exactly why the two tiers are split and scaled independently.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A DELETE call in a blob store typically reclaims the object\'s chunk storage synchronously, before returning success to the caller.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Physical chunk reclamation is deferred to a background garbage collector. A synchronous delete only needs to remove or tombstone the metadata pointer, which is fast regardless of object size.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — deletes are logical (metadata) first and physical (chunk reclamation) later, which keeps delete latency independent of object size and avoids racing concurrent readers holding an old chunk list.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why does multipart upload split each part into its own placement-and-acknowledgment cycle instead of treating the whole object as one write?',
+      options: [
+        { id: 'a', text: 'So a failure partway through only requires retrying the affected part, not the entire object', correct: true, explanation: 'This is the main motivation: an 8MB part retry after a network drop is cheap; restarting a multi-gigabyte upload from scratch is not.' },
+        { id: 'b', text: 'Because the metadata service cannot store more than one chunk ID per object', correct: false, explanation: 'The metadata service stores an ordered list of chunk IDs per object — there is no such limitation; this is not the reason for multipart upload.' },
+        { id: 'c', text: 'Because storage nodes reject any single write larger than one chunk', correct: false, explanation: 'The chunk size limit is a design choice for placement and range-read simplicity, not an inherent storage-node restriction — and it doesn\'t explain why parts are acknowledged independently rather than in one batch.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,244 @@
+---
+title: "Challenges of Client-Side Error Monitoring"
+module: "Monitor Client-Side Errors"
+moduleOrder: 15
+order: 1
+track: "concept"
+summary: "Explains why capturing errors on user devices is a fundamentally harder distributed-systems problem than server-side logging, and what an error-monitoring pipeline must solve to be reliable."
+tags: ["client-side-monitoring", "observability", "error-tracking", "distributed-systems", "frontend-reliability"]
+estMinutes: 11
+cheatsheet:
+  - "Client-side errors happen on devices you don't control and can't SSH into — the only signal you get is whatever the client chooses (and manages) to send you."
+  - "Source maps are mandatory for minified/bundled JS, but they leak source code — never serve them publicly; upload them privately to your error-tracking backend and store per-release."
+  - "Errors and their context (breadcrumbs, session/user IDs) arrive out of order and possibly hours late due to offline devices — design ingestion to tolerate that, not assume near-real-time arrival."
+  - "Dedup/grouping (fingerprinting) is a first-class problem: one bug produces thousands of raw reports across devices, and naive grouping by message text merges unrelated errors or splits identical ones."
+  - "Client-side sampling and rate-limiting are required, not optional — an unthrottled client can DoS your own ingestion endpoint during a bad release when every user hits the same crash simultaneously."
+  - "PII scrubbing must happen on the client before the payload leaves the device wherever possible — stack traces, URLs, and form state routinely contain emails, tokens, and other sensitive data."
+  - "A crash in your error handler must never crash the app a second time — the reporting path itself needs to fail silently and cheaply."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+When a request fails inside your backend, you have logs, traces, metrics,
+and a machine you can attach a debugger to. When a `TypeError` happens
+inside a user's browser tab in a hotel with bad wifi, you have none of
+that — the failure occurred on hardware you don't own, on a build you
+might not recognize, and the only way you'll ever hear about it is if the
+client itself notices, packages up the failure, and successfully phones
+home. Client-side error monitoring is really a small distributed system
+that has to survive on the least trustworthy, least controllable node in
+your whole architecture: the end user's device.
+
+This lesson covers why that's a genuinely different (and harder) problem
+than server-side observability, before the next lesson in this module
+designs a concrete pipeline to solve it.
+
+## Why this isn't "just logging, but in the browser"
+
+Server-side logging assumes things client-side monitoring can't:
+
+- **You control the runtime.** Server fleets run a known set of OS/runtime
+  versions you chose. Client errors happen across an open-ended matrix of
+  browsers, OS versions, extensions, and device capabilities you never
+  tested against.
+- **The process is reachable while it's failing.** You can attach a
+  profiler or read `/proc` on a live server. A browser tab that crashes or
+  gets killed by the OS for memory pressure is just gone — whatever state
+  wasn't already flushed is lost forever.
+- **The network path back to you is reliable.** A server writing to a
+  local log agent essentially never loses that write. A phone losing LTE
+  coverage mid-crash loses the report unless the client buffered it for
+  a later retry.
+- **You can reproduce it.** Backend bugs are largely deterministic given
+  the same inputs and the same deployed code. Client bugs are entangled
+  with an ad blocker, a stale service worker, a third-party script racing
+  yours, or a device-specific rendering quirk — reproduction often
+  requires the exact device.
+
+The consequence: a client-side error pipeline has to be designed
+defensively at every stage, because the thing generating the telemetry
+is also the thing most likely to be broken, offline, resource-constrained,
+or actively hostile (bots, ad blockers stripping your script).
+
+## The core challenges
+
+### 1. Capturing the error at all
+
+Not every failure surfaces the same way. You need distinct capture paths
+for:
+
+- **Uncaught exceptions** — via `window.onerror` / `window.addEventListener('error', ...)`.
+- **Unhandled promise rejections** — a separate event
+  (`unhandledrejection`) that plain `try/catch` never sees, and a very
+  common source of silently swallowed failures in async code.
+- **Framework-boundary errors** — a React error boundary, for instance,
+  catches render-phase errors in its subtree but not errors in event
+  handlers or effects fired outside a render — those still need the
+  global handlers above.
+- **Resource loading failures** — a script, stylesheet, or image that
+  404s doesn't throw a catchable JS exception; it fires a `error` event
+  on the element itself, which most naive setups never listen for.
+- **"Silent" failures** — a promise that resolves with an error object
+  instead of rejecting, or a caught exception that's logged to `console`
+  and swallowed. These never reach any global handler at all; catching
+  them requires instrumenting the call sites directly.
+
+Missing any one of these categories means a whole class of production
+bugs is invisible to you, no matter how good the rest of the pipeline is.
+
+### 2. Turning a stack trace into something a human can read
+
+Production JS is minified and bundled — the stack trace your handler
+receives points at `a.js:1:48213`, not the source line a developer wrote.
+**Source maps** translate minified positions back to original source, but
+they introduce their own problems: they must be generated per build, kept
+in lockstep with the exact deployed release (a mismatch produces a
+confidently wrong stack trace, which is worse than no trace), and they
+must never be served publicly, since a source map effectively hands out
+your unminified source. The standard approach is to build them, upload
+them privately to your error-tracking backend keyed by release/version,
+and resolve them server-side when a report comes in — never ship them to
+the CDN path users hit.
+
+### 3. Getting the report off the device reliably
+
+The device that just crashed is the same device that has to send you the
+crash report, and it may be about to lose network, get backgrounded, or
+be killed by the OS before the send completes. That forces some
+uncomfortable trade-offs:
+
+- Use `navigator.sendBeacon` (or a `fetch` with `keepalive: true`) so the
+  browser can complete the send even as the page unloads — a normal async
+  `fetch` can get cancelled mid-flight.
+- Buffer reports locally (e.g. in `localStorage`/IndexedDB) so an offline
+  device can retry once connectivity returns, instead of dropping the
+  report the instant the first send attempt fails.
+- Accept that some fraction of reports are simply lost forever — a device
+  that loses power mid-crash isn't sending anything, no matter how well
+  you engineer the client. Design your reliability targets around "best
+  effort with retry," not "guaranteed delivery."
+
+### 4. Volume, dedup, and grouping
+
+A single bad deploy can turn one bug into millions of raw error reports —
+one per affected page load, across every affected user. Your backend has
+to solve two things the client can't:
+
+- **Fingerprinting/grouping** — deciding which raw reports represent "the
+  same underlying bug" so a human sees one issue with a count of 40,000
+  occurrences, not 40,000 separate tickets. Grouping purely by error
+  message is naive: `Cannot read properties of undefined (reading 'id')`
+  is the generic shape of dozens of unrelated bugs, while the same root
+  cause can produce slightly different messages across browsers.
+  Stronger fingerprints combine the normalized stack trace (function
+  names and file:line after source-mapping, not raw text) with the error
+  type.
+- **Sampling and rate limiting** — if 100,000 clients hit the same crash
+  in the same minute, you don't need 100,000 identical payloads to know
+  about it and fix it; you need one full report plus a count. Client-side
+  rate limiting (e.g. "at most N reports of the same fingerprint per
+  session") and server-side sampling protect both the user's bandwidth
+  and your ingestion tier from a self-inflicted denial-of-service during
+  an incident — precisely the moment you need the pipeline to still be up.
+
+### 5. Privacy and payload hygiene
+
+A useful error report wants context: the URL, recent user actions
+(breadcrumbs), maybe local component state. That same context is exactly
+where PII tends to hide — an email address in a query string, an auth
+token pasted into a stack trace by an overly verbose error message, form
+input echoed into a breadcrumb. Scrubbing has to happen client-side,
+before the payload ever leaves the device, because once it's on your
+server it's already been transmitted (and possibly logged by an
+intermediate proxy) regardless of what you do with it afterward.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Uncaught error / rejection / resource failure] --> B[Client-side handler captures + scrubs PII]
+  B --> C{Network available?}
+  C -- yes --> D[sendBeacon / fetch keepalive]
+  C -- no --> E[Buffer in local storage]
+  E -. retries later .-> D
+  D --> F[Ingestion endpoint: rate limit + sample]
+  F --> G[Symbolicate via source maps]
+  G --> H[Fingerprint + group into issues]
+`} />
+
+## Worked example: sizing the "storm" problem
+
+Say your product has 2 million daily active users, and a bad deploy
+introduces a crash on the checkout page that hits roughly 5% of sessions
+that reach that page. If 10% of DAU reach checkout on a given day, that's
+`2,000,000 * 0.10 * 0.05 = 10,000` crashing sessions. If each crash
+produces one report plus 20 breadcrumb events building up to it, and the
+bad deploy stays live for 30 minutes before rollback, your ingestion tier
+needs to absorb roughly `10,000 * 21 = 210,000` events concentrated into
+that half hour — a burst rate over 100 events/second sustained, arriving
+in a spike correlated with the deploy, not spread evenly through the day.
+
+That's the number that should drive your rate-limiting and backpressure
+design in the next lesson: a pipeline sized for average daily error
+volume will fall over exactly when a bad release makes it matter most.
+
+<Callout type="warning">
+  The most common mistake teams make: wrapping the error-reporting call
+  itself in code that can also throw — a `JSON.stringify` on a payload
+  containing a circular reference, or a network call with no try/catch
+  around it. When your error handler errors, you don't just lose that one
+  report; depending on how it's wired up, you can trigger an infinite loop
+  of error events reporting on themselves, or crash the tab a second time
+  while it's already in a bad state. Every line in the reporting path must
+  be defensively coded to fail silently and cheaply — this is the one
+  place in your codebase where "just log it and move on" beats any
+  attempt to be clever.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="cli-err-challenges-of-client-side-error-monitoring"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A promise rejects but nothing ever calls `.catch()` on it. Which capture mechanism is needed to observe this?',
+      options: [
+        { id: 'a', text: 'window.onerror', correct: false, explanation: 'window.onerror fires for uncaught thrown exceptions in synchronous code and script errors, not for unhandled promise rejections, which are a distinct event.' },
+        { id: 'b', text: 'The unhandledrejection event', correct: true, explanation: 'Unhandled promise rejections fire a separate `unhandledrejection` event on window; without listening for it, these failures are invisible to a handler only wired to onerror.' },
+        { id: 'c', text: 'A React error boundary', correct: false, explanation: 'Error boundaries catch errors thrown during rendering, lifecycle methods, and constructors in their subtree — they do not catch promise rejections, which happen outside the render phase.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine reasons client-side error monitoring is harder than server-side logging? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The device generating the error may go offline before the report is sent', correct: true, explanation: 'Unlike a server writing to a local log agent, a client report has to survive an unreliable, possibly disconnecting network path back to you.' },
+        { id: 'b', text: 'Client code runs across an open-ended matrix of browsers, OS versions, and extensions you did not choose', correct: true, explanation: 'Server fleets run known, chosen runtimes; client code runs on whatever device and configuration the user happens to have, which you cannot standardize or fully test.' },
+        { id: 'c', text: 'JavaScript cannot throw exceptions, so there is nothing to catch', correct: false, explanation: 'This is false — JavaScript throws exceptions constantly; the challenge is reliably capturing and transmitting them from an uncontrolled device, not a lack of exceptions to catch.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Source maps should be uploaded privately to your error-tracking backend rather than served publicly alongside your minified bundles.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — a source map effectively exposes your original, unminified source code. It should be resolved server-side against a privately stored map, never shipped on the public CDN path.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Serving source maps publicly would let anyone reconstruct your original source from the minified bundle, which is a real information-disclosure risk teams need to avoid.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A bad deploy causes 10,000 client sessions to crash within 30 minutes, each producing a report plus 20 breadcrumb events. What is the primary design implication for the ingestion pipeline?',
+      options: [
+        { id: 'a', text: 'It should be sized for average daily error volume, since spikes are rare', correct: false, explanation: 'This is backwards — sizing only for average daily volume guarantees the pipeline falls over during exactly the bursty, correlated event (a bad release) when it matters most.' },
+        { id: 'b', text: 'It needs rate limiting and sampling to absorb a correlated burst without falling over during the incident that matters most', correct: true, explanation: 'Bad releases produce highly correlated bursts far above average volume; without client- and server-side rate limiting/sampling, the ingestion tier can be knocked over right when you need visibility most.' },
+        { id: 'c', text: 'It should drop breadcrumb events entirely to reduce load', correct: false, explanation: 'Breadcrumbs are valuable debugging context; the fix for burst volume is rate limiting and sampling, not discarding a whole category of useful diagnostic data.' },
+      ],
+    },
+  ]}
+/>

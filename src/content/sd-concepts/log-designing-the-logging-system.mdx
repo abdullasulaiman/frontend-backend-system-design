@@ -1,0 +1,129 @@
+---
+title: "Designing the Logging System"
+module: "Distributed Logging"
+moduleOrder: 22
+order: 3
+track: "concept"
+summary: "Assembles agents, buffering, processing, storage tiers, and a query layer into one end-to-end centralized logging system, with a worked capacity estimate."
+tags: ["logging", "observability", "distributed-systems", "capacity-planning", "system-design"]
+estMinutes: 13
+cheatsheet:
+  - "Five stages, each scaling and failing independently: local agent -> durable buffer/queue -> processing (parse, enrich, redact) -> tiered storage -> query API."
+  - "The local agent must be disk-backed and rate-limited — an agent that blocks the application thread or OOMs the host on a log burst is worse than losing some logs."
+  - "A queue (Kafka-style) between shippers and processors is what lets ingestion absorb bursts and lets storage fall behind temporarily without dropping data or backpressuring production traffic."
+  - "Structure logs at write time (JSON with a schema) instead of parsing free-text at query time — every field you want to filter or aggregate on later should already be a field, not a regex away."
+  - "Tier storage by age: hot/indexed for the last few days (fast search), warm for weeks (slower, cheaper), cold object storage for compliance retention (rarely read, never indexed)."
+  - "Sample or drop DEBUG/TRACE-level logs before they hit the network — indexing cost, not disk cost, is usually what makes 'log everything' unaffordable."
+  - "Never let the logging pipeline apply backpressure to the application it's monitoring — drop logs locally before you slow down a request path."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've seen why distributed logging is hard and walked through the pipeline's building blocks. Now put them together. The interview question "design a centralized logging system for a few thousand services" isn't answered by naming Kafka and Elasticsearch — it's answered by tracing a single log line from a `print` statement on some host, through every hop, to an engineer's search query at 3 a.m., and defending each hop's failure mode and cost.
+
+This lesson builds that end-to-end system: requirements, the five-stage pipeline, a capacity estimate with real numbers, and the mistakes that turn "just log everything" into an outage or a runaway bill.
+
+## Requirements first
+
+Pin down what "logging system" actually needs to do before drawing boxes:
+
+- **Functional**: engineers can search logs by service, host, time range, and free text; they can pull every log line for a single request across services via a correlation/trace ID; recent logs are visible within seconds (near-real-time tailing during an incident).
+- **Scale**: total ingest volume (lines/sec and bytes/sec) across the fleet, which is dominated by your noisiest few services, not the average one.
+- **Durability vs. cost**: losing a handful of DEBUG lines during a burst is fine; losing the one ERROR line that explains an outage is not. Full-fidelity retention for months is expensive, so most systems keep raw data briefly and aggregates or samples longer.
+- **Isolation**: the logging pipeline must never slow down or crash the application it instruments — a slow log write should never become a slow HTTP response.
+
+That last point drives most of the design below.
+
+## The five-stage pipeline
+
+### 1. Local agent
+
+A lightweight process on each host tails log files (or receives log lines directly from the app via a local socket/library) and forwards them. It must be non-blocking from the application's point of view: writes go to a local buffer — ideally a small disk-backed queue, not just an in-memory ring buffer — so an agent restart or a network blip doesn't silently drop a burst of logs that arrived seconds before a crash.
+
+The agent also does the cheapest possible filtering: dropping or sampling DEBUG/TRACE lines, truncating oversized messages, and tagging each line with host, service, and environment metadata before it ever leaves the box.
+
+### 2. Central buffer (the shipping queue)
+
+Agents forward batches into a distributed queue (a Kafka-style log, partitioned by service or shard). This is the single most important decoupling point in the whole system: it lets thousands of agents push independently of how fast downstream processing and storage can consume, absorbs traffic spikes (a bad deploy that starts logging 50x its normal volume), and gives you a replay point if a downstream stage crashes.
+
+### 3. Processing (parse, enrich, redact)
+
+Consumers read off the queue and turn raw lines into structured records: parsing unstructured text into fields, attaching trace/span IDs for cross-service correlation, redacting known PII patterns, and computing derived fields (status-code buckets, latency percentile bucket) that make later queries cheap instead of computing them at read time.
+
+Doing this here — once, in a stage you control — beats asking every service team to log perfectly structured JSON by hand, though encouraging structured logging at the source (see below) still reduces this stage's work.
+
+### 4. Storage (tiered)
+
+Processed records land in an indexed store for the "hot" window (typically the last few days), where an inverted index on structured fields plus a text index on the message body makes search fast. Older data moves to a "warm" tier with less indexing, and eventually to cheap object storage for compliance retention, which is rarely queried and never indexed.
+
+### 5. Query / API layer
+
+A query service fronts the hot and warm tiers, translating a user's "service=checkout AND trace_id=abc123 AND last 15 minutes" into index lookups, merging results, and streaming them back — including a "tail" mode that keeps a query open and streams new matching lines as they arrive, which is what an on-call engineer actually uses during an incident.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[App + local agent] -->|disk-backed buffer| B[Central queue: Kafka-style]
+  B --> C[Processor: parse, enrich, redact]
+  C --> D[(Hot indexed storage: days)]
+  D --> E[(Warm storage: weeks)]
+  E --> F[(Cold object storage: months/years)]
+  D --> G[Query API]
+  G --> H[Search UI / tail / alerting on log patterns]
+`} />
+
+## Worked example: sizing the pipeline
+
+Say the fleet has 5,000 hosts, each emitting an average of 200 log lines/sec at roughly 300 bytes/line (message plus metadata).
+
+- **Raw throughput**: 5,000 x 200 = 1,000,000 lines/sec fleet-wide, or about 300 MB/sec raw.
+- **After local sampling** (drop 80% of DEBUG-level lines, which are the bulk of volume): roughly 400,000 lines/sec, ~120 MB/sec hitting the queue.
+- **Queue sizing**: at 120 MB/sec sustained plus headroom for a 3x burst (a bad deploy, a retry storm), the queue tier needs to absorb ~360 MB/sec peak — this is the number that sets partition count and broker throughput, not the average.
+- **Hot storage, 3-day retention**: 120 MB/sec x 86,400 sec/day x 3 days ~ 31 TB/day x 3 ~ 93 TB before replication; with 3x replication for durability, roughly 280 TB of hot indexed storage.
+- **Indexing cost dominates**: indexing every field of every line at that volume is usually the actual bottleneck — not the raw bytes, but the CPU cost of building inverted indexes at 400,000 lines/sec. This is why most systems index a curated set of fields (service, level, trace ID, status code) and rely on grep-style scans over compressed raw text for anything else.
+
+The number that should scare you in a design interview isn't storage bytes — it's indexing throughput, because that's what forces the sampling and field-selection decisions above.
+
+<Callout type="warning">
+  The most common mistake: treating the queue between agents and processors as durable long-term storage, or skipping it entirely and writing straight from agents to the indexed store. Both couple ingestion rate directly to indexing rate — a slow index write during a traffic spike now backs up agents, which either blocks application threads or drops logs at the worst possible moment. The queue exists specifically to let those two rates diverge temporarily without data loss or app-side impact.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="log-designing-the-logging-system"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why put a distributed queue between the log-shipping agents and the processing/indexing stage, rather than having agents write directly to the indexed store?',
+      options: [
+        { id: 'a', text: 'It decouples ingestion rate from indexing rate, so a slow or backed-up index does not block agents or the application', correct: true, explanation: 'Correct — the queue absorbs bursts and lets storage catch up independently, which is exactly what keeps a logging slowdown from becoming an application slowdown.' },
+        { id: 'b', text: 'It makes log lines permanently durable, so storage retention policies are unnecessary', correct: false, explanation: 'The queue is typically short-retention itself and is not a substitute for the storage tier\'s durability and retention design.' },
+        { id: 'c', text: 'It automatically parses unstructured log lines into structured fields', correct: false, explanation: 'Parsing and enrichment happen in the processing stage that consumes from the queue, not in the queue itself.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are legitimate ways to control the cost/throughput of a centralized logging pipeline? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Sample or drop a large fraction of DEBUG/TRACE-level lines at the local agent before they leave the host', correct: true, explanation: 'Correct — this is usually the single biggest lever, since DEBUG volume dwarfs ERROR/WARN volume in most services.' },
+        { id: 'b', text: 'Index only a curated set of structured fields rather than every field of every line', correct: true, explanation: 'Correct — indexing throughput, not raw storage bytes, is usually the real bottleneck at high line rates.' },
+        { id: 'c', text: 'Move older data to a cheaper, unindexed cold storage tier instead of keeping everything in hot indexed storage', correct: true, explanation: 'Correct — most log data is never read again after the first few days, so paying indexed-storage cost for it long-term is wasteful.' },
+        { id: 'd', text: 'Have the application block on a synchronous write to the central store for every log line to guarantee no loss', correct: false, explanation: 'This is the opposite of a good idea — it couples application latency directly to the logging pipeline\'s health, the exact coupling the queue and local buffering exist to avoid.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In a well-designed logging pipeline, a slow or unavailable indexed-storage tier should be able to cause elevated latency on the application\'s own request path.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'This should not happen. The local agent buffer and central queue exist precisely to isolate the application from downstream slowness in the logging pipeline.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — isolating the app from logging-pipeline slowness is a core design goal; if it fails, the pipeline is dropping logs locally instead, not the request path.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,165 @@
+---
+title: "Requirements for Rate Limiting"
+module: "Rate Limiter"
+moduleOrder: 19
+order: 1
+track: "concept"
+summary: "Establishes what a rate limiter actually needs to guarantee — which dimension it throttles, how it behaves under failure, and how precise it must be — before picking an algorithm or a distributed architecture."
+tags: ["rate-limiting", "requirements", "api-design", "distributed-systems", "availability"]
+estMinutes: 10
+cheatsheet:
+  - "State the limiting key first: per-user, per-API-key, per-IP, or per-endpoint — the wrong key either blocks innocent traffic (shared IPs, NAT) or lets abuse through (a single user with rotating IPs)."
+  - "A rate limiter's job is to say allow or deny and return enough information (retry-after, remaining quota) for the caller to behave correctly — not just to drop requests silently."
+  - "Decide fail-open vs. fail-closed for when the limiter itself is unreachable: fail-open protects availability but stops protecting your backend; fail-closed protects the backend but can reject all traffic during an outage."
+  - "The limiter must add negligible latency (sub-millisecond to low-single-digit ms) — it sits in front of every request, so it can't become the new bottleneck it was meant to prevent."
+  - "Precision is a spectrum, not a binary: exact global counting is expensive at scale; most systems accept some slack (a burst slightly over the limit) in exchange for speed and simplicity, and that trade-off should be a stated requirement, not an accident."
+  - "Multiple limits often coexist at different granularities (per-second burst cap + per-day quota) — these serve different goals (protect infra vs. enforce a pricing tier) and usually need different enforcement layers."
+  - "Where the limiter lives (client, gateway, service, or downstream resource) changes what it can and can't see — this sets up the placement trade-offs the design lesson later in this module works through."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every public API eventually meets a client that calls it far more than intended — a buggy retry loop, a scraper, or a legitimate customer whose traffic spiked ten times overnight. Without a limiter, that one client can starve everyone else, or take down a backend that was sized for normal load. A rate limiter exists to answer one question cheaply and consistently: "has this caller made too many requests, and if so, what should happen next?" That sounds trivial until you have to make it work correctly across thousands of servers handling millions of requests a second, without becoming a bottleneck itself.
+
+This is the first lesson in the Rate Limiter module. The lessons that follow — the token bucket/leaky bucket/window algorithms, making the count correct across a fleet of machines, and the full system design — are all mechanisms for satisfying the requirements this lesson pins down. Skip this step and you'll find yourself debating "token bucket vs. sliding window" before anyone has said what's actually being limited or what happens when the limiter itself goes down.
+
+## What a rate limiter actually does
+
+Strip away any specific algorithm and a rate limiter's contract is small:
+
+- **Identify** the caller against some key (a user ID, an API key, an IP address, or a composite of these).
+- **Check** whether that key's recent request count is within an allowed threshold.
+- **Decide**: allow the request through, or reject it with enough context for the caller to react sensibly (typically an HTTP `429 Too Many Requests` plus headers describing when to retry).
+- **Update** the count so the next request sees an accurate picture.
+
+Everything else — which algorithm tracks the count, whether that count lives on one machine or is synchronized across a cluster — is implementation detail in service of that contract. State the contract this plainly out loud in an interview; it forces the next, harder questions.
+
+## Functional requirements to pin down
+
+### What dimension are you limiting?
+
+This is the single most consequential requirement, and it's the one candidates skip most often.
+
+- **Per user or account** — "each authenticated user gets 1,000 requests/hour." Requires reliable identity (a session or API key), and doesn't help against pre-auth abuse (login attempts, signup spam).
+- **Per API key** — common for third-party integrations; a business can sell different tiers (100 req/min on the free plan, 5,000 req/min on enterprise).
+- **Per IP address** — the only option pre-authentication (login endpoints, public search), but a leaky proxy: many real users can share one IP behind a corporate NAT, and an abusive actor can rotate IPs to dodge it entirely.
+- **Per endpoint or resource** — a cheap `GET /health` and an expensive `POST /search` that fans out to five services shouldn't necessarily share one global limit.
+
+Real systems usually combine two or three of these — e.g., a coarse per-IP limit on unauthenticated endpoints, and a tighter per-API-key limit once a request is authenticated.
+
+### What does "too many" mean?
+
+A limit is meaningless without a **quota** and a **window**: "100 requests" alone tells you nothing — "100 requests per minute" does. Decide, and state, both the numeric threshold and the time window it applies over, since these are exactly the inputs the algorithm lessons later in this module need.
+
+### What happens on rejection?
+
+A rate limiter that just drops requests silently forces every client to guess why things are failing. A well-specified limiter returns:
+
+- A clear status code (`429`), not a generic `500` or a hung connection.
+- A `Retry-After` header (or equivalent) telling the caller when to try again.
+- Optionally, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers so well-behaved clients can self-throttle before ever hitting the limit.
+
+This is a requirement, not a nice-to-have: a client that retries immediately after a silent rejection makes the overload worse, not better.
+
+## Non-functional requirements: where the real trade-offs live
+
+### Low latency overhead
+
+The limiter sits in the request path of every single call. If checking "is this allowed?" takes 20ms, you've added 20ms to every request just to protect against a minority that's abusive — the cure is worse than the disease. The check itself (an in-memory counter lookup, or a single round trip to a fast cache) needs to cost a small fraction of the request's overall budget, typically sub-millisecond to a few milliseconds.
+
+### Accuracy vs. cost
+
+Counting requests *exactly* — a single global, perfectly synchronized counter per key — is expensive once more than one server handles traffic for that key: every request needs a coordinated read-modify-write across machines. Most real systems accept a small amount of slack (a client might get a few requests over the limit right at a window boundary) in exchange for staying fast and simple. Whether that slack is acceptable — "hard cap, never one request over" vs. "roughly N per window, small overshoot is fine" — is itself a requirement to state, and it's exactly the question the Distributed Rate Limiting lesson in this module answers in depth.
+
+### Fail-open vs. fail-closed
+
+What happens if the component tracking counts (a cache, a database) becomes unreachable?
+
+- **Fail-open**: let requests through when the limiter can't be reached. Availability wins; your backend is temporarily unprotected.
+- **Fail-closed**: reject requests when the limiter can't be reached. Your backend stays protected; you've turned a rate-limiter outage into a full outage for legitimate traffic too.
+
+Neither answer is universally correct — a payments API might fail-closed (protect the backend at all costs), while a read-heavy content API might fail-open (an unprotected backend for a few seconds beats rejecting every real user). State which one the system needs and why.
+
+### Scalability and fairness
+
+The limiter must handle the same request volume as the system it protects, which means the state it tracks (counts per key) has to scale horizontally too — a single in-process counter on one server doesn't work once traffic is spread across many servers hitting the same keys. Left uncoordinated, ten servers each independently tracking "requests per key" let a caller spread evenly across all ten get roughly ten times the intended quota — the opposite of what the limit promised. This requirement — one consistent view of a key's count, shared across the fleet — is what motivates the low-latency shared store the Distributed Rate Limiting lesson builds out.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Incoming request] --> B[Identify limiting key: user / API key / IP]
+  B --> C{Under quota for this key + window?}
+  C -->|yes| D[Allow, update count, forward request]
+  C -->|no| E[Reject: 429 + Retry-After header]
+  D --> F{Limiter store reachable?}
+  F -->|down, fail-open| G[Allow through, log for review]
+  F -->|down, fail-closed| H[Reject until store recovers]
+`} />
+
+## Worked example: requirements for a public checkout API
+
+Say the prompt is "design a rate limiter for a checkout API that partner storefronts call to place orders." A requirements pass, stated out loud:
+
+- **Limiting key**: per API key (each partner storefront has one), not per IP — partner traffic comes from shared backend IPs, and the caller is a server, not an end user.
+- **Quota**: two tiers — a burst cap of 20 requests/second per key (protects the checkout backend from a spike) and a daily cap of 50,000 requests/day per key (enforces the partner's contracted plan).
+- **Rejection behavior**: `429` with `Retry-After` in seconds, plus `X-RateLimit-Remaining` so well-integrated partners can back off before hitting the wall.
+- **Fail-closed for the burst limiter**: checkout writes to an inventory and payment system downstream; letting unlimited traffic through during a limiter outage risks overselling stock, so availability is sacrificed here in favor of correctness.
+- **Accuracy**: the daily cap can tolerate a little slack (ending the day at 50,050 instead of exactly 50,000 is fine); the per-second burst cap needs to be much tighter, since it protects a backend with a hard concurrency ceiling.
+
+Two tiers, two different tolerances for slack, two different failure postures — all decided before a single algorithm is chosen. That's the point: the next lesson picks token bucket, leaky bucket, or a windowed counter specifically because it fits requirements like these, not because it's the most familiar name.
+
+<Callout type="warning">
+  The most common mistake at this stage is treating "rate limiting" as one uniform problem and reaching for "IP-based limiting" or "just use a token bucket" as a reflex answer. In practice, different endpoints in the same system often need different keys (per-IP for a public login page, per-API-key for authenticated traffic), different quotas (a tight per-second burst cap alongside a loose per-day quota), and different failure behavior (fail-closed for anything that touches money or inventory, fail-open for read-only traffic). An interviewer who hears "I'll rate-limit by IP" for an authenticated API, or a single limit with no stated failure behavior, will immediately probe the gap. Spend the first few minutes stating the key, the quota, the rejection contract, and the fail-open/fail-closed choice before naming an algorithm.
+</Callout>
+
+## Putting the requirements together
+
+A solid requirements pass for a rate limiter leaves you able to state, in a few sentences: what dimension is being limited (user, API key, IP, or a combination), the quota and window for each tier of limit, what a caller sees on rejection, whether the system fails open or closed when the limiter's own state store is unreachable, and how much slack in accuracy is acceptable in exchange for speed at scale. Every later lesson in this module — which counting algorithm to use, how to keep that count consistent across a fleet of servers, and how to assemble the full system — is engineering built to satisfy exactly the answers you write down here.
+
+<Quiz
+  lessonId="rl-requirements-for-rate-limiting"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'An authenticated API wants to limit each customer account to 1,000 requests/hour, regardless of which device or IP address they call from. Which limiting key fits this requirement?',
+      options: [
+        { id: 'a', text: 'Per IP address', correct: false, explanation: 'IP-based limiting would let the same account exceed the intended limit by switching networks or devices, and would incorrectly throttle unrelated users sharing an IP behind NAT.' },
+        { id: 'b', text: 'Per user/account identity', correct: true, explanation: 'Correct. The requirement is stated in terms of the account regardless of device or network, so the limiting key must be the authenticated user identity, not the network address.' },
+        { id: 'c', text: 'Per endpoint only, with no distinction between callers', correct: false, explanation: 'Limiting purely by endpoint would apply the same cap to every caller combined, not per account, which does not match "each customer account gets 1,000/hour."' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are non-functional requirements that should be decided before picking a rate-limiting algorithm? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Whether the system should fail open or fail closed if the limiter\'s state store is unreachable', correct: true, explanation: 'This directly trades off backend protection against availability during an outage, and must be decided per system rather than assumed.' },
+        { id: 'b', text: 'How much overshoot/slack is acceptable versus enforcing an exact hard cap', correct: true, explanation: 'Exact global counting is expensive at scale; deciding how much slack is tolerable determines how much coordination the limiter actually needs.' },
+        { id: 'c', text: 'The specific programming language used to implement the limiter service', correct: false, explanation: 'Implementation language is an engineering detail unrelated to the distributed-systems requirements that shape the limiter\'s design.' },
+        { id: 'd', text: 'How much added latency the limiter check is allowed to introduce per request', correct: true, explanation: 'Since the check runs on every request, its latency budget is a hard constraint — a slow check can become a worse bottleneck than the abuse it prevents.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A rate limiter that rejects a request should just return an error status code; adding headers like Retry-After is an optional nicety, not a real requirement.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Without a Retry-After (or equivalent) hint, well-behaved clients can\'t know when to try again and may retry immediately, worsening the exact overload the limiter exists to prevent.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Telling the caller when/how much it can retry is part of the limiter\'s functional contract, not an optional extra — it lets clients self-throttle instead of hammering the endpoint.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A checkout API writes to inventory and payment systems downstream. If the rate limiter\'s own state store becomes unreachable, which failure behavior best protects correctness, even at the cost of availability?',
+      options: [
+        { id: 'a', text: 'Fail-open: allow all requests through while the store is down', correct: false, explanation: 'Fail-open maximizes availability, but for a checkout flow it risks unlimited concurrent writes to inventory/payments during the outage — exactly the correctness risk this system cannot tolerate.' },
+        { id: 'b', text: 'Fail-closed: reject requests while the store is down', correct: true, explanation: 'Correct. For a system where uncontrolled traffic risks overselling stock or double-charging, rejecting requests until the limiter\'s state store recovers protects correctness, even though it sacrifices availability during the outage.' },
+        { id: 'c', text: 'It does not matter, since fail-open and fail-closed produce the same outcome', correct: false, explanation: 'They produce opposite outcomes during an outage: fail-open lets all traffic through unprotected, fail-closed blocks all traffic — the right choice depends on which risk (overload vs. unavailability) the system cares about more.' },
+      ],
+    },
+  ]}
+/>

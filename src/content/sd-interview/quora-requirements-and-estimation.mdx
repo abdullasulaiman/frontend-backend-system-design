@@ -1,0 +1,256 @@
+---
+title: "Requirements and Estimation"
+module: "Design Quora"
+moduleOrder: 2
+order: 1
+track: "interview"
+summary: "Scopes the Quora Q&A problem into functional and non-functional requirements, then derives read, write, and vote throughput to justify a feed-and-ranking-first architecture."
+tags: ["requirements", "capacity-estimation", "feed-ranking", "q-and-a", "interview-framework"]
+estMinutes: 12
+cheatsheet:
+  - "Feed reads dwarf content writes by several orders of magnitude in a Q&A product — design the read path (caching, precomputed rankings) before you touch the write path."
+  - "Votes are a separate, much higher-volume write stream than questions/answers — treat vote counts as eventually consistent, approximate counters, not a strongly consistent field updated synchronously per click."
+  - "A pure fan-out-on-write feed breaks on hot topics and highly-followed users (the 'celebrity problem') — flag this in requirements so the high-level design lesson can justify a hybrid push/pull model."
+  - "Text content (questions, answers, comments) is cheap to store compared to video or images — the hard resource constraint here is compute (ranking, feed assembly), not storage."
+  - "State DAU, answers/day, votes/day, and feed-loads/day explicitly before deriving QPS — the read:write:vote ratio is the single number that shapes every later design decision."
+  - "Durability matters for authored content (an answer must never silently disappear) even though the surrounding metrics (votes, view counts) can tolerate approximate, delayed consistency."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design Quora" (or Stack Overflow, or Reddit) looks at first glance like a
+simpler cousin of "Design YouTube" — it's text, not video, so how hard can
+it be? The trap is treating it as a CRUD app for questions and answers.
+The actual hard problem is that every user's home feed is a personalized,
+constantly-reranked view over a graph of questions, topics, and people they
+follow, and that ranking has to feel fresh and relevant at a scale where
+computing it fresh, per user, per request, is not an option.
+
+This lesson is about establishing the scope and the numbers before any of
+that gets designed. Everything downstream — the data model, the feed
+generation strategy, the scaling approach — is a direct response to the
+read:write:vote ratio and the "who follows whom" fan-out shape we pin down
+here.
+
+## Step 1: Scope the functional requirements
+
+Agree on scope with the interviewer instead of assuming everything is in
+play. A reasonable core:
+
+- **Ask and answer**: a user posts a question (with topic tags); other
+  users write answers to it.
+- **Vote**: users upvote or downvote answers (and often questions), which
+  feeds directly into ranking.
+- **Follow**: users follow other users, topics, and individual questions,
+  which determines what shows up in their feed.
+- **Feed**: a personalized home feed surfaces new and re-ranked content
+  from what a user follows.
+- **Search**: find questions and topics by keyword.
+
+Explicitly defer and say so out loud: real-time chat/DMs, ads and
+monetization, detailed spam/abuse ML, and comment threads nested more than
+one level deep are all real Quora features, but each is its own design
+problem. Naming them and moving on signals seniority.
+
+### Non-functional requirements
+
+- **Read-heavy, and the reads are personalized.** Unlike a video's read
+  path (same bytes served to everyone), a feed read here is a unique
+  computation per user — that changes the caching strategy fundamentally.
+- **Vote counts and rankings can be eventually consistent.** A vote count
+  off by a handful for a few seconds is invisible to users; treating every
+  vote as a strongly consistent write against a single row would tank
+  throughput for no real benefit.
+- **Authored content must be durable.** Losing a user's answer is a much
+  worse failure than a stale vote count or a feed that's a few minutes
+  behind — durability requirements are not uniform across the data model.
+- **Feed freshness matters, but not real-time-chat levels of freshness.**
+  A feed item appearing 30-60 seconds late is fine; a feed that never
+  updates within a session is not.
+
+## Step 2: Establish the scale
+
+Rough, stated assumptions beat no assumptions. A workable set of numbers
+for a large (Quora-sized) Q&A platform:
+
+- 300 million monthly active users, 30 million daily active users (DAU).
+- Each DAU opens the feed about 4 times per session-day, loading roughly
+  20 feed items per open.
+- 1 in 3,000 DAU writes an answer on a given day; 1 in 15,000 DAU asks a
+  new question.
+- Each DAU casts an average of 8 votes per day (upvotes/downvotes on
+  answers they read).
+- Average answer: roughly 800 characters of text plus metadata, call it
+  2 KB stored per answer.
+
+<Callout type="tip">
+  Say these numbers out loud before computing anything: "Let's assume 30
+  million DAU and roughly 20 feed items loaded per feed open — does that
+  match what you had in mind?" This turns the estimate into a shared
+  checkpoint instead of a monologue.
+</Callout>
+
+## Step 3: Derive traffic and storage numbers
+
+Work through content writes, votes, and feed reads separately — they
+stress completely different parts of the system.
+
+### Content write throughput
+
+- Daily answers: 30,000,000 divided by 3,000 is 10,000 answers/day.
+- Daily new questions: 30,000,000 divided by 15,000 is 2,000
+  questions/day.
+- Writes per second (average): (10,000 + 2,000) divided by 86,400 is
+  about 0.14/sec — trivially small, even at a 5-10x peak multiplier.
+
+### Vote throughput
+
+- Daily votes: 30,000,000 DAU multiplied by 8 is 240,000,000 votes/day.
+- Votes per second (average): 240,000,000 divided by 86,400 is about
+  2,800/sec; at a 5x peak multiplier, roughly 14,000/sec at peak.
+- This is 4-5 orders of magnitude more writes than authored content — the
+  vote stream, not the content stream, is the real write-scaling problem.
+
+### Feed read throughput
+
+- Daily feed opens: 30,000,000 DAU multiplied by 4 is 120,000,000 opens/day.
+- Feed items served: 120,000,000 multiplied by 20 is 2.4 billion items/day.
+- Feed opens per second (average): 120,000,000 divided by 86,400 is about
+  1,400/sec; at a 5x peak multiplier, roughly 7,000 feed-assembly
+  requests/sec at peak — each one a personalized ranking computation, not
+  a cache-identical byte stream.
+
+### Storage
+
+- Daily content storage: 10,000 answers multiplied by 2 KB is about 20 MB
+  of new answer text per day — negligible even over years.
+- Daily vote-log storage (if you keep a per-vote record for auditing/ML,
+  not just an aggregate counter): 240,000,000 votes multiplied by roughly
+  20 bytes per record is about 4.8 GB/day, or on the order of 1.7 TB/year.
+
+The contrast is the key takeaway: **content storage is cheap; the vote
+stream and the feed-assembly compute are the expensive parts.** A
+relational or document store sized for questions and answers is trivial at
+this scale — the real capacity planning problem is a counter-update
+pipeline that absorbs ~14,000 writes/sec at peak, and a feed-ranking
+service that assembles ~7,000 personalized feeds/sec.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    C["12K writes/day\n(~0.14/sec avg)"] --> CS["Content storage\n~20MB/day, trivial"]
+    V["240M votes/day\n(~14K/sec peak)"] --> VC["Approximate counters\n+ async reconciliation"]
+    F["2.4B feed items/day\n(~7K feed-assemblies/sec peak)"] --> R["Precomputed / cached\nranked feed"]
+    VC -.->|ranking signal| R
+    style C fill:#4a5568,color:#fff
+    style V fill:#2b6cb0,color:#fff
+    style F fill:#2b6cb0,color:#fff
+    style CS fill:#4a5568,color:#fff
+    style VC fill:#4a5568,color:#fff
+    style R fill:#4a5568,color:#fff
+`} />
+
+## Step 4: State the resulting design constraints
+
+1. **Vote counts should be approximate, asynchronously-updated counters**,
+   not synchronous strongly-consistent writes — at ~14,000 writes/sec
+   peak, batching and eventual reconciliation is the only workable design.
+2. **Feed assembly must be mostly precomputed, not built from scratch per
+   request** — 7,000 personalized ranking computations/sec is too
+   expensive to run live against raw data on every feed open; expect a
+   fan-out or precomputation strategy, refined in the next lesson.
+3. **Storage engineering is not the bottleneck** — plan capacity around
+   compute (ranking, counter aggregation) and hot-key fan-out, not around
+   text storage volume.
+4. **A single, uniform "push every update to every follower" strategy
+   will not survive a topic or user with millions of followers** — flag
+   this "celebrity problem" now so the high-level design explicitly
+   chooses a hybrid push/pull model instead of pure fan-out-on-write.
+
+## Worked example: sanity-checking a hot topic
+
+Suppose a topic like "Machine Learning" has 5 million followers, and a
+single new answer gets posted to a question tagged with it. A pure
+fan-out-on-write design would insert that one answer into 5 million
+separate feed structures immediately — a 5-million-write burst from one
+event. Re-running the estimation method with this case in mind: if even
+0.1% of daily answers land in a topic this large, that's 10 such events/day
+adding 500,000 fan-out writes each, or 5 million extra writes/day just from
+"hot" content — on top of the 240 million vote writes already budgeted.
+That's the concrete number that justifies pulling (computing on read) for
+very large fan-out targets instead of pushing to every follower, which
+we'll design explicitly in the next lesson.
+
+<Callout type="warning">
+  A common mistake is spending the estimation phase entirely on text
+  storage — "how many bytes per answer, times number of answers" — because
+  it feels like the YouTube-style exercise. For a Q&A platform the storage
+  number is almost always a rounding error. The numbers that actually
+  drive the design are vote throughput and feed-assembly QPS, plus the
+  fan-out shape of a small number of very-high-follower topics or users.
+  Skipping those in favor of a comfortable storage calculation leaves you
+  with no justification for the ranking and feed-generation choices you'll
+  need to defend later.
+</Callout>
+
+## Where this leads
+
+The shape we derived — cheap content storage, a large approximate-counter
+write stream, and an expensive personalized-feed read path with a
+celebrity/hot-topic fan-out risk — is exactly what drives the high-level
+architecture in the next lesson: a content service backed by a simple
+store, a counting/aggregation pipeline decoupled from the request path,
+and a feed service that mixes precomputed fan-out with on-demand
+computation for outsized topics. Keep these numbers in mind as you move
+forward — every choice in the rest of this module should trace back to one
+of them.
+
+<Quiz
+  lessonId="quora-requirements-and-estimation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Given 30 million DAU casting an average of 8 votes/day, which figure is closest to the average vote-writes-per-second the system must sustain?',
+      options: [
+        { id: 'a', text: 'About 2,800 votes/sec', correct: true, explanation: '30,000,000 x 8 = 240,000,000 votes/day; divided by 86,400 seconds/day is approximately 2,800 votes/sec on average.' },
+        { id: 'b', text: 'About 280 votes/sec', correct: false, explanation: 'This undershoots by a factor of 10 — 240 million divided by 86,400 is close to 2,800, not 280.' },
+        { id: 'c', text: 'About 14,000 votes/sec', correct: false, explanation: 'That is the estimated peak figure (average times a 5x peak multiplier), not the average the question asks for.' },
+        { id: 'd', text: 'About 240,000 votes/sec', correct: false, explanation: 'This overshoots by roughly two orders of magnitude; it would require every DAU to vote nearly once per second continuously, which contradicts the stated assumption.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasonable non-functional priorities to state upfront when scoping a Quora-like Q&A platform? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Vote counts and rankings can be eventually consistent', correct: true, explanation: 'A vote count off by a few for a short window is invisible to users, and treating it as strongly consistent would unnecessarily bottleneck the highest-volume write stream in the system.' },
+        { id: 'b', text: 'An authored answer must not be silently lost once submitted', correct: true, explanation: 'Durability of user-authored content is a hard requirement, unlike the surrounding approximate metrics such as vote counts.' },
+        { id: 'c', text: 'Every feed request should be computed live from raw, fully up-to-date data with zero precomputation', correct: false, explanation: 'At the derived feed-assembly QPS, computing every personalized feed live from scratch is not viable — some precomputation or caching strategy is required.' },
+        { id: 'd', text: 'A single push-based fan-out strategy should be used uniformly for every user and topic regardless of follower count', correct: false, explanation: 'This is the "celebrity problem" trap: a uniform push (fan-out-on-write) strategy breaks down for topics or users with very large follower counts and needs a hybrid approach instead.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'For a text-based Q&A platform at this scale, raw content storage (questions and answers) is typically the dominant capacity-planning constraint, similar to how video bytes dominate a video platform.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Incorrect — text content storage is comparatively tiny (tens of megabytes per day in the worked estimate); the dominant constraints are vote-write throughput and feed-assembly compute, not storage.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — unlike a video platform, storage is cheap here; the expensive resources are the high-volume vote/counter write stream and the per-user feed-ranking computation.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A topic followed by 5 million users gets a new answer. What does this scenario mainly illustrate for the design?',
+      options: [
+        { id: 'a', text: 'That content storage costs scale unpredictably with follower count', correct: false, explanation: 'Storage cost for one additional answer is unaffected by how many people follow the topic; the issue here is write fan-out, not storage.' },
+        { id: 'b', text: 'That a pure fan-out-on-write feed strategy can create a massive write burst for a single event, motivating a hybrid push/pull design for high-follower topics or users', correct: true, explanation: 'Pushing one new answer into millions of individual follower feed structures at once is exactly the "celebrity problem" that justifies computing feeds on read (pull) for outsized fan-out targets rather than pushing universally.' },
+        { id: 'c', text: 'That vote counts need to become strongly consistent to handle popular topics correctly', correct: false, explanation: 'Vote consistency is a separate concern from feed fan-out; strong consistency for votes would not address the fan-out write burst at all.' },
+        { id: 'd', text: 'That search indexing becomes the primary bottleneck at this follower count', correct: false, explanation: 'Search was scoped as a feature but is not the bottleneck implied by this scenario; the scenario specifically stresses feed fan-out on a write event.' },
+      ],
+    },
+  ]}
+/>

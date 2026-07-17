@@ -1,0 +1,141 @@
+---
+title: "Blob Store Requirements"
+module: "Blob Store"
+moduleOrder: 20
+order: 1
+track: "concept"
+summary: "Defines the functional and non-functional requirements for a distributed blob store and shows how object size, immutability, and durability targets drive every later design decision."
+tags: ["blob-store", "requirements", "object-storage", "durability", "distributed-systems"]
+estMinutes: 11
+cheatsheet:
+  - "A blob store's API is deliberately small: put(object), get(object), delete(object), plus listing by prefix — no in-place edits, no queries on content."
+  - "Objects are almost always treated as immutable: an 'update' is a brand-new object version, not a byte-range patch. Say this out loud early — it rules out a whole class of file-system-like designs."
+  - "State the size distribution (not just an average) — a store holding thumbnails and 4K video masters needs a chunking/multipart strategy that a store of only small profile photos doesn't."
+  - "Durability is usually the headline non-functional requirement: '11 nines' means the failure mode you design against is silent data loss across multiple disks/racks, not just a single node crash."
+  - "Split storage into two paths on purpose: object bytes (cheap, replicated, rarely random-access) and metadata (small, hot, needs fast lookup) — they have opposite scaling needs and usually live in different systems."
+  - "Write down the read/write ratio and access pattern (hot-then-cold) up front — it decides whether you need a tiering/lifecycle policy (hot -> warm -> cold -> archive) later in the design."
+  - "Large objects change the API contract itself: uploads and downloads need to support resumability and range requests, not just a single blocking request/response."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design a blob store" (or its more recognizable framing, "design S3" or "design a photo/video storage service") is a favorite system design prompt because it looks deceptively simple: store a file, get it back later. The trap is treating it like a bigger key-value store. It isn't. A blob can be 40 bytes or 40 gigabytes, it's written once and read many times, and the two halves of the problem — where the bytes live and where the metadata about those bytes lives — scale completely differently. Candidates who skip straight to "I'll shard the bytes across nodes" without first pinning down object size, mutability, and durability targets end up re-deriving the whole architecture mid-interview when the interviewer casually mentions "oh, and some of these are 2GB video files."
+
+This lesson is the first in the Blob Store module, and its job is to get those requirements on the table before any architecture gets drawn. The lessons that follow — data model and architecture, partitioning/replication/durability, and putting the full design together — each answer a question this lesson raises. Get the requirements right here and the rest of the module reads as "here's how we satisfy what we already agreed to," not a list of memorized facts about how S3 works internally.
+
+## Start with the API, and what's deliberately absent
+
+A blob store's functional surface is narrow by design:
+
+- `put(key, bytes, metadata)` — store an object's bytes under a key (often within a bucket/container namespace), along with a small amount of metadata (content-type, custom tags).
+- `get(key)` — retrieve the full object, or a specific byte range (`Range: bytes=0-1023`) for large objects.
+- `delete(key)` — remove an object (frequently a soft delete / tombstone with a retention window, not an instant hard delete).
+- `list(prefix)` — enumerate keys under a prefix, since there's no query language over content.
+
+What's missing matters as much as what's present: no partial in-place writes, no transactions spanning multiple objects, no server-side joins or filtering by content. If an interview prompt starts asking for "search objects by a field inside the file" or "edit byte 500 of this object without re-uploading," that's a sign the requirement has drifted into a different system (a search index, or a file system) — call that out as a scope decision rather than quietly designing it in.
+
+## Functional requirements to pin down
+
+- **Object size distribution, not just an average.** A store for avatar thumbnails (a few KB to low MB) is architecturally different from one that also holds video masters (multi-GB). If large objects are in scope, uploads/downloads need chunking (multipart upload) and range-read support — a single-request PUT of 5GB isn't a viable API.
+- **Mutability.** Treat objects as immutable by default: a "new version" of a key is a new object, not a patch to bytes in place. This single decision simplifies replication enormously (no partial-write conflicts to resolve) and is why most real blob stores (S3, GCS) work this way. If the prompt truly needs byte-range mutation of existing objects, say so explicitly — it's a materially harder problem.
+- **Namespacing.** Objects usually live inside a bucket/container, and access control, quotas, and lifecycle policies are typically scoped per-bucket, not per-object. Decide whether the design needs multi-tenant buckets.
+- **Consistency of listing and metadata.** Is it acceptable for a `list` call to lag slightly behind a very recent `put` (eventual consistency), or must a `get` immediately after a `put` always see the new object (read-after-write consistency)? Most blob stores guarantee the latter for a specific key even under eventual consistency elsewhere, and that guarantee shapes the metadata store design in the next lesson.
+
+## Non-functional requirements: where the real trade-offs live
+
+### Scale and access pattern
+
+Get real numbers on the table: total objects, average and max object size, write QPS, read QPS, and total storage footprint. Just as importantly, get the *access pattern*: blob stores are almost universally write-once, read-many, with sharp recency bias — a photo uploaded today is read constantly for a week and then almost never again. That access curve is exactly what drives a tiered storage design (hot -> warm -> cold -> archive) later in the module; state it now so it isn't a surprise.
+
+### Durability
+
+This is usually the headline requirement, and it's worth being precise about what it means. "11 nines of durability" (99.999999999%) doesn't describe uptime — it describes the probability that a *specific stored object* is never permanently lost across its lifetime, even accounting for disk failures, rack failures, and even a full datacenter loss. That's a durability target, distinct from availability (can you serve a request *right now*). A blob store can be briefly unavailable during a failover and still be perfectly durable; it can never be allowed to silently lose an object, no matter how rare the failure.
+
+### Availability
+
+State a target (e.g., 99.9% vs 99.99%) and note that availability and durability are optimized differently: durability is about redundant copies surviving failure, availability is about at least one copy being reachable and serving traffic right now. A design can over-invest in one and under-invest in the other if this isn't separated explicitly.
+
+### Cost
+
+Storage cost scales with total bytes stored x replication/erasure-coding factor x number of storage tiers, and it is usually the dominant non-functional constraint for a blob store specifically (unlike a KV store, where compute/memory often dominates cost). A design that ignores cost and just says "replicate everything 3x forever" will get pushback in a real interview — this is why lifecycle-based tiering exists as a first-class requirement, not a nice-to-have.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[put request] --> B{Object size}
+  B -->|small, e.g. under 5MB| C[Single-request upload]
+  B -->|large, e.g. video| D[Multipart / chunked upload]
+  C --> E[Object bytes stored, replicated]
+  D --> E
+  A --> F[Metadata written: key, size, content-type, location]
+  E --> G[Durability target: survive disk / rack / DC failure]
+  F --> H[Fast key lookup for get and list]
+`} />
+
+<Callout type="warning">
+  The most common mistake at this stage is jumping straight to "I'll store blobs on a distributed file system and shard by key hash" without separating object bytes from object metadata as two different problems with two different scaling needs. Metadata (key, size, content-type, storage location, version) is small and needs fast, indexable lookup — it behaves like a KV store or a small database table. Object bytes are large, rarely need random access, and are optimized for sequential write/read and cheap replication. Conflating the two into one storage system usually means over-provisioning expensive fast storage for the bytes, or under-provisioning lookup performance for the metadata. State the split explicitly before moving to the data model lesson.
+</Callout>
+
+## Worked example: sizing a photo-storage service
+
+Say the prompt is "design a blob store to back a photo-sharing app with 100 million users, each uploading 5 photos per day on average, average photo size 2MB." A tight requirements pass:
+
+- **API:** `put`/`get`/`delete` per object key, `list` by user-prefix; objects immutable (a re-upload creates a new key/version).
+- **Scale:** 100M users x 5 photos/day = 500M writes/day (~5,800 writes/sec average, plan for a peak multiple of that). Reads dominate writes heavily — say a 50:1 read/write ratio typical of social photo apps, so ~290K reads/sec at peak.
+- **Storage growth:** 500M photos/day x 2MB = ~1PB of *new* raw data per day, before replication.
+- **Durability:** 11 nines — losing a user's photo permanently is unacceptable, so 3x replication (or erasure coding for older, colder data) is a requirement, not an optimization.
+- **Access pattern:** heavy recency bias — a photo is viewed constantly in its first week, then rarely. This justifies a lifecycle policy: full replication on fast storage for 30 days, then transition to cheaper erasure-coded cold storage.
+
+With 3x replication, that 1PB/day of raw uploads becomes ~3PB/day of storage consumed before any tiering kicks in — a number that makes "just replicate everything forever on the fastest disks" obviously unworkable, and directly motivates the tiered storage and erasure-coding decisions in the durability lesson later in this module.
+
+## Putting the requirements together
+
+A solid requirements pass for a blob store interview question leaves you able to state, in a few sentences: the API and its deliberate limits (no in-place edits, no content queries), the object size distribution and whether chunked upload is needed, the mutability model (immutable, versioned), the durability and availability targets stated as distinct numbers, the access pattern (hot-then-cold), and a rough capacity estimate. Every later lesson in this module — how metadata and bytes are modeled and stored, how bytes get partitioned and replicated for durability, and how the pieces snap together into one architecture — is just engineering in service of the numbers and decisions written down here.
+
+<Quiz
+  lessonId="blob-blob-store-requirements"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why do most blob store designs treat stored objects as immutable, where an "update" creates a new object/version rather than patching bytes in place?',
+      options: [
+        { id: 'a', text: 'It avoids the need to resolve partial-write conflicts and greatly simplifies replication across multiple copies.', correct: true, explanation: 'Correct — immutability means replicas never need to merge concurrent in-place edits to the same bytes; a "write" is always a whole new object, which replication can just copy wholesale.' },
+        { id: 'b', text: 'It is required so that objects can be compressed before storage.', correct: false, explanation: 'Compression is independent of whether objects are mutable or immutable; you can compress either way.' },
+        { id: 'c', text: 'It reduces the size of the metadata needed per object.', correct: false, explanation: 'Immutability does not shrink metadata — in fact, versioned immutable objects typically need slightly more metadata (a version identifier) than a mutable model.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are non-functional requirements that should be pinned down before designing how blob bytes get partitioned and replicated? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The durability target (e.g., probability of never permanently losing a stored object)', correct: true, explanation: 'Durability is usually the headline requirement for a blob store and directly determines replication factor or erasure coding strategy.' },
+        { id: 'b', text: 'The access pattern over time (e.g., heavy read traffic soon after upload, then rarely accessed)', correct: true, explanation: 'This recency-bias pattern is exactly what motivates tiered storage (hot/warm/cold/archive) and lifecycle policies.' },
+        { id: 'c', text: 'The exact on-disk file format used to serialize object bytes', correct: false, explanation: 'That is an implementation detail decided later, not a requirement gathered up front during this stage.' },
+        { id: 'd', text: 'The size distribution of objects (small thumbnails vs. multi-GB video)', correct: true, explanation: 'Size distribution decides whether chunked/multipart upload and range reads are required at all, which changes the API and storage layout.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Durability and availability describe the same guarantee for a blob store, so stating one target automatically covers the other.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'They are distinct: durability is about a stored object never being permanently lost across failures over time, while availability is about whether the system can serve a request right now. A system can be briefly unavailable during a failover while remaining fully durable.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — durability and availability are separate guarantees, optimized by different mechanisms (redundant copies vs. reachable serving capacity), and a design should state targets for both explicitly.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A photo-sharing service uploads 500 million 2MB photos per day. With 3x replication for durability, roughly how much storage does one day of uploads consume across the cluster?',
+      options: [
+        { id: 'a', text: '~1 PB', correct: false, explanation: 'That is the raw (unreplicated) size — 500M x 2MB ~ 1PB — but it omits the 3x replication factor.' },
+        { id: 'b', text: '~3 PB', correct: true, explanation: 'Correct: 500M photos x 2MB ~ 1PB of raw daily uploads, and 3x replication means roughly 3PB of storage is consumed per day before any cold-tier compaction.' },
+        { id: 'c', text: '~300 TB', correct: false, explanation: 'This undershoots the estimate — it does not match 500M x 2MB x 3 replicas, which comes out to petabytes, not hundreds of terabytes.' },
+      ],
+    },
+  ]}
+/>

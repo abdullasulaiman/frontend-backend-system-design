@@ -1,0 +1,135 @@
+---
+title: "Requirements for Distributed Unique IDs"
+module: "Unique ID Generator"
+moduleOrder: 12
+order: 1
+track: "concept"
+summary: "Explains why a single auto-increment column stops working once an application spans multiple database instances, and pins down the properties a distributed ID generator actually needs before you pick an algorithm."
+tags: ["unique-id", "distributed-systems", "requirements", "sharding", "scalability"]
+estMinutes: 10
+cheatsheet:
+  - "Auto-increment breaks the moment you have more than one writable database instance — two shards can both hand out id 501, and merging or resharding later means renumbering rows that other systems already reference."
+  - "Uniqueness alone is a low bar (a random 128-bit string clears it). The real design constraints are usually monotonicity, size, and generation without a coordinator on the hot path."
+  - "Roughly sortable-by-time IDs (not necessarily strictly monotonic) are what most systems actually need — they keep index inserts append-only and make 'newest N rows' queries cheap, without requiring a single global counter."
+  - "Write down your actual throughput and ID lifetime before comparing algorithms: 64 bits comfortably covers timestamp + machine id + per-ms sequence for decades; 128-bit UUIDs trade size for zero coordination."
+  - "A generator that depends on a single database or service to hand out the next ID is a new single point of failure and a new bottleneck — decide up front whether that's acceptable or a hard no."
+  - "Clock behavior is a requirement, not an implementation detail: state whether IDs must never regress even across NTP adjustments or generator restarts, because that decision shapes which algorithm survives clock skew."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every relational database gives you unique IDs for free, right up until it doesn't. A single Postgres or MySQL instance can hand out `id = 1, 2, 3, ...` from an auto-increment column forever, because there's exactly one place tracking "what's the next number." The problem shows up the moment that assumption breaks: you shard the table across four database instances to handle write volume, or you run active-active in two regions for availability, and now you have four (or more) places independently counting up from 1. Shard A's row 501 and shard C's row 501 are both real rows with the same ID. Anything downstream that treats an ID as globally unique — a URL, a cache key, a foreign key referenced from another service — silently breaks.
+
+This lesson is the "requirements" step for the Unique ID Generator design problem, the same way you'd clarify requirements before designing any other system. It doesn't pick an algorithm yet — that's the next lesson, which compares UUIDs, database ticket servers, and Snowflake-style generators. Here, the goal is to nail down exactly what "unique ID" needs to mean for a given system, because that list of properties is what makes one algorithm the right choice and another the wrong one.
+
+## Why auto-increment stops working
+
+A single auto-increment counter is really a serialization point: every insert has to go through the one place that knows the current max value, so writes are naturally ordered and collision-free. Distributing the database removes that serialization point on purpose — that's the whole reason you sharded — but it takes the free uniqueness guarantee with it.
+
+The naive "just have shards use disjoint ranges" (shard A starts at 1, shard B starts at 10,000,000) works until a shard runs out of its range or you add a fifth shard nobody planned for. It's a workaround, not a design; a real distributed ID generator needs to keep working as you add shards, regions, or entirely new services, without a resharding migration every time.
+
+## The properties that actually matter
+
+"Unique" is necessary but nowhere near sufficient — a random 128-bit value is already unique with overwhelming probability. The properties below are what separate ID generators in practice, and an interviewer expects you to raise them unprompted rather than jump straight to "I'll use Snowflake."
+
+### Global uniqueness
+
+No two IDs collide, ever, across every generator instance running concurrently, forever. This has to hold even if two instances generate an ID in the same nanosecond with no communication between them — coordination-free uniqueness is the entire point of doing this instead of a single counter.
+
+### Roughly ordered by time (not always strict monotonicity)
+
+Most systems don't need `id(n+1) > id(n)` guaranteed for every single call across every machine — they need IDs that are *roughly* increasing with wall-clock time. Why this matters concretely: a B-tree index built on a column that arrives in random order (like a UUIDv4 primary key) causes inserts to land at random pages across the whole tree, thrashing the page cache and fragmenting the index. IDs that trend upward over time make inserts append mostly to the tail of the index, which is dramatically cheaper. It also makes "give me the latest 100 rows" a cheap range scan instead of a full sort.
+
+Decide explicitly whether your system needs strict monotonicity (this ID is always greater than every ID issued before it, no exceptions) or just rough time-ordering (IDs from an hour ago are usually smaller than IDs from now, with some jitter). Strict monotonicity across a fleet of independent generators is a much harder — and more expensive — guarantee to make.
+
+### Compact, fixed size
+
+A 64-bit integer fits in a single machine word, sorts cheaply, indexes cheaply, and takes half the storage of a 128-bit UUID at billions of rows. If IDs show up in URLs or get typed by a human, size and readability matter too. State the acceptable size range as a requirement before comparing algorithms — it immediately rules some out.
+
+### No single point of failure or bottleneck
+
+Whatever generates the ID must not become a new chokepoint that the sharding was supposed to eliminate. If every insert across every shard has to call one ID service before it can proceed, you've reintroduced the exact serialization point you were trying to remove, just one layer up — and now it's also a new thing that can go down and take writes with it.
+
+### High throughput, low latency, generated locally when possible
+
+Generating an ID should ideally be a local, in-process computation (nanoseconds), not a network round trip. A system doing tens of thousands of writes per second per shard cannot afford a network call per ID on the hot path — that requirement alone pushes you toward algorithms that combine information already available locally (a machine/shard identifier, the current timestamp, a per-millisecond counter) rather than asking a central service for the next value.
+
+### Availability under clock and node failure
+
+Generators must keep producing valid, unique IDs even if a node restarts, a clock jumps backward (NTP correction, VM migration), or a datacenter is unreachable. If your chosen scheme derives part of the ID from the local clock, you need an explicit answer for "what happens if this machine's clock goes backward" — silently allowing that produces IDs that violate whatever ordering guarantee you promised.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  subgraph Requirements
+    U["Global uniqueness<br/>no coordination needed"]
+    O["Roughly time-ordered<br/>append-friendly for indexes"]
+    S["Compact, fixed size<br/>64 vs 128 bits"]
+    N["No single bottleneck<br/>no SPOF"]
+    T["Local generation<br/>low latency, high throughput"]
+    C["Survives clock skew<br/>and node restarts"]
+  end
+  Requirements --> D["Pick an algorithm:<br/>UUID / DB ticket / Snowflake"]
+`} />
+
+## A worked example: why this matters before you code anything
+
+Say you're building a URL shortener that's been sharded across 8 database instances to handle write load, and short codes are derived from the row's numeric ID. If each shard keeps its own auto-increment counter, shard 3 and shard 7 will both eventually produce ID 42, generate the same short code, and one of your two URLs silently overwrites lookups for the other.
+
+Walking through the requirements above for this specific system: uniqueness is non-negotiable (that's the whole bug). Strict time-ordering isn't needed — nobody cares if a code created a millisecond earlier sorts after one created a millisecond later. Compactness matters because the ID gets encoded into a short URL, so 128-bit UUIDs (encoding to a long, ugly string) are a worse fit than a 64-bit integer. No single bottleneck matters a lot, since this system may do thousands of writes per second and can't afford a network call to a central counter service per shortened URL. Local, low-latency generation matters for the same reason. Clock-skew tolerance matters somewhat, but "roughly ordered" is enough — a full monotonicity guarantee isn't worth the coordination cost here.
+
+That's five distinct decisions, each with a concrete reason, before a single line of the generator is designed. That's the output this lesson is asking for: not "unique ID," but a specific, justified list like the one above, which the next lesson uses to actually evaluate UUIDs, database tickets, and Snowflake-style generators against.
+
+<Callout type="warning">
+  A common mistake is treating "must be unique" as the entire requirements list and jumping straight to an algorithm (usually UUIDv4, because it's familiar). That skips the trade-offs that actually differentiate the options: a random UUID is unique but not sortable by time and is twice the size of a 64-bit integer, which hurts index locality and storage at scale. An interviewer who hears "I'll just use UUIDs" with no discussion of ordering, size, or generation cost will usually push back with "what if we need to sort by creation time?" — have that answer ready by working through the properties above first, not by picking an algorithm and hoping it fits.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="uid-requirements-for-distributed-unique-ids"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does a simple auto-increment column stop working once a table is sharded across multiple database instances?',
+      options: [
+        { id: 'a', text: 'Auto-increment columns are too slow for high write volume', correct: false, explanation: 'Speed is not the core issue here — a single instance auto-increment column is actually very fast. The problem is uniqueness across instances, not throughput on one instance.' },
+        { id: 'b', text: 'Each shard maintains its own counter, so different shards can independently produce the same ID value', correct: true, explanation: 'Correct. Sharding removes the single serialization point that made auto-increment collision-free; without coordination, two shards can both generate ID 501 for different rows.' },
+        { id: 'c', text: 'Auto-increment columns cannot store 64-bit integers', correct: false, explanation: 'Auto-increment columns commonly store 64-bit integers just fine; storage size is not the reason this breaks under sharding.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are properties you should explicitly decide on before choosing a distributed ID generation algorithm? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Whether IDs need strict monotonicity or just rough time-ordering', correct: true, explanation: 'This is a core requirement — strict, cross-machine monotonicity is far more expensive to guarantee than IDs that merely trend upward over time.' },
+        { id: 'b', text: 'The acceptable ID size (e.g. 64-bit integer vs. 128-bit UUID)', correct: true, explanation: 'Size affects index performance, storage cost at scale, and whether IDs are reasonable to embed in URLs — it should be stated as a requirement up front.' },
+        { id: 'c', text: 'Whether generation can happen locally without a network call, or must call a central service', correct: true, explanation: 'This determines whether the generator introduces a new bottleneck or single point of failure on the write hot path.' },
+        { id: 'd', text: 'The exact programming language the ID generator library is written in', correct: false, explanation: 'The implementation language is an engineering detail, not a system design requirement that differentiates ID generation algorithms.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'IDs that are only "roughly" ordered by time (not strictly monotonic across every generator) are still useful for keeping database index inserts efficient.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct. Even rough time-ordering keeps most inserts landing near the tail of a B-tree index rather than scattered randomly, which is the main performance benefit — strict cross-machine monotonicity is not required to get it.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This is incorrect — rough ordering is exactly what most systems rely on for append-friendly index inserts; strict monotonicity is a stronger (and more expensive) guarantee than what is actually needed for this benefit.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A design where every write across every shard must call one central "next ID" service before proceeding has which problem?',
+      options: [
+        { id: 'a', text: 'It reintroduces a single point of failure and a serialization bottleneck, the same problem sharding was meant to remove', correct: true, explanation: 'Correct. Routing every insert through one central ID service recreates the single-serialization-point problem, just at a different layer, and makes that service a new outage risk.' },
+        { id: 'b', text: 'It makes IDs too large to store efficiently', correct: false, explanation: 'A central counter service typically returns small IDs (e.g. a 64-bit integer) — size is not the problem with this design.' },
+        { id: 'c', text: 'It prevents IDs from ever being unique', correct: false, explanation: 'A central service can absolutely guarantee uniqueness; the problem is availability and throughput, not correctness of uniqueness.' },
+      ],
+    },
+  ]}
+/>

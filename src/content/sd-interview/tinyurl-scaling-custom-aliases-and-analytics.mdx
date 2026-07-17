@@ -1,0 +1,215 @@
+---
+title: "Scaling, Custom Aliases, and Analytics"
+module: "Design TinyURL"
+moduleOrder: 9
+order: 2
+track: "interview"
+summary: "Extends the core TinyURL design with custom aliases, expiration, and click analytics, then works through the caching, database, and load-balancing changes needed to serve billions of redirects a day."
+tags: ["scalability", "caching", "url-shortener", "system-design", "read-heavy"]
+estMinutes: 13
+cheatsheet:
+  - "TinyURL is extremely read-heavy — redirects (GET) can outnumber creations (POST) by 100:1 or more, so cache the redirect path aggressively and don't let it share a bottleneck with the write path."
+  - "Cache short-code-to-long-URL lookups in Redis/Memcached with an LRU-style eviction policy; a small fraction of links (viral posts, marketing campaigns) drive a large fraction of traffic, so cache hit rate matters more than cache size."
+  - "Custom aliases just move uniqueness-checking earlier: check the requested alias against the key store synchronously at creation time instead of relying on the base-62 counter to guarantee no collision."
+  - "Expiration is a lazy-delete-friendly problem: store an expires_at column, filter it out (or 404) on lookup, and sweep expired rows out of the hot store with a background job rather than deleting synchronously on every request."
+  - "Do not log analytics synchronously in the redirect's request path — fire an async event (queue or log stream) and let a separate pipeline aggregate clicks, or you've added write latency to your single hottest read."
+  - "Shard the key-value store by short code (or a hash of it) once one database can't hold the working set; a short code's own key already distributes evenly, so there's no natural hot-shard risk the way there is with, say, a single celebrity user's data."
+  - "A 301 redirect gets cached by browsers/CDNs (fewer hits to your server on repeat visits but no analytics on those cached hits); a 302 always round-trips to your server (accurate analytics, more load) — this trade-off is a common interview probe."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson nailed down the core of TinyURL: generate a short code,
+store the mapping, redirect on lookup. That design works fine for a
+weekend project. It falls over the moment real traffic shows up, and it's
+missing three features every interviewer expects you to raise on your
+own: letting users pick their own alias, expiring links, and reporting how
+many times a link got clicked. This lesson covers both halves of "make it
+real" — the product features, and the scaling changes needed to serve them
+at TinyURL's actual traffic shape: overwhelmingly reads, with writes as a
+rounding error.
+
+## Custom aliases
+
+A custom alias (`tiny.url/my-launch` instead of a random `tiny.url/aZ9k2`)
+sounds like a small feature, but it changes a core assumption from the base
+design. The base-62 counter approach guarantees a collision-free code by
+construction — you never have to check if a generated code is already
+taken. A user-supplied alias has no such guarantee, so you're back to
+handling collisions explicitly:
+
+1. On creation, if the request includes a custom alias, look it up in the
+   key store first.
+2. If it exists, reject the request (`409 Conflict`) — don't silently
+   overwrite someone else's link.
+3. If it's free, insert the mapping keyed by that alias directly, skipping
+   the counter entirely for this row.
+
+This means your key store needs a uniqueness constraint on the short code
+regardless of whether it came from the counter or a user, and the
+"check-then-insert" for custom aliases must be atomic (a unique index plus
+a single insert that fails on conflict, not a separate read followed by a
+write) or two users racing for the same alias can both think they
+succeeded.
+
+## Expiration
+
+Most links don't need to live forever, and letting every link live forever
+means your key store only grows. Add an `expires_at` timestamp (nullable —
+not every link expires) and handle it at two points:
+
+- **On lookup**: if `expires_at` is in the past, return `404`/`410` instead
+  of the stored long URL, even if the row is still physically present.
+- **On a background sweep**: a periodic job deletes expired rows from the
+  hot store (and, if you're archiving, moves them to cold storage first).
+  Don't delete synchronously as part of every lookup — that turns your
+  cheapest, highest-volume request into a conditional write.
+
+This is the same "check lazily, clean up asynchronously" pattern you'll
+see all over distributed systems: correctness on the read path doesn't
+require the delete to have already happened, only that expired data is
+never served.
+
+## Click analytics
+
+Product wants to know how many times a link was clicked, from where, and
+on what device. The tempting-but-wrong approach is to `UPDATE clicks =
+clicks + 1` (or insert a click-event row) inside the redirect handler,
+synchronously, before responding. Don't — the redirect path is your
+highest-QPS endpoint by a wide margin, and a synchronous database write
+there means every redirect now waits on a write, and a hot link can turn
+into the same hot-row contention problem you'd see in any heavily-voted
+system.
+
+Instead, treat analytics the way you'd treat any high-volume event stream:
+
+1. The redirect handler fires an asynchronous event (append to a queue or
+   log stream: short code, timestamp, referrer, user-agent, IP) and
+   immediately issues the redirect — the event send should not block the
+   response.
+2. A downstream consumer batches and aggregates these events (clicks per
+   link per hour, top referrers, geographic breakdown) and writes
+   aggregates to an analytics store, separate from the key-value store
+   serving redirects.
+3. A dashboard or API reads from the analytics store, never from the
+   redirect path's hot store.
+
+This decouples "serve the redirect fast" from "count it accurately," the
+same separation of concerns you'd use for likes, views, or votes in any
+other read-heavy system.
+
+## Scaling the redirect path
+
+Redirects are reads: given a short code, fetch the long URL and respond.
+At scale this is a classic cache-in-front-of-key-value-store problem:
+
+- **Cache the hot set.** Put a Redis or Memcached layer in front of the
+  primary store, keyed by short code. Because link popularity follows a
+  power law — a small number of links (viral posts, ad campaigns) account
+  for most traffic — an LRU cache with even a modest size relative to the
+  total link count can absorb the vast majority of lookups.
+- **Read replicas for cache misses.** A miss shouldn't always hit a single
+  primary; route cache-miss reads to replicas so read volume scales
+  independently of the small trickle of writes (new links, alias claims).
+- **Shard once one database can't hold the data or throughput.** Short
+  codes shard cleanly — hash the code (or use the code's own bits if it's
+  derived from a counter) to pick a shard. Unlike a system keyed by a
+  single popular entity, there's no natural "everyone hits shard 3" problem
+  here, because each short code is its own independent key.
+- **CDN/edge caching for redirects.** Since a redirect response for a given
+  short code rarely changes, you can cache the 301/302 response itself at
+  the edge, not just the underlying database lookup — this serves repeat
+  visits to the same link with zero trips to your infrastructure at all.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    Client[Client] --> CDN[CDN / Edge Cache]
+    CDN -->|cache miss| LB[Load Balancer]
+    LB --> App[Redirect Service]
+    App -->|lookup| Cache[Redis: code to long URL]
+    Cache -->|miss| Replica[(Read Replicas)]
+    Replica --> Primary[(Primary, sharded by short code)]
+    App -->|async event| Queue[Click Event Queue]
+    Queue --> Aggregator[Analytics Aggregator]
+    Aggregator --> AnalyticsDB[(Analytics Store)]
+`} />
+
+## Worked example: sizing the cache and estimating write load
+
+Say the service handles 500 million redirects a day and 5 million new
+links created per day — a 100:1 read/write ratio, typical for a URL
+shortener. That's roughly 5,800 redirects/second average (much higher at
+peak, say 3-5x, so plan for 20,000-30,000/second) against only about 58
+creations/second average.
+
+If 20% of links account for 80% of clicks (a reasonable power-law
+assumption), caching just that top 20% of the active link set can absorb
+80% of the 20,000/second peak redirect load — leaving only about
+4,000/second hitting the database tier, which read replicas handle
+comfortably. Contrast that with the write side: even generously assuming
+every creation also does a uniqueness check for a custom alias, you're
+still under 100 writes/second at peak, which a single sharded primary
+handles without breaking a sweat. This asymmetry is exactly why the
+scaling story for TinyURL is "cache and replicate the read path
+aggressively" — the write path was never the bottleneck.
+
+<Callout type="warning">
+  A common mistake: designing custom aliases and the counter-based short
+  code generator as if they're independent systems with separate
+  namespaces. If a user claims the alias `abc123` and your counter later
+  happens to generate `abc123` as a "random" code for someone else, you get
+  a silent collision — one user's link overwrites or is blocked by the
+  other's, depending on your insert logic. Both paths must check and
+  insert against the *same* unique short-code space, with a single
+  uniqueness constraint enforced at the database level, not two
+  independent code paths that each assume the other doesn't exist.
+</Callout>
+
+<Quiz
+  lessonId="tinyurl-scaling-custom-aliases-and-analytics"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Where should click-count analytics be recorded when a redirect request comes in?',
+      options: [
+        { id: 'a', text: 'Synchronously, incrementing a counter in the primary database before returning the redirect', correct: false, explanation: 'This adds a database write to your highest-QPS endpoint and risks hot-row contention on popular links, exactly what you want to avoid on the read path.' },
+        { id: 'b', text: 'Asynchronously, via a queue or event stream consumed by a separate aggregation pipeline', correct: true, explanation: 'Firing an async event keeps the redirect response fast and decouples analytics aggregation from the hot redirect path entirely.' },
+        { id: 'c', text: 'Analytics should not be tracked at all for redirects', correct: false, explanation: 'Click analytics is a real product requirement; the question is how to record it without slowing down redirects, not whether to record it.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which changes are needed to support user-supplied custom aliases that were not needed in the base counter-only design? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'An atomic check-then-insert (or unique constraint) against the short-code key space at creation time', correct: true, explanation: 'Custom aliases are not guaranteed collision-free like a counter-generated code, so uniqueness must be enforced explicitly and atomically.' },
+        { id: 'b', text: 'Rejecting a creation request when the requested alias is already taken', correct: true, explanation: 'Silently overwriting an existing mapping would break whoever owns the existing link; a taken alias should return a conflict response instead.' },
+        { id: 'c', text: 'Switching the entire system from base-62 encoding to a different encoding scheme', correct: false, explanation: 'Custom aliases coexist with counter-generated codes in the same key space — no need to change the encoding scheme used for auto-generated codes.' },
+        { id: 'd', text: 'Increasing the length of all short codes to accommodate aliases', correct: false, explanation: 'Custom aliases can be any length the product allows; this does not require changing the length of auto-generated codes.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Because URL shorteners are read-heavy, sharding the redirect lookup store by short code risks the same hot-shard problem as sharding a social feed by a single popular user.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A hot-shard problem arises when one shard key concentrates disproportionate traffic (like one celebrity user). Short codes are independent keys, so even a very popular link only makes its own key hot, not an entire shard shared with many other unrelated keys in a predictable way.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Each short code is its own key, so sharding by short code (or its hash) distributes load evenly; a viral link makes one key hot, which a cache layer absorbs, rather than concentrating load on one shard the way a single hot entity key would in other systems.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A link is past its expires_at timestamp but the background cleanup job has not run yet. What should the redirect endpoint do when this link is requested?',
+      options: [
+        { id: 'a', text: 'Return the long URL anyway, since the row still physically exists', correct: false, explanation: 'Serving an expired link because cleanup has not run yet violates the expiration feature; correctness on the read path must not depend on the sweep having already happened.' },
+        { id: 'b', text: 'Check expires_at on lookup and return a 404/410 if it has passed, independent of whether the row has been physically deleted', correct: true, explanation: 'Checking expiration at read time (lazy expiration) guarantees correct behavior regardless of when the background sweep runs, which can then run on its own schedule purely for storage cleanup.' },
+        { id: 'c', text: 'Synchronously delete the row and then return a 404', correct: false, explanation: 'Deleting synchronously inside the read path adds a write to your highest-volume endpoint for what should be a simple, fast lookup — the delete belongs in an async background job.' },
+      ],
+    },
+  ]}
+/>

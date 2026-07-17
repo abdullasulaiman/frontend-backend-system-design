@@ -1,0 +1,108 @@
+---
+title: "How to Use This Course"
+module: "Introduction"
+moduleOrder: 1
+order: 3
+track: "concept"
+summary: "Explains how the System Design Interview course is organized into two tracks and gives a concrete study plan for using them together instead of just reading passively."
+tags: ["study-plan", "course-structure", "mock-interviews", "active-recall"]
+estMinutes: 9
+cheatsheet:
+  - "Two tracks, one order: work through Foundations & Building Blocks concept lessons before the matching Design Problems case study — a case study assumes its building blocks already make sense."
+  - "Each concept lesson ends with a quiz; treat it as a checkpoint, not an afterthought — if you can't answer it without looking back, the lesson hasn't landed yet."
+  - "Cheatsheet bullets are for the week before an interview, not for first-pass learning — re-reading them without having done the lesson first just produces false familiarity."
+  - "A case study's Mock Interview lesson is the actual skill being tested — talk out loud, on a timer, before you look at the rubric, or you're only practicing recognition, not recall under pressure."
+  - "Skipping straight to Design Problems because they feel closer to 'the real interview' backfires — every case study leans on the Foundations lessons for its vocabulary and trade-off reasoning."
+  - "Revisit lessons out of order once you've done a full pass — a case study on rate limiting will make you want to re-read the caching or queueing lesson with fresh eyes, and that's the point."
+  - "Budget for repetition: one read-through rarely sticks for trade-off reasoning the way it does for a fact; plan to revisit the diagrams and worked examples, not just the prose."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous two lessons made the case for *what* modern system design is and *why* it's worth learning even outside interview prep. This one is shorter and more practical: how to actually move through the course so the effort you put in turns into skill you can use under pressure — in an interview room or in a real design review — rather than a stack of half-remembered diagrams.
+
+That distinction matters because system design content is unusually easy to feel like you've learned without actually having learned it. Reading a clear explanation of consistent hashing feels like understanding it. Being asked "how would you shard this and rebalance it when you add a node" cold, in front of another engineer, is a different skill entirely. This course is built around closing that gap, and using it well means leaning into the parts that create that gap deliberately — the quizzes, the mock interviews, the worked examples — not skimming past them to get to "the next topic."
+
+## Two tracks, and why the order matters
+
+The course is split into two tracks that map to two different jobs:
+
+- **Foundations & Building Blocks** (where this lesson lives) — concept lessons covering the individual pieces: load balancing, caching, database replication, partitioning, queues, consensus, and the reasoning framework for combining them. Each lesson stands mostly on its own and teaches one idea precisely.
+- **Design Problems** — full case studies ("design a URL shortener," "design a rate limiter," "design a chat system") where you combine several building blocks into one coherent architecture under a specific set of constraints, ending in a timed mock-interview exercise.
+
+The Design Problems track is where the building blocks actually get exercised together, which is also why it's tempting to jump there first — it feels more like "the real thing." Resist that. A case study on designing a news-feed service will casually reference fan-out-on-write vs. fan-out-on-read, cache invalidation, and read replicas as if you already have working definitions for them, because the course expects you to. Reading the case study first, without the building blocks, means either getting lost in vocabulary or — worse — nodding along without the words meaning anything specific, which is exactly the "feels learned but isn't" trap from above.
+
+The practical rule: finish (or at least skim-and-quiz) the Foundations lessons relevant to a case study before attempting that case study. You don't need every single Foundations lesson before starting Design Problems — but you do need the ones a given case study leans on.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Foundations lesson:\nread + quiz] --> B[Cheatsheet:\nquick review later]
+  A --> C[Design Problems case study\nthat uses this concept]
+  C --> D[Mock Interview:\ntimed, talk out loud]
+  D --> E[Revisit Foundations lesson\nwith sharper questions]
+  E -.-> A
+`} />
+
+## What each piece of a lesson is actually for
+
+Every concept lesson in this course has the same shape on purpose, and each part earns its place:
+
+- **The prose body** teaches the concept and its trade-offs — this is the "first exposure" pass. Read it for understanding, not memorization.
+- **The diagram** exists because some relationships (data flow, request paths, state transitions) are genuinely faster to absorb visually than in a paragraph. If a diagram doesn't click immediately, re-read the paragraph right above it — the two are meant to reinforce each other, not stand alone.
+- **The worked example** is where the abstract idea meets specific numbers. This is usually the part worth re-reading a second time, because interview prompts and real design problems are always specific ("500K writes/sec," not "a lot of writes"), and the worked example is your rehearsal for translating a vague concept into concrete numbers.
+- **The pitfalls callout** is a shortcut past a mistake that normally takes a bad code review or a production incident to learn the hard way. Don't skip it because it's short.
+- **The quiz** is the active-recall checkpoint. Reading comprehension and answer-under-quiz-conditions are different skills; getting a question wrong here, while it's cheap, is far more useful than getting the equivalent point wrong in an interview.
+- **The cheatsheet bullets** in the frontmatter are deliberately not a summary of the lesson — they're written to be useful stripped of context, the night before an interview when you don't have time to re-read six paragraphs. Use them for review, not first-pass learning; if a bullet doesn't make sense on its own, that's a sign to go back to the full lesson, not to just memorize the sentence.
+
+## A concrete study plan
+
+Suppose you have three weeks before a system design interview loop and roughly five hours a week. A reasonable way to spend that:
+
+- **Week 1**: Go through the Introduction module (these three lessons) and then the core Foundations lessons — networking basics, load balancing, caching, database fundamentals, replication and partitioning. Take every quiz. Don't start Design Problems yet, even if it's tempting.
+- **Week 2**: Do three or four Design Problems case studies that combine what you just learned, doing the Mock Interview exercise for each one on an actual timer, out loud (even alone). After each one, jump back to any Foundations lesson that felt shaky during the mock and re-read it — you'll get more out of it now that you've seen it fail to come to mind under pressure.
+- **Week 3**: Do the remaining case studies, revisit cheatsheets across both tracks for a fast pass, and redo the Mock Interview exercise for the one or two case studies where your first attempt felt weakest. Repetition on your weakest points beats a first pass through everything you haven't touched yet.
+
+The specific numbers (three weeks, five hours) aren't the point — the shape is: foundations first, then combine them under timed practice, then go back and shore up the weak spots you only discover by practicing.
+
+<Callout type="warning">
+  The most common way to waste time in a course like this is passive re-reading: going back over a lesson's prose a second or third time because the first pass "didn't quite stick," instead of testing yourself with the quiz or trying to explain the concept out loud from memory. Re-reading feels productive because the material feels familiar on the second pass — but familiarity when the text is right in front of you says nothing about whether you can produce that reasoning from scratch when it isn't. If a lesson didn't stick, retake its quiz and try to state the trade-off in your own words before rereading the paragraph that explains it.
+</Callout>
+
+<Quiz
+  lessonId="intro-how-to-use-this-course"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does this lesson recommend finishing relevant Foundations & Building Blocks lessons before attempting a Design Problems case study on the same topic?',
+      options: [
+        { id: 'a', text: 'Because the case studies are strictly harder and reserved for advanced readers', correct: false, explanation: 'The reasoning given is about dependency, not difficulty tiers — case studies assume specific building-block vocabulary and reasoning, not general advancedness.' },
+        { id: 'b', text: 'Because a case study assumes the underlying concepts (like fan-out or cache invalidation) already make sense, and skipping ahead risks either confusion or hollow nodding-along', correct: true, explanation: 'This matches the lesson’s core argument: case studies combine building blocks the reader is expected to already understand, so skipping ahead undermines the point of doing the case study at all.' },
+        { id: 'c', text: 'Because the site enforces a strict lesson unlock order and will not display later lessons otherwise', correct: false, explanation: 'The lesson never claims a technical lock — the recommendation is about learning effectiveness, not a platform restriction.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'According to this lesson, which of these are genuinely useful ways to use a concept lesson’s parts? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Retaking the quiz and trying to state the trade-off from memory before rereading, if the concept didn’t stick the first time', correct: true, explanation: 'This is the active-recall approach the lesson recommends in place of passive rereading.' },
+        { id: 'b', text: 'Treating the cheatsheet bullets as the primary way to learn a topic for the first time', correct: false, explanation: 'The lesson explicitly says cheatsheet bullets are for review before an interview, not first-pass learning — they’re written to be terse, not to teach from scratch.' },
+        { id: 'c', text: 'Doing the Mock Interview exercise on a timer and talking out loud, rather than only reading the rubric', correct: true, explanation: 'The lesson stresses that talking it through under time pressure is the actual skill being practiced; reading the rubric alone only exercises recognition.' },
+        { id: 'd', text: 'Skipping the pitfalls callout since it is usually shorter than the rest of the lesson', correct: false, explanation: 'The lesson explicitly warns against skipping the pitfalls callout just because it is short — it exists to shortcut a mistake that is normally learned the hard way.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'This lesson argues that re-reading a lesson’s prose a second time is generally the most effective way to fix a concept that "didn’t stick" on the first pass.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The lesson argues the opposite — passive re-reading feels productive because the text is familiar, but that familiarity doesn’t test whether you can produce the reasoning without the text in front of you.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. The lesson recommends active recall — retaking the quiz or explaining the idea from memory — over passive re-reading as the fix for a concept that didn’t stick.' },
+      ],
+    },
+  ]}
+/>

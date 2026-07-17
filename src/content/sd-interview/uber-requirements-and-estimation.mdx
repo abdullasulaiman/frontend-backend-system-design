@@ -1,0 +1,262 @@
+---
+title: "Requirements and Estimation"
+module: "Design Uber"
+moduleOrder: 5
+order: 1
+track: "interview"
+summary: "Scopes a ride-hailing system into request/match, live location, pricing/ETA, and trip-lifecycle sub-problems, then derives QPS and storage estimates from online-driver counts and daily trip volume."
+tags: ["requirements", "capacity-estimation", "uber", "ride-hailing", "interview-framework"]
+estMinutes: 11
+cheatsheet:
+  - "Split the problem into four sub-systems up front: trip request/matching, live location tracking, pricing and ETA, and trip lifecycle/payment — each has its own latency and consistency profile."
+  - "Location ingestion (a steady ping from every online driver), not trip requests, is the dominant QPS in the system — most drivers are online far more often than they're mid-trip."
+  - "Matching is inherently geo-local: a request only needs drivers within a few kilometers, so partition driver location data by geographic cell (geohash or S2 cell), not as one global index."
+  - "Favor availability and eventual consistency for location broadcasting; favor strong consistency (or at least an idempotent lock) for the single moment a driver is assigned to a rider — double-dispatch is a correctness bug, not a cosmetic glitch."
+  - "State the driver ping interval explicitly — halving it doubles location-ingestion QPS with zero effect on trip-request or pricing QPS."
+  - "Size load off concurrent online drivers and daily trips, not monthly active users — MAU tells you almost nothing about matching or location load."
+  - "Decide up front what location history you retain (last-known position vs. full trail) — raw pings are cheap individually but enormous in aggregate over a day."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design Uber" is a favorite interview prompt precisely because it punishes
+vague answers. It looks like a single app, but underneath it's several
+systems with very different personalities: a matching engine that has to
+decide in seconds, a location pipeline that never stops streaming, a
+pricing engine that has to react to demand spikes, and a trip ledger that
+has to get money and state transitions exactly right. If you jump straight
+to "we'll use a message queue and a database," you skip the step that
+actually determines the architecture: how much load each piece carries and
+what it can and can't get wrong.
+
+This lesson is that scoping step. Everything in the rest of this module —
+the high-level design, the matching algorithm, the location pipeline, and
+pricing — builds on the numbers and constraints established here.
+
+## Step 1: Scope the functional requirements
+
+Propose a core scope out loud and let the interviewer redirect you rather
+than silently guessing at what they want:
+
+- **Request a ride.** A rider specifies a pickup location and destination
+  and requests a trip.
+- **Match rider to driver.** The system finds a nearby available driver,
+  offers them the trip, and confirms the match.
+- **Track the trip live.** Both rider and driver see the other's live
+  position on a map for the duration of the trip.
+- **Price the trip and estimate arrival.** The system quotes an upfront (or
+  metered) price and an ETA, both for driver arrival and for trip
+  completion.
+- **Complete the trip lifecycle.** The trip moves through clear states
+  (requested, matched, driver en route, in progress, completed) and ends
+  with payment and receipt.
+
+Explicitly defer: scheduled rides booked hours in advance, pooled/shared
+rides with multiple riders per trip, driver incentive programs, and
+in-app support/disputes. Each is a legitimate follow-up but would dilute a
+45-minute session if tackled up front. (Food delivery is a deliberately
+related but distinct system — this course covers it separately later,
+since sharing a rider-facing app doesn't mean sharing a matching model.)
+
+### Non-functional requirements
+
+- **Matching must be fast.** A rider expects a driver assignment within a
+  couple of seconds of requesting, not tens of seconds. This pushes the
+  design toward pre-computed, geo-indexed driver locations rather than a
+  live scan of every driver on every request.
+- **Location updates favor availability over strict consistency.** A
+  driver's position being a few seconds stale is invisible to the user;
+  losing the entire location feed because one replica is down is not
+  acceptable. Availability and low latency win here, not perfect ordering
+  or durability of every single ping.
+- **Trip assignment needs a correctness guarantee.** Exactly one driver
+  gets assigned per trip request — two drivers accepting the same ride is
+  a real-world failure, not a display bug. This one narrow slice of the
+  system needs a stronger consistency mechanism (an idempotent
+  claim/lock), even while everything around it stays eventually
+  consistent.
+- **The system is inherently geographic.** A ride in Austin never competes
+  for drivers with a ride in Berlin. This isn't just a data-locality
+  optimization — it should shape how you partition data and estimate load
+  from the very first numbers you write down.
+
+## Step 2: Establish the scale
+
+State assumptions and invite correction rather than presenting them as
+fact:
+
+- 100 million monthly active riders worldwide; 25 million daily active
+  riders (DAU).
+- 5 million trips requested per day.
+- 2 million drivers online (available or on a trip) at a given moment
+  during a global peak window, out of a much larger registered driver
+  base.
+- An average trip lasts 15 minutes door to door.
+- Every online driver's app sends a location ping every 4 seconds,
+  whether or not they're currently on a trip — this matters, because most
+  online drivers are idle/available far more of the time than they're
+  actively driving a fare.
+
+<Callout type="tip">
+  Say it plainly: "I'll assume 25 million daily riders, 5 million trips a
+  day, and roughly 2 million drivers online at peak, each pinging location
+  every 4 seconds — does that match the scale you have in mind?" Getting
+  a nod (or a correction) here means every number downstream is defensible.
+</Callout>
+
+## Step 3: Derive the numbers for each sub-system
+
+### Trip request and matching QPS
+
+- Daily trip requests: 5,000,000. Average QPS: 5,000,000 divided by 86,400
+  seconds is about 58 requests/sec.
+- Ride-hailing demand is spikier than most consumer traffic — commute
+  hours, bar close, and bad-weather surges concentrate demand hard. Apply
+  an 8x peak multiplier (higher than a typical 3-5x for browsing traffic):
+  peak matching load is roughly 460 requests/sec globally.
+- Each match isn't a simple lookup — it queries nearby available drivers,
+  ranks candidates, and confirms an assignment, so treat this as
+  moderately expensive per request even though the QPS is modest.
+
+### Location ingestion QPS
+
+- 2,000,000 online drivers, each sending one ping every 4 seconds, gives
+  2,000,000 divided by 4 is 500,000 location pings/sec on average — and
+  this is steady throughout business hours, not spiky like trip requests,
+  because drivers stay online (searching for fares) far longer than any
+  single trip lasts.
+- 500,000 pings/sec dwarfs the roughly 460 matching requests/sec at peak.
+  That gap is the single most important number in this lesson: **location
+  ingestion, not matching, is the dominant load on the system**, purely
+  because it's a continuous per-driver stream rather than a one-shot
+  request.
+
+### Storage: trip records vs. raw location history
+
+- Trip records: 5,000,000 trips/day at roughly 1 KB each (rider ID,
+  driver ID, timestamps, route summary, price) is about 5 GB/day, or
+  under 2 TB/year — trivially small, easily handled by an ordinary
+  relational or document store.
+- Raw location pings, if you kept every single one: 500,000 pings/sec at
+  roughly 100 bytes each is 50 MB/sec, which is about 4.3 TB/day. That's
+  a very different order of magnitude from trip records, and it's why
+  most systems keep only a rolling window of raw pings (for live tracking
+  and safety/audit needs) and discard or downsample the rest rather than
+  retaining every ping forever.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    Req["~58 req/sec avg, ~460/sec peak\nTrip requests"] --> M["Matching service"]
+    Loc["~500,000 pings/sec\nDriver location pings"] --> Ing["Location ingestion pipeline"]
+    Ing --> Idx["Geo-partitioned driver index"]
+    M --> Idx
+    M --> Ledger["Trip state ledger\n(exactly-once assignment)"]
+    style Loc fill:#9c4221,color:#fff
+    style Ing fill:#9c4221,color:#fff
+    style Req fill:#2b6cb0,color:#fff
+    style M fill:#2b6cb0,color:#fff
+    style Ledger fill:#4a5568,color:#fff
+`} />
+
+## Step 4: State the resulting design constraints
+
+1. **Location ingestion is the system's dominant QPS path** — at roughly
+   500,000 pings/sec, this needs a horizontally partitioned, write-optimized
+   pipeline (think a partitioned queue keyed by geographic cell), not a
+   synchronous write per ping into a single database.
+2. **Matching must query a geo-local subset, never a global scan** — even
+   though 2 million drivers are online globally, a single match only ever
+   considers drivers within a few kilometers, so the driver index should
+   be partitioned by geographic cell (geohash/S2) from day one, not
+   bolted on later.
+3. **Trip assignment is the one place that needs a strong guarantee** —
+   an idempotent claim on a trip request (so exactly one driver accept
+   "wins") sits inside an otherwise eventually-consistent system.
+4. **Trip metadata storage is a non-problem; raw location history is the
+   real capacity decision** — decide explicitly what window of location
+   pings you retain versus discard, because storing everything forever
+   scales into terabytes per day for no clear benefit.
+
+<Callout type="warning">
+  A common mistake is sizing the whole system off one blended QPS number,
+  or off monthly active users instead of concurrent online drivers. Both
+  hide the real bottleneck: the roughly 460 requests/sec of matching
+  traffic looks like the "main" load because it maps to a visible user
+  action, but the roughly 500,000 pings/sec of location updates — an
+  always-on background stream — is over three orders of magnitude larger
+  and needs its own dedicated, geo-partitioned ingestion path.
+</Callout>
+
+## Worked example: sanity-checking a follow-up
+
+Suppose the interviewer asks: "What if we tightened the driver ping
+interval from 4 seconds to 2 seconds for smoother map movement?" Re-derive
+rather than guess: pings per driver per second go from `1/4` to `1/2`, a
+2x increase, so location-ingestion QPS jumps from 500,000/sec to about
+1,000,000/sec — while trip-request QPS (still 58/sec average, 460/sec
+peak) and trip-record storage are completely unaffected, since neither
+depends on ping frequency. Naming exactly which number a changed
+assumption touches — and which numbers it leaves alone — is what
+distinguishes a candidate who understands the system from one who's just
+re-multiplying numbers.
+
+## Where this leads
+
+The split established here — a moderate-QPS matching path that needs
+geo-local queries and a strong assignment guarantee, versus a
+high-QPS, availability-first location-ingestion path — is exactly the
+shape of the architecture in the next lesson. It's also why matching and
+dispatch, and real-time location updates, get their own dedicated lessons
+rather than being folded into one generic "backend" discussion: they are
+different problems wearing the same UI.
+
+<Quiz
+  lessonId="uber-requirements-and-estimation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'With 2 million drivers online at peak, each sending a location ping every 4 seconds, what is the approximate average location-ping rate across the system?',
+      options: [
+        { id: 'a', text: 'About 500,000 pings/sec', correct: true, explanation: '2,000,000 drivers divided by a 4-second interval gives 2,000,000 / 4 = 500,000 pings/sec.' },
+        { id: 'b', text: 'About 2,000,000 pings/sec', correct: false, explanation: 'That treats every driver as pinging once per second rather than once every 4 seconds; dividing by the 4-second interval is required.' },
+        { id: 'c', text: 'About 460 pings/sec', correct: false, explanation: 'That is this lesson\'s estimated peak trip-request rate, a completely different (and far smaller) load than continuous location pings.' },
+        { id: 'd', text: 'About 58 pings/sec', correct: false, explanation: 'That is the average trip-request rate, not the location-ping rate — location pings come from every online driver continuously, not once per trip request.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasonable non-functional priorities for the design of a ride-hailing system? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Location broadcasting should favor availability and low latency over guaranteeing delivery of every single ping', correct: true, explanation: 'A missed ping every few seconds is invisible to the user, since the client can interpolate; prioritizing uptime and low latency over strict delivery is the right trade here.' },
+        { id: 'b', text: 'Driver-to-rider matching should scan every online driver worldwide on each request to guarantee the closest possible match', correct: false, explanation: 'A ride only ever needs drivers within a few kilometers; scanning a global pool wastes latency and compute for no benefit — the driver index should be geo-partitioned instead.' },
+        { id: 'c', text: 'Exactly one driver should end up assigned to a given trip request, even under concurrent accept attempts', correct: true, explanation: 'Double-dispatch (two drivers both matched to the same rider) is a real operational failure, so this one step needs a strong, idempotent assignment guarantee even in an otherwise eventually-consistent system.' },
+        { id: 'd', text: 'Trip pricing and location tracking have identical staleness tolerances and should be updated on the same schedule', correct: false, explanation: 'Live position needs frequent, low-latency updates for tracking; a price quote, once given for a trip, does not need re-computation on the same cadence as a moving dot on a map.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In this lesson\'s estimation, live location-ping ingestion produces a higher average QPS than trip-request matching.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — roughly 500,000 pings/sec on average versus roughly 58 requests/sec average (about 460/sec at peak), because every online driver streams continuously while a trip request is a single one-shot event.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Incorrect for this estimation — location ingestion is the far larger load precisely because it is a continuous per-driver stream rather than a per-trip request.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why does it matter to partition the driver-location index by geographic cell (e.g. geohash) rather than keeping one global index?',
+      options: [
+        { id: 'a', text: 'Because a matching request only ever needs drivers within a small radius, so a geo-partitioned index lets each query touch a small, local slice of data instead of scanning or filtering a global dataset', correct: true, explanation: 'Matching is inherently local — a ride in one city never competes with drivers in another — so structuring the index by geographic cell keeps each query fast and keeps the dataset each query touches small, regardless of total global driver count.' },
+        { id: 'b', text: 'Because location data is only valid within the city it was generated in and cannot be transmitted elsewhere', correct: false, explanation: 'There is no such technical restriction on transmitting location data across regions; the reason for geo-partitioning is query efficiency and locality of matching, not a data-validity constraint.' },
+        { id: 'c', text: 'Because global indexes are always slower than partitioned ones regardless of query pattern', correct: false, explanation: 'That is not a general truth — the specific reason it matters here is that the query pattern (find nearby drivers) is inherently local, not that partitioning is universally faster for any workload.' },
+        { id: 'd', text: 'Because trip pricing requires a global index and location matching must share the same structure', correct: false, explanation: 'Pricing and location matching are separate sub-systems with separate data needs; there is no requirement that they share the same index structure.' },
+      ],
+    },
+  ]}
+/>

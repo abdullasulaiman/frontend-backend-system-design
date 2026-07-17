@@ -1,0 +1,236 @@
+---
+title: "Data Model and Queues"
+module: "Distributed Task Scheduler"
+moduleOrder: 23
+order: 2
+track: "concept"
+summary: "Defines the core entities a distributed task scheduler must persist and shows how priority queues, delay queues, and partitioned queues turn 'due jobs' into work a fleet of workers can safely pick up."
+tags: ["task-scheduler", "data-model", "queues", "priority-queue", "distributed-systems"]
+estMinutes: 12
+cheatsheet:
+  - "Separate the job definition (what to run, how often) from job runs (one row per execution attempt) — this is what lets you track retries, history, and concurrent runs without corrupting the schedule."
+  - "A due-jobs index (sorted by next_run_at) plus a separate visibility/lease mechanism is what turns 'jobs whose time has come' into 'jobs safely claimed by exactly one worker.'"
+  - "Priority queues answer 'which job first among ready jobs'; delay queues answer 'this job isn't ready yet.' A scheduler needs both, not one instead of the other."
+  - "A visibility timeout (lease) makes a claimed job invisible to other workers for a bounded window; if the worker doesn't finish or renew in time, the job becomes visible again — this is what survives a crashed worker."
+  - "Partition the due-jobs structure by shard key (e.g. hash of job ID or tenant) so no single node has to scan and lock the entire schedule; each partition owner only competes with itself."
+  - "Idempotency keys on job runs prevent 'at-least-once delivery plus a crash after execution but before ack' from turning into duplicate side effects (double-charged customers, duplicate emails)."
+  - "Cron-style recurrence should compute the next run_at once each time a run completes, rather than pre-materializing every future occurrence — infinite series don't fit in a finite table."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The [previous lesson](/system-design/sched-task-scheduler-requirements) settled
+what the scheduler needs to do: accept job definitions, run them at the
+right time (once or on a recurring schedule), and guarantee each due job
+gets executed exactly the number of times it's supposed to, even as workers
+crash and restart. None of that is possible without deciding, concretely,
+what gets stored and how "it's time to run this" turns into a worker
+actually picking it up. Get the data model wrong — say, storing recurring
+jobs as a single row with no concept of individual runs — and you can't
+tell whether last Tuesday's 2am backup actually succeeded, or retry only
+the failed attempt without also re-triggering next Tuesday's. This lesson
+builds the entities and the queueing structures that make the rest of the
+design (covered in the next lesson) straightforward instead of ad hoc.
+
+## Two entities, not one: job definitions vs. job runs
+
+The single biggest modeling mistake is conflating "the job" with "an
+execution of the job." A recurring job (`send_daily_report`, cron
+`0 6 * * *`) is a standing definition that produces a new execution every
+day; a one-off job (`resize_image_42`) produces exactly one. Both need a
+concept of "this specific attempt succeeded, failed, or is still running,"
+which the definition alone can't hold without losing history on every run.
+
+**Job definition** — the schedule itself:
+
+- `job_id`, `owner`/`tenant_id`, `handler` (what code/queue/endpoint to
+  invoke), `payload` (arguments)
+- `schedule`: either a `cron_expr` for recurring jobs or a single
+  `run_at` for one-off jobs
+- `next_run_at` — the next time this definition should produce a run
+  (computed, kept up to date)
+- `status`: active, paused, disabled
+- `retry_policy`: max attempts, backoff strategy
+- `timeout`: how long a single run is allowed before it's considered stuck
+
+**Job run** — one execution attempt:
+
+- `run_id`, `job_id` (foreign key), `attempt_number`
+- `scheduled_for` (when it was due), `started_at`, `finished_at`
+- `state`: pending, claimed, running, succeeded, failed, dead
+- `worker_id` — who currently holds (or last held) this run
+- `lease_expires_at` — see the visibility timeout section below
+- `idempotency_key` — derived from `job_id` + `scheduled_for` (or a
+  caller-supplied key for one-off jobs), so re-delivery never causes
+  double execution
+
+Splitting these apart is what lets you answer real questions cleanly:
+"show me every failed run for this job in the last 7 days" is a query over
+`job_run`, not a scan of side-channel logs; "pause this recurring job
+without losing history" is a single `status` flip on `job_definition` that
+leaves every past run untouched.
+
+## From "due" to "claimed": the queueing layer
+
+Having the right rows isn't enough — workers need an efficient way to find
+"which runs are ready right now" without scanning the whole table, and
+exactly one worker needs to win each run. That's the job of the queueing
+layer, which sits on top of the data model above.
+
+### Priority queues: order among ready work
+
+Not all ready jobs are equal. A payment-retry job is usually more urgent
+than a nightly report regeneration. A **priority queue** orders ready runs
+by a priority score (often a combination of an assigned priority tier and
+how overdue the job already is, so low-priority work doesn't starve
+forever behind an endless stream of high-priority arrivals). Workers pull
+from the head of this ordering rather than in arbitrary or strict FIFO
+order.
+
+### Delay queues: order among not-yet-ready work
+
+Most runs aren't ready the instant they're created — a job scheduled for
+6am tomorrow needs to sit somewhere until then without workers repeatedly
+checking it early. A **delay queue** (typically implemented as an index or
+min-heap keyed on `next_run_at` / `scheduled_for`) holds not-yet-due work
+and moves entries into the ready/priority queue only once their time
+arrives. A background sweeper (or the queue's own delayed-delivery feature,
+if using something like a message broker with native delay support) polls
+this structure on a short interval — a few seconds is typical — and
+promotes anything whose time has come.
+
+### Visibility timeouts: surviving a crashed worker
+
+A worker claiming a run has to make it invisible to other workers, or
+you'll get duplicate execution the moment two workers grab the same due
+job in a race. The standard mechanism is a **visibility timeout** (also
+called a lease): claiming a run sets `state = claimed`,
+`worker_id = <this worker>`, and `lease_expires_at = now + lease_duration`.
+Other workers skip runs whose lease hasn't expired. The worker executing
+the job must either finish (and mark it `succeeded`/`failed`) or
+periodically renew the lease before it expires (a heartbeat) if the job
+runs longer than one lease window. If the worker crashes and neither
+happens, the lease simply expires and the run becomes claimable again —
+no crash-detection logic needed, just a timestamp comparison.
+
+This is the same mechanism as visibility timeouts in general-purpose
+message queues (see the messaging queue module's delivery-semantics
+lesson) applied specifically to scheduled work.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    JD[Job definitions] -->|next_run_at reached| DQ[Delay queue\nnot-yet-due runs]
+    DQ -->|sweeper promotes\nat due time| PQ[Priority queue\nready runs]
+    PQ -->|claim + set lease| W1[Worker claims run]
+    W1 -->|success| Done[Run marked succeeded]
+    W1 -->|lease expires\nno heartbeat| PQ
+    W1 -->|failure, retries left| DQ
+`} />
+
+## Partitioning the schedule
+
+A single sorted structure for "all due jobs across the whole system"
+becomes a lock-contention bottleneck once you have thousands of workers
+and millions of jobs — every worker is fighting over the same head of the
+same queue. The fix is the same one used throughout this course:
+**partition** the due-jobs structure by a shard key (hash of `job_id`, or
+`tenant_id` for a multi-tenant system), so each partition has its own
+delay queue and priority queue, owned by a subset of workers. A worker
+only competes with the other workers assigned to its partition, not the
+entire fleet — this is what lets throughput scale roughly linearly with
+partition count instead of flattening out as contention grows.
+
+## Worked example: modeling a retrying webhook-delivery job
+
+Say a job definition sends a webhook to a customer's endpoint every time
+an internal event fires, with up to 5 retries on failure using exponential
+backoff (1min, 2min, 4min, 8min, 16min).
+
+1. Event fires -> a new `job_run` row is inserted: `attempt_number = 1`,
+   `scheduled_for = now`, `state = pending`,
+   `idempotency_key = event_id` (not `job_id` + timestamp, since this is
+   event-triggered rather than cron-triggered).
+2. The run enters the priority queue immediately (it's already due) and a
+   worker claims it, setting a 30-second lease.
+3. The webhook call times out. The worker marks this run `failed` and
+   inserts a *new* run row: `attempt_number = 2`,
+   `scheduled_for = now + 1min`, `state = pending`. That new row goes into
+   the delay queue, not the priority queue, since it isn't due for another
+   minute.
+4. After 1 minute, the sweeper promotes it to the priority queue; a worker
+   claims it; suppose it succeeds this time. `state = succeeded`, and no
+   further runs are created for this event.
+5. If all 5 attempts fail, the last run is marked `dead` and the job
+   definition's dead-letter policy fires (alerting, or writing to a
+   dead-letter store for manual inspection) — you never silently drop a
+   customer's webhook.
+
+Every attempt is its own row with its own `idempotency_key`, so even if a
+worker's success acknowledgment gets lost after the webhook actually fired
+and a retry is triggered, the receiving endpoint (if it also checks
+idempotency keys, which any well-built webhook consumer should) won't
+double-process the event.
+
+<Callout type="warning">
+  A common mistake is materializing every future occurrence of a recurring
+  job up front — inserting a `job_run` row for every day for the next year
+  the moment a daily job is created. This doesn't scale (a handful of
+  yearly, hourly, and per-minute jobs across many tenants produces an
+  enormous row count for occurrences that may never even happen, since the
+  schedule could be edited or paused first) and it doesn't handle daylight
+  saving time or calendar edge cases (a "run on the 31st of every month"
+  job) cleanly, because you computed all those dates at creation time
+  under assumptions that might change. Compute `next_run_at` lazily —
+  once, right after the current run completes — and only ever have at most
+  one pending future run materialized per job definition at a time.
+</Callout>
+
+## Quick check
+
+<Quiz
+  lessonId="sched-data-model-and-queues"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why do task schedulers model "job definition" and "job run" as two separate entities instead of one?',
+      options: [
+        { id: 'a', text: 'It reduces the total number of database tables needed', correct: false, explanation: 'It actually adds a table, not removes one — the benefit is not schema minimization.' },
+        { id: 'b', text: 'A recurring definition produces many executions over time, each with its own state, timing, and retry history that a single row per job cannot hold', correct: true, explanation: 'Separating them lets you track per-attempt state (pending/claimed/succeeded/failed), query run history, and retry one failed run without disturbing the recurring schedule itself.' },
+        { id: 'c', text: 'Job runs are only needed for one-off jobs, never for recurring ones', correct: false, explanation: 'Recurring jobs need job runs even more than one-off jobs do, since they produce a new execution on every occurrence, each needing its own tracked state.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements about visibility timeouts (leases) on claimed job runs are correct? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'They make a claimed run invisible to other workers until the lease expires', correct: true, explanation: 'That is the core mechanism — other workers skip runs whose lease has not yet expired, preventing two workers from executing the same run concurrently.' },
+        { id: 'b', text: 'A worker running a job longer than one lease window must renew (heartbeat) the lease or risk another worker reclaiming the run', correct: true, explanation: 'Without a heartbeat, the lease expires on schedule regardless of whether the original worker is still legitimately working, and the run becomes claimable again.' },
+        { id: 'c', text: 'They eliminate the need for idempotency keys, since only one worker can ever run a job', correct: false, explanation: 'Leases reduce concurrent double-claims but do not eliminate all duplicate-execution risk (e.g., a lease expiring right as a slow worker finishes) — idempotency keys are still needed as a second layer of defense.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A priority queue and a delay queue serve the same purpose in a scheduler and only one of them is needed.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'They answer different questions: a delay queue holds not-yet-due work and promotes it when its time arrives, while a priority queue orders already-ready work by urgency. A scheduler needs both.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — delay queues manage "not ready yet," priority queues manage "ready, but in what order." Dropping either loses either correct timing or correct ordering among ready jobs.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why should a recurring job’s next occurrence be computed lazily (after the current run completes) rather than materializing all future runs up front?',
+      options: [
+        { id: 'a', text: 'Lazy computation is required because databases cannot store more than a few thousand rows per table', correct: false, explanation: 'That is not a real database limitation; the issue is unnecessary row growth and rigidity, not a hard storage ceiling.' },
+        { id: 'b', text: 'Pre-materializing every future run wastes storage on occurrences that may be edited or paused before they happen, and locks in schedule assumptions (like DST or month-end dates) that may later change', correct: true, explanation: 'Computing next_run_at once per completed run keeps at most one pending future run per job, avoids wasted rows, and lets a paused or edited schedule take effect immediately without cleanup.' },
+        { id: 'c', text: 'It has no real benefit; both approaches perform identically at scale', correct: false, explanation: 'They differ meaningfully at scale — materializing years of future occurrences across many tenants produces large amounts of speculative, possibly-invalid data.' },
+      ],
+    },
+  ]}
+/>

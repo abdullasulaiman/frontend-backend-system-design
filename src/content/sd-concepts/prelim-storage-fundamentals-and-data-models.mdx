@@ -1,0 +1,145 @@
+---
+title: "Storage Fundamentals and Data Models"
+module: "Preliminary Concepts"
+moduleOrder: 3
+order: 3
+track: "concept"
+summary: "Covers how storage engines actually persist and retrieve data, and how to choose between relational, key-value, document, wide-column, and object data models based on access patterns rather than habit."
+tags: ["storage", "databases", "data-modeling", "fundamentals", "scalability"]
+estMinutes: 13
+cheatsheet:
+  - "Pick a data model from the access pattern, not familiarity: point lookups by key favor key-value, flexible nested records favor document, wide time-series/analytics favor wide-column, ad-hoc joins and strong invariants favor relational."
+  - "A B-tree index is read-optimized (fast point lookups, in-place updates); an LSM-tree is write-optimized (sequential writes, background compaction, slower worst-case reads) — this is often the real decision behind 'SQL vs NoSQL.'"
+  - "Sharding by the wrong key creates hot shards — pick a shard key that matches your dominant query pattern and spreads load evenly, not just whatever looks like a natural primary key."
+  - "Normalization avoids update anomalies but costs joins at read time; denormalization trades storage and write complexity for read speed — most high-scale systems denormalize deliberately, not by accident."
+  - "A secondary index speeds up one query pattern and slows down every write to that table; don't add one 'just in case' without a query that needs it."
+  - "Object storage (blobs) is for large, immutable, infrequently-updated payloads (images, videos, backups) — never store large binaries directly in a row-oriented database."
+  - "Schema flexibility (schema-on-read) is a trade-off, not a free lunch — it moves validation and consistency work from write time to every read path that touches the field."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Almost every interesting system design question eventually collapses into a storage question. "Design a URL shortener" is really "how do you look up a short code by key at massive scale." "Design a news feed" is really "how do you store and fan out a write-heavy, read-heavy stream of small documents." Get the storage layer wrong — the wrong data model, the wrong index, a shard key that concentrates all the load on one node — and no amount of clever caching or load balancing above it will save the design.
+
+This lesson is about the fundamentals underneath "pick a database": how storage engines actually read and write data on disk, the major data models and what access pattern each one is built for, and how sharding and indexing change the picture once one machine isn't enough. The next lesson in this module, "Consistency and Availability Models," builds directly on this one — you can't reason about replication trade-offs until you know what's being replicated and why.
+
+## How a storage engine actually stores your data
+
+Underneath every database — relational or not — is a storage engine deciding how to lay bytes out on disk, and that choice shapes everything above it.
+
+**B-trees** are the classic choice (Postgres, MySQL's InnoDB, most relational databases). Data lives in a balanced tree of fixed-size pages; a read walks `O(log n)` pages to find a key, and an update modifies the page in place. B-trees are **read-optimized**: point lookups and range scans are fast and predictable. The cost shows up on writes — updating a row can mean rewriting a whole page, and random writes across a large tree thrash the disk cache.
+
+**LSM-trees** (log-structured merge-trees) power most modern write-heavy stores (Cassandra, RocksDB, and the underlying engine of many "NoSQL" databases). Writes are appended sequentially to an in-memory buffer, flushed to disk as immutable sorted files, and periodically merged ("compacted") in the background. LSM-trees are **write-optimized**: writes are always sequential and cheap. The cost shows up on reads — a lookup may have to check the in-memory buffer and several on-disk files before it can answer, though bloom filters and compaction keep this manageable in practice.
+
+This is, underneath the marketing, the real engineering difference behind a lot of "SQL vs. NoSQL" folklore: it's less about SQL-the-language and more about B-tree-style read optimization versus LSM-tree-style write optimization. A workload that's 95% point-lookup reads (a user profile cache) wants the former; a workload that's a firehose of writes (event logging, time-series ingestion) wants the latter.
+
+## Data models: matching the shape to the query
+
+The data model is the contract you design your queries against. Choosing one is really choosing which operations are cheap and which are awkward.
+
+- **Relational (tables + rows, SQL)**: schema, foreign keys, joins, transactions across rows/tables. Best for many-to-many relationships queried ad-hoc, where correctness matters more than raw write throughput. Cost: joins get expensive as tables grow, and horizontal scaling isn't free.
+- **Key-value**: a map from key to opaque value (Redis, simple DynamoDB usage). Best when every access is "give me the value for this key" — sessions, feature flags, a cache. Fast and trivially shardable by key, but no query flexibility beyond that key.
+- **Document (JSON-like, nested)**: a key-value store where the value is a structured, queryable record (MongoDB). Best when a natural unit of data is a self-contained record with fields that vary between records (a catalog entry, a profile with an arbitrary address list). Cost: no cheap cross-document joins, and duplicated data if the same fact appears in many documents.
+- **Wide-column**: rows keyed by a partition key, each holding a huge, sparse, sorted set of columns (Cassandra, Bigtable). Best for time-series/event data written constantly and read by key plus time range — sensor readings by device ID, clicks by user ID. Cost: built around one access pattern; a query you didn't design the row key for is slow or impossible.
+- **Object / blob storage**: large, opaque byte payloads (S3, GCS) addressed by key, with metadata but no structured querying inside. Best for images, videos, backups. Never store large binaries as fields in a row-oriented database — it bloats every backup and scan of the table they live in.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  Q[What is the dominant access pattern?] --> K{Point lookup by key?}
+  K -->|yes, simple value| KV[Key-value store]
+  K -->|yes, nested structured record| DOC[Document store]
+  Q --> J{Need joins across entities and strong invariants?}
+  J -->|yes| REL[Relational database]
+  Q --> T{Write-heavy, read-by-key-plus-time-range?}
+  T -->|yes| WC[Wide-column store]
+  Q --> B{Large immutable binary payload?}
+  B -->|yes| OBJ[Object storage]
+`} />
+
+## Normalization vs. denormalization
+
+A relational schema starts normalized: each fact lives in exactly one place, referenced by foreign key elsewhere. Normalization prevents update anomalies — change a user's display name once, and every place that references it sees the update, because there's only one copy.
+
+The cost is joins. Reading "this order plus the customer's name and address" means joining three tables, and joins get slower as tables grow and as you shard across machines (a join across shards is one of the most expensive things you can do in a distributed system).
+
+Denormalization flips this: store the customer's name directly on the order row, accepting duplication, so a read is a single lookup with no join. The cost moves to writes — updating a customer's name now means updating it everywhere it's duplicated, or accepting that historical orders show the name as it was at order time (often actually the *desired* behavior — an old invoice shouldn't retroactively show someone's current name).
+
+Most systems at real scale denormalize deliberately for their hottest read paths while keeping a normalized source of truth elsewhere (or accept eventual consistency between the two, which the next lesson covers in depth). This is a design decision, not a shortcut — know which reads you're optimizing and what staleness or duplication you're trading for it.
+
+## Indexes: the second data structure you didn't ask for
+
+An index is a separate, ordered structure mapping a column's values to row locations, so the database doesn't have to scan every row to satisfy `WHERE email = ...`. A primary index (usually the same B-tree as the table itself) gets you fast lookup by primary key for free. A secondary index — say, on `email` — has to be built and maintained explicitly.
+
+The trade-off is symmetric: an index that speeds up one query pattern slows down every write to that table, because each insert/update/delete now has to update the index too, not just the row. A table with eight secondary indexes on it can look fast in read benchmarks and fall over under write load, because every write fans out into nine structure updates instead of one. Add an index because a real query needs it — not preemptively "in case it's useful later."
+
+## Sharding: what happens when one machine isn't enough
+
+Once data outgrows a single machine's disk or a single machine's write throughput, you shard: split rows across multiple machines by some **shard key**, so each machine only holds and serves a slice of the data.
+
+The shard key choice determines whether sharding actually helps. Shard a `users` table by `user_id` and most queries ("get this user's data") hit exactly one shard — good. Shard an `orders` table by `created_date` and every write for "today" piles onto one shard while yesterday's shards sit idle — a **hot shard**, and you've gained none of the throughput sharding was supposed to buy you. The rule of thumb: the shard key should match your dominant, highest-volume query pattern, and it should spread writes roughly evenly across shards over time — not just be whichever column looks like a natural ID.
+
+Sharding also breaks anything that assumed all your data lived on one machine: a join across two entities on different shards, a `COUNT(*)` across the whole table, a unique constraint across the whole keyspace. Every one of those becomes either a scatter-gather query across all shards (slow) or something you have to give up and redesign around (e.g., generate globally unique IDs instead of relying on auto-increment).
+
+## Worked example: choosing storage for a ride-hailing dispatch system
+
+Say you're designing the backend for a ride-hailing app and need to store three different things. Walking through each by access pattern:
+
+- **Active driver locations** (updated every few seconds, read constantly by the dispatch matcher): a point-lookup-by-key workload with extreme write volume and no need for durability beyond "the last few seconds" — a key-value store keyed by driver ID (Redis-style) is the right fit; a relational table would buckle under constant location pings.
+- **Trip records** (rider, driver, fare, status — queried by rider/driver history, joined with payments, must never show a half-written trip): this needs relational storage with transactions — "a trip is either fully booked and charged, or not booked at all" is exactly what ACID guarantees.
+- **Trip event history for analytics** (every state change logged for offline analysis, written constantly, almost never read row-by-row): a write-heavy, sequential-append workload with time-range reads — a wide-column store keyed by trip ID with time as the clustering column fits, and a B-tree-based table would not.
+
+Three different data models in one system isn't over-engineering — it's matching each sub-problem's actual access pattern instead of forcing everything through one database because it's the one already in the stack.
+
+<Callout type="warning">
+  A common mistake: defaulting to "we'll use Postgres for everything" or "we'll use a NoSQL document store for everything" without naming the access pattern first. Interviewers notice when a candidate picks a database by brand-name comfort rather than by reasoning: "this is a point lookup by key at very high write volume, so I want write-optimized storage" is a much stronger answer than "let's use MongoDB because it's flexible." State the access pattern (read/write ratio, lookup vs. range vs. join, consistency requirement) before naming a product.
+</Callout>
+
+## Quick check
+
+<Quiz
+  lessonId="prelim-storage-fundamentals-and-data-models"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A workload consists almost entirely of high-volume sequential writes (event logging) with occasional range reads by time. Which storage engine style fits best?',
+      options: [
+        { id: 'a', text: 'A B-tree-based engine, because it keeps data sorted for range scans.', correct: false, explanation: 'B-trees do support range scans, but they are optimized for reads with in-place updates — they are not the best fit for extremely high sequential write volume, where the cost of maintaining the tree structure on every write dominates.' },
+        { id: 'b', text: 'An LSM-tree-based engine, because writes are appended sequentially and merged in the background.', correct: true, explanation: 'LSM-trees buffer writes in memory and flush them as sequential, immutable files, making them write-optimized — exactly the profile of a high-volume append-heavy logging workload.' },
+        { id: 'c', text: 'It does not matter — all storage engines perform identically under write load.', correct: false, explanation: 'Storage engines make explicit trade-offs between read and write optimization; B-tree and LSM-tree engines behave very differently under sustained high write volume.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are real costs of denormalizing a schema (e.g., copying a customer name onto every order row)? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Updating the customer name now requires updating it everywhere it was duplicated (or accepting staleness).', correct: true, explanation: 'This is the core cost of denormalization: duplicated facts need to be kept in sync, or the design has to explicitly accept that duplicated copies represent a point-in-time snapshot.' },
+        { id: 'b', text: 'Reads that need the combined data become slower because they require a join.', correct: false, explanation: 'This is backwards — denormalization removes the need for a join on read, which is the whole point of doing it. The cost shows up on the write side, not the read side.' },
+        { id: 'c', text: 'Extra storage is used to hold duplicated data.', correct: true, explanation: 'Storing the same fact (like a name) in many rows uses more storage than storing it once and referencing it — a real, if often acceptable, cost.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Sharding a table by its primary/natural ID column always distributes load evenly across shards, regardless of the query pattern.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False in general — a shard key only distributes load evenly if it matches the dominant access pattern. Sharding by a monotonically increasing value like a creation timestamp, for instance, concentrates all current writes on one shard even if it looks like a reasonable ID.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. The shard key has to be chosen based on the dominant query and write pattern; the wrong choice creates a hot shard even if the key looks like a natural identifier.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why should large binary files (e.g., user-uploaded videos) generally go into object storage rather than as a column in a relational database table?',
+      options: [
+        { id: 'a', text: 'Relational databases cannot technically store binary data at all.', correct: false, explanation: 'Most relational databases can technically store binary blobs (BLOB/bytea columns) — the issue is operational cost, not a hard technical impossibility.' },
+        { id: 'b', text: 'Large binaries bloat backups, replication, and scans of the table they live in, and object storage is purpose-built for large immutable payloads.', correct: true, explanation: 'Storing large binaries inline drags every backup, every replica sync, and every full scan of that table with them, even when the query never touches the blob column. Object storage keys/metadata can live in the database while the actual bytes live in a system designed for that access pattern.' },
+        { id: 'c', text: 'Object storage provides stronger consistency guarantees than any relational database.', correct: false, explanation: 'Object storage systems typically offer weaker consistency/transactional guarantees than relational databases, not stronger ones — that is not the reason to use them for blobs.' },
+      ],
+    },
+  ]}
+/>

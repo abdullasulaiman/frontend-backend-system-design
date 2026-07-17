@@ -1,0 +1,243 @@
+---
+title: "Presence, Groups, and Notifications"
+module: "Design WhatsApp"
+moduleOrder: 11
+order: 4
+track: "interview"
+summary: "Covers how a chat system tracks who's online, fans a single message out to every member of a group, and wakes up devices that have gone to sleep."
+tags: ["whatsapp", "presence", "fan-out", "push-notifications", "groups"]
+estMinutes: 12
+cheatsheet:
+  - "Presence is a heartbeat problem, not a message problem — a client pings every 20-30s, the server flips a Redis key with a TTL slightly longer than that, and expiry (not an explicit 'offline' message) is what marks someone away."
+  - "Never broadcast every presence change to every contact — batch/debounce updates and only push presence for contacts a client actually has an open chat screen or contact list showing right now."
+  - "Groups are fan-out-on-write: one send, N writes into N per-user inboxes, done by a queue-backed worker so the sender's request returns immediately regardless of group size."
+  - "Cap group size (WhatsApp-style caps sit in the low thousands) specifically because fan-out cost is O(members) per message — an uncapped group turns one send into an unbounded burst of writes."
+  - "Read receipts in groups need per-member tracking (who has read up to which message), which is a different, heavier data structure than the single delivered/read flag a 1:1 chat needs."
+  - "Push notifications (APNs/FCM) are a wake-up nudge, not the delivery channel — the payload should be minimal (sender + preview), and the app must still pull the real message over its own connection to avoid the two ever disagreeing."
+  - "Treat push providers as unreliable and best-effort — always keep messages queued server-side so a dropped push just means the client catches up on next reconnect instead of losing the message."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson got a single message from sender to recipient reliably
+and in order. That covers a 1:1 chat between two people who are both
+online. Real usage looks messier: a friend wants to know if you're
+"online" before they type, a 200-person family group chat needs every
+message copied to every member, and half of your users have the app
+backgrounded or fully closed, so a message sitting in a queue does nothing
+until something wakes the phone up. Presence, group fan-out, and push
+notifications are three separate subsystems that interviewers expect you
+to design once the core pipe is working — each has a different failure
+mode, and conflating them is a common way to lose points in this part of
+the interview.
+
+## Presence: tracking who's online
+
+Presence looks like it should be a message ("user X went online/offline")
+but treating it that way breaks the moment a client disconnects
+uncleanly — a killed app, a dropped Wi-Fi connection, or a phone that dies
+mid-session never gets to send its "I'm going offline" message, and the
+system is stuck showing that user as online forever.
+
+The fix is to make presence a **heartbeat with expiry**, not an event:
+
+- Each connected client sends a lightweight heartbeat (or the existing
+  connection's keepalive doubles as one) every 20-30 seconds.
+- The server stores presence as a key with a short TTL — `online:{userId}`
+  in Redis, TTL'd at maybe 45-60 seconds (comfortably longer than the
+  heartbeat interval to absorb a couple of missed beats).
+- Every heartbeat refreshes the TTL. Stop hearing from a client and the key
+  simply expires — no explicit "offline" event required, and it's
+  self-healing after crashes and network drops alike.
+
+The harder problem isn't storing presence, it's **distributing** it. A
+user with 500 contacts doesn't want 500 people notified the instant they
+open the app, and the system doesn't want to push 500 presence updates on
+every connect/disconnect. Two practical constraints keep this bounded:
+
+- Only push a user's presence to contacts who have that chat (or contact
+  list) actually open on screen right now — this is normally tracked via a
+  lightweight subscription: "client C is watching presence for user U,"
+  torn down when the chat closes.
+- Debounce presence changes for flaky connections — a phone bouncing
+  between Wi-Fi and cellular can flap online/offline several times a
+  minute; delay marking someone offline by a few seconds so a brief blip
+  doesn't fan out a flurry of updates.
+
+<Callout type="tip">
+  "Last seen" is presence's cheaper cousin: instead of real-time push,
+  just stamp `last_seen_at` on disconnect (or on TTL expiry via a
+  background sweep) and serve it on request. It doesn't need the
+  subscription machinery above at all.
+</Callout>
+
+## Group messaging: fan-out on write
+
+A 1:1 message is one write. A group message to N members is logically N
+deliveries, and the design decision that matters is *when* that
+fan-out happens.
+
+**Fan-out on write** (fan-out at send time): the moment a message arrives,
+a worker copies it into each member's personal inbox/queue immediately.
+Each recipient then just reads their own inbox exactly like a 1:1 chat —
+the read path never changes, and offline members simply see the message
+waiting when they reconnect.
+
+**Fan-out on read** (fan-out at fetch time): store the message once,
+tagged with the group ID, and have each client query "give me new
+messages for groups I'm in" on their own schedule.
+
+For chat, fan-out on write wins almost every time: messaging is
+latency-sensitive (every member expects a near-instant push, not a poll),
+and group sizes are small enough (WhatsApp caps around a few thousand
+members) that N writes per message is cheap compared to the read-side
+complexity of reconstructing per-user timelines on demand. Fan-out on read
+only starts winning when N gets huge and unpredictable — which is exactly
+the newsfeed problem, not the chat problem.
+
+The mechanics:
+
+1. Sender's message hits the chat service and is durably queued once
+   (one write, one source of truth).
+2. A fan-out worker reads the group's member list and enqueues a delivery
+   task per member into that member's per-user delivery queue — the same
+   queue a 1:1 message would use.
+3. Each member's existing connection/push path (from the previous lesson)
+   delivers it, completely unaware it originated from a group.
+
+This keeps the sender's request fast (it only waits on step 1) and reuses
+the entire single-recipient delivery pipeline for step 3 — no group-aware
+code needed on the delivery hot path.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  S[Sender] -->|1 write| Q[Message store]
+  Q --> W[Fan-out worker]
+  W -->|N writes| I1[Inbox: Member A]
+  W --> I2[Inbox: Member B]
+  W --> I3[Inbox: Member C]
+  I1 --> D1[Deliver / push A]
+  I2 --> D2[Deliver / push B]
+  I3 --> D3[Deliver / push C]
+`} />
+
+### Read receipts get heavier in groups
+
+A 1:1 chat needs one bit of state per message: delivered, then read. A
+group needs to know, per message, *which* members have read it — that's
+an `(message_id, user_id) -> read_at` mapping, not a single flag. Most
+clients only show an aggregate ("read by 8 of 12") and let the sender
+drill in for the full list, precisely because rendering 200 read
+timestamps per message doesn't scale visually or in storage. A common
+trade-off: track per-member read cursors ("member X has read up through
+message Y") rather than a per-message-per-member row — it's far cheaper
+to store and still answers "has X seen this" in O(1).
+
+## Push notifications: waking up a sleeping client
+
+Everything above assumes the recipient's device has a live connection to
+pull from. Mobile OSes aggressively suspend backgrounded apps to save
+battery, so that connection is frequently not there. Push notification
+services — Apple's APNs, Google's FCM — exist to solve exactly this: the
+OS itself keeps one persistent, battery-optimized connection to the
+platform's push service, and your backend can wake a specific app instance
+through it even while your own connection to that device is dead.
+
+The design pattern:
+
+- When a message is queued for a user who has no active connection (or
+  hasn't acknowledged within a short window), the delivery worker also
+  fires a push request to APNs/FCM with that user's device token.
+- The push payload should be **minimal** — sender name and a short
+  preview, not the full message — for two reasons: push payloads have
+  small size limits, and (per the encryption lesson next) you often don't
+  want plaintext content sitting in a third party's push infrastructure at
+  all.
+- The push is a *wake-up nudge*, not the delivery channel itself. Tapping
+  the notification (or the OS silently waking the app) should cause the
+  client to reconnect and pull the real message from your own backend —
+  the source of truth stays the message store, never the push payload.
+
+This separation matters because push delivery is best-effort — tokens go
+stale, providers rate-limit, notifications can be dropped by the OS under
+memory pressure. As long as the message itself stays durably queued
+server-side, a lost push just means the user finds out a little later
+(next app open, or the next successful push retry) rather than losing the
+message outright.
+
+## Worked example: a 500-member "College Friends" group, one member offline
+
+Member A sends "reunion is confirmed for June 12" to a 500-person group.
+Walk it through:
+
+1. The message hits the chat service, gets a message ID, and is written
+   once to durable storage (say, ~2-3ms for the write).
+2. A fan-out worker picks it up and looks up the group's 500 member IDs
+   (cached, since group rosters change rarely relative to messages sent).
+3. It enqueues 500 delivery tasks, one per member's inbox. At maybe
+   0.5-1ms of queue-write time each, parallelized across worker instances,
+   this finishes in well under a second even for one of the larger groups
+   the product allows.
+4. 480 members have an active connection: their clients get pushed the
+   message over the existing socket in real time.
+5. 20 members are offline. Their delivery tasks sit in their per-user
+   inbox *and* trigger a push notification via APNs/FCM with the payload
+   "A: reunion is confirmed..." (truncated preview, sender name only).
+6. One of those 20 has a stale push token (reinstalled the app last
+   month). The push silently fails. No data is lost — their message is
+   still sitting in their inbox, and the next time they open the app and
+   reconnect, normal sync delivers it exactly as if the push had worked.
+
+The key property: whether a member was online, offline-with-working-push,
+or offline-with-broken-push, the *guarantee* is identical — eventual
+delivery from the durable inbox. Push only affects *how fast* an offline
+member finds out, never *whether* they get the message.
+
+<Callout type="warning">
+  A frequent design mistake is putting the actual message content in the
+  push notification and treating "push sent" as "message delivered."
+  Push providers are unreliable and rate-limited, payloads get silently
+  dropped under load, and a stale/uninstalled-app token means the
+  notification never arrives at all — none of which the sender or your
+  own metrics can see. Always keep the message durably queued server-side
+  independent of push, and use push purely as a low-latency hint to make
+  the client check in sooner.
+</Callout>
+
+<Quiz
+  lessonId="whatsapp-presence-groups-and-notifications"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why is presence usually implemented as a TTL-based heartbeat key rather than explicit online/offline events?',
+      options: [
+        { id: 'a', text: 'TTL keys are cheaper to store than event logs', correct: false, explanation: 'Storage cost is not the driving reason — a single presence flag either way is trivially small.' },
+        { id: 'b', text: 'A client that disconnects uncleanly (crash, dead battery, dropped network) never gets to send an explicit "offline" event', correct: true, explanation: 'Correct. Relying on an explicit offline event leaves a user stuck showing "online" forever after any ungraceful disconnect. Expiry-based presence self-heals because absence of a heartbeat is itself the offline signal.' },
+        { id: 'c', text: 'It lets the server push presence updates less frequently', correct: false, explanation: 'Heartbeat frequency is independent of this choice; the real benefit is correctness under unclean disconnects, not update frequency.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasons chat systems use fan-out-on-write for group messages instead of fan-out-on-read? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Messaging is latency-sensitive, and members expect near-instant delivery rather than polling', correct: true, explanation: 'Correct. Fan-out on write lets each member get pushed immediately through their existing per-user delivery path.' },
+        { id: 'b', text: 'Group sizes are capped and small relative to something like a newsfeed follower count, so N writes per message stays cheap', correct: true, explanation: 'Correct. Groups typically cap in the low thousands, so the fan-out write cost is bounded and predictable, unlike an unbounded follower graph.' },
+        { id: 'c', text: 'It avoids ever needing a message queue', correct: false, explanation: 'The opposite is true — fan-out on write is typically implemented with a queue-backed worker precisely so the sender is not blocked on N synchronous writes.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A push notification payload (APNs/FCM) should be treated as the authoritative delivery of a message, so it is safe to remove the message from the server queue once the push is sent.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Push delivery is best-effort and can silently fail (stale token, rate limiting, OS drops it). Treating a sent push as "delivered" risks permanently losing the message for that user.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. The message must stay durably queued server-side regardless of push outcome; push is only a wake-up hint, and the client still pulls the real message once reconnected.' },
+      ],
+    },
+  ]}
+/>

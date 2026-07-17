@@ -1,0 +1,136 @@
+---
+title: "Scalability"
+module: "Non-Functional Characteristics"
+moduleOrder: 4
+order: 3
+track: "concept"
+summary: "Explains what scalability actually means, the difference between scaling up and scaling out, and the concrete techniques (partitioning, replication, caching, async processing) that let a system absorb 10x load without a 10x rewrite."
+tags: ["scalability", "horizontal-scaling", "sharding", "load-balancing", "capacity-planning"]
+estMinutes: 12
+cheatsheet:
+  - "Scalability is a system's ability to handle load growth by adding resources, with cost and performance staying roughly proportional — not just 'it stays up under load' (that's closer to availability/reliability)."
+  - "Vertical scaling (bigger machine) is simple but hits a hard ceiling and a single point of failure; horizontal scaling (more machines) has near-unlimited headroom but requires the workload to be splittable."
+  - "Statelessness at the application tier is what makes horizontal scaling easy — push session/state into a shared store (cache, DB) so any instance can handle any request."
+  - "Partitioning (sharding) scales the data tier by splitting data across nodes by key; pick a partition key that spreads both storage and traffic evenly, or you just relocate the bottleneck to one hot shard."
+  - "Read replicas and caching scale read-heavy workloads cheaply; they don't help write-heavy workloads, which need partitioning or a different write path."
+  - "Load grows in at least three independent dimensions — request rate, data volume, and connection/concurrency count — and a design that scales one doesn't automatically scale the others."
+  - "Scaling out trades single-node simplicity for coordination problems (rebalancing, cross-shard queries, distributed transactions) — budget real engineering time for those, not just 'add more boxes.'"
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A system that works perfectly for 100 users and falls over at 100,000 hasn't failed at reliability or availability in the usual sense — it failed at scalability. This is the non-functional property interviewers probe hardest, because it's the one that actually reshapes an architecture: a single Postgres instance with an in-process cache is a completely reasonable design for a startup's MVP, and a completely wrong answer once you say "500 million daily active users" out loud. Knowing *when* and *how* a design needs to change as load grows is most of what separates a junior answer from a senior one in a system design interview.
+
+This lesson is about that "how load grows and what you do about it" question specifically. The previous lessons in this module covered availability (staying reachable) and reliability/durability (behaving correctly and not losing data) — scalability is the third leg: handling *more* of everything without a proportional blowup in cost, latency, or failure rate.
+
+## What scalability actually means
+
+A system is scalable if you can handle growth in load by adding resources, and the relationship between "resources added" and "load handled" stays roughly linear (or better). Concretely, load can grow along several independent axes:
+
+- **Request rate** — more requests per second hitting your API.
+- **Data volume** — more rows, more objects, more total bytes stored.
+- **Concurrency** — more simultaneous connections, sessions, or in-flight operations.
+- **Complexity of work per request** — bigger queries, larger payloads, more joins.
+
+A design can scale well on one axis and badly on another. A stateless API tier scales request rate beautifully by adding more instances behind a load balancer, but if every one of those instances still hits a single-node database, you haven't scaled data volume or write concurrency at all — you've just moved the bottleneck one hop over. Good scalability analysis asks "which axis is actually growing, and what specifically breaks first?" rather than treating "scalability" as one undifferentiated property.
+
+## Scaling up vs. scaling out
+
+There are exactly two levers for adding capacity, and almost every scalability technique is one of them applied to a specific tier.
+
+**Vertical scaling (scaling up)** means making one machine bigger: more CPU, more RAM, faster disks. It's the simplest option — no code changes, no coordination — and it's often the right first move. But it has a hard ceiling (there's a biggest instance your cloud provider sells), it doesn't survive that one machine dying, and cost tends to grow faster than linearly as you move up the instance-size ladder (the biggest machines carry a premium).
+
+**Horizontal scaling (scaling out)** means adding more machines and splitting the work across them. Headroom is much larger — you add another node instead of hoping a bigger one exists — and it naturally gives you redundancy, since no single node losing power takes the whole system down. The cost is that the workload has to actually be splittable, and now you have a distributed system with all the coordination problems that implies: load balancing, data partitioning, cross-node consistency.
+
+Most real systems do both: scale up a bit for simplicity, then scale out once you hit the ceiling or need the redundancy anyway.
+
+### Statelessness is the enabler for horizontal scaling
+
+The single biggest design decision that determines whether your application tier can scale out cleanly is whether it's stateless. If any server can handle any incoming request — because session data, user state, and shopping-cart contents live in a shared cache or database rather than in that server's memory — then a load balancer can route requests to whichever instance is least busy, and adding capacity is just adding instances. If state is pinned to a specific server (sticky sessions, in-memory caches with no shared backing store), you've capped your horizontal scalability and created a node whose failure loses data, which also drags in the reliability lesson's territory.
+
+## Scaling the data tier
+
+The application tier is usually the easy part; the data tier is where scalability gets hard, because data has to actually live somewhere and can't just be duplicated onto every node for free.
+
+**Caching** absorbs read load before it reaches the database. A well-hit cache (Redis, Memcached, or a CDN for static/semi-static content) can turn a database that tops out at 5,000 reads/sec into an effective 500,000 reads/sec system, since most of those reads never touch the database at all. Caching helps reads; it does nothing for write throughput.
+
+**Read replicas** scale reads a different way: copies of the primary database serve read traffic while the primary handles writes. This scales read capacity roughly linearly with the number of replicas, at the cost of replication lag (replicas are slightly stale) — a trade-off explored more in the consistency lesson later in this module.
+
+**Partitioning (sharding)** is what actually scales writes and total data volume: split the dataset across N nodes by some partition key (user ID, region, hash of a primary key), so each node only holds and serves a slice of the data. Done well, this scales close to linearly — 10 shards can handle roughly 10x the writes of one. Done badly — a poorly chosen key that sends most traffic to one shard (a celebrity user ID, a single popular region) — you get a hot shard that's just as bottlenecked as the single-node case, except now you also carry the complexity of cross-shard queries and rebalancing when you add or remove nodes.
+
+**Asynchronous processing** scales work that doesn't need to happen inline with the user's request. Push it onto a queue and let a pool of workers drain it at whatever rate they can sustain, instead of making the request handler do it synchronously. Video transcoding, email sending, and analytics aggregation are classic examples — the request returns fast, and worker capacity scales independently of API capacity.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    C[Clients] --> LB[Load balancer]
+    LB --> A1[App instance 1]
+    LB --> A2[App instance 2]
+    LB --> A3[App instance N]
+    A1 --> Cache[(Shared cache)]
+    A2 --> Cache
+    A3 --> Cache
+    Cache -.miss.-> Shard1[(Shard: users A-M)]
+    Cache -.miss.-> Shard2[(Shard: users N-Z)]
+    A1 --> Queue[[Async job queue]]
+    Queue --> Worker[Worker pool]
+`} />
+
+## Worked example: sizing for a spike
+
+Say you're designing a ticket-sales API for a stadium concert. Normal traffic across all events is 200 requests/sec. When a popular show goes on sale, traffic spikes to 40,000 requests/sec for about 10 minutes, then drops back down.
+
+A single application server handling 500 requests/sec comfortably would need 80 instances at peak — versus 1 instance normally. Provisioning 80 instances permanently is wasteful; provisioning 1 and hoping is a guaranteed outage. This is exactly the case for horizontal auto-scaling: keep the app tier stateless, put an auto-scaling group behind the load balancer, and let it add instances as request rate climbs (typically triggered on CPU or request-queue-depth, with a few minutes of lead time to spin up new instances — which is why you also want to pre-warm capacity ahead of a known on-sale time rather than relying purely on reactive scaling).
+
+The database tells a different story. Ticket inventory for one concert is a small, hot dataset — maybe 20,000 seats — with an extreme write contention problem (everyone trying to buy the same 20,000 rows in the first 60 seconds). Adding more database read replicas doesn't help; this is a write-contention problem, not a read-throughput problem. The real fix is usually to take the "reserve a seat" step out of the hot path entirely: a short-lived reservation lock or queue-based admission control that only lets a bounded number of buyers attempt checkout at a time, with the actual database write happening at a controlled rate behind it. This is the pattern behind most real "virtual waiting room" implementations for high-demand sales.
+
+<Callout type="warning">
+  A common mistake in interviews: proposing "let's add a cache" or "let's add read replicas" as a generic fix for any scalability problem, without checking whether the bottleneck is actually reads. A write-heavy or write-contended workload — inventory decrements, counters, leaderboards — gets no benefit from either technique. State explicitly which axis (reads, writes, storage volume, connection count) is under pressure before proposing the fix; a design that scales reads brilliantly while a single row absorbs all the writes has solved the wrong problem.
+</Callout>
+
+<Quiz
+  lessonId="nfr-scalability"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A team moves session data out of each app server\'s memory and into a shared Redis cache. What does this primarily enable?',
+      options: [
+        { id: 'a', text: 'Horizontal scaling of the app tier, since any instance can now serve any request', correct: true, explanation: 'Removing server-local state is exactly what lets a load balancer route a request to any instance interchangeably — the prerequisite for scaling out the app tier.' },
+        { id: 'b', text: 'Stronger durability guarantees for user data', correct: false, explanation: 'Moving session data to a shared cache is about enabling statelessness for scaling, not primarily about durability (a cache is often not even durable storage).' },
+        { id: 'c', text: 'Lower request latency for every request', correct: false, explanation: 'An extra network hop to a shared cache can add latency compared to reading local memory; the win here is scalability/flexibility, not raw speed.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which techniques primarily help scale read-heavy load rather than write-heavy load? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Adding read replicas of the primary database', correct: true, explanation: 'Read replicas serve read traffic in parallel but all writes still go through the primary, so this scales reads, not writes.' },
+        { id: 'b', text: 'Adding a caching layer in front of the database', correct: true, explanation: 'A cache absorbs read traffic before it reaches the database; it does not increase write capacity.' },
+        { id: 'c', text: 'Partitioning (sharding) the dataset across multiple nodes by key', correct: false, explanation: 'Sharding splits both reads and writes across nodes, and it is specifically the technique that scales write throughput and total storage — unlike replicas or caching.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Vertical scaling (using a bigger machine) has essentially unlimited headroom, making horizontal scaling unnecessary as long as you keep upgrading the instance size.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Vertical scaling always hits a ceiling — the largest instance a provider offers — and it remains a single point of failure regardless of size. It does not substitute for horizontal scaling at large scale.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Vertical scaling has a hard ceiling and no redundancy; horizontal scaling is what provides near-unlimited headroom and failure isolation, though it requires a splittable workload.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A ticket-sales database is overwhelmed not by read traffic but by thousands of concurrent attempts to write to the same small set of inventory rows. What is the most appropriate fix?',
+      options: [
+        { id: 'a', text: 'Add more read replicas to spread out the load', correct: false, explanation: 'Read replicas do not help write contention — every write still has to go through the primary (or its shard), so this leaves the actual bottleneck untouched.' },
+        { id: 'b', text: 'Add a queue or admission-control step so writes to the hot rows happen at a controlled, bounded rate', correct: true, explanation: 'This directly addresses write contention on a small hot dataset by controlling concurrency into the write path, rather than trying to scale reads or storage that were never the bottleneck.' },
+        { id: 'c', text: 'Increase the cache TTL for inventory data', correct: false, explanation: 'Caching helps reads become stale-tolerant; it does nothing to reduce the number of concurrent writers contending for the same rows, and a longer TTL would make inventory data even less accurate under fast-changing writes.' },
+      ],
+    },
+  ]}
+/>

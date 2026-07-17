@@ -1,0 +1,138 @@
+---
+title: "Architecture and Fan-Out"
+module: "Pub-Sub"
+moduleOrder: 18
+order: 2
+track: "concept"
+summary: "Explains how a pub-sub broker structures topics, partitions, and subscriptions to deliver one published message to many independent consumers, and the push-vs-pull and fan-out-on-write-vs-read tradeoffs that follow."
+tags: ["pub-sub", "fan-out", "message-broker", "architecture", "scalability"]
+estMinutes: 12
+cheatsheet:
+  - "A topic is a durable, append-only log, not a mailbox — subscribers each keep their own read cursor (offset) into the same log, which is what lets a publisher stay ignorant of who or how many are reading."
+  - "Partitioning a topic is how you parallelize fan-out and consumption; it costs you global ordering (only per-partition order is guaranteed) in exchange for horizontal scale."
+  - "Push delivery (broker calls the subscriber, e.g. webhooks) gives low latency but couples the broker to subscriber uptime and speed; pull delivery (subscriber polls, e.g. Kafka consumer) isolates the broker from slow or dead subscribers at the cost of poll latency."
+  - "A consumer group shares partitions among its members (each message to exactly one member); a broadcast subscription set gives the same message to every independent subscriber — most real systems need both, layered."
+  - "Fan-out-on-write (push to every follower's feed at publish time) trades write amplification for fast reads; fan-out-on-read (compute the feed at request time) trades slower reads for cheap writes — the celebrity-follower problem is why most systems end up doing both, split by follower count."
+  - "One slow consumer inside a shared partition can stall every other message behind it in that partition; isolate flaky or slow consumers onto their own partition or subscription rather than letting them share fate with healthy ones."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson set up the pub-sub contract: publishers don't know who's listening, subscribers don't know who's publishing, and the broker sits in between decoupling the two in time and in number. That contract sounds simple until you ask the question an interviewer will actually push on: how does one published message end up delivered to a thousand subscribers, some of them slow, some of them offline for an hour, without the publisher waiting on any of them? The answer is the fan-out architecture — how topics are stored, how they're split for scale, and how delivery actually reaches each subscriber. Get this wrong in a design and you've built a system where a single slow consumer can stall every publisher, which defeats the entire point of pub-sub.
+
+## The core pieces
+
+A pub-sub broker is built from four things:
+
+- **Topic** — a named, durable, append-only log of messages. Not a queue: nothing is removed when it's read.
+- **Partition** — a topic is split into one or more ordered partitions, each an independent log with its own append order. Partitioning is the unit of parallelism.
+- **Subscription** — a named registration of interest in a topic, tracking its own position (offset) into the log independently of every other subscription.
+- **Consumer / consumer group** — the process(es) reading a subscription. A group can have multiple members that split the partitions between them for parallel consumption.
+
+The key design idea: the topic is one shared, immutable log, and *fan-out happens by giving every subscription its own cursor into that same log* rather than copying the message once per subscriber at write time. A publish is a single append; a hundred subscribers each reading at their own pace cost nothing extra at write time — they're just a hundred independent offsets pointed at the same bytes.
+
+## Partitioning: parallelism at the cost of global order
+
+A single-partition topic gives you total order — every subscriber that reads from the start sees messages in exactly the order they were published. That's easy to reason about but caps your throughput at what one partition (one disk, one set of consumers) can handle.
+
+Splitting a topic into partitions (commonly by hashing a key — `userId`, `deviceId`, `orderId`) lets you parallelize both the write path and the read path: each partition can live on a different broker node, and each partition can be consumed independently. The tradeoff is that you only get ordering *within* a partition, never across the whole topic. If a caller needs "all events for order 42 in order," hashing on `orderId` guarantees that, because every event for order 42 always lands in the same partition. If a caller needs "every event across all orders in global order," partitioning breaks that — you'd need a single partition, which caps scale.
+
+## Consumer groups vs. broadcast subscriptions
+
+Two different fan-out shapes get conflated constantly, and telling them apart is the actual skill:
+
+- **Broadcast (topic → many independent subscriptions)**: every subscription gets every message. This is "pub-sub" in the purest sense — a `PriceChanged` event goes to the search-index updater, the cache invalidator, and the analytics pipeline, and each of those three sees every message, independently, at its own pace.
+- **Consumer group (subscription → many competing members)**: within one subscription, the partitions are divided among group members so each message goes to exactly one member of that group, not all of them. This is how you scale a single logical consumer (say, "the cache invalidator") horizontally without duplicating work — five worker processes split twenty partitions, each handling four.
+
+Put together: a topic commonly has several broadcast subscriptions (one per downstream system), and each of those subscriptions is itself consumed by a scaled-out consumer group.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    P[Publisher] -->|append| T[Topic: PriceChanged]
+    T --> P0[Partition 0]
+    T --> P1[Partition 1]
+    T --> P2[Partition 2]
+    P0 & P1 & P2 --> S1[Subscription: search-index]
+    P0 & P1 & P2 --> S2[Subscription: cache-invalidator]
+    P0 & P1 & P2 --> S3[Subscription: analytics]
+    S2 --> C1[Consumer A]
+    S2 --> C2[Consumer B]
+`} />
+
+In that picture, `search-index` and `analytics` are single consumers reading the full subscription; `cache-invalidator` has scaled out into a two-member consumer group, so consumer A and consumer B split the three partitions between them rather than each seeing every message.
+
+## Push vs. pull delivery
+
+Once a subscription exists, how does a message actually reach the consumer's code?
+
+**Push**: the broker calls the subscriber — an HTTP webhook, a gRPC stream, an open socket. Latency is low (delivery happens the instant the broker has the message), but the broker now depends on the subscriber being reachable and fast. A subscriber that's down, slow, or rate-limiting the broker turns into the broker's problem: retries, dead-letter queues, and backoff policies all exist to manage this coupling.
+
+**Pull**: the subscriber polls the broker for the next batch at its own cadence. This fully isolates the broker from subscriber health — a dead consumer just stops advancing its own offset, and the broker does nothing differently. The cost is polling latency (how often you poll trades off against staleness and request volume) and the consumer needs its own scheduling/retry logic instead of the broker providing it.
+
+Most large-scale designs (Kafka, Kinesis) use pull for the core log because it keeps the broker simple and consumer-failure-agnostic, then let teams bolt push semantics on top (a small relay service that pulls and then pushes to webhooks) when low-latency delivery to external, less-trusted consumers is genuinely required.
+
+## Worked example: fan-out-on-write vs. fan-out-on-read
+
+Say you're designing the "new post" fan-out for a social feed, where publishing a post should show up in every follower's feed. A user with 500 followers posts roughly once a day; a celebrity account with 20 million followers also posts about once a day.
+
+**Fan-out-on-write**: at publish time, write the post ID into every follower's personal feed store. For the 500-follower user, that's 500 writes — trivial. For the 20-million-follower celebrity, that single post now triggers 20 million writes, all before (or shortly after) the post can be considered "published." If a hundred celebrity-tier accounts post in the same minute, that's on the order of a couple billion feed writes competing for the same fan-out workers, which either fall dangerously behind or need enormous burst capacity that sits idle the rest of the day.
+
+**Fan-out-on-read**: don't write anything at publish time beyond the one post itself; when a follower opens their feed, merge the posts of everyone they follow on the fly. Publishing a celebrity's post is now a single write no matter the follower count, but every feed *read* becomes more expensive, since it has to merge across every followed account at request time.
+
+Neither one is right alone. The standard resolution is a hybrid: fan-out-on-write for ordinary accounts (the 500-follower case, where the write cost is cheap and reads stay fast), and fan-out-on-read for accounts past some follower threshold (merge celebrity posts into the feed at read time instead of pre-writing them everywhere). This is the concrete reason "how do you fan out?" questions in an interview almost always want you to name a follower-count threshold and defend it, not just pick one strategy globally.
+
+<Callout type="warning">
+  A frequent mistake is designing fan-out as a synchronous loop — "on publish, call every subscriber's endpoint and wait" — because it looks simple on a whiteboard. This makes publish latency depend on the slowest subscriber and turns one dead or throttled consumer into an outage for every publisher. Decouple fan-out from publish: persist the message durably first (the log append), acknowledge the publisher immediately, and let delivery to each subscription happen asynchronously off that durable log at its own pace. The publisher's job ends at "the broker has it," never at "everyone received it."
+</Callout>
+
+## Handling the slow-subscriber problem
+
+Because partitions are the unit of both parallelism and ordering, one slow or stuck consumer inside a shared partition blocks every message queued behind it for that partition — the broker can't skip ahead without breaking the ordering guarantee that partition promises. Two practical mitigations: give known-slow or bursty consumers their own dedicated partition or subscription rather than sharing one with fast consumers, and set a per-message processing timeout with a dead-letter subscription so a single poison message doesn't permanently wedge a partition. Both are really the same idea — isolate blast radius so one subscriber's problem can't become every subscriber's problem.
+
+<Quiz
+  lessonId="pubsub-architecture-and-fan-out"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why can a pub-sub broker let a hundred subscriptions read the same published message without copying the message a hundred times at write time?',
+      options: [
+        { id: 'a', text: 'Each subscription keeps its own read offset into one shared, durable log; publishing is a single append regardless of subscriber count.', correct: true, explanation: 'This is the core design: the topic log is written once, and fan-out is realized by each subscription tracking its own position into that same log, not by duplicating data per subscriber.' },
+        { id: 'b', text: 'The broker batches all subscribers into a single shared offset so they all read together.', correct: false, explanation: 'Subscriptions are independent precisely so one subscriber\'s pace never affects another\'s — sharing one offset across subscriptions would remove that independence, not enable it.' },
+        { id: 'c', text: 'Because messages are deleted immediately after the first subscriber reads them, keeping storage cost flat.', correct: false, explanation: 'That describes queue semantics (message removed after one consumer takes it), which would break pub-sub — the whole point is that every subscription gets to read every message independently.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements correctly describe the tradeoff of splitting a topic into multiple partitions? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Partitioning increases achievable throughput because each partition can be written to and consumed independently.', correct: true, explanation: 'Partitions can live on different broker nodes and be consumed in parallel, which is exactly how partitioning raises throughput beyond what one log could handle.' },
+        { id: 'b', text: 'Partitioning preserves global ordering across the entire topic by default.', correct: false, explanation: 'The opposite is true — partitioning only guarantees order within a single partition. Global order across the whole topic requires a single partition, which caps scale.' },
+        { id: 'c', text: 'Hashing a partition key like orderId ensures all events for that key land in the same partition, preserving per-key order.', correct: true, explanation: 'Consistent key hashing routes every event for the same key to the same partition, which is exactly what gives you ordered delivery for that key even though the topic overall is unordered.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In a design where publish() waits for a synchronous call to every subscriber before returning, one slow or unreachable subscriber can degrade publish latency for every publisher.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — coupling publish acknowledgment to delivery of every subscriber means the slowest subscriber sets the floor on publish latency, which is exactly the anti-pattern the pitfalls section warns against.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'A synchronous fan-out loop does create this coupling: if publish only returns after every subscriber call completes, one dead or throttled subscriber directly slows or blocks every publish.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A social feed uses fan-out-on-write for regular accounts but switches to fan-out-on-read for accounts above a large follower-count threshold. What problem is this hybrid primarily solving?',
+        options: [
+        { id: 'a', text: 'The celebrity-follower problem, where fan-out-on-write for a huge follower count creates massive write amplification at publish time.', correct: true, explanation: 'A celebrity post with millions of followers would trigger millions of feed writes under pure fan-out-on-write; computing their posts at read time instead avoids that write spike while keeping cheap writes for typical accounts.' },
+        { id: 'b', text: 'Ensuring every follower sees posts in strict global chronological order across all accounts they follow.', correct: false, explanation: 'Ordering the merged feed is a read-time concern regardless of which fan-out strategy is used; the hybrid choice here is specifically about write amplification, not ordering.' },
+        { id: 'c', text: 'Reducing the storage cost of keeping the topic log durable.', correct: false, explanation: 'Both strategies still require durably storing the post itself; the hybrid choice is about where the fan-out work happens (write time vs. read time), not about log durability or retention.' },
+      ],
+    },
+  ]}
+/>

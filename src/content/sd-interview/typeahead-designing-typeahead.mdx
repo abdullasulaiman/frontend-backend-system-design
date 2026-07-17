@@ -1,0 +1,236 @@
+---
+title: "Designing Typeahead"
+module: "Design Typeahead Suggestion"
+moduleOrder: 12
+order: 4
+track: "interview"
+summary: "Assembles the trie, the ranking model, and the data pipelines from the earlier lessons into one end-to-end typeahead architecture, covering both the read path that serves suggestions and the write path that keeps them fresh."
+tags: ["typeahead", "autocomplete", "system-design", "caching", "data-pipeline"]
+estMinutes: 13
+cheatsheet:
+  - "Split the system into two paths: a read path (client keystroke -> cache -> trie service -> ranked suggestions) and a write path (query logs -> aggregation -> offline trie rebuild). They run on completely different cadences."
+  - "Never build the serving trie directly from live traffic. Log queries, aggregate counts in a batch or streaming job, then publish a new trie snapshot — this keeps the hot read path free of write contention."
+  - "Cache full prefixes (especially short ones like 1-3 characters) at the edge or in a fronting cache — they're few in number and get hit by nearly every user, so a cache absorbs the bulk of QPS before it reaches the trie service."
+  - "Shard the trie by prefix range (e.g. a-i, j-r, s-z) so each shard fits in memory on one node; a client's request only ever needs to fan out to one shard per keystroke, not the whole dataset."
+  - "Give trending/breaking queries a fast lane: a lightweight real-time counter that can bump a term's rank within minutes, separate from the slower full-trie rebuild that runs hourly or daily."
+  - "Debounce keystrokes client-side (roughly 100-200ms) before firing a request — without it, a five-character word fires five full round trips instead of one or two."
+  - "Design for graceful degradation: if the trie service or cache is unavailable, fall back to no suggestions, not a blocked search box — typeahead is an enhancement, not a dependency of core search."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've picked a trie to store prefixes and a ranking approach to decide which
+completions to show first. Neither of those, on its own, is a system. An
+interviewer who's happy with "I'll use a trie with popularity scores" will
+push further: where does that trie live, how does a keystroke actually reach
+it, who rebuilds it as query patterns shift, and what happens under 50,000
+requests per second from users who are each typing five separate letters for
+a single search? This lesson wires the pieces from the last two lessons — the
+data structure and the ranking signal — into one coherent architecture, split
+cleanly into a read path that serves suggestions and a write path that keeps
+them current.
+
+## Two paths, two very different jobs
+
+Typeahead has an unusual property compared to most CRUD-shaped systems: the
+"write" that matters (a user's search query) and the "read" it eventually
+feeds (someone else's typeahead suggestions) are almost never the same
+request, and they can be arbitrarily far apart in time. That decoupling is
+the single most important design decision in this system.
+
+- **The read path** serves suggestions for a prefix in single-digit to
+  low-double-digit milliseconds. It's read-only, extremely latency-sensitive,
+  and must never wait on anything resembling a database write.
+- **The write path** collects what people actually searched for, aggregates
+  it, and periodically produces a new version of the trie for the read path
+  to serve. It can tolerate delay measured in minutes to hours — nobody
+  expects a query typed once to instantly change global suggestions.
+
+Treating these as one system (e.g., incrementing a counter in the live trie on
+every keystroke) couples a hot, latency-critical path to a write workload,
+and is the fastest way to make `p99` latency unpredictable.
+
+## The read path
+
+1. The client debounces keystrokes (roughly 100-200ms of no typing) so it
+   isn't firing a request per character.
+2. The request — a prefix like `"des"` — hits a cache first. Short prefixes
+   (1-3 characters) are few in number (26, then 676, then ~17,000
+   combinations) and get hit by a huge fraction of all users, so a cache in
+   front of the trie service absorbs most traffic cheaply.
+3. On a cache miss, the request reaches the **trie service**, which is
+   sharded by prefix range so any one shard's trie fits comfortably in memory
+   on a single node.
+4. The shard walks down to the node for the given prefix and returns its
+   precomputed top-K list — computed once when the trie was built, not
+   recomputed per request (see the ranking lesson for how that list is
+   scored).
+5. Results are cached (prefix -> top-K list) and returned to the client.
+
+Because the top-K list at each node is precomputed, a request is just "find
+the node, return its cached list" — no scoring happens on the request path at
+all. That's what makes single-digit-millisecond responses realistic even at
+very high QPS.
+
+## The write path
+
+1. Every completed search query is logged — just the raw query text and a
+   timestamp, appended to a log or a queue (e.g., Kafka). This is cheap and
+   asynchronous; it never blocks the user's actual search.
+2. A batch job (commonly hourly or daily) aggregates logs into query counts:
+   how many times was `"design patterns"` searched in this window.
+3. Those counts feed into the trie-build job, which merges new counts with
+   existing frequency data (often with time-decay, so last month's spike
+   doesn't dominate forever), recomputes each node's top-K list, and produces
+   a new trie snapshot.
+4. The new snapshot is pushed out to trie service shards, usually with a
+   rolling swap so no shard goes offline to reload.
+
+This works well for organic, gradually shifting query popularity, but it's
+too slow for anything breaking *right now* — a news event or a viral topic
+can spike in minutes, and waiting for tomorrow's batch job means suggestions
+stay stale exactly when they matter most.
+
+### The fast lane for trending queries
+
+A common addition is a lightweight, separate real-time counter — a sliding
+window count per query term, updated as logs stream in — that can inject a
+term into a prefix's suggestion list within minutes, bypassing the full
+rebuild. It doesn't replace the batch pipeline; it's a small, fast overlay
+that the trie service checks alongside the precomputed list, blended in with
+a boost so a genuinely spiking term can surface even before it's "earned" its
+place through the slower aggregation.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph Read Path
+      Client[Client: debounced keystrokes] --> Cache[Prefix cache]
+      Cache -->|miss| Trie[Trie service - sharded by prefix]
+      Trie --> TopK[Precomputed top-K per node]
+      TopK --> Client
+    end
+    subgraph Write Path
+      Search[Completed search queries] --> Logs[Query logs / queue]
+      Logs --> Batch[Batch aggregation job]
+      Batch --> Build[Trie build job]
+      Build -->|new snapshot| Trie
+      Logs --> RealTime[Real-time trending counter]
+      RealTime -->|boost| Trie
+    end
+`} />
+
+## Sharding and fault tolerance
+
+Splitting one giant trie across nodes usually means sharding by prefix range
+(`a-i` on shard 1, `j-r` on shard 2, and so on), so a client's request for a
+given prefix always routes to exactly one shard — no fan-out needed for a
+single keystroke's lookup. Each shard is replicated for read throughput and
+failover, the same as any other stateless-ish read service (the trie itself
+is effectively read-only between rebuilds, so replicas can be trivially
+kept in sync by just shipping them the same snapshot).
+
+<Callout type="tip">
+  If certain letters are far more common as starting characters than others
+  (English text skews heavily toward a handful of starting letters), a naive
+  alphabetic split creates lopsided shards. Rebalance by query volume, not by
+  letter count — a shard boundary can be `a-c` if those three letters carry
+  as much traffic as `t-z` combined.
+</Callout>
+
+## Worked example: a 500ms search from "d" to "design"
+
+A user types "design" one character at a time. With a 150ms debounce, typing
+at a normal pace (roughly 200ms between keystrokes) means most individual
+keystrokes fire their own request — say the client actually sends requests
+after `"d"`, `"des"`, and `"design"` (the debounce coalesces the fastest
+bursts, but three round trips is realistic for a six-letter word typed at
+normal speed).
+
+- `"d"` — a 1-character prefix. Near-certainly a cache hit; the fronting
+  cache returns the top-10 completions for "d" in under 5ms.
+- `"des"` — a 3-character prefix, still common enough to likely be cached;
+  if not, it's one hop to the trie shard covering `d`, a node lookup, and a
+  precomputed top-10 list — maybe 8-12ms including network.
+- `"design"` — a longer, more specific prefix. Less likely to be cached,
+  same trie-shard lookup applies, similarly fast, because the cost is
+  dominated by the node walk, not by how long the prefix is.
+
+Total: three requests, each independently fast, each of which could fail
+without breaking the search box — if the third request times out or the
+service is degraded, the client just keeps showing the results from `"des"`
+until the user presses enter and runs an actual search. Meanwhile, none of
+this activity touches the write path at all; "design" being searched adds one
+line to a log that's aggregated hours later, alongside every other query from
+every other user that hour.
+
+<Callout type="warning">
+  A frequent design mistake: describing the trie as something that gets
+  updated live, on the request path, whenever a user searches something (an
+  "increment the counter and re-rank on every query" design). At real
+  traffic volumes this turns every read into a write, forces locking or
+  contention on hot nodes near the root of the trie, and makes latency
+  unpredictable exactly where it needs to be most reliable. Keep writes
+  entirely on their own asynchronous path — logging now, aggregating and
+  rebuilding later — and let the read path stay a pure, contention-free
+  lookup against an immutable snapshot.
+</Callout>
+
+## Where this leaves you
+
+You now have the complete request lifecycle: a debounced client request hits
+a cache, falls through to a sharded trie service that returns a precomputed
+ranked list with no scoring on the critical path, while a completely
+separate pipeline logs queries, aggregates them, and periodically republishes
+new trie snapshots — with an optional fast lane for genuinely trending terms.
+The final lesson in this module pushes on what breaks as this design scales
+further: how shard counts and rebuild frequency change under 10x or 100x the
+traffic, and how to keep rebuilds cheap as the underlying dataset grows.
+
+<Quiz
+  lessonId="typeahead-designing-typeahead"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does a typeahead system keep query logging/aggregation (the write path) architecturally separate from serving suggestions (the read path)?',
+      options: [
+        { id: 'a', text: 'The read path needs to be a low-latency, contention-free lookup, while the write path can tolerate delay measured in minutes to hours — coupling them would make read latency unpredictable.', correct: true, explanation: 'Correct — this is the core reason: a hot, latency-sensitive read path cannot afford to wait on or contend with write-side aggregation work.' },
+        { id: 'b', text: 'Because trie data structures cannot support both reads and writes at the same time under any circumstances.', correct: false, explanation: 'Tries can technically support concurrent reads and writes with the right locking; the real reason for separation is latency and contention risk on a hot path, not a hard structural limitation.' },
+        { id: 'c', text: 'Because search queries and typeahead suggestions must always be stored in different databases for legal reasons.', correct: false, explanation: 'This is not a real constraint in typeahead design; the separation is an architectural/performance choice, not a compliance requirement.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are legitimate parts of a typeahead read path as described in this lesson? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A fronting cache that absorbs traffic for short, high-frequency prefixes before it reaches the trie service.', correct: true, explanation: 'Short prefixes are few and heavily reused across users, so caching them is a cheap, effective way to cut load on the trie service.' },
+        { id: 'b', text: 'Sharding the trie by prefix range so a single keystroke request only needs to route to one shard.', correct: true, explanation: 'Prefix-range sharding keeps a single request from needing to fan out across the whole dataset.' },
+        { id: 'c', text: 'Returning a precomputed top-K list stored at each trie node, rather than scoring and ranking candidates during the request.', correct: true, explanation: 'Precomputing rankings during the (offline) build step is what keeps the read path fast, since no scoring work happens per request.' },
+        { id: 'd', text: 'Re-running the full ranking/scoring algorithm over all matching completions on every keystroke.', correct: false, explanation: 'This is exactly what the design avoids — re-scoring on every request would make the read path slow and defeats the point of precomputing top-K lists during the build.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A real-time trending-query counter is meant to fully replace the batch aggregation and trie-rebuild pipeline.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The real-time counter is described as a small overlay/fast lane that boosts genuinely spiking terms — it supplements the batch pipeline, it does not replace the mechanism that builds the base ranked lists.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the batch pipeline still produces the underlying precomputed rankings; the real-time counter only adds a way for a spiking term to surface faster than a full rebuild would allow.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'The trie service becomes unavailable for a few seconds due to a rolling snapshot deployment. What should the client experience, per the design in this lesson?',
+      options: [
+        { id: 'a', text: 'The search box should block user input entirely until suggestions are available again.', correct: false, explanation: 'Typeahead is meant to be an enhancement layered on top of search, not a hard dependency — blocking the whole search experience over it defeats that design goal.' },
+        { id: 'b', text: 'The client should show no suggestions (or its last successful results) and let the user keep typing or submit the search normally.', correct: true, explanation: 'Correct — the read path is designed to degrade gracefully; a missing or slow suggestion response should never block the core ability to search.' },
+        { id: 'c', text: 'The client should fall back to querying the write-path log storage directly for suggestions.', correct: false, explanation: 'The write-path logs are raw, unaggregated data, not something designed to be queried directly for ranked suggestions in real time.' },
+      ],
+    },
+  ]}
+/>

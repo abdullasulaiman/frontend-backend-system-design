@@ -1,0 +1,112 @@
+---
+title: "What Is Modern System Design?"
+module: "Introduction"
+moduleOrder: 1
+order: 1
+track: "concept"
+summary: "Defines modern system design as the practice of turning a rough product requirement into a working distributed architecture under real constraints of scale, failure, and cost."
+tags: ["system-design", "distributed-systems", "fundamentals", "architecture"]
+estMinutes: 11
+cheatsheet:
+  - "Modern system design is decision-making under constraints (scale, latency, cost, failure) — not memorizing a fixed list of architectures."
+  - "A design is never 'done,' only correct for a stated set of numbers: users, request rate, data size, and durability/availability targets."
+  - "Every distributed design is a trade-off surface, most commonly consistency vs. availability, latency vs. throughput, and cost vs. redundancy."
+  - "Single-machine systems fail as a unit; distributed systems fail continuously and partially — design for partial failure as the default, not the exception."
+  - "The three universal levers for scaling are: do less work, do it closer to the user, or spread it across more machines — most techniques are one of these in disguise."
+  - "State the requirements and constraints out loud before proposing components — an architecture without stated assumptions can't be evaluated as right or wrong."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Ask ten engineers to "design a URL shortener" and you'll get ten different diagrams — a load balancer here, a cache there, maybe a message queue if someone's feeling ambitious. Most of those diagrams would technically work for a shortener with ten users a day. Almost none of them would survive ten million users a day without a rewrite. The gap between those two versions is what this course is about: not drawing boxes and arrows, but reasoning about a system well enough to know which boxes and arrows actually matter at a given scale.
+
+Modern system design is the discipline of turning a fuzzy requirement ("users should be able to shorten a URL") into a concrete architecture that holds up under real traffic, real failures, and real cost pressure. It sits between two extremes: pure algorithms (where the input size is given and the answer is either correct or not) and pure product thinking (where the "right" answer depends on business priorities as much as engineering ones). System design lives in the middle — you're given ambiguous requirements, you have to make them concrete, and then you have to defend the trade-offs you chose.
+
+## Why "modern" matters here
+
+The term isn't decoration. System design as a discipline changed shape over the last two decades because the default deployment target changed. Twenty-five years ago, "design a system" usually meant designing software for one powerful machine, maybe with a hot standby. Today it almost always means designing for a fleet of machines that individually fail all the time, spread across networks that drop and delay packets, serving users who are scattered across the planet with wildly different latency to any given data center.
+
+That shift is why this course focuses on **distributed** system design specifically:
+
+- **Scale forces distribution.** Past a certain request rate or data volume, no single machine — no matter how large — is enough. You split the work across many machines, and now you have a distributed system whether you planned one or not.
+- **Failure becomes routine, not exceptional.** A single server either works or is down. A fleet of a thousand servers has some of them down, right now, at any given moment, as a statistical certainty. Designing for "the happy path plus a crash handler" isn't enough — failure has to be a first-class case in the design, not an afterthought.
+- **The network is part of the system.** Calls between services can be slow, can time out, can succeed on the server but have the response lost in transit. A modern design has to account for the network itself as an unreliable component, not just the code running on either end.
+
+## The three questions every design answers
+
+Whatever the specific prompt — a chat app, a rate limiter, a ride-hailing dispatch system — a system design boils down to answering three questions, in order:
+
+1. **What does it need to do, at what scale?** This means concrete numbers: how many users, how many requests per second, how much data, read-heavy or write-heavy, how fresh does data need to be. Skipping this step is the single most common reason designs go wrong — a design that's correct for 1,000 users a day and a design that's correct for 100 million users a day can look nothing alike.
+2. **What can it get away with not guaranteeing?** Every real system trades something away. Can a "like" count be off by a few for a couple of seconds? Can a search result lag behind the latest write by a minute? Can the system reject new writes during a partition rather than risk inconsistency? Naming what you're willing to sacrifice is what makes the rest of the design tractable.
+3. **Given 1 and 2, what components, and why?** Only now do you reach for a load balancer, a cache, a queue, a particular database family. Each component is a specific answer to a specific pressure identified in the first two steps — not a default you add because "that's what these diagrams have."
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Vague requirement] --> B[Concrete scale: users, QPS, data size]
+  B --> C[Explicit trade-offs: what can degrade, what must not]
+  C --> D[Component choices: LB, cache, DB, queue...]
+  D --> E[Architecture that is defensible, not just drawable]
+`} />
+
+## The levers behind almost every technique
+
+New patterns and vendor names show up constantly — a new caching layer, a new database, a new message broker — and it's easy to feel like the list of things to learn never ends. Underneath nearly all of it, though, there are only three levers for handling more load than a single machine can:
+
+- **Do less work.** Caching, precomputing results, denormalizing data, and approximating (e.g., an approximate count instead of an exact one) all reduce the work required per request.
+- **Do it closer to the user.** CDNs, edge caches, and regional deployments cut the physical distance data has to travel, which cuts latency — often the cheapest win available.
+- **Spread it across more machines.** Horizontal scaling, sharding, and partitioning let you add capacity by adding machines rather than by making one machine faster, which has a hard ceiling.
+
+Every technique you'll meet in this course — read replicas, consistent hashing, write-ahead logs, load balancing algorithms — is a specific implementation of one of these three ideas, usually with a cost attached (staleness, complexity, or money). Recognizing which lever a technique pulls, and what it costs, is more durable knowledge than memorizing the technique's name.
+
+## Worked example: "just add a cache" isn't a design
+
+Say the prompt is: "Design a service that returns a user's profile given a user ID, and it's getting slow." The instinctive answer is "add a cache." That's a lever (do less work), but it's not a design until it's grounded in numbers and trade-offs:
+
+- **Scale**: is this 10,000 profile reads/day or 500,000/second? At 10,000/day, the database was probably never the bottleneck, and the "slowness" is likely elsewhere (a slow query missing an index, an N+1 call pattern, a chatty network hop). At 500,000/second, a cache is close to mandatory, but now you need to say which cache topology, what eviction policy, and what happens on a cache miss stampede.
+- **Trade-off**: a cache means profile data can be briefly stale after an update. Is a 30-second staleness window on "user changed their display name" acceptable? Almost certainly yes. Is a 30-second staleness window acceptable on "user changed their account balance"? Almost certainly not — that's a different consistency requirement, and it changes whether caching that particular field is even appropriate.
+- **Component choice**: only after those two answers do you pick — an in-process cache, a shared cache like Redis, cache-aside vs. write-through, and a TTL or invalidation strategy tied to how the underlying data actually changes.
+
+The one-word answer ("cache it") isn't wrong, exactly — it's just incomplete in a way that an interviewer (or a production incident) will find immediately. The next two lessons build on this: why the reasoning skill above is worth learning even if you never sit a system design interview, and how this course is structured to build it deliberately.
+
+<Callout type="warning">
+  A common early mistake is treating system design as "memorize famous architectures" — learn how "the" URL shortener or "the" chat system is built and reproduce it on demand. That approach breaks the moment a prompt varies the constraints even slightly (what if writes must be strongly consistent? what if the system must work across three regions?). Learn the underlying levers and trade-offs instead of a fixed set of diagrams — that's what transfers to a prompt you've never seen before.
+</Callout>
+
+<Quiz
+  lessonId="intro-what-is-modern-system-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What most distinguishes "modern" system design, as covered in this course, from classic single-machine software design?',
+      options: [
+        { id: 'a', text: 'It focuses only on choosing the fastest programming language for a task', correct: false, explanation: 'Language choice is a minor factor compared to how work is distributed, cached, and made resilient to failure — that is not the defining difference.' },
+        { id: 'b', text: 'It treats distribution across many machines, and partial/continuous failure, as the default case to design for', correct: true, explanation: 'Past a certain scale, work must be spread across machines, and with many machines, some are always failing — modern system design treats that as the normal condition, not an edge case.' },
+        { id: 'c', text: 'It only applies to companies with more than one million users', correct: false, explanation: 'The reasoning skills apply at any scale — the numbers just change which trade-offs make sense, they do not gate whether the discipline applies.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are among the three universal levers described for handling more load than a single machine can bear? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Do less work (e.g., caching or approximating results)', correct: true, explanation: 'Reducing the work required per request is one of the three core levers.' },
+        { id: 'b', text: 'Do the work closer to the user (e.g., CDNs or regional deployments)', correct: true, explanation: 'Cutting physical distance to the user reduces latency and is one of the three core levers.' },
+        { id: 'c', text: 'Spread the work across more machines (e.g., sharding or horizontal scaling)', correct: true, explanation: 'Adding capacity by adding machines, rather than relying on one faster machine, is the third core lever.' },
+        { id: 'd', text: 'Always choose the newest database technology available', correct: false, explanation: 'Newness is not a lever at all — a technology choice only matters insofar as it helps do less work, work closer to the user, or spread work across machines.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'According to this lesson, stating concrete scale numbers (users, requests per second, data size) should come before proposing specific components like caches or queues.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'The lesson frames this as the first of three questions a design must answer — components are a response to scale and trade-offs, not a starting point.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'The lesson explicitly argues the opposite: jumping straight to components without grounding them in scale (like reflexively answering "just add a cache") is called out as an incomplete approach.' },
+      ],
+    },
+  ]}
+/>

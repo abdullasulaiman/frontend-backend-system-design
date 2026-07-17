@@ -1,0 +1,113 @@
+---
+title: "Ranking and Personalization"
+module: "Design Typeahead Suggestion"
+moduleOrder: 12
+order: 3
+track: "interview"
+summary: "Covers how to score and rank the candidate completions a trie returns, and how to layer per-user personalization on top without blowing up storage or latency."
+tags: ["ranking-algorithms", "personalization", "caching", "typeahead"]
+estMinutes: 12
+cheatsheet:
+  - "A trie only tells you which strings share a prefix — it says nothing about which ones a user actually wants to see. Store a score at (or reachable from) each terminal node and keep the top-k cached per prefix node, not recomputed per request."
+  - "Global popularity score = a decayed count of how often a completed query was searched, not how often it was merely typed as a prefix — decay (e.g. exponential with a multi-day half-life) so trending queries can overtake stale ones."
+  - "Precompute top-k per prefix offline/async; never sort the full candidate set live on the request path. A prefix node should carry a small pre-ranked list, refreshed on a delay, not recalculated on every keystroke."
+  - "Personalization is a re-ranking pass, not a replacement: blend a personal signal (this user's own history, recency-weighted) with the global top-k, don't build a separate full trie per user."
+  - "Cold-start users (no history) should silently fall back to the global ranking — never show an empty or degraded list just because personalization has nothing to work with yet."
+  - "Freshness lag is a deliberate trade-off: batch-updating scores every few minutes to hours keeps the write path cheap, at the cost of a few minutes' delay before a suddenly-trending query climbs the rankings."
+  - "Don't conflate ranking (which order to show candidates) with retrieval (which candidates to consider at all) — retrieval is the trie's job; ranking is a scoring function applied to whatever the trie returns."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson gave you a trie that can answer "what strings share this prefix" in time proportional to the prefix length. That's necessary but nowhere near sufficient. A prefix like `"a"` might match tens of thousands of completed queries in a real search system — nobody wants a dropdown with ten thousand options, and nobody wants them in insertion order or alphabetical order either. The trie solves *retrieval*; this lesson solves *ranking* — deciding which handful of candidates actually deserve the top 5-10 slots, and how much of that ordering should be tailored to the specific person typing.
+
+Get this wrong and the symptoms are obvious to any user: the box suggests three years of stale queries above what's actually popular right now, or it suggests the same list to every user regardless of what they've searched before. Get the mechanics wrong — recomputing a full sort on every keystroke, or building a separate trie per user — and the system that worked fine in a demo falls over under real traffic. Both failure modes come up constantly in interviews, so it's worth separating "what makes a good score" from "how do you serve that score cheaply."
+
+## Scoring: what makes one completion rank above another
+
+### Frequency, but decayed
+
+The baseline signal is simple: count how often each completed query has actually been submitted (not just typed as a prefix — a search someone abandoned halfway through shouldn't count the same as one they finished). Raw lifetime counts are a bad final score on their own, though, because they entrench old winners. A query that was huge two years ago and has since died off will still out-rank a genuinely trending query if you only ever add to its count.
+
+The fix is decay: weight recent searches more heavily than old ones, typically with an exponential decay function applied to counts bucketed by time (e.g. per hour or per day). A common approach is to keep a rolling score per query where each new occurrence adds weight `1` and the whole score is multiplied by a decay factor (something like `0.5` per day, tuned to how fast your domain's trends move) on each update cycle. The half-life you pick is a product decision: news and e-commerce search want a short half-life (hours to a couple of days) because relevance moves fast; something like map or address search can tolerate a much longer half-life because "popular streets" doesn't change week to week.
+
+### Precompute, don't sort live
+
+However you score, the crucial architectural decision is *when* you rank. Sorting every candidate for a prefix at request time — especially a short, high-fan-out prefix — is exactly the kind of per-request cost that kills p99 latency once QPS climbs. The standard approach: attach a small precomputed top-k list (k is usually 5-10) to each node in the trie, or to a subset of nodes worth caching, and refresh those lists asynchronously as scores change. A background job walks completed queries, updates decayed scores, and periodically recomputes each affected node's top-k — on a cadence of minutes to hours, not per-request.
+
+This means the "read path" (a user typing) never touches a scoring function at all — it just walks the trie to the node for the typed prefix and returns whatever top-k list is already sitting there. The "write path" (score updates) is entirely decoupled and can run as slow, batched background work.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  Q[Completed queries] --> AGG[Aggregation job<br/>decayed counts]
+  AGG --> RANK[Re-rank affected<br/>prefix nodes]
+  RANK --> CACHE[(Top-k per prefix<br/>cache/trie nodes)]
+  U[User keystroke] --> LOOKUP[Trie prefix lookup]
+  LOOKUP --> CACHE
+  CACHE --> RESP[Ranked suggestions]
+`} />
+
+## Personalization: re-ranking, not re-building
+
+Personalization is tempting to over-engineer. The wrong instinct is "build a separate trie, or a separate top-k list, per user" — that multiplies your storage by however many active users you have, for a signal that's usually thin (most users haven't typed enough for their own history to be statistically meaningful on its own).
+
+The workable pattern is a **re-ranking pass**: fetch the global top-k for the typed prefix exactly as before, then blend in a personal signal — most simply, this user's own recent search history that happens to share the prefix, boosted to the top or interleaved by a weighted score (`final_score = w1 * global_score + w2 * personal_recency_score`). The personal signal is small (a user's own recent queries, maybe a few hundred at most, kept in a compact per-user structure like a small LRU list or a Redis sorted set keyed by user ID) — nowhere near the size of a full trie.
+
+This has a nice property: it degrades gracefully. A brand-new user with no history just gets the global ranking untouched, because their personal-score term contributes nothing — there's no special-cased "cold start" branch to write, it falls out of the blend naturally.
+
+### What personal signal is worth using
+
+- **Own search history** — if you've searched `"machine learning course"` three times this month, `"machine"` should probably surface that above a merely-globally-popular `"machine gun"`.
+- **Recent context** — what the user searched in this session (e.g. someone who just searched a city name gets that city's landmarks boosted for follow-up prefixes).
+- **Coarse profile signals** — locale, language, or a rough location, used to boost regionally relevant completions (this is closer to segment-level personalization than truly per-user, and it's cheap because you can precompute per-segment top-k lists the same way you do for the global list).
+
+Deep personalization (embeddings, learned ranking models over dozens of features) is a legitimate answer in a senior-level interview, but always name it as a layer *on top of* the frequency-based baseline, not a replacement — you still need the cheap, fast global path for cold-start users and as a fallback when the personalization service is slow or down.
+
+## Worked example: sizing the precomputation job
+
+Say the product has 50 million distinct completed queries in the system, and on average each query's prefixes touch about 8 trie nodes worth caching (for an average query length around 8 characters). That's roughly 400 million (query, prefix-node) pairs to potentially consider for a top-k recompute.
+
+You don't recompute all 400 million every cycle — only nodes whose underlying scores actually changed materially since the last run. If your traffic produces, say, 2 million completed searches per hour, and each touches ~8 prefix nodes, that's about 16 million "dirty" node updates per hour to reprocess — comfortably batchable by a job that dedupes affected node IDs and re-sorts just their candidate lists, run every few minutes. That's the kind of number an interviewer wants to hear you reason through out loud: not "we run a cron job," but "here's roughly how much work that cron job actually has to do per cycle, and why that's cheap enough to run frequently."
+
+<Callout type="warning">
+  A common mistake: treating personalization as "run the same ranking model, but per user" and then trying to serve it by building a per-user index. That's a storage and infra multiplier you almost never need. Keep one shared global ranking structure, keep personal signals small and separate (a compact per-user history, not a full candidate index), and combine them at read time with a lightweight blended score. If an interviewer asks "how would you personalize this," reach for re-ranking first, not re-indexing.
+</Callout>
+
+<Quiz
+  lessonId="typeahead-ranking-and-personalization"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why is decaying the frequency score important for typeahead ranking, rather than using a raw lifetime count?',
+      options: [
+        { id: 'a', text: 'It reduces the number of trie nodes needed', correct: false, explanation: 'Decay is a scoring concern, not a data-structure-size concern — it does not change how many nodes the trie needs.' },
+        { id: 'b', text: 'It lets recently trending queries overtake old queries that accumulated a large count in the past but are no longer relevant', correct: true, explanation: 'Without decay, a once-popular query keeps outranking newer, actually-trending ones forever, since counts only ever go up.' },
+        { id: 'c', text: 'It makes the scoring function run faster at request time', correct: false, explanation: 'Scoring should already be precomputed off the request path; decay affects the score\'s accuracy over time, not lookup speed.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'boolean',
+      prompt: 'The read path for a typeahead request should run a live sort over all candidates matching the typed prefix each time a user types a character.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Sorting live on every keystroke does not scale — the standard approach precomputes a top-k list per prefix asynchronously and serves it directly on read.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Ranking should be precomputed and cached per prefix node; the read path only performs a lookup, not a sort.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'multi',
+      prompt: 'Which of these are reasonable ways to add personalization to a typeahead system? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Blend a small per-user recency signal with the existing global top-k score at read time', correct: true, explanation: 'This is the standard re-ranking approach — cheap, and it degrades gracefully for users with no history.' },
+        { id: 'b', text: 'Build a complete separate trie for every user containing only their own history', correct: false, explanation: 'This multiplies storage by the number of users for a signal that is usually thin on its own — an anti-pattern to avoid.' },
+        { id: 'c', text: 'Fall back silently to the global ranking for users with no search history', correct: true, explanation: 'This is the correct cold-start behavior — no personal signal simply means the blended score reduces to the global score.' },
+        { id: 'd', text: 'Recompute a personalized ranking model from scratch on every keystroke for every user', correct: false, explanation: 'This is far too expensive to run on the request path; personalization signals should be precomputed or cheaply blended, not recomputed live per keystroke.' },
+      ],
+    },
+  ]}
+/>

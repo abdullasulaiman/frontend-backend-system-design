@@ -1,0 +1,177 @@
+---
+title: "Data Model and API"
+module: "Design Quora"
+moduleOrder: 2
+order: 3
+track: "interview"
+summary: "Designs the entity model and API surface for a Quora-style Q&A platform, showing how questions, answers, votes, and follows map to different storage and consistency needs."
+tags: ["data-modeling", "api-design", "database-schema", "voting-systems", "q-and-a"]
+estMinutes: 12
+cheatsheet:
+  - "Split questions/answers (relational, need joins and moderate write volume) from votes (write-heavy, needs idempotency, benefits from a KV/counter store) from follows/feed edges (graph-shaped, high fan-out)."
+  - "A vote is not `UPDATE answers SET score = score + 1` — model it as a row in a `votes` table keyed by `(user_id, answer_id)` so a repeat vote is an update, not a double-count, then aggregate the score asynchronously."
+  - "Store one row per answer, not embedded in the question row — a question with 200 answers should not force loading 200 answers' worth of text to read the question title."
+  - "Cursor-based pagination (keyed on rank score + id, not offset) for both answer lists and the home feed — offset pagination breaks under concurrent inserts and gets slower with page depth."
+  - "The write path for posting an answer and the read path for viewing a question have very different shapes: writes are relatively rare and can afford a slower, consistent path; reads are the dominant load and should be served from cache or a precomputed feed."
+  - "Denormalize read-heavy counters (answer_count on questions, vote_score on answers) and reconcile them periodically — don't compute them with a live COUNT/SUM on every page load."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The high-level design from the previous lesson drew boxes for a question service, an answer service, a feed service, and some kind of ranking layer — but none of that means anything until you've decided what a "question" and an "answer" actually look like in storage, and what shape the API calls take to write and read them. This is the lesson where an interviewer starts asking "okay, walk me through the schema" and "what does the `POST` body for submitting an answer look like" — and where a fuzzy answer starts costing you points.
+
+The core tension in a Q&A platform's data model is that a question with a good answer gets read thousands of times more often than it gets written to, and a small number of questions and answers absorb a disproportionate share of votes and views. Get the entity boundaries and the read/write split right here, and ranking and feed generation (the next lesson) has clean building blocks to work with. Get it wrong — say, storing vote counts as a column you increment synchronously — and every later lesson inherits a bottleneck.
+
+## The core entities
+
+Five entities carry the weight of the product:
+
+- **User** — account, profile, topics they follow.
+- **Question** — the title/body, the asker, tags/topics, and denormalized counters (`answer_count`, `follower_count`).
+- **Answer** — belongs to exactly one question, written by one user, has its own body and a denormalized `vote_score`.
+- **Vote** — one row per `(user_id, target_id)` pair, `target_id` referring to either a question or an answer.
+- **Follow** — a user following a question, a topic, or another user, which drives what shows up in their feed.
+
+As with any platform that mixes structured records with high-volume counters, don't reach for one database for all five. Split by access pattern.
+
+### Questions and answers: relational, and deliberately normalized
+
+```
+questions
+  id            bigint PK
+  author_id     bigint FK -> users.id
+  title         varchar(300)
+  body          text
+  answer_count  int          -- denormalized, reconciled periodically
+  created_at    timestamp
+
+answers
+  id            bigint PK
+  question_id   bigint FK -> questions.id
+  author_id     bigint FK -> users.id
+  body          text
+  vote_score    int          -- denormalized, reconciled periodically
+  created_at    timestamp
+```
+
+Answers live in their own table rather than as a JSON blob or child rows embedded in the question record. That matters for a concrete reason: rendering a question page needs the title, body, and a *paginated slice* of answers ordered by rank — not every answer's full text loaded up front. Keeping answers as independent rows, indexed by `question_id`, lets you fetch page one of answers with a simple indexed range query and leave the rest on disk until requested.
+
+This tier is a good fit for a relational store sharded by `question_id` (co-locating a question with its own answers on one shard avoids cross-shard joins for the single most common query: "show me this question and its top answers").
+
+### Votes: separate table, idempotent by construction
+
+```
+votes
+  user_id     bigint FK -> users.id
+  target_id   bigint       -- question_id or answer_id
+  target_type enum('question','answer')
+  value       smallint     -- +1 or -1
+  created_at  timestamp
+  PRIMARY KEY (user_id, target_id, target_type)
+```
+
+The primary key is the whole point: a user voting on the same answer twice is an `UPSERT` on an existing row (changing `+1` to `-1` if they switch their vote, or a no-op if they click the same button twice), never a second row. That makes the vote endpoint naturally idempotent, which matters because clients retry on timeouts — a non-idempotent "increment score by one" endpoint would double-count on every retried request.
+
+Votes are also the highest-write-volume table on the platform by a wide margin, so the same logic from any high-traffic counter design applies: don't synchronously recompute `vote_score` on the answer row for every vote. Write the vote row, publish an event, and let an aggregator reconcile `vote_score` every few seconds.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  U[User clicks upvote] --> API[Vote API]
+  API --> VT[(votes table: upsert by user+target)]
+  API --> EVT[Vote event stream]
+  EVT --> AGG[Aggregator]
+  AGG --> CTR[(answer.vote_score, cached)]
+  CTR --> READ[Question page reads cached score]
+`} />
+
+### Follows: a graph-shaped edge table
+
+```
+follows
+  follower_id   bigint FK -> users.id
+  target_id     bigint       -- user_id, question_id, or topic_id
+  target_type   enum('user','question','topic')
+  created_at    timestamp
+  PRIMARY KEY (follower_id, target_id, target_type)
+```
+
+This table answers two very different queries — "who follows this question" (fan-out on write, when a new answer needs to notify followers) and "what does this user follow" (used to build their feed). Both are simple point/range lookups on this one table if you index both directions (`(follower_id, target_type)` and `(target_id, target_type)`); you don't need a dedicated graph database for a Q&A platform's follow relationships at typical interview-discussion scale.
+
+## The API surface
+
+Group the endpoints by their read/write and consistency profile — that grouping is exactly what an interviewer wants to hear, not a flat list of routes.
+
+**Write path (question and answer creation)**
+
+- `POST /questions` — creates a `questions` row, `answer_count=0`; synchronous, low volume relative to reads.
+- `POST /questions/{id}/answers` — creates an `answers` row, increments `answer_count` (or defers it to the same reconciliation job as vote scores), and triggers a fan-out job to notify the question's followers.
+- `PATCH /answers/{id}` — edit; keep an `edited_at` timestamp since "was this edited" is a trust signal readers care about.
+
+**Read path (dominant load, cache-first)**
+
+- `GET /questions/{id}` — question body plus the first page of answers, ordered by rank score; served from a cache in front of the relational store, invalidated on new answers or significant vote-score changes.
+- `GET /questions/{id}/answers?cursor=...&sort=top|new` — cursor-based pagination keyed on `(vote_score, id)` for `top` or `(created_at, id)` for `new`. Offset pagination is the wrong tool here for the same reason it's wrong for any frequently-inserted, frequently-reordered list: page 3 shifts under you as new votes and answers land.
+- `GET /feed?cursor=...` — the home feed, covered in depth in the next lesson; from this lesson's angle, it's a read endpoint over precomputed feed entries, not a live join across everything a user follows.
+
+**Engagement (idempotent by design)**
+
+- `POST /votes` — body is `{ target_id, target_type, value }`; upserts the caller's own vote row. Same call twice with the same value is a no-op; opposite value flips it.
+- `POST /follows` / `DELETE /follows/{id}` — toggling a follow; drives both notification fan-out and feed composition.
+
+<Callout type="warning">
+A common mistake in this lesson is designing `vote_score` as a column updated with `UPDATE answers SET vote_score = vote_score + :value` directly inside the vote request. Two problems compound here: first, a popular answer's row becomes a write hotspot under concurrent voting, contending with the same table other readers are querying for ranked answer lists. Second, and more subtly, this pattern makes double-voting a real bug — if the client retries a timed-out vote request, or the same user clicks upvote twice without a `votes` table to check against, the score gets incremented twice for one logical vote. The `votes` table with a `(user_id, target_id)` primary key is what makes the operation idempotent; the score column is a cache of an aggregate over that table, not the source of truth.
+</Callout>
+
+## Worked example: "how do you serve the top answers for a question with 50,000 answers?"
+
+Say an interviewer asks this directly, since it's a natural follow-up to "answers are their own table." The question row itself is tiny and cheap to fetch. The expensive part is: which answers go on page one, sorted by score, when the underlying `vote_score` values are changing continuously as new votes arrive?
+
+The fix is the same cursor-pagination pattern from the API surface above, applied concretely: maintain a composite index on `answers(question_id, vote_score DESC, id DESC)`. The first page is `WHERE question_id = ? ORDER BY vote_score DESC, id DESC LIMIT 20` — an index scan, not a full table scan. The client's next request passes the `(vote_score, id)` of the last row it saw as a cursor: `WHERE question_id = ? AND (vote_score, id) < (:cursor_score, :cursor_id) ORDER BY vote_score DESC, id DESC LIMIT 20`.
+
+This does mean a vote landing on an answer already on page one *while* a user is reading page two can reorder things slightly — a minor, acceptable inconsistency, not a correctness bug, since nobody expects a live-reordering answer list mid-scroll. That's the trade-off worth stating out loud in the interview: perfect real-time ordering isn't the goal, a stable and fast paginated read is.
+
+## Quiz
+
+<Quiz lessonId="quora-data-model-and-api" client:visible questions={[
+  {
+    id: 'q1',
+    kind: 'mcq',
+    prompt: 'Why should votes be modeled as rows in a `votes` table keyed by `(user_id, target_id)` rather than as a counter column incremented directly on the question or answer?',
+    options: [
+      { id: 'a', text: 'Because relational databases cannot store counters efficiently', correct: false, explanation: 'Counters are cheap to store; the real issues are write contention on a hot row and the lack of idempotency, not a storage limitation.' },
+      { id: 'b', text: 'Because a votes table makes voting idempotent (the same user voting twice updates one row rather than double-counting) and lets score updates be aggregated asynchronously', correct: true, explanation: 'Correct. The (user_id, target_id) primary key prevents duplicate counting on retries or double-clicks, and separates the write-heavy vote event from the read-heavy score the UI displays.' },
+      { id: 'c', text: 'Because votes need to be visible to other users in real time', correct: false, explanation: 'Vote visibility isn’t the driver here — the reasoning is about correctness (idempotency) and write scalability, and a slightly delayed score is generally acceptable.' },
+    ],
+  },
+  {
+    id: 'q2',
+    kind: 'multi',
+    prompt: 'Which of these are good reasons to paginate an answer list with a cursor rather than LIMIT/OFFSET? (Select all that apply.)',
+    options: [
+      { id: 'a', text: 'Offset pagination requires scanning and discarding rows before the requested page, which gets slower with page depth', correct: true, explanation: 'Correct — OFFSET 10000 still has to walk past 10,000 rows before returning results, an increasingly expensive operation on deep pages.' },
+      { id: 'b', text: 'New votes and new answers can reorder the list between page loads, shifting what appears on each offset-based page', correct: true, explanation: 'Correct — a frequently-reordered, frequently-inserted list is exactly the case where offset pagination gives inconsistent pages; a cursor anchored to a specific row’s value avoids that.' },
+      { id: 'c', text: 'Cursor pagination lets a client jump directly to page 50 without reading earlier pages', correct: false, explanation: 'The opposite is true — cursor pagination trades away random access to arbitrary pages in exchange for stable, efficient forward paging, which is an acceptable trade-off for a comment/answer feed.' },
+    ],
+  },
+  {
+    id: 'q3',
+    kind: 'boolean',
+    prompt: 'Answers should be stored as rows in their own table indexed by question_id, rather than embedded as a JSON array inside the question row.',
+    options: [
+      { id: 'true', text: 'True', correct: true, explanation: 'Correct — embedding answers would force loading every answer’s text just to read a question, and would make paginating and ranking answers independently of the question awkward.' },
+      { id: 'false', text: 'False', correct: false, explanation: 'This is in fact the right approach: separate answer rows let you fetch a paginated, ranked slice without touching the rest, and let answer volume scale independently of the question record.' },
+    ],
+  },
+  {
+    id: 'q4',
+    kind: 'mcq',
+    prompt: 'A user posts a new answer to a question that 10,000 people follow. What should happen on the write path?',
+    options: [
+      { id: 'a', text: 'The API synchronously sends a notification to all 10,000 followers before returning success to the poster', correct: false, explanation: 'Blocking the answer-creation response on fanning out to 10,000 followers would make posting an answer slow and fragile — a single slow notification target shouldn’t delay confirming the write.' },
+      { id: 'b', text: 'The API creates the answer row synchronously, then triggers an asynchronous fan-out job to notify followers, keeping the write path fast', correct: true, explanation: 'Correct. The answer itself is the thing that must be durably written before responding; notifying followers is a side effect that can and should happen asynchronously.' },
+      { id: 'c', text: 'The API skips creating an answer row and only stores the notification events', correct: false, explanation: 'The answer row is the source of truth that the question page reads from — notifications are a downstream effect of it existing, not a replacement for it.' },
+    ],
+  },
+]} />

@@ -1,0 +1,138 @@
+---
+title: "Ordering, Deduplication, and Idempotency"
+module: "Distributed Messaging Queue"
+moduleOrder: 17
+order: 3
+track: "concept"
+summary: "Explains why distributed queues struggle to guarantee strict ordering and no duplicates, and the partitioning, sequencing, and idempotency techniques that make at-least-once delivery safe in practice."
+tags: ["messaging-queue", "ordering", "idempotency", "deduplication", "distributed-systems"]
+estMinutes: 12
+cheatsheet:
+  - "A single partition/shard with one active writer and one active consumer at a time is the only way to get strict ordering — fanning out across partitions or consumers trades order for throughput."
+  - "Ordering is normally scoped per key (e.g. per user, per order), not global across the whole queue — global order needs a single serialization point and doesn't scale."
+  - "At-least-once delivery plus retries means duplicates are a certainty, not an edge case — design consumers assuming a message can and will arrive more than once."
+  - "Deduplication needs a durable, bounded index of recently-seen message IDs (broker-side or consumer-side) with a TTL matched to your maximum expected retry/redelivery window."
+  - "Idempotency is the real fix: make the *effect* of processing a message safe to apply twice, using a stable idempotency key plus a conditional write, rather than relying only on catching duplicates upfront."
+  - "Client-generated message IDs (not broker-assigned ones) are what make dedup work across producer retries, since a broker-assigned ID changes on every resend attempt."
+  - "Combine per-key ordering with idempotent writes — ordering solves 'wrong sequence,' idempotency solves 'processed twice,' and you almost always need both, not one instead of the other."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson landed on at-least-once delivery as the practical default: brokers redeliver on any doubt, because losing a message is worse than seeing it twice. That decision creates two problems every messaging-queue design has to solve explicitly. First, spreading messages across partitions for throughput means a consumer can easily see them out of order. Second, "redeliver on any doubt" guarantees duplicates will show up at consumers — not rarely, but routinely, every time a producer retries or a consumer crashes mid-processing. A queue that doesn't address both is unsafe to build real features on: a payment double-charged, an inventory count that goes negative, or a notification sent five times are the direct, visible cost of getting this wrong.
+
+## Why ordering breaks down at scale
+
+A single-threaded, single-partition queue naturally preserves order: one writer appends, one reader consumes, first-in is first-out. The moment you partition the queue for throughput — which every high-volume design does — that guarantee weakens. Messages for different partitions can be produced, stored, and consumed by entirely different machines running at different speeds, so there's no reason `message A` sent before `message B` finishes processing before `B` does, unless they land in the same partition.
+
+The fix isn't "make everything ordered" — that reintroduces the single-writer bottleneck you partitioned to avoid. The fix is scoping order to what actually needs it. Most systems don't need global order; they need order *per key*: all events for `order_id=42` must be processed in the sequence they happened, but `order_id=42`'s events have no ordering relationship with `order_id=99`'s. You get this by routing every message with the same key to the same partition (typically `hash(key) % partition_count`), and having exactly one consumer actively processing that partition at a time. Order falls out naturally from "one writer, one partition, one active reader" — you don't need a separate ordering mechanism on top.
+
+### Sequence numbers: detecting gaps and reordering
+
+Routing by key gets you order for messages that stay in one partition, but you still need a way to detect if something arrived wrong — a consumer restarted and lost its position, or a rebalance briefly handed the partition to two consumers. The standard tool is a monotonically increasing sequence number (or offset) per partition, assigned at write time. A consumer tracks the last sequence number it processed, and if the next message's sequence isn't exactly `last + 1`, it knows something is off: a gap (possible data loss upstream) or a duplicate/replay (sequence number it already saw). This doesn't fix ordering by itself, but it turns "silently wrong order" into "detectable and specifically handleable," which is the difference between a bug you find in production and one you catch in a consumer's own logic.
+
+## Why duplicates are guaranteed, not occasional
+
+At-least-once delivery means every uncertain outcome resolves toward redelivery:
+
+- A producer sends a message, the network drops the acknowledgment, the producer retries — the broker now has two copies.
+- A consumer processes a message, crashes before committing its offset, restarts, and gets the same message again.
+- A partition rebalance briefly assigns the same partition range to two consumers during the handoff window.
+
+None of these are rare — retries and rebalances happen constantly at scale, so duplicate delivery is a baseline condition of the design, not a tail-latency edge case. That reframes the problem: you don't ask "how do we avoid duplicates," you ask "how do we make duplicates harmless."
+
+## Deduplication: catching the duplicate
+
+Deduplication is the detection layer: recognizing that a message you're about to process is one you (or another consumer) already handled. It needs three pieces:
+
+1. **A stable message ID** the producer assigns and keeps constant across retries. If the ID is assigned by the broker on receipt, every retry gets a new ID and dedup is impossible — the ID has to come from the producer, ideally derived from something inherent to the business event (e.g. `order_id + event_type + attempt_count=0`, not a fresh UUID per network call).
+2. **A durable index of recently-seen IDs**, checked before processing. This can live on the broker (reject/drop a duplicate publish before it's ever stored) or on the consumer side (an idempotency table keyed by message ID, checked before running business logic).
+3. **A bounded retention window.** You cannot keep every message ID forever — the index would grow unboundedly. Pick a TTL that comfortably covers your worst-case redelivery window (e.g. "no retry logic in this system ever redelivers more than 24 hours late") and expire entries past it. This trades a theoretical possibility of a very late duplicate slipping through for a bounded, cheap index.
+
+Deduplication alone isn't sufficient — it only helps if checking and marking-seen are atomic with the processing itself. If a consumer checks "have I seen this ID," then crashes before marking it seen, the next attempt sees no record and reprocesses anyway. The more robust fix operates one layer deeper: idempotency.
+
+## Idempotency: making the duplicate harmless
+
+Idempotency means the *effect* of applying an operation twice is identical to applying it once. Instead of (only) trying to catch a duplicate before it's processed, you design the processing step itself so that a second application is a no-op or converges to the same result. This is more robust than dedup-by-ID alone because it doesn't depend on perfectly tracking every message you've ever seen — it holds even if your dedup index has a gap.
+
+Concrete patterns:
+
+- **Conditional / compare-and-set writes.** Instead of `balance += amount`, do `UPDATE accounts SET balance = balance + amount WHERE id = X AND last_applied_txn_id != 'txn-789'`, then record `txn-789` as applied in the same transaction. A replay of `txn-789` matches zero rows and changes nothing.
+- **Upserts keyed by a natural identity.** `INSERT ... ON CONFLICT (order_id) DO NOTHING` (or `DO UPDATE` with the same values) means creating the same order record twice has no additional effect.
+- **Idempotency keys on external side effects.** For actions with no natural key — sending an email, calling a third-party payment API — the producer generates an idempotency key up front and passes it through; the downstream service (many payment APIs support this natively) uses it to collapse retried calls into one actual charge.
+- **Naturally idempotent operations.** Setting a field to an absolute value (`status = 'shipped'`) is idempotent for free; incrementing a counter (`views += 1`) is not — prefer the former shape when the business logic allows it.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    P[Producer] -->|publish with client-generated key K| Broker
+    Broker -->|partition by routing key, e.g. order_id| PA[Partition for order_id=42]
+    PA -->|in-order delivery| C[Consumer]
+    C --> Check{Seen key K before?}
+    Check -->|yes: dedup index hit| Skip[Skip - no-op]
+    Check -->|no| Apply[Apply write conditionally on key K]
+    Apply --> Mark[Mark K applied, same transaction]
+`} />
+
+## Worked example: an order-fulfillment consumer
+
+Say `checkout-service` publishes an `OrderPlaced` event per order, keyed by `order_id`, and a `fulfillment-service` consumes it to decrement warehouse inventory and kick off shipping. Walk through what goes wrong without ordering and idempotency, and how the fixes apply:
+
+- **Without per-key partitioning:** `OrderPlaced` and a later `OrderCancelled` for the same order land in different partitions and get processed out of order by different consumer threads. Fulfillment ships a cancelled order. Fix: route both event types by `order_id` so they land in the same partition and are processed by the same consumer in send order.
+- **Without dedup/idempotency:** the consumer decrements inventory by 1, crashes before committing its offset, restarts, and reprocesses the same `OrderPlaced` message — inventory drops by 2 for a single order. Fix: the write is `UPDATE inventory SET qty = qty - 1 WHERE sku = X AND NOT EXISTS (SELECT 1 FROM applied_events WHERE event_id = 'evt-501')`, with `evt-501` inserted into `applied_events` in the same transaction. The redelivered message finds `evt-501` already applied and changes nothing.
+- **Sizing the dedup index:** at 2,000 orders/sec and a generous 48-hour maximum redelivery window (covering a stuck consumer group manually restarted two days later), you need roughly `2,000 * 3600 * 48 ≈ 345M` entries live at once. At ~40 bytes per entry (event ID + timestamp), that's about 14 GB — shardable across a key-value store, but not something to hold in a single unbounded in-memory set. This is why the TTL/bound matters: without one, the index grows forever instead of settling at a fixed working-set size.
+
+<Callout type="warning">
+  A common mistake is treating deduplication as a substitute for idempotent writes rather than a complement to it. A dedup check-then-process sequence that isn't atomic (check the ID, then separately update state, then separately mark the ID seen) has a crash window in the middle where a message can be processed but never get marked as seen — the next redelivery sails right past the dedup check and reprocesses it. Always make "apply the effect" and "record that you applied it" a single atomic operation (one DB transaction, one conditional write), not two steps a crash can split apart.
+</Callout>
+
+## Ordering and idempotency are solving different problems
+
+It's tempting to treat these as one bucket ("message reliability stuff"), but they answer different questions and neither substitutes for the other. Ordering answers "did events for this key arrive and get processed in the sequence they happened?" — get this wrong and you apply a cancellation before the order it cancels, regardless of duplicates. Idempotency answers "if the same event arrives twice, does the second arrival change anything?" — get this wrong and a single event double-applies, regardless of order. A production consumer generally needs both: per-key partitioning (plus sequence numbers to detect gaps) for order, and conditional/idempotent writes keyed by a stable message ID for safety against duplicates. The next lesson picks up storage and retention — how long a broker keeps messages around once they're written, which is what makes redelivery and replay possible in the first place.
+
+<Quiz
+  lessonId="mq-ordering-deduplication-and-idempotency"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A queue partitions messages across 20 partitions for throughput. What is the standard way to guarantee that all events for a given order_id are still processed in the order they were sent?',
+      options: [
+        { id: 'a', text: 'Route every message by hashing order_id so all of that order\'s events land in the same partition, processed by one consumer at a time', correct: true, explanation: 'Order only falls out naturally when a single writer feeds a single partition read by a single active consumer at a time; keying by order_id guarantees that order\'s events all take that path.' },
+        { id: 'b', text: 'Attach a global timestamp to every message and have consumers sort by it before processing', correct: false, explanation: 'Clock skew across producers/brokers makes global timestamp ordering unreliable, and sorting requires buffering across all partitions, which defeats the purpose of partitioning for throughput.' },
+        { id: 'c', text: 'Increase the number of partitions so each one has less contention', correct: false, explanation: 'More partitions increases throughput but does nothing for ordering across partitions - it can make the out-of-order problem worse if related events end up spread across more partitions.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine reasons duplicate message delivery is expected under at-least-once semantics, not just a rare edge case? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A producer retries a publish after not receiving an acknowledgment in time, even though the broker actually stored the first attempt', correct: true, explanation: 'A lost ack (not a lost message) is a routine network event, and the producer has no way to distinguish it from a genuinely lost publish, so it retries - creating a duplicate.' },
+        { id: 'b', text: 'A consumer crashes after processing a message but before committing its offset, so the same message is redelivered on restart', correct: true, explanation: 'This is one of the most common duplicate sources: processing and offset-commit are two separate steps, and any crash in between causes reprocessing on restart.' },
+        { id: 'c', text: 'The broker only ever assigns exactly one partition to one consumer, so rebalances cannot cause duplicates', correct: false, explanation: 'The opposite is true: during a rebalance handoff, there is often a brief window where two consumers can both believe they own a partition, which is itself a source of duplicate processing.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Checking a message ID against a "seen IDs" index before processing is sufficient on its own to make duplicate delivery safe, as long as the index has no TTL and never loses entries.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Even a perfect, unbounded index isn\'t sufficient by itself if the check and the actual state-changing write aren\'t atomic - a crash between "checked, not seen" and "marked seen" lets a redelivered message slip through and reprocess. Idempotent writes close that gap.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Dedup indexes need to be paired with an idempotent write (e.g. a conditional update in the same transaction as marking the ID seen) to be robust against a crash landing between the check and the effect.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A consumer processes a "TransferMoney" event with the write `balance += amount`. What is the most direct problem with this write if the event is redelivered?',
+      options: [
+        { id: 'a', text: 'It is not idempotent - reprocessing the same event applies the transfer a second time, changing the balance again', correct: true, explanation: 'An increment has no memory of whether it already ran, so redelivery double-applies the transfer. A conditional write keyed by a transaction ID (only applying if that ID has not already been recorded) fixes this.' },
+        { id: 'b', text: 'It is fine, since at-least-once delivery guarantees the event will never actually be redelivered in practice', correct: false, explanation: 'At-least-once delivery specifically means redelivery is expected and common (via producer retries, consumer crashes, rebalances), not a rare theoretical case.' },
+        { id: 'c', text: 'It is an ordering problem, not a duplication problem, since amount could arrive before balance is initialized', correct: false, explanation: 'This scenario is about the same event being applied more than once, which is a duplication/idempotency issue - ordering (sequence of distinct events) is a separate concern.' },
+      ],
+    },
+  ]}
+/>

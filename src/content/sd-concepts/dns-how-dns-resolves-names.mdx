@@ -1,0 +1,155 @@
+---
+title: "How DNS Resolves Names"
+module: "Domain Name System"
+moduleOrder: 7
+order: 1
+track: "concept"
+summary: "Explains how DNS turns a domain name into an IP address, walking through the resolver, root, TLD, and authoritative name-server hops and the record types involved."
+tags: ["dns", "networking", "name-resolution", "latency", "infrastructure"]
+estMinutes: 11
+cheatsheet:
+  - "DNS resolution is a chain of delegated lookups: resolver asks a root server for the TLD, the TLD server for the authoritative server, and the authoritative server for the actual record."
+  - "A stub resolver on your device almost never talks to the internet directly — it asks a recursive resolver (ISP, `8.8.8.8`, `1.1.1.1`) to do the multi-step walk on its behalf."
+  - "TTL on a record controls how long resolvers may cache it — short TTLs mean faster failover/change propagation but more query volume; long TTLs mean less load but slower rollout of changes."
+  - "A records map a name to an IPv4 address, AAAA to IPv6, CNAME aliases one name to another, and NS/SOA records describe delegation and zone metadata — mixing up CNAME and A is a common source of misconfiguration."
+  - "DNS mostly runs over UDP on port 53 for speed, falling back to TCP for large responses (e.g. DNSSEC, zone transfers) — this is why DNS amplification is a favorite DDoS vector."
+  - "Caching happens at every layer (browser, OS, resolver) — a stale cache is one of the first things to suspect when a DNS change 'isn't taking effect.'"
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every request your system serves — an API call, a page load, a service-to-service call in a microservices mesh — almost always starts with a name lookup. Your client knows `api.example.com`; the network only knows how to route packets to an IP address. DNS is the system that bridges that gap, and it does it billions of times a second globally without most engineers ever thinking about it. That invisibility is exactly why it matters in system design interviews: when someone asks "how would you route traffic to the nearest data center" or "how do you fail over to a backup region in under a minute," the honest answer runs straight through how DNS resolution actually works and where its caching lives.
+
+This lesson covers the mechanics of resolving a name to an address — the actors involved, the record types, and the step-by-step walk a query takes. The next lesson in this module builds on top of this to cover how DNS gets used deliberately as an infrastructure tool: caching strategy, latency-based routing, and global load balancing.
+
+## The actors in a DNS lookup
+
+A single lookup involves four distinct roles, each run by different organizations:
+
+- **Stub resolver** — a small piece of software on your laptop, phone, or server that just forwards the question ("what's the address for `api.example.com`?") to a recursive resolver. It does no real work itself.
+- **Recursive resolver** — the workhorse. Usually run by your ISP, or a public service like Google's `8.8.8.8` or Cloudflare's `1.1.1.1`. It does the actual multi-hop walk described below and returns a final answer to the stub resolver, caching the result along the way.
+- **Root name servers** — 13 logical root servers (each backed by many physical, geographically distributed machines) that know which servers are authoritative for each top-level domain (`.com`, `.org`, `.io`, etc.).
+- **Authoritative name servers** — the servers that actually hold the records for a specific domain. When you configure DNS for `example.com` in your registrar or cloud provider, you're telling the world which servers are authoritative for it.
+
+The key structural idea is **delegation**: nobody holds the whole DNS database. Root servers delegate to TLD servers, TLD servers delegate to your domain's authoritative servers, and your authoritative servers can even delegate subdomains to yet another set of servers. This is what lets DNS scale to hundreds of millions of domains without any single organization owning all of it.
+
+## The resolution walk, step by step
+
+Say a client wants to reach `api.example.com` and nothing is cached anywhere yet (a "cold" lookup):
+
+1. The stub resolver asks the configured recursive resolver for `api.example.com`.
+2. The recursive resolver asks a root server: "who handles `.com`?" The root server doesn't know the answer for `api.example.com`, but it replies with a referral to the `.com` TLD servers.
+3. The recursive resolver asks a `.com` TLD server the same question. It doesn't know the final answer either, but it knows which name servers are authoritative for `example.com` and refers the resolver there.
+4. The recursive resolver asks `example.com`'s authoritative name server for `api.example.com`. This server actually holds the record and returns the IP address (an A or AAAA record).
+5. The recursive resolver returns that IP address to the stub resolver, and caches it locally for as long as the record's TTL allows.
+6. The client now opens a TCP (or QUIC) connection directly to that IP address — DNS's job is done.
+
+In practice, steps 2 and 3 are almost always served from the recursive resolver's cache rather than a live query, since root and TLD server answers change extremely rarely. The expensive, genuinely "cold" hop is usually just step 4 against the authoritative server, and even that gets cached per the record's TTL.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant C as Client (stub resolver)
+    participant R as Recursive resolver
+    participant Root as Root server
+    participant TLD as .com TLD server
+    participant Auth as example.com authoritative server
+    C->>R: Resolve api.example.com
+    R->>Root: Who handles .com?
+    Root-->>R: Refer to .com TLD servers
+    R->>TLD: Who handles example.com?
+    TLD-->>R: Refer to example.com's authoritative servers
+    R->>Auth: What is api.example.com?
+    Auth-->>R: A record: 203.0.113.42
+    R-->>C: 203.0.113.42 (cached for TTL)
+`} />
+
+## Record types you actually need
+
+DNS stores several kinds of records per name, called a "zone" for a domain:
+
+- **A** — maps a name to an IPv4 address (`api.example.com -> 203.0.113.42`).
+- **AAAA** — same idea, for IPv6 addresses.
+- **CNAME** — aliases one name to another name, not an address directly (`www.example.com -> example.com`). The resolver follows the CNAME and then resolves the target name to an A/AAAA record — one extra hop.
+- **NS** — declares which name servers are authoritative for a zone; this is the delegation mechanism itself.
+- **SOA** — "start of authority," carries zone-wide metadata: the primary name server, a serial number used for replication between name servers, and default TTLs.
+- **MX** — mail exchange records, pointing at servers that accept email for the domain (not relevant to HTTP traffic, but shows up constantly in DNS configuration work).
+- **TXT** — arbitrary text, commonly used for domain-ownership verification and email anti-spoofing policies (SPF/DKIM).
+
+A rule worth internalizing: **a CNAME cannot coexist with other records at the same name** (you can't have both a CNAME and an A record for `api.example.com`), which is why root domains (`example.com` itself) typically use an A record or a provider-specific "ALIAS"/"flattened CNAME" extension rather than a plain CNAME.
+
+## Caching and TTL
+
+Every DNS record carries a **TTL (time to live)**, in seconds, set by whoever controls the zone. It tells every resolver and client along the chain how long they're allowed to reuse a cached answer before asking again. This single number is a major lever in system design:
+
+- A **short TTL** (e.g. 30–60 seconds) means you can change where a name points and have the change take effect quickly everywhere — critical for fast failover to a backup region.
+- A **long TTL** (e.g. hours or a day) means far fewer queries hit your authoritative servers, which is cheaper and more resilient to load, but a misconfiguration or failover takes much longer to propagate, since caches around the world keep serving the old answer until it expires.
+
+Caching happens at multiple independent layers, not just the recursive resolver: many operating systems cache resolved names, and browsers keep their own short-lived DNS cache on top of that. That's why "I updated the DNS record and nothing changed" is so often actually "the change worked, but something upstream is still serving a cached answer."
+
+## Worked example: sizing a failover TTL
+
+Say you run `checkout.example.com` pointed at a primary region, and you want the ability to fail over to a secondary region within 2 minutes of detecting an outage. If your A record's TTL is set to 1 hour (a common default), even a perfect, instant DNS update after detecting the outage won't help most clients — resolvers around the world are holding that hour-long-valid answer and won't ask again until it expires. Some fraction of traffic could stay pointed at the dead region for up to an hour.
+
+To hit a 2-minute failover target, you'd set the TTL to something like 30-60 seconds well ahead of time (not during the incident — TTL changes only apply to lookups that happen after the change, and any answer already cached upstream keeps its original TTL until it expires). The trade-off: at 30-second TTLs, your authoritative name servers see roughly 120x more query volume than at 1-hour TTLs for the same client population, so this is a genuine cost/latency-of-failover trade-off, not a free win — one reason large systems often pair a short TTL with a managed DNS provider built to absorb that query volume rather than rolling their own authoritative servers.
+
+<Callout type="warning">
+  A common mistake is treating a DNS-based failover as instantaneous. Even with a short TTL, DNS caching is advisory, not enforced — some resolvers and client libraries ignore TTLs or cache far longer than instructed ("TTL flouting"), and any client that already has an open connection to the old IP won't re-resolve until that connection drops. Design failover to tolerate a tail of stale traffic for minutes, not seconds, and pair DNS-level failover with health checks / connection draining at the application layer rather than relying on DNS alone for a hard cutover.
+</Callout>
+
+## Common pitfalls beyond TTL
+
+Two more things worth knowing before an interview:
+
+- **DNS mostly rides on UDP port 53** because most responses are small and a full TCP handshake would add needless round trips at this scale. It falls back to TCP when a response is too large for a single UDP packet (common with DNSSEC-signed responses) or for zone transfers between name servers. The UDP-first, low-verification nature of DNS is also why it's a favorite amplification vector for DDoS attacks — a small spoofed query can trigger a much larger response sent to a victim's IP.
+- **Recursive resolvers do the heavy lifting so authoritative servers don't have to.** If every client on earth queried root and TLD servers directly for every lookup, they'd fall over instantly. The two-tier resolver/authoritative split, plus aggressive caching at the resolver layer, is what makes DNS's request volume tractable at internet scale.
+
+## Quiz
+
+<Quiz
+  lessonId="dns-how-dns-resolves-names"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'In a cold DNS lookup for api.example.com, what does a root name server actually return to the recursive resolver?',
+      options: [
+        { id: 'a', text: 'The IP address of api.example.com', correct: false, explanation: 'Root servers do not hold records for individual domains; they only know which servers are authoritative for each top-level domain.' },
+        { id: 'b', text: 'A referral to the name servers authoritative for the .com TLD', correct: true, explanation: 'Root servers delegate by pointing the resolver at the correct TLD servers, which is the next hop in the chain.' },
+        { id: 'c', text: "A referral directly to example.com's authoritative name servers", correct: false, explanation: 'That referral comes from the TLD server (the next hop after root), not the root server itself.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements about DNS record TTLs are correct? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A shorter TTL lets changes (like failover) propagate faster, at the cost of more query volume on authoritative servers', correct: true, explanation: 'Shorter TTLs mean caches expire sooner, so more lookups bypass the cache and reach the authoritative servers, but changes take effect faster everywhere.' },
+        { id: 'b', text: 'Lowering a TTL during an active incident immediately shortens the cache lifetime of answers already cached elsewhere', correct: false, explanation: 'Already-cached answers keep the TTL value they were fetched with; a new TTL only applies to lookups made after the change, which is why failover TTLs need to be set low well in advance.' },
+        { id: 'c', text: 'All resolvers and client libraries strictly honor the TTL they are given', correct: false, explanation: 'Some resolvers and clients cache longer than instructed ("TTL flouting") or keep using an already-open connection regardless of TTL, so DNS TTL alone is not a hard guarantee of cutover timing.' },
+        { id: 'd', text: "TTL is set by whoever controls the zone (the authoritative side), not chosen by the querying client", correct: true, explanation: 'The zone owner sets the TTL on each record; resolvers and clients only decide whether to honor it, not what its value is.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A CNAME record and an A record can both exist for the same exact name (e.g. api.example.com) at the same time.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A CNAME must be the only record at that name; it cannot coexist with an A record or any other record type for the same name.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. This restriction is exactly why root domains typically use an A record (or a provider-specific ALIAS-style extension) instead of a plain CNAME.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why does DNS mostly use UDP rather than TCP for queries?',
+      options: [
+        { id: 'a', text: 'UDP guarantees delivery, which DNS requires for correctness', correct: false, explanation: 'UDP does not guarantee delivery — the opposite of this claim. DNS uses UDP for its low overhead, not delivery guarantees.' },
+        { id: 'b', text: 'Most DNS responses are small, so skipping the TCP handshake saves round trips at very high query volume', correct: true, explanation: 'Avoiding a TCP handshake for typically-small responses reduces latency and overhead, which matters given how many DNS queries happen globally.' },
+        { id: 'c', text: 'TCP is not supported by any DNS server software', correct: false, explanation: 'DNS does fall back to TCP for larger responses (e.g. DNSSEC) and for zone transfers between name servers, so TCP support exists and is used.' },
+      ],
+    },
+  ]}
+/>

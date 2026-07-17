@@ -1,0 +1,131 @@
+---
+title: "Task Scheduler Requirements"
+module: "Distributed Task Scheduler"
+moduleOrder: 23
+order: 1
+track: "concept"
+summary: "Defines the functional and non-functional requirements for a distributed task scheduler, including execution guarantees, overlap policy, and the scale numbers that shape the rest of the module."
+tags: ["task-scheduler", "requirements", "distributed-systems", "cron", "fault-tolerance"]
+estMinutes: 11
+cheatsheet:
+  - "Separate the scheduler (decides when a job is due) from the worker (actually runs it) in your requirements, even before you design either — they scale on different axes."
+  - "Pin down the execution guarantee explicitly: at-least-once is the realistic default; exactly-once is not a free feature, it requires idempotent job handlers plus a dedup mechanism."
+  - "Ask what happens when a job's runtime exceeds its own schedule interval (e.g., a 5-minute job that takes 20 minutes) — skip, queue, or run concurrently is a real design decision, not an edge case to hand-wave."
+  - "State a timing precision tolerance (e.g., fire within 30 seconds of the scheduled time) rather than promising exact-time execution — real schedulers batch and jitter on purpose."
+  - "Scheduled systems have thundering-herd moments (top of the hour, midnight UTC) — size for the peak trigger rate, not the daily average."
+  - "Durability of the job definition and its 'last successful run' bookkeeping matters as much as durability of in-flight executions — losing either causes missed or duplicate runs after a crash."
+  - "Decide up front whether the system schedules independent jobs or dependent multi-step workflows (DAGs) — the second is a materially bigger system (see Airflow-style orchestrators) and should be called out as a scope decision."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every backend eventually needs something to run later, or run again and again: a nightly billing job, an hourly report export, a "retry this failed webhook in 30 seconds" task, a "send this reminder email in 3 days" delay. The naive answer — a cron entry on one box — works until that box reboots mid-job, until two people schedule jobs on it without knowing about each other, or until "one box" can't keep up with a million tenants each wanting their own schedule. A distributed task scheduler is the system that replaces that single crontab: it durably tracks what should run and when, fires jobs across a cluster of workers instead of one machine, and keeps running correctly through worker crashes, deploys, and scheduler restarts.
+
+This is the first lesson in the module, and its only job is to pin down what "correct" means here before any architecture gets drawn. The lessons that follow — data model and queues, designing the scheduler, and scaling and fault tolerance — all answer questions this lesson raises. Get sloppy here (for example, promising "exactly-once execution" without noticing that's a hard distributed-systems promise) and you'll spend the rest of the design fixing a requirement that was wrong from the start.
+
+## Scoping the problem: scheduler vs. workflow engine
+
+Two questions decide how big this system is, and both are worth asking an interviewer directly rather than assuming:
+
+- **Independent jobs, or dependent workflows?** A scheduler that runs `run_report(tenant_id)` every day at 3am is a different (simpler) system than one that runs a DAG — "extract, then transform, then load, then notify" — where each step depends on the previous one succeeding. The DAG version is closer to Airflow or Temporal; this module assumes the simpler case (independent scheduled jobs) unless stated otherwise, and calls out DAG support as a possible extension.
+- **What triggers a run?** Time-based triggers come in a few flavors worth naming precisely: a **cron expression** (`0 3 * * *` — recurring, calendar-aware), a **fixed interval** (every 5 minutes from creation time), and a **one-off** future timestamp (run once, at 2026-08-01 09:00 UTC). Some designs also support event-based triggers (run when an upstream file lands), but that pulls in a pub/sub component and is worth flagging as a separate concern rather than folding it in silently.
+
+Also fix the vocabulary, since it gets reused for the rest of the module: a **job definition** is the durable "what and when" record a user registers; a **trigger** or **schedule** is the timing rule attached to it; an **execution** (or "run") is one concrete firing of that job at a point in time, with its own status and result.
+
+## Functional requirements
+
+- **Job registration API.** Create, update, pause, resume, and delete a job definition — including its trigger, a reference to the work to perform (a queue topic, a container image, an RPC endpoint), a timeout, and a retry policy. Updating a job's schedule shouldn't require deleting and recreating it.
+- **Execution guarantee.** State this explicitly rather than assuming: **at-least-once** (a job may run more than once after a failure, so it must be idempotent) is the realistic default for a distributed scheduler. **Exactly-once** is not free — it needs an idempotency key per intended execution plus a dedup check, and even then only holds if the job's side effects go through that same dedup path. **At-most-once** (skip rather than risk a duplicate) is easier but means some scheduled work silently never happens after a crash.
+- **Overlap / concurrency policy.** If a job is still running when its next trigger time arrives, what happens — skip this firing, queue it to run right after the current one finishes, or allow both to run concurrently? Each is a legitimate choice depending on the job (a stock-price sync job might allow overlap; a "close the books" billing job must not).
+- **Retry and failure handling.** A configurable retry count with backoff (fixed or exponential), and a defined outcome after retries are exhausted — typically a dead-letter record and an alert, not a silent drop.
+- **Cancellation and manual trigger.** Users need to cancel an in-flight execution and manually fire a job "now" outside its schedule (for testing or catch-up), without that manual run confusing the next scheduled run's bookkeeping.
+- **Visibility.** Query next-run time, execution history, and current status for any job — this is what makes the system operable, and it's the first thing an on-call engineer reaches for at 3am when a job didn't fire.
+
+## Non-functional requirements
+
+- **Scale.** Two different numbers matter: the number of distinct job definitions the system holds (could be millions, one or more per tenant in a multi-tenant SaaS product), and the trigger throughput — how many jobs come due per second. These are not proportional to each other in a simple way, because schedules cluster at common times.
+- **Timing precision.** Don't promise exact-time firing. State a tolerance instead — "a job scheduled for 3:00:00 fires by 3:00:30" is realistic and lets the scheduler batch trigger checks instead of busy-polling every job every millisecond.
+- **Durability.** A job definition, its schedule, and its last-successful-run bookkeeping must survive a scheduler process crash without loss — otherwise a restart either forgets to run jobs or re-runs everything from scratch. This is a requirement on the system, not yet a design (that's the next lesson).
+- **Availability of the scheduler itself.** The component deciding "what's due right now" cannot be a single point of failure; a crash there should not stop new triggers from firing after a short failover, and should not double-fire triggers that already fired.
+- **Fault tolerance on the execution side.** A worker crashing mid-job should result in that job being retried elsewhere, not silently lost — this implies some kind of lease or heartbeat so the system can tell "still running" apart from "died and needs reassignment."
+- **Independent scalability.** Trigger evaluation (lightweight, frequent) and job execution (can be heavy, slow, resource-hungry) should scale independently — a burst of long-running report jobs shouldn't degrade the scheduler's ability to keep firing everyone else's jobs on time.
+- **Multi-tenancy and fairness.** In a shared system, one tenant scheduling 500,000 jobs for the same minute shouldn't starve every other tenant's jobs — this points toward per-tenant quotas or fair-share dispatch, a topic picked up when workers and queues are designed.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Job registry: definitions + schedules] --> B[Trigger evaluator: what's due now?]
+  B --> C[Dispatch: enqueue due executions]
+  C --> D[Worker pool]
+  D -->|success| E[Record execution result]
+  D -->|failure, retries left| F[Retry with backoff]
+  F --> C
+  D -->|failure, retries exhausted| G[Dead-letter + alert]
+  E --> H[Update next-run time]
+`} />
+
+## Worked example: sizing the problem before designing anything
+
+Take a concrete prompt: a SaaS platform with 2 million tenants, each configuring an average of 5 scheduled jobs (report exports, digest emails, sync tasks), so roughly 10 million job definitions live in the system at once.
+
+- **Average trigger rate:** if a typical job runs about once a day, that's 10,000,000 / 86,400 seconds ≈ 116 triggers per second on average — a manageable number for a single well-indexed store to evaluate.
+- **Peak trigger rate:** schedules cluster. If a large fraction of daily jobs are set for common times (midnight UTC, top of the hour, 9am local time rounded to a handful of timezones), the peak can easily be 50-100x the average — meaning the system needs to comfortably handle bursts of 5,000-10,000 triggers per second, not just the daily average, or every top-of-hour becomes an incident.
+- **Execution duration spread:** most jobs (status checks, small syncs) finish in under a second; some (bulk report generation, data exports) run for 10+ minutes. This spread is exactly why trigger evaluation and job execution must be decoupled — the scheduler's job is to notice "this is due" and hand it off quickly, not to block on the job's actual runtime.
+
+Those three numbers — job count, peak trigger rate, and execution duration spread — are the inputs the next lesson uses to decide how job definitions and pending executions actually get stored and queued.
+
+<Callout type="warning">
+  The most common mistake at this stage is treating "at-least-once execution" and "exactly-once execution" as interchangeable, or assuming exactly-once is simply a matter of trying hard enough. At-least-once means a job can and will occasionally run twice (after a crash right after execution but before the success record is durably saved) — so every job handler in the system needs to be idempotent, or wrapped with a dedup key the scheduler checks before re-running. If a design promises exactly-once without an idempotency mechanism anywhere in it, that promise is fiction. Say "at-least-once, with idempotent handlers" out loud early — it's the honest default and it simplifies everything downstream.
+</Callout>
+
+## Putting the requirements together
+
+A solid requirements pass here leaves you able to state, in a few sentences: whether the system schedules independent jobs or dependent workflows, what trigger types it supports (cron, fixed-interval, one-off), the execution guarantee (at-least-once, with idempotent handlers, as the default), the overlap policy for slow jobs, a timing precision tolerance instead of an exact-time promise, and rough scale numbers for job count and peak trigger rate. Everything in the rest of this module — how jobs and schedules are modeled and queued, how the scheduler and workers are actually built, and how the system stays correct through crashes at scale — is just engineering in service of the requirements written down here.
+
+<Quiz
+  lessonId="sched-task-scheduler-requirements"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Which execution guarantee is the realistic default for a distributed task scheduler, assuming job handlers are written to be idempotent?',
+      options: [
+        { id: 'a', text: 'At-least-once', correct: true, explanation: 'Correct — a distributed scheduler can occasionally re-run a job after a crash near the moment of completion; at-least-once plus idempotent handlers is the standard, achievable guarantee.' },
+        { id: 'b', text: 'Exactly-once, with no additional mechanism needed', correct: false, explanation: 'Exactly-once is not free — it requires an idempotency key or dedup mechanism threaded through the execution path, not just "trying hard."' },
+        { id: 'c', text: 'At-most-once, since skipping a run is always safer than duplicating one', correct: false, explanation: 'At-most-once avoids duplicates but risks silently skipping scheduled work after a crash, which is unacceptable for many job types (e.g., billing runs).' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are non-functional requirements that should be pinned down before designing the scheduler and worker architecture? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A timing precision tolerance (e.g., fire within 30 seconds of the scheduled time)', correct: true, explanation: 'Promising exact-time firing is unrealistic; stating a tolerance is what lets the scheduler batch trigger checks efficiently.' },
+        { id: 'b', text: 'The peak trigger rate, accounting for clustering at common times like midnight or top of the hour', correct: true, explanation: 'Schedules cluster, so peak trigger rate can be far higher than the daily average — sizing for the average alone causes outages at predictable times.' },
+        { id: 'c', text: 'The exact serialization format used to store a job payload on disk', correct: false, explanation: 'That is an implementation detail decided later, not a requirement gathered during this scoping stage.' },
+        { id: 'd', text: 'Whether trigger evaluation and job execution can scale independently of each other', correct: true, explanation: 'Trigger evaluation is lightweight and frequent while execution can be slow and resource-heavy; requiring independent scaling avoids one degrading the other.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'If a job is still running when its next scheduled trigger time arrives, every distributed task scheduler should simply skip that firing.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Skip is only one valid overlap policy. Depending on the job, queueing the next run to start right after, or allowing concurrent runs, may be the correct choice — this is a requirement to clarify, not a fixed rule.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the overlap policy (skip, queue, or allow concurrent execution) depends on the specific job and must be stated as a requirement rather than assumed.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A platform has 10 million job definitions, each triggering roughly once a day on average. Which statement about sizing the scheduler is most accurate?',
+      options: [
+        { id: 'a', text: 'The average trigger rate (~116/sec) is the number to design capacity around, since schedules are spread evenly across the day.', correct: false, explanation: 'Schedules are rarely spread evenly — clustering at common times (midnight, top of the hour) means the peak can be far higher than the average.' },
+        { id: 'b', text: 'The system should be sized for a peak trigger rate well above the ~116/sec average, since schedules cluster around common times.', correct: true, explanation: 'Correct — thundering-herd moments at popular scheduled times (e.g., midnight UTC) can push peak load to 50-100x the daily average, and capacity must account for that.' },
+        { id: 'c', text: 'Trigger rate is irrelevant as long as the job registry can store 10 million definitions.', correct: false, explanation: 'Storage capacity for definitions is necessary but not sufficient — the system also has to evaluate and dispatch triggers fast enough at peak load.' },
+      ],
+    },
+  ]}
+/>

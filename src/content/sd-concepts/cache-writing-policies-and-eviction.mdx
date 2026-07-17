@@ -1,0 +1,139 @@
+---
+title: "Writing Policies and Eviction"
+module: "Distributed Cache"
+moduleOrder: 16
+order: 2
+track: "concept"
+summary: "Covers the three main strategies for writing through a cache and the eviction policies that decide what gets thrown away when the cache is full."
+tags: ["caching", "eviction", "write-through", "lru", "consistency"]
+estMinutes: 12
+cheatsheet:
+  - "Write-through writes to cache and the database in the same request — safest, but every write pays the database's latency."
+  - "Write-around skips the cache on writes and only populates it on the next read — good for write-heavy, rarely-re-read data; the first read after a write is always a miss."
+  - "Write-back (write-behind) acks the write once it's in cache and flushes to the database asynchronously — fastest writes, but an uncommitted flush is lost data if the cache node dies."
+  - "LRU evicts the least-recently-used entry; it's the default choice because it approximates 'hot data stays hot' cheaply, but a single large scan can flush out a whole working set (scan pollution)."
+  - "LFU evicts by access frequency, not recency — better for stable popularity distributions, worse at adapting when what's hot changes quickly."
+  - "Real systems approximate LRU (sampling a handful of keys, Redis-style) rather than maintaining an exact ordering, because exact LRU bookkeeping doesn't scale to millions of keys per node."
+  - "TTL and eviction solve different problems — TTL bounds staleness, eviction bounds memory. You usually need both, and TTL expiry storms need jitter to avoid synchronized cache-miss spikes."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson decided where a cache sits and what problem it solves. This lesson is about the two decisions that determine whether that cache actually behaves correctly under load: what happens to the database when you write through the cache, and what happens to the cache itself when it's full and something new needs room. Get the write policy wrong and you either eat unnecessary latency on every request or silently lose data during a crash. Get eviction wrong and your hit rate collapses exactly when traffic spikes — the moment you need the cache most.
+
+## Write policies: where does a write actually land first?
+
+When a client writes data that's also cached, you have to decide the order of operations between the cache and the backing store (usually a database). There are three standard shapes.
+
+### Write-through
+
+The write goes to the cache and the database as part of the same operation, and the client doesn't get a success response until both are done. This keeps the cache and the database in lockstep — a read right after a write always sees the new value, whether it hits the cache or falls through to the database.
+
+The cost is latency: every write now pays the database's write latency, plus the cache's, and the cache gives you no write-side speedup at all. It's the right default when correctness matters more than write throughput — account balances, inventory counts, anything where a stale read is a real problem.
+
+### Write-around
+
+The write goes straight to the database; the cache isn't touched at all. The entry gets populated only later, lazily, the next time something reads it and misses (the cache-aside pattern from the previous lesson). This avoids filling the cache with data that was written once and may never be read again — think audit logs or one-off form submissions.
+
+The trade-off: the read immediately following a write is guaranteed to be a cache miss, so if your access pattern is "write it, then immediately read it back" (a common one), write-around actively hurts you by manufacturing a miss you didn't need to have.
+
+### Write-back (write-behind)
+
+The write lands in the cache, and the client gets a success response immediately. The cache asynchronously flushes the write to the database later, often batched with other writes to the same key or nearby keys. This is the fastest option for the client and can dramatically cut database write load by coalescing repeated writes to the same key (a view counter incremented 500 times a second only needs to hit the database once a second).
+
+The cost is durability risk: between "cache acked the write" and "database has the write," the only copy of that data lives in cache memory. If that cache node dies before the flush completes, the write is gone, and the client already believes it succeeded. Production write-back systems mitigate this with a durable write-ahead log or a replicated in-memory buffer so an unflushed write survives a single node failure — but that's added complexity, not a free lunch.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    W[Write request] --> Q{Write policy}
+    Q -->|Write-through| A[Write cache + DB synchronously]
+    A --> A2[Ack after both succeed]
+    Q -->|Write-around| B[Write DB only]
+    B --> B2[Cache populated later on next read miss]
+    Q -->|Write-back| C[Write cache, ack immediately]
+    C --> C2[Async flush to DB, often batched]
+`} />
+
+## Eviction: what gets thrown away when the cache is full
+
+A cache is finite memory holding a subset of a much larger dataset. Once it's full, every new entry means kicking something out. Which entry you kick out determines your hit rate, so this isn't a minor implementation detail — it's the core trade-off of the whole cache.
+
+### LRU (Least Recently Used)
+
+Evict whichever key hasn't been accessed in the longest time. The intuition: recently-used data is likely to be used again soon (temporal locality), so keep it and let stale entries go. LRU is the default in most systems (Redis, Memcached, most application-level caches) because it's cheap to approximate and works well for typical access patterns — product pages, user profiles, session data.
+
+Its weak spot is **scan pollution**: a single sequential scan over a huge, mostly-cold dataset (a batch job, a report export) touches every key exactly once, which under strict LRU pushes every genuinely hot key out to make room for data that will never be read again. Systems that expect this pattern use a segmented approach — split the cache into a "probationary" segment for first-touch keys and a "protected" segment for keys touched more than once, so a one-off scan can't evict your actual working set.
+
+### LFU (Least Frequently Used)
+
+Evict whichever key has been accessed the fewest total times. This handles a stable popularity distribution better than LRU — a genuinely popular item that happens not to have been touched in the last minute won't get evicted just because of bad timing. The weak spot is the mirror image of LRU's strength: LFU is slow to let go of yesterday's popular item and slow to adopt a newly-trending one, because a fresh key starts at zero and has to accumulate hits to compete with old, deeply-entrenched counts.
+
+### FIFO and Random
+
+Evict the oldest-inserted key (FIFO) or a uniformly random key (Random), regardless of access pattern. Both are cheaper to implement than LRU/LFU — no bookkeeping on every read — and surprisingly, Random performs close to LRU on some workloads while being trivial to implement and immune to scan pollution. They're a reasonable choice when the access-pattern assumptions behind LRU/LFU don't hold, or when the tracking overhead of "cheap" LRU still isn't cheap enough at your scale.
+
+### Exact vs. approximated eviction
+
+Maintaining a perfectly-ordered LRU list means updating a linked list on every single read — real contention at millions of ops/sec per node. Production systems like Redis instead **approximate** LRU: on eviction, sample a small handful of random keys (say, 5), check their last-access timestamps, and evict the oldest of that sample rather than the true oldest across the whole keyspace. This gets you LRU-like behavior at O(1)-ish cost instead of maintaining exact global ordering, at the price of occasionally evicting a key that isn't quite the actual least-recently-used one — a trade almost every workload is happy to make.
+
+### TTL is not eviction
+
+A time-to-live expires an entry once it's a certain age, regardless of memory pressure — it bounds *staleness*, not memory. Eviction policy kicks in when the cache is full, regardless of age — it bounds *memory*, not staleness. You typically need both: TTL to guarantee data doesn't go stale forever even if it stays popular, and an eviction policy to handle the cache filling up before anything expires.
+
+## Worked example: a product catalog cache
+
+Say you're caching product-detail pages for an e-commerce catalog of 2 million SKUs behind an 8 GB cache node, average entry size 2 KB — roughly 4 million entries fit, so the whole catalog could theoretically fit, but you're running several such nodes and want headroom for other tenants sharing the box, so you provision for the hot 10%: about 200,000 SKUs actually get requested in a given day (a typical long-tail distribution — a small fraction of products drive most traffic).
+
+For reads, LRU is the right eviction policy here: today's trending products should stay resident, and yesterday's trending products should age out naturally as attention moves on — exactly the recency pattern LRU rewards. For writes — updating a product's price or stock count — write-through is the right call, not write-back: a stale price shown to a customer is a real business problem (worse: a stale "in stock" that leads to overselling), so it's worth the extra write latency to guarantee the cache and database agree the instant the write completes. Meanwhile, a "times viewed today" counter on each product page is a great write-back candidate: losing a few increments on a crash is harmless, and batching thousands of increments into one periodic database write saves enormous write load for data nobody needs to read consistently.
+
+<Callout type="warning">
+  A common mistake: setting the same TTL on every key in a large batch — say, re-warming 500,000 keys with a flat 10-minute expiry. They all expire within the same second, and the next request for each of those keys becomes a simultaneous cache miss, hammering the database with a spike of identical load right as the cache should be protecting it (a "thundering herd" of expirations). Add jitter — a random offset of, say, ±60 seconds per key — so expirations spread out instead of firing in lockstep.
+</Callout>
+
+<Quiz
+  lessonId="cache-writing-policies-and-eviction"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A service increments a "page views today" counter on every request and can tolerate losing a handful of increments if a node crashes. Which write policy fits best?',
+      options: [
+        { id: 'a', text: 'Write-back', correct: true, explanation: 'Write-back acks the write immediately from cache and flushes to the database asynchronously (often batched), which is exactly right for high-frequency, loss-tolerant counters.' },
+        { id: 'b', text: 'Write-through', correct: false, explanation: 'Write-through would force every single increment to wait on a database write, which is unnecessary latency for data that tolerates some loss.' },
+        { id: 'c', text: 'Write-around', correct: false, explanation: 'Write-around writes straight to the database and skips the cache, which does nothing to reduce the database write volume from a high-frequency counter — the opposite of what this workload needs.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine risks or downsides of write-back (write-behind) caching? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'An unflushed write can be lost if the cache node crashes before the database write completes', correct: true, explanation: 'The client already received a success response, but the only durable copy at that moment is in cache memory — a crash before flush loses it.' },
+        { id: 'b', text: 'It requires extra machinery (write-ahead log, replication) to be safe against node failure', correct: true, explanation: 'Making write-back durable in practice usually means logging writes somewhere durable before acking, which is added complexity write-through does not need.' },
+        { id: 'c', text: 'It always increases total database write volume compared to write-through', correct: false, explanation: 'The opposite is typically true — batching and coalescing repeated writes to the same key usually reduces database write volume compared to writing through on every request.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A single large sequential scan over a mostly-cold dataset can evict an LRU cache\'s entire hot working set, because every scanned key looks equally "just accessed."',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'This is scan pollution: strict LRU treats a one-time scan the same as genuine repeat access, so it can push out truly hot keys to make room for data that will never be read again. Segmented LRU (probationary vs. protected segments) exists specifically to prevent this.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This is a real, well-known failure mode of plain LRU, which is exactly why production caches often use a segmented variant that protects keys touched more than once.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why do systems like Redis use an approximated LRU (sampling a few keys) instead of maintaining an exact least-recently-used ordering?',
+      options: [
+        { id: 'a', text: 'Exact LRU requires updating ordering metadata on every read, which is too much overhead at millions of operations per second', correct: true, explanation: 'Maintaining a perfectly ordered structure means touching shared state on every access — sampling a handful of keys at eviction time gets similar recency behavior at far lower per-read cost.' },
+        { id: 'b', text: 'Exact LRU is illegal to implement in most cache software licenses', correct: false, explanation: 'This is not a licensing issue — it is a pure performance and scalability trade-off.' },
+        { id: 'c', text: 'Approximated LRU uses less memory per entry than exact LRU', correct: false, explanation: 'The main savings is in per-access CPU/contention overhead, not primarily per-entry memory, though avoiding a full ordering structure does save some bookkeeping memory too — the driving reason is access-time overhead.' },
+      ],
+    },
+  ]}
+/>

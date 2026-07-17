@@ -1,0 +1,249 @@
+---
+title: "Requirements and Pipeline Design"
+module: "Design a Deployment System"
+moduleOrder: 14
+order: 1
+track: "interview"
+summary: "Scopes a CI/CD and deployment system into concrete requirements, then designs the build, test, artifact, and rollout pipeline stages that turn a commit into running production code."
+tags: ["ci-cd", "deployment", "pipeline-design", "requirements", "artifact-management"]
+estMinutes: 13
+cheatsheet:
+  - "Separate 'CI' (build + test, produces a verified artifact) from 'CD' (deploy that artifact) — they have different triggers, different failure semantics, and often different owners."
+  - "Build exactly one immutable artifact per commit and promote that same artifact through environments (dev to staging to prod) — rebuilding per environment risks environment drift and non-reproducible bugs."
+  - "A pipeline is a DAG of stages, not a strict line — lint, unit tests, and security scans can run in parallel; only the deploy stage has to wait for all of them."
+  - "Gate every stage transition on a concrete, automated signal (test pass, scan clean, canary healthy) — a pipeline that lets humans manually skip a stage under deadline pressure isn't actually enforcing anything."
+  - "Estimate pipeline throughput in builds/hour, not just single-build latency — a fleet of 500 engineers pushing all day needs concurrent runners, or queue time becomes the bottleneck, not build time."
+  - "Version and store build artifacts (container images, binaries) in a registry keyed by commit SHA — 'redeploy the previous version' should be a config change pointing at an existing artifact, never a rebuild."
+  - "Config and secrets are inputs to the deploy stage, not baked into the artifact — the same image runs in staging and prod with different config injected at deploy time."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every other system in this course gets designed once and then runs. A
+deployment system is different: it's the machine that ships every change
+to every other system, every day, for years. Get it wrong and you don't
+get one bad incident — you get a standing tax on every engineer's
+velocity, or a standing risk that any bad commit reaches production
+before anyone notices. "Design a CI/CD system" shows up in interviews
+because it forces you to reason about a pipeline as a distributed system
+in its own right: it has throughput, latency, failure modes, and state
+(what's currently deployed where) just like the systems it deploys.
+
+This lesson scopes the problem and designs the pipeline itself — the
+stages a commit passes through from "pushed" to "verified artifact ready
+to deploy." The next lesson in this module, Rollouts, Rollbacks, and
+Safety, picks up from a built artifact and covers how it actually reaches
+production safely — canaries, progressive rollout, and fast rollback.
+Keep that boundary in mind here: this lesson stops at "we have an
+artifact that passed every gate," not "it's live."
+
+## Step 1: Scope the requirements
+
+State the scope before designing, the same way you would for any other
+system.
+
+**Functional requirements:**
+
+- **Trigger a pipeline run** on a code push (or a merge to a target
+  branch), running build, test, and packaging steps automatically.
+- **Produce a versioned, immutable artifact** (a container image, a
+  binary, a deployable bundle) for every commit that passes all gates.
+- **Deploy an artifact to an environment** (dev, staging, prod) on
+  demand or automatically, per a defined promotion policy.
+- **Roll back** to a previously deployed artifact quickly.
+- **Visibility**: every engineer can see what's currently deployed where,
+  and the status/logs of any pipeline run.
+
+Explicitly defer for this lesson: fine-grained canary analysis and
+automated rollback triggers (next lesson), multi-region deploy
+sequencing, and feature-flag-based release decoupling. Naming these as
+"out of scope for the pipeline design, in scope for rollout strategy" is
+exactly the kind of boundary-drawing that reads well in an interview.
+
+**Non-functional requirements:**
+
+- **Fast feedback**: a typical build+test cycle should complete in
+  minutes, not tens of minutes — slow pipelines get bypassed or ignored.
+- **Reproducibility**: the same commit, built twice, produces a
+  functionally identical artifact; no "works on the build server"
+  surprises.
+- **Isolation**: one team's flaky pipeline or noisy build shouldn't
+  starve another team's runs — this is a multi-tenant resource scheduling
+  problem as much as a CI problem.
+- **Auditability**: every deploy is traceable to a commit, an artifact
+  hash, an approver (if required), and a timestamp.
+- **Safety by default**: a bad build should be structurally hard to ship,
+  not merely discouraged by process.
+
+## Step 2: Model the pipeline as a DAG, not a line
+
+The instinctive mental model — "build, then test, then deploy" — is a
+straight line, and it's wrong for anything beyond a toy project. Real
+pipelines are a directed acyclic graph: several checks can run in
+parallel once a build artifact exists, and the deploy stage is a join
+point that waits on all of them.
+
+Typical stages:
+
+1. **Checkout + build** — compile/package the code into an artifact.
+   This stage is a hard prerequisite for almost everything after it.
+2. **Unit tests, lint, static analysis, security/dependency scan** — all
+   of these can run concurrently against the same build output. They
+   don't depend on each other.
+3. **Package + push to artifact registry** — tag the artifact with the
+   commit SHA (and often a semantic version), store it in an immutable,
+   content-addressed registry.
+4. **Integration/end-to-end tests** — usually run against a deployed
+   instance in an ephemeral or shared test environment, so this stage
+   depends on a successful package step.
+5. **Deploy gate** — an automated or human approval gate before
+   promotion to the next environment.
+6. **Deploy** — hand off to the rollout mechanism (covered next lesson).
+
+Modeling this as a DAG matters for two concrete reasons: it's how you
+get fast feedback (parallel stages instead of one long serial chain),
+and it's how you reason about partial failure (a security scan failing
+shouldn't block unit test results from being visible, even though it
+does block the deploy).
+
+<Mermaid client:visible chart={`
+flowchart LR
+    A[Commit pushed] --> B[Build artifact]
+    B --> C[Unit tests]
+    B --> D[Lint / static analysis]
+    B --> E[Security scan]
+    B --> F[Push to artifact registry]
+    C --> G{All gates pass?}
+    D --> G
+    E --> G
+    F --> G
+    G -->|yes| H[Integration tests]
+    H --> I[Deploy gate]
+    I --> J[Deploy to environment]
+    G -->|no| K[Fail build, notify author]
+`} />
+
+## Step 3: Build once, promote everywhere
+
+The single most important design decision in this pipeline is: **build
+the artifact once per commit, and promote that exact artifact through
+environments** — dev, then staging, then prod — rather than rebuilding
+from source at each stage.
+
+Rebuilding per environment seems harmless but isn't. A dependency
+resolved slightly differently (a floating version tag, a base image that
+moved under you between builds), a different compiler flag picked up
+from environment-specific CI config, or simple non-determinism in the
+build itself can produce an artifact in prod that isn't bit-for-bit what
+passed tests in staging. When that happens, "it worked in staging" stops
+being a useful signal.
+
+The fix is mechanical: the build stage produces one artifact, tagged
+with the commit SHA, stored in a registry. Every later stage — staging
+deploy, prod deploy, rollback — references that same artifact by its
+immutable tag. Promotion becomes "point this environment's deployment
+config at artifact `sha:abc123`," not "run the build again with a
+different target." Config and secrets (database URLs, feature flags,
+API keys) are injected at deploy time, not baked into the artifact, so
+the same image is genuinely identical across environments.
+
+This also makes rollback trivial to reason about: rolling back is
+pointing the environment at the previous SHA's already-built artifact,
+which already exists in the registry — no rebuild, no new code path, no
+new risk introduced by the rollback itself.
+
+## Step 4: Gate stages on signals, not on trust
+
+Every transition between stages needs an automated, checkable condition
+— tests passed, coverage didn't regress, the scan found no critical
+CVEs, a required approver clicked approve. The gate has to be
+enforced by the pipeline itself (it refuses to proceed, full stop), not
+implemented as a convention someone can skip under deadline pressure.
+
+This has a direct interview payoff: when asked "how do you keep a bad
+commit from reaching production," the answer isn't "code review" (a
+process, easily bypassed) — it's "the pipeline mechanically cannot
+produce a deployable artifact, or cannot promote one, unless every gate
+returned green." Humans can still override in a documented, audited
+emergency path, but that's an exception path, not the default one.
+
+## Worked example: sizing the pipeline for scale
+
+Say you're designing this for an org with 800 engineers, each pushing to
+their team's main branch on average 4 times a day during a 10-hour
+working window. That's `800 x 4 = 3,200` pipeline runs/day, concentrated
+in working hours — call it roughly 320 runs/hour at peak, or about one
+run every 11 seconds across the whole org.
+
+If a single build+test run takes 6 minutes end to end and each run needs
+a dedicated runner (a build machine/container) for its full duration,
+you need enough concurrent runner capacity to avoid queueing:
+`320 runs/hour x 6 min/60 = 32` runner-minutes of work arriving per
+minute at peak — so you need on the order of 32 concurrently active
+runners just to keep queue time near zero at peak load, before adding
+margin for retries and flaky reruns. That's the capacity-planning
+question a "how would you scale the build fleet" follow-up is actually
+asking: it's a queueing problem (arrival rate vs. service time x
+concurrent servers), not a "just add more machines" hand-wave. In a real
+system you'd autoscale this runner pool up and down with observed queue
+depth rather than provisioning for peak, since demand is bursty and
+concentrated in working hours.
+
+<Callout type="warning">
+  A common design mistake: treating the artifact registry as an
+  afterthought and rebuilding from source at deploy time "for freshness."
+  This silently reintroduces the exact problem build-once-promote-everywhere
+  solves — the artifact that gets scanned and tested is no longer
+  guaranteed to be the artifact that ships. If your design has a deploy
+  stage that runs a build step, that's a bug in the design, not a detail
+  to fill in later.
+</Callout>
+
+<Quiz
+  lessonId="deploy-requirements-and-pipeline-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should a CI/CD pipeline build one artifact per commit and promote that same artifact through dev, staging, and prod, rather than rebuilding at each stage?',
+      options: [
+        { id: 'a', text: 'Rebuilding is always slower, so this is purely a speed optimization', correct: false, explanation: 'Speed is a nice side effect, but the core reason is correctness: rebuilding risks producing a subtly different artifact than the one that was tested.' },
+        { id: 'b', text: 'It guarantees the artifact that passed tests in staging is bit-for-bit what runs in prod, so "worked in staging" stays a meaningful signal', correct: true, explanation: 'This is the key correctness argument: rebuilding per environment can silently introduce differences (dependency resolution, base image drift, non-determinism), breaking the link between "tested" and "deployed."' },
+        { id: 'c', text: 'It removes the need for an artifact registry entirely', correct: false, explanation: 'The opposite is true — build-once-promote-everywhere requires an artifact registry to store and reference the single built artifact by an immutable tag.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these pipeline stages can typically run in parallel, right after a build artifact is produced? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Unit tests', correct: true, explanation: 'Unit tests only need the build artifact and can run independently of lint or security scans.' },
+        { id: 'b', text: 'Static analysis / lint', correct: true, explanation: 'Lint and static analysis operate on the same build output and have no dependency on test results.' },
+        { id: 'c', text: 'Security/dependency scan', correct: true, explanation: 'A security scan is another independent check against the same artifact, with no dependency on the other verification stages.' },
+        { id: 'd', text: 'The prod deploy', correct: false, explanation: 'Deploy is a join point — it must wait until all the parallel verification stages (tests, lint, scan) have passed, so it cannot run in parallel with them.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In a well-designed pipeline, a stage gate (like "all tests must pass") is enforced mechanically by the pipeline itself, not just by team convention or code review policy.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — gates need to be automated and enforced by the system; anything that relies purely on humans following a process can be skipped under pressure and provides no real guarantee.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This understates the requirement. Code review and convention are useful, but the pipeline itself must refuse to proceed on a failed gate for the guarantee to actually hold.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'An org runs 320 pipeline builds/hour at peak, each taking 6 minutes and occupying one dedicated runner for its full duration. Roughly how many concurrent runners are needed to keep queue time near zero at peak?',
+      options: [
+        { id: 'a', text: 'About 6', correct: false, explanation: 'This is just the per-build duration in minutes, not accounting for how many builds arrive concurrently per hour.' },
+        { id: 'b', text: 'About 32', correct: true, explanation: '320 runs/hour x 6 minutes each = 1,920 runner-minutes of work per hour, i.e. 32 runner-minutes per minute — so roughly 32 concurrently active runners are needed to absorb peak arrival rate without queueing.' },
+        { id: 'c', text: 'About 320', correct: false, explanation: 'That would assume every build in the hour runs simultaneously with zero overlap accounted for by duration — it ignores that each build only occupies a runner for 6 of the 60 minutes in the hour.' },
+      ],
+    },
+  ]}
+/>

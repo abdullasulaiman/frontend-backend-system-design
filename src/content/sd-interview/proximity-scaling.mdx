@@ -1,0 +1,200 @@
+---
+title: "Scaling"
+module: "Design a Proximity Service (Yelp)"
+moduleOrder: 4
+order: 5
+track: "interview"
+summary: "Covers how a nearby-places service scales past a single index — sharding the geospatial index without creating hot shards in dense cities, caching hot queries, and keeping the index fresh as businesses open, close, and move."
+tags: ["scalability", "geospatial-indexing", "sharding", "caching", "system-design"]
+estMinutes: 13
+cheatsheet:
+  - "Nearby-search traffic is overwhelmingly read-heavy; business create/update/delete is a tiny write volume by comparison — scale the two paths separately."
+  - "Never shard a geospatial index by uniform geohash-prefix length alone — dense cities produce hot shards while rural cells sit nearly empty. Split hot cells further and merge sparse ones."
+  - "A grid-based index maps naturally to range-based sharding (contiguous geohash prefixes per shard); a quadtree maps naturally to sharding by subtree, with router nodes tracking which shard owns which region."
+  - "Cache query results keyed by (grid cell, category, radius) — nearby-search queries repeat heavily by geography, so a short-TTL cache absorbs most read load before it reaches the index."
+  - "Update the index asynchronously through a queue, not synchronously on every business write — a moved or closed business can tolerate a few seconds of staleness far better than the write path can tolerate a slow index rebuild."
+  - "Deploy read replicas / index copies close to users regionally, but keep a single source of truth for business data to avoid conflicting concurrent edits to the same business."
+  - "A radius search near a shard boundary must fan out to neighboring shards and merge results — test this case explicitly, it's the one interviewers probe hardest."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've already picked a geospatial index (geohash or quadtree) and sketched
+the service around it. That design works fine for a demo with a few thousand
+businesses on one machine. It falls over the moment you point real traffic at
+it, for a reason that's specific to geospatial systems: the data and the
+traffic are both wildly non-uniform across space. Manhattan has tens of
+thousands of businesses in a few square miles and gets searched constantly;
+most of Montana has almost none. Any scaling plan that assumes "just split
+the data evenly across N machines" breaks against that skew. This lesson is
+about the specific techniques that handle it.
+
+## Where the load actually concentrates
+
+Two asymmetries drive every decision here:
+
+- **Reads dwarf writes.** Someone opens the app and searches "coffee near me"
+  far more often than a business updates its hours or a new business opens.
+  Design the read path for scale first; the write path just needs to stay
+  correct and reasonably fast.
+- **Both reads and writes are spatially skewed.** A geohash prefix covering
+  downtown San Francisco can have 1000x the business density and query
+  volume of a same-length prefix covering open desert. Anything you shard by
+  raw geography will inherit that skew unless you actively counteract it.
+
+Everything below is really about handling that second point without giving
+up the first.
+
+## Sharding the index without creating hot shards
+
+The natural instinct is to shard by geohash prefix: shard 1 owns cells
+starting `9q8`, shard 2 owns `9q9`, and so on. This works, and it keeps
+range queries (a user's cell and its neighbors) mostly within one or two
+shards. But fixed-length prefixes assign *equal address space*, not *equal
+load* — a `9q8` prefix over central London and a same-length prefix over the
+North Atlantic get wildly different traffic.
+
+Two fixes, and you'll usually combine both:
+
+1. **Adaptive cell granularity.** Split dense cells into more, smaller
+   shards (deeper geohash prefixes, or deeper quadtree subdivision) and
+   merge sparse cells into coarser ones. This is exactly the same idea used
+   for the index structure itself, just applied one level up at the
+   sharding boundary — a busy downtown gets many narrow shards; a sparse
+   region gets one wide shard.
+2. **A routing layer that tracks ownership, not a fixed formula.** Instead of
+   computing "shard = hash(prefix) mod N" and hoping it balances, keep a
+   small routing table (cell range → shard) that a lightweight router
+   service consults per request. When a shard gets hot, split its range,
+   move half to a new shard, and update the routing table — no client
+   changes required, no rebalancing outage.
+
+Quadtree-based designs get this almost for free, since the tree already
+subdivides dense regions more finely; the natural sharding boundary is a
+subtree, with router nodes forwarding a query to whichever shard owns the
+subtree the query's coordinates fall into.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    Client[Client: lat/lng + radius] --> Router[Geo Router: cell range to shard]
+    Router --> ShardA[Shard: dense downtown cell]
+    Router --> ShardB[Shard: adjacent cell]
+    Router --> ShardC[Shard: wide sparse region]
+    ShardA --> Cache[(Query Result Cache)]
+    ShardB --> Cache
+    ShardC --> Cache
+    Writer[Business create/update/delete] --> Queue[Index Update Queue]
+    Queue --> Indexer[Async Indexer]
+    Indexer --> ShardA
+    Indexer --> ShardB
+    Indexer --> ShardC
+`} />
+
+## Caching the read path
+
+Nearby-search queries repeat heavily by geography — hundreds of users
+standing within a few blocks of each other all search "restaurants nearby"
+and get nearly the same answer. Cache results keyed by a coarse version of
+the query (grid cell, category filter, radius bucket) with a short TTL, say
+30-60 seconds. This absorbs the vast majority of read traffic before it ever
+touches a shard, and a modest staleness window is invisible to users — a
+restaurant that closes doesn't need to vanish from search results within a
+second.
+
+Cache invalidation should ride the same async pipeline as index updates
+(below), not fire per-request: when a business in a cell changes, invalidate
+that cell's cached query results rather than trying to patch them in place.
+
+## Keeping the index fresh without blocking writes
+
+A business's location, hours, or open/closed status changes far less often
+than it's searched, so the write path can afford to be asynchronous:
+
+1. A business update lands in the primary business-data store and emits an
+   event onto a queue.
+2. An async indexer consumes the event and updates the affected shard(s) —
+   removing the business from its old cell if it moved, inserting it into
+   the new one, and invalidating the relevant cache entries.
+3. Search continues serving from the (briefly stale) index the whole time;
+   there's no lock, no rebuild pause, no coordination with in-flight reads.
+
+The one edge case worth calling out explicitly: a business moving across a
+cell or shard boundary needs a delete-from-old-cell plus insert-into-new-cell,
+not just an update-in-place — get this wrong and the business silently
+duplicates in stale caches or vanishes from search entirely.
+
+## Worked example: rebalancing a hot shard
+
+Say your service shards by 5-character geohash prefix uniformly, ~150
+shards total, and each shard is provisioned for roughly 2,000 queries/sec.
+A prefix covering a dense few blocks of Manhattan starts receiving 40,000
+queries/sec during lunch hour — 20x its provisioned capacity — while a
+same-length prefix over rural Nevada gets 10 queries/sec.
+
+Fixed sharding has no answer here short of over-provisioning every shard for
+worst-case load, which is wasteful at the scale of "every rural shard also
+gets Manhattan-level capacity." With adaptive splitting, the router detects
+the Manhattan prefix is hot, splits it into 8 finer sub-cells (deeper
+prefixes), and spreads those across 8 shards — each now handling roughly
+5,000 queries/sec, within capacity. The routing table is updated to reflect
+the new finer boundaries for that region; the rural shard is untouched, or
+could even be merged with a neighbor since it's far under capacity. The
+result is capacity that tracks actual demand instead of raw map area.
+
+<Callout type="warning">
+  A common interview mistake: proposing "shard by geohash prefix, done" and
+  moving on. An interviewer will immediately ask what happens to the shard
+  covering Times Square versus the one covering open ocean — if you don't
+  have an answer (adaptive splitting/merging, or a routing layer that can
+  rebalance), you've described a design that works in a demo and falls over
+  in production. Always name the hot-shard mitigation explicitly.
+</Callout>
+
+<Quiz
+  lessonId="proximity-scaling"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does sharding a geospatial index by fixed-length geohash prefix alone tend to create hot shards?',
+      options: [
+        { id: 'a', text: 'Fixed-length prefixes assign equal map area per shard, but business density and query volume vary enormously by area', correct: true, explanation: 'A prefix over a dense city center covers the same area size as one over open countryside, but carries far more data and traffic — equal area does not mean equal load.' },
+        { id: 'b', text: 'Geohashes cannot represent dense urban coordinates precisely', correct: false, explanation: 'Geohash precision is just a matter of string length; it represents any coordinate equally well. The imbalance is about load distribution, not encoding precision.' },
+        { id: 'c', text: 'Fixed-length prefixes require a full index rebuild on every business update', correct: false, explanation: 'That is a separate concern (write-path freshness), unrelated to why fixed-length sharding produces uneven load across shards.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are effective ways to relieve a hot shard covering a dense downtown area? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Split the hot cell into finer sub-cells and distribute them across more shards', correct: true, explanation: 'Deeper subdivision spreads the same data and traffic across more shards, directly reducing per-shard load.' },
+        { id: 'b', text: 'Use a routing layer that tracks cell-to-shard ownership so ranges can be rebalanced without client changes', correct: true, explanation: 'A routing table decouples clients from the physical shard layout, letting the range assignment change (split/merge) transparently.' },
+        { id: 'c', text: 'Force every shard, regardless of region, to provision for worst-case dense-city load', correct: false, explanation: 'This "fix" wastes enormous capacity on sparse regions and does not scale — it treats the symptom by overpaying everywhere instead of addressing the imbalance directly.' },
+        { id: 'd', text: 'Cache popular query results per cell with a short TTL to absorb repeated nearby-search traffic', correct: true, explanation: 'Caching reduces the read load that reaches the shard at all, which helps regardless of how sharding is done — a complementary technique, not a substitute for rebalancing.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'When a business moves to a new location that falls in a different grid cell, the index update should be an in-place update of that business\'s record rather than a delete from the old cell plus an insert into the new cell.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'An in-place update leaves the business indexed under its old cell, since the index is organized by cell, not by business ID — that would return stale locations or duplicate entries.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Crossing a cell boundary requires removing the business from the old cell\'s index entry and inserting it into the new cell\'s entry; an in-place update alone does not relocate it within a cell-organized index.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why should business updates flow through an async queue to the index instead of updating the index synchronously within the write request?',
+      options: [
+        { id: 'a', text: 'Because business writes are so rare that synchronous updates would be too slow to matter', correct: false, explanation: 'The reasoning is the opposite direction — async decoupling matters because it protects the read path and write latency, regardless of how rare writes are.' },
+        { id: 'b', text: 'Because a brief staleness window on index updates is an acceptable trade for keeping writes fast and avoiding coordination with concurrent reads', correct: true, explanation: 'Business changes (hours, status, location) tolerate a few seconds of lag far better than users would tolerate slow writes or locked reads during a synchronous index update.' },
+        { id: 'c', text: 'Because synchronous updates are not technically possible against a sharded geospatial index', correct: false, explanation: 'It is technically possible, just undesirable — synchronous updates would add latency to every write and risk contending with concurrent search reads on the same shard.' },
+      ],
+    },
+  ]}
+/>

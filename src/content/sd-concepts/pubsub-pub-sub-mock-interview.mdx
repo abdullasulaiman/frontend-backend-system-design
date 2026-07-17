@@ -1,0 +1,138 @@
+---
+title: "Pub-Sub: Mock Interview"
+module: "Pub-Sub"
+moduleOrder: 18
+order: 3
+track: "concept"
+summary: "A timed mock interview that combines topic/partition design, fan-out to independent consumers, and delivery-guarantee trade-offs into one end-to-end pub-sub design exercise."
+tags: ["pub-sub", "mock-interview", "system-design", "messaging", "fan-out"]
+estMinutes: 13
+cheatsheet:
+  - "Open with the fan-out question: how many independent consumer groups need every event, and does any of them need strict per-key ordering? That answer shapes the partition key before anything else."
+  - "State your delivery guarantee out loud (at-least-once is the realistic default) and immediately pair it with how consumers get idempotency — those two decisions are inseparable in a real design."
+  - "Partition by the entity that needs ordering (trip ID, driver ID, account ID) — never by a random or round-robin key if any consumer cares about sequence."
+  - "A slow or crashed consumer group must never block another consumer group or the producer — each group tracks its own offset/cursor independently."
+  - "Have a concrete retry-and-dead-letter story ready: bounded retries with backoff, then move the message to a DLQ rather than blocking the partition forever."
+  - "Bring one estimation number (topics × partitions × replication factor, or messages/sec × retention window = storage) — it shows you can turn the design into a resource budget, not just a diagram."
+  - "Narrate trade-offs instead of freezing on them: 'I'll accept at-least-once and push dedup to consumers because building exactly-once end-to-end costs more than the duplicate-handling logic it replaces.'"
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+import MockInterview from '../../components/MockInterview';
+
+The first two lessons in this module gave you the pieces separately: how to model publishers, subscribers, and topics, and how a broker fans a single event out to many independent consumers without one slow reader stalling the rest. An interviewer doesn't hand you those pieces one at a time — they hand you a business problem ("notify these five services when a trip ends") and expect you to reconstruct the whole design live, defending each choice as you make it.
+
+This lesson is that rehearsal. Set a timer, talk out loud as if someone were watching, and only look at the rubric after you've committed to an answer.
+
+## What this prompt is really testing
+
+"Design a pub-sub system" is rarely the literal ask — it's almost always "design the messaging backbone for a specific fan-out scenario," and the specifics matter. A stock-ticker feed, an order-fulfillment pipeline, and a ride-hailing trip-completion event all use the same pub-sub primitives, but land on different partition keys, retention windows, and ordering guarantees. The interviewer is watching whether you:
+
+1. Turn a vague fan-out requirement into concrete numbers (event rate, number of consumer groups, ordering scope, retention needs).
+2. Choose a partition key and delivery guarantee that are consistent with each other and with the requirements — not two decisions made in isolation.
+3. Handle the failure modes a real broker actually hits: a slow consumer, a crashed consumer, a duplicate delivery, a hot partition.
+
+That third point is where most candidates run out of things to say. Anyone can draw "producer → broker → consumers." Fewer candidates can explain what happens when consumer group 3 falls two hours behind, or how a consumer tells a duplicate delivery from a genuinely new event.
+
+## A structure for the 45 minutes
+
+- **Minutes 0–8: requirements.** Roughly how many events per second, how many independent consumer groups need a full copy of the stream, whether any consumer cares about per-key ordering, and how long data needs to be replayable.
+- **Minutes 8–18: topic and partition design.** Pick a partition key tied to the ordering requirement; decide topic count and partition count per topic.
+- **Minutes 18–28: fan-out and consumption model.** Multiple consumer groups reading the same partitions independently, each with its own offset; push vs. pull delivery to those groups.
+- **Minutes 28–36: delivery guarantees and idempotency.** At-least-once as the default, plus how each consumer group deduplicates.
+- **Minutes 36–45: failure modes and a capacity check.** Slow consumer, broker/partition-leader loss, retry and dead-letter handling, plus one throughput or storage estimate.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    A[Clarify: event rate, consumer groups, ordering scope] --> B[Pick partition key + partition count]
+    B --> C[Design fan-out: N independent consumer groups, each with its own offset]
+    C --> D[Pick delivery guarantee: at-least-once + consumer-side idempotency]
+    D --> E[Failure modes: slow consumer, retries, dead-letter queue]
+    E --> F[Capacity check: events/sec, storage, replication factor]
+`} />
+
+## Questions a strong candidate asks first
+
+A prompt like "notify billing, analytics, fraud detection, and the rider's app when a trip completes" hides several decisions inside it. Useful clarifiers:
+
+- **Does any consumer need trips ordered relative to each other, or just events within one trip ordered?** If fraud detection only needs "trip started" before "trip completed" for the *same* trip, partitioning by trip ID is enough — you don't need a single global ordering.
+- **Can any consumer tolerate losing an event entirely, or does every consumer need every event eventually?** Billing almost certainly can't lose a completed-trip event; a live map overlay might be fine dropping a stale one.
+- **How far back does replay need to reach?** "Fraud detection needs to reprocess the last 7 days after a model change" is a retention and storage requirement, not just a delivery one.
+- **What happens if one downstream consumer (say, analytics) falls hours behind — does that block anything else?** The answer should be "no," and getting the interviewer to confirm that up front justifies designing independent consumer offsets rather than one shared queue.
+
+Nailing these down before drawing boxes is the highest-leverage five minutes of the interview — it also signals you know pub-sub design isn't one-size-fits-all.
+
+## Where candidates lose points
+
+The recurring failure pattern: a candidate draws "producer → topic → consumers," says "Kafka-like" once, and stops there — without ever explaining how ordering, deduplication, or a stuck consumer actually get handled. It sounds correct in outline and collapses the moment the interviewer asks "what if the fraud-detection consumer crashes mid-batch and comes back up — does it double-process anything?"
+
+The fix is narrating the connective tissue between decisions, not adding more boxes: "I'm partitioning by trip ID, *because* fraud detection needs per-trip ordering but doesn't care about ordering across different trips — that lets me run many partitions in parallel instead of forcing one global sequence" is a stronger sentence than "I'll use partitions."
+
+<Callout type="interview">
+  When two reasonable options exist (e.g. push delivery to consumers vs. consumers pulling at their own pace), say the trade-off and commit: "I'll go with pull-based consumption — each consumer group advances its own offset at its own pace, so a slow fraud-detection job never causes the broker to push faster than analytics can handle. The cost is consumers polling instead of getting instant push, which is fine for this use case since sub-second delivery isn't a stated requirement." That's judgment, not just recall.
+</Callout>
+
+## Worked example: sizing the trip-completion topic
+
+Suppose requirements surface this: 50,000 trips complete per hour at peak (~14 events/sec average, call it 50/sec at burst), each event is about 1 KB, four consumer groups (billing, analytics, fraud, rider notification) each need the full stream, and fraud detection needs 7 days of replay.
+
+- **Partition count**: partitioning by trip ID with 24 partitions comfortably spreads 50 events/sec across parallel partitions (roughly 2/sec per partition at burst) while leaving headroom for 5–10x growth before repartitioning is needed.
+- **Storage for replay**: 50,000 trips/hour × 24 hours × 7 days × 1 KB ≈ 8.4 million events/week × 1 KB ≈ 8 GB/week of raw event data — trivial to retain on disk for 7 days even with a 3x replication factor (about 25 GB total), so the interviewer's "keep 7 days for reprocessing" requirement is cheap to satisfy, not a reason to reach for cold storage.
+- **Consumer independence check**: because each of the four consumer groups tracks its own offset into the same partitions, fraud detection replaying the last 7 days doesn't re-deliver anything to billing or analytics — it only rewinds its own group's cursor, which is exactly the isolation the requirements called for.
+- **Delivery guarantee**: with billing in the consumer list, at-most-once (silently dropping a message on a hiccup) is unacceptable — the design commits to at-least-once delivery, and billing dedups by trip ID plus a monotonic version number stored in its own database, since a duplicate completed-trip event is far cheaper to handle than a lost one.
+
+That's the pattern to produce live: pull a number from the requirements phase, turn it into a partition count or a storage figure, and let that number justify a design decision instead of asserting it.
+
+<Quiz
+  lessonId="pubsub-pub-sub-mock-interview"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A candidate is asked to design a pub-sub system for "trip completed" events consumed by billing, analytics, and fraud detection. What is the strongest first move?',
+      options: [
+        { id: 'a', text: 'Immediately propose partitioning by a random or round-robin key to maximize parallelism.', correct: false, explanation: 'Partition key choice depends on which consumer needs ordering and over what scope — picking a random key before knowing that risks breaking an ordering requirement no one asked about yet.' },
+        { id: 'b', text: 'Ask whether any consumer needs per-key ordering, whether any consumer can tolerate losing an event, and how far back replay needs to reach.', correct: true, explanation: 'These three answers directly determine the partition key, the delivery guarantee, and the retention window — the three foundational decisions everything else builds on.' },
+        { id: 'c', text: 'Pick Kafka by name and move directly to drawing brokers and partitions.', correct: false, explanation: 'Naming a specific technology does not substitute for reasoning about ordering scope, delivery guarantees, or retention — an interviewer wants the reasoning, not a product name.' },
+        { id: 'd', text: 'Ask what programming language the consumers are written in.', correct: false, explanation: 'Consumer implementation language does not affect any of the architectural decisions being evaluated in this exercise.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Given that billing, analytics, fraud detection, and a rider-notification service all need a full copy of the trip-completion stream, and fraud detection needs 7 days of replay, which design choices are well justified? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Each consumer group tracks its own offset into the shared partitions, independent of the others.', correct: true, explanation: 'Independent offsets are exactly what lets fraud detection replay 7 days of history without re-delivering anything to billing or analytics, and let one slow consumer group not affect the others.' },
+        { id: 'b', text: 'Partitioning by trip ID so that events for the same trip stay in order relative to each other.', correct: true, explanation: 'Per-trip ordering (e.g. "started" before "completed") typically matters more than global ordering across unrelated trips, so keying by trip ID gets ordering where it matters while still allowing parallelism.' },
+        { id: 'c', text: 'Using at-most-once delivery to keep the broker simple, since duplicate billing events are easy to detect later.', correct: false, explanation: 'At-most-once risks silently dropping a completed-trip event entirely, which is unacceptable for billing — the safer default here is at-least-once paired with consumer-side deduplication.' },
+        { id: 'd', text: 'Deleting events immediately after every consumer group has acknowledged them, with no retention window.', correct: false, explanation: 'This directly contradicts the stated requirement that fraud detection needs 7 days of replay after the fact — retention has to outlive normal acknowledgment.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In a well-designed pub-sub fan-out, a consumer group that falls hours behind (for example, during a batch reprocessing job) should not block the broker from delivering to other consumer groups.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Independent per-group offsets are the whole point of the fan-out model covered earlier in this module — a slow or replaying consumer group only affects its own cursor, never the others.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'A design where one slow consumer group blocks delivery to the rest reduces to a single shared queue, which defeats the purpose of independent fan-out and should be called out as a design flaw in an interview, not accepted as normal behavior.' },
+      ],
+    },
+  ]}
+/>
+
+<MockInterview
+  lessonId="pubsub-pub-sub-mock-interview"
+  client:visible
+  prompt="Design the pub-sub messaging backbone for a ride-hailing platform. When a trip completes, four independent services need to react: billing (charge the rider), analytics (update dashboards), fraud detection (flag suspicious patterns, and periodically reprocess recent history when models change), and the rider's mobile app (push a 'trip complete, here's your receipt' notification). Design the topic/partition structure, the fan-out and consumption model, the delivery guarantee, and how the system handles a slow or crashed consumer. Assume you can ask the interviewer clarifying questions."
+  rubric={[
+    { point: 'Gathers requirements before designing', detail: 'Asks about event rate, which consumers need ordering and at what scope (per-trip vs. global), which consumers can tolerate a lost event, and how far back replay needs to reach.' },
+    { point: 'Chooses a partition key tied to the ordering requirement', detail: 'Partitions by trip ID (or an equivalent per-entity key) rather than a random key, and explains why that scope of ordering is sufficient without forcing a single global sequence.' },
+    { point: 'Designs true fan-out with independent consumer groups', detail: 'Gives each of the four services its own consumer group and offset/cursor into the same partitions, explicitly stating that one group falling behind does not affect the others.' },
+    { point: 'Commits to a delivery guarantee and pairs it with idempotency', detail: 'Picks at-least-once as the realistic default (given billing cannot tolerate lost events) and explains how at least one consumer (e.g. billing) deduplicates repeated deliveries.' },
+    { point: 'Handles the slow/crashed consumer and retry path concretely', detail: 'Describes bounded retries with backoff, a dead-letter queue for messages that keep failing, and confirms none of this blocks the partition for other consumer groups.' },
+    { point: 'Grounds the design in at least one estimate', detail: 'Produces a rough partition count, storage/retention figure, or throughput-per-partition number from the gathered requirements rather than leaving the design purely qualitative.' },
+  ]}
+/>

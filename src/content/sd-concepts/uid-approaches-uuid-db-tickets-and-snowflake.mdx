@@ -1,0 +1,193 @@
+---
+title: "Approaches: UUID, DB Tickets, and Snowflake"
+module: "Unique ID Generator"
+moduleOrder: 12
+order: 2
+track: "concept"
+summary: "Compares UUIDs, database ticket servers, and Snowflake-style time-ordered IDs as the three practical ways to generate unique IDs in a distributed system."
+tags: ["unique-id", "distributed-systems", "snowflake", "uuid", "sharding"]
+estMinutes: 12
+cheatsheet:
+  - "UUIDv4 needs zero coordination and scales infinitely, but its 128 random bits are not sortable and bloat B-tree indexes with random inserts."
+  - "UUIDv7 keeps UUID's coordination-free property but front-loads a timestamp, so it's roughly time-sortable and index-friendly — prefer it over v4 for primary keys."
+  - "A DB auto-increment column is naturally ordered and compact, but a single sequence is a write bottleneck and a single point of failure."
+  - "The ticket server pattern (batching ID ranges from a DB) trades some staleness/waste for far fewer round trips to the database."
+  - "Snowflake-style IDs pack timestamp + machine/shard ID + sequence into one 64-bit integer: no coordination after startup, roughly sortable, and compact."
+  - "Snowflake's failure mode is clock skew — if a node's clock goes backwards, it can mint an ID it already used. Guard with NTP plus a monotonic check that refuses to generate IDs until the clock catches up."
+  - "Pick the approach by what you need: use ID sortability for pagination/sharding, coordination-free generation for write throughput, and compactness for index size and network payload."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Once you've settled on what a unique ID generator needs to guarantee —
+uniqueness across machines, no single point of failure, low latency, and
+ideally rough time-ordering — the next question is mechanical: how do you
+actually produce these IDs? Three families of answers show up in almost
+every real system and almost every interview: random IDs (UUIDs), IDs
+minted by a database, and hybrid IDs that pack a timestamp and a machine
+identifier into one integer (the Snowflake pattern). Each makes a different
+trade between coordination, ordering, and size, and picking the wrong one
+for your workload shows up later as index bloat, a write bottleneck, or a
+subtle correctness bug under clock skew.
+
+## UUIDs: no coordination, no ordering
+
+A UUID (Universally Unique Identifier) is a 128-bit value, usually rendered
+as 32 hex characters like `f47ac10b-58cc-4372-a567-0e02b2c3d479`. The most
+common variant, UUIDv4, is just 122 random bits (6 bits are fixed to mark
+the version). With that much randomness, the odds of two machines
+independently generating the same value are astronomically small — you can
+generate UUIDs on any node, with no network call and no shared state, and
+collisions are a non-issue in practice.
+
+That independence is the whole appeal: any service instance can mint IDs
+locally, forever, with no coordination and no bottleneck. The cost is that
+v4 UUIDs are **not ordered**. Two UUIDs generated a second apart look
+nothing alike, which means:
+
+- You can't infer creation order from the ID.
+- Inserting them as a primary key in a B-tree-indexed table causes random
+  writes all over the index instead of appends at the tail, hurting insert
+  throughput and increasing page splits/fragmentation.
+- They're 16 bytes raw (36 characters as text) — bigger than a 64-bit
+  integer, which adds up across billions of rows and network payloads.
+
+**UUIDv7** fixes the ordering problem while keeping the coordination-free
+property: it puts a 48-bit millisecond timestamp in the high bits and fills
+the rest with random bits. IDs generated later sort after IDs generated
+earlier (mostly — ties within the same millisecond are still random), which
+makes it a much better default for primary keys than v4. If your database
+or language runtime supports UUIDv7 generation, it's usually the right
+choice over v4 for anything that becomes a table's primary key.
+
+## Database-generated IDs: auto-increment and ticket servers
+
+The simplest alternative is to let the database hand out IDs, the way a
+single-node `AUTO_INCREMENT` or `SERIAL` column does. It's compact (a 64-bit
+integer), naturally ordered by insertion, and trivial to reason about — but
+it only works cleanly with a single writable database. Once you shard the
+database (see the sharding lesson in the Building Blocks module), a naive
+auto-increment column produces colliding IDs across shards unless you
+coordinate ranges.
+
+The **ticket server** pattern fixes this without giving up "the database
+mints IDs." A small, dedicated service owns one (or a few) auto-increment
+counters and hands out **batches** of IDs to application servers on
+request — for example, "here's your next 1,000 IDs, numbers 45,001 through
+46,000." Each application server then assigns from its local batch without
+talking to the ticket server again until it runs out.
+
+This turns a potential "one DB round trip per ID" bottleneck into "one DB
+round trip per 1,000 IDs," which is usually enough to keep the ticket
+server from becoming a hotspot. The trade-offs: the ticket server is still
+a form of centralized coordination (you need it to be highly available,
+typically via a primary/replica setup or multiple independent counters),
+and any unused IDs in a batch are wasted if a server crashes mid-batch —
+acceptable for most systems, since IDs just need to be unique, not
+gapless.
+
+## Snowflake: timestamp + machine ID + sequence, packed into one integer
+
+Twitter's Snowflake approach (since widely copied and adapted) generates a
+64-bit integer built from three parts, without any database or shared
+counter in the hot path:
+
+- **Timestamp** (~41 bits) — milliseconds since a custom epoch (not 1970,
+  to leave more useful range), giving roughly 69 years of unique
+  timestamps.
+- **Machine/shard ID** (~10 bits) — a value assigned to each generator node
+  at startup, giving room for ~1,024 concurrent generator instances.
+- **Sequence number** (~12 bits) — a counter reset to zero every
+  millisecond, giving each node up to 4,096 IDs within the same
+  millisecond before it has to wait for the clock to tick forward.
+
+Because the timestamp occupies the high bits, IDs are roughly sortable by
+generation time (roughly, because clocks across nodes aren't perfectly
+in sync). Because each node has its own machine ID and its own
+per-millisecond sequence, no node ever needs to ask another node or a
+database for permission to mint an ID — generation is entirely local after
+the machine ID is assigned once at startup.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  subgraph ID [64-bit Snowflake ID]
+    T["Timestamp\n~41 bits"] --> M["Machine ID\n~10 bits"] --> S["Sequence\n~12 bits"]
+  end
+  N1["Node A\n(machine id 3)"] -->|mints locally| ID
+  N2["Node B\n(machine id 7)"] -->|mints locally| ID
+`} />
+
+This gives you the best of both worlds compared to the first two
+approaches: coordination-free generation like a UUID, but compact (a plain
+64-bit integer, half the size of a UUID) and roughly time-ordered like a
+database sequence. That's why it's the default answer most candidates
+converge on for "design a unique ID generator" — and it's exactly what the
+next lesson in this module builds out in full.
+
+## Worked example: sizing the bit layout
+
+Say you need to support 500 generator nodes (rounds up to 9 bits, since
+`2^9 = 512`) and expect at most 8,000 IDs per node per millisecond at peak
+(needs 13 bits, since `2^13 = 8192`). With a 64-bit budget and 1 bit
+reserved as a sign bit (so the ID stays a positive integer in languages
+without unsigned 64-bit types), you have `63 - 9 - 13 = 41` bits left for
+the timestamp. At 41 bits of milliseconds, that's `2^41` milliseconds, or
+about 69.7 years of unique timestamps from your chosen epoch before the
+counter wraps — comfortably longer than most systems will run before a
+redesign. This is the same trade-off exercise you'd walk through out loud
+in an interview: bits aren't free, so you size each field to the smallest
+range that covers your real node count and throughput, then give the
+timestamp whatever's left.
+
+<Callout type="warning">
+  The most common Snowflake bug isn't in the bit-packing — it's clock skew.
+  If a node's system clock jumps backward (NTP correction, VM pause, leap
+  second handling), the node can generate a timestamp it already used, and
+  under load its sequence counter could reissue an ID that's already in
+  use. Guard against this by tracking the last timestamp a node minted an
+  ID at: if the clock reads earlier than that, refuse to generate (or
+  block briefly) rather than silently producing IDs from an earlier point
+  in time. Combine that with NTP and monotonic clock sources — don't rely
+  on wall-clock time alone.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="uid-approaches-uuid-db-tickets-and-snowflake"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why is UUIDv4 a poor choice for a primary key in a high-throughput, B-tree-indexed table?',
+      options: [
+        { id: 'a', text: 'It has a meaningful risk of collisions at scale', correct: false, explanation: 'With 122 random bits, collision risk is astronomically low in practice — that is not the problem with v4 as a primary key.' },
+        { id: 'b', text: 'Its randomness causes scattered, non-sequential inserts that fragment the index', correct: true, explanation: 'Because v4 UUIDs are not time-ordered, each insert lands at a random point in the B-tree instead of appending near the tail, hurting insert performance and locality.' },
+        { id: 'c', text: 'It requires a network round trip to generate', correct: false, explanation: 'UUIDv4 generation is entirely local — no coordination or network call is needed. That is one of its main advantages.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which properties does a Snowflake-style ID provide? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Coordination-free generation after the machine ID is assigned at startup', correct: true, explanation: 'Each node mints IDs locally using its own timestamp, machine ID, and per-millisecond sequence — no database or peer lookup needed per ID.' },
+        { id: 'b', text: 'Rough time-ordering across nodes', correct: true, explanation: 'Because the timestamp occupies the high bits, IDs generally sort by creation time, modulo small clock differences between nodes.' },
+        { id: 'c', text: 'Guaranteed perfectly gapless sequential numbering with no skipped values', correct: false, explanation: 'Snowflake IDs are unique and roughly ordered, not gapless — sequence counters reset every millisecond and machine IDs interleave, so gaps are expected and fine.' },
+        { id: 'd', text: 'A more compact representation than a 128-bit UUID', correct: true, explanation: 'A Snowflake ID is a single 64-bit integer, half the raw size of a 128-bit UUID.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A ticket server that hands out ID ranges in batches (e.g. 1,000 at a time) still requires a database round trip for every single ID it issues.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The whole point of batching is to amortize the database round trip across many IDs — a server only goes back to the ticket server once its local batch is exhausted.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — batching turns "one DB call per ID" into "one DB call per batch," which is why the ticket server pattern scales far better than a naive shared counter.' },
+      ],
+    },
+  ]}
+/>

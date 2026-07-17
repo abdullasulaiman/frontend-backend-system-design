@@ -1,0 +1,221 @@
+---
+title: "Sharded Counter Design"
+module: "Sharded Counters"
+moduleOrder: 24
+order: 2
+track: "concept"
+summary: "Explains how to split a single hot counter into many independently-writable shards so write throughput scales with shard count instead of being capped by one row's lock contention."
+tags: ["sharded-counters", "hot-key", "scalability", "distributed-systems", "write-throughput"]
+estMinutes: 12
+cheatsheet:
+  - "A sharded counter replaces one row/key with `N` independent shard rows; a write picks one shard at random (or by hash) and increments only that shard, so contention drops by roughly a factor of `N`."
+  - "Total throughput scales with shard count until you hit the *system's* ceiling (connection pool, network, downstream aggregator) — sharding removes the single-row bottleneck, it doesn't create infinite capacity."
+  - "Random shard selection needs no coordination and spreads load evenly on average, but gives no guarantees for a single request; hashing on a request/idempotency key gives duplicate-safe retries at the cost of a little more skew."
+  - "In-memory shards (e.g. one atomic counter per shard in Redis) buy you far higher per-shard throughput than DB row shards, at the cost of needing an explicit durability plan (periodic flush, AOF/RDB, or a write-behind log)."
+  - "Reshard by adding new empty shards, not by redistributing existing ones — splitting existing shard state correctly is much harder than just adding capacity for new writes."
+  - "Read amplification is the cost you're deferring: an `N`-shard counter needs an `N`-way sum to read its current value, which is the subject of the next lesson."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson established the problem: a single counter — one row, one
+key, one number — can only absorb as many writes per second as one storage
+location allows, because every increment has to serialize against every
+other increment touching the same row. A viral post's like count or a
+trending hashtag's view count can demand tens of thousands of increments per
+second against that single number, far past what row-level locking or
+single-key contention can sustain, no matter how fast the underlying storage
+is.
+
+Sharded counters are the fix, and the idea is almost embarrassingly simple:
+stop trying to make one number absorb all the writes, and store the count as
+several numbers instead. This lesson covers how to actually build that —
+picking a shard count, routing writes to shards, choosing durable vs.
+in-memory shard storage, and resharding without losing data. Reading the
+total back out is a big enough topic on its own that it gets the next
+lesson.
+
+## The core idea: replace one counter with many
+
+Instead of a single row `likes(post_id, count)`, you store `N` rows:
+`likes(post_id, shard_id, count)` for `shard_id` from `0` to `N-1`. A "like"
+event no longer updates *the* row for a post — it updates *one* of that
+post's `N` shard rows, chosen by the request. Because different requests
+usually land on different shards, they no longer queue up behind each
+other's lock. Two increments hitting shard 3 and shard 7 at the same instant
+proceed completely independently.
+
+The current total is just the sum of all `N` shards for that post. You pay
+for this at read time (summing `N` rows instead of reading one), which is
+exactly the trade-off sharded counters make: spread out write contention,
+concentrate the cost on reads instead — and reads are usually far less
+frequent and far easier to cache than writes on a viral item.
+
+## Choosing how many shards
+
+Shard count is a capacity dial, not a fixed architectural constant. If one
+row can sustain roughly `C` writes per second before contention becomes the
+bottleneck, and you need to sustain `T` writes per second for a given
+counter, you want roughly `N = T / C` shards (with headroom — see the worked
+example below). Two things follow directly from this:
+
+- **Hot items need more shards than cold ones.** A post with 10 likes total
+  needs exactly one shard; a post going viral at 50,000 likes/second needs
+  dozens. Uniformly giving every counter in your system, say, 100 shards
+  wastes read cost (100-way sums) on the 99.9% of counters that never see
+  meaningful concurrent write pressure.
+- **Shard count should be adjustable per item, ideally dynamically.**
+  A fixed shard count decided at counter-creation time either under-provisions
+  items that later go viral, or over-provisions every quiet item "just in
+  case." Production designs typically start items at a small shard count and
+  add shards when write latency or contention crosses a threshold.
+
+## Routing writes to a shard
+
+Given `N` shards, which one does a given increment hit? Two common
+approaches, with different trade-offs:
+
+**Random shard pick.** Each writer picks `shard_id = random(0, N-1)` and
+increments that row. This needs zero coordination and, over enough requests,
+spreads load close to evenly across shards. Its weakness: a single request
+has no guarantee about which shard it lands on, so you can't use shard
+routing itself to deduplicate a retried request — two retries of "the same"
+like could land on different shards and both apply, double-counting if your
+client doesn't otherwise guard against duplicate delivery.
+
+**Hash-based pick.** Compute `shard_id = hash(idempotency_key) mod N` (using
+a stable per-request key: a user+post pair for a "like," or a request UUID).
+Retries of the same logical request hash to the same shard, so a
+shard-scoped "have I already applied this key" check can dedupe safely. The
+cost is that hashing distributes less evenly than true randomness in
+practice — a burst of requests that happen to share hash buckets can still
+create a locally hot shard, though this is far less severe than a single
+unsharded row taking 100% of traffic.
+
+Most real designs use random selection for pure "fire and forget, eventual
+consistency is fine" counters (view counts, impression counts) and
+hash-based selection when duplicate suppression matters (billing-adjacent
+counters, anything counted exactly once per user).
+
+<Mermaid client:visible chart={`
+flowchart LR
+    C1[Client A] --> R{Shard router}
+    C2[Client B] --> R
+    C3[Client C] --> R
+    R --> S0[(Shard 0: count)]
+    R --> S1[(Shard 1: count)]
+    R --> S2[(Shard 2: count)]
+    R --> S3[(Shard 3: count)]
+    S0 & S1 & S2 & S3 --> AG[Aggregator: sum shards]
+    AG --> Total[Total count]
+`} />
+
+## Durable rows vs. in-memory shards
+
+Where a shard actually lives matters as much as how many there are:
+
+- **A row per shard in your primary database** is the simplest option and
+  reuses whatever durability and backup story the database already gives
+  you. Its ceiling is whatever that database can do per row under
+  contention — better than one row for the whole counter, but each shard
+  still inherits the database's per-row write ceiling.
+- **An atomic counter per shard in an in-memory store** (e.g. one Redis key
+  per shard, incremented with an atomic `INCR`) pushes per-shard throughput
+  much higher, since you've dropped disk I/O and lock manager overhead from
+  the hot path. The trade-off is durability: an in-memory store needs an
+  explicit plan for surviving a crash — periodic snapshotting, an
+  append-only log, or accepting that a narrow window of increments could be
+  lost on a hard failure, which is often an acceptable trade for something
+  like a view counter but not for anything billing-related.
+
+Many systems land on a hybrid: shards live in memory for speed, with a
+background process periodically flushing aggregated totals to durable
+storage, trading a small, bounded durability window for throughput that a
+pure database design can't reach.
+
+## Resharding without losing counts
+
+Traffic to a given item changes over time, so shard count needs to change
+too. The safe move is to **only ever add shards, never redistribute
+existing ones**: bump `N` from 8 to 16 by creating 8 new, zero-initialized
+shard rows and starting to route new writes across all 16. The 8 original
+shards keep whatever counts they already have — nothing needs to move, split,
+or be recomputed. The read path (summing shards) already has to handle a
+per-item shard count that can grow over time; it just sums however many
+shards currently exist for that item.
+
+Trying to instead "rebalance" by moving count mass between existing shards
+is solving a much harder problem (you'd need to freeze writes, recompute,
+and resume without losing anything in flight) for no real benefit — the goal
+of resharding is added capacity for future writes, not evenly redistributing
+history that's already correct.
+
+## Worked example: a viral post's like counter
+
+Say a single database row on your setup can sustain about 800 increments per
+second before write latency starts climbing sharply — that's your `C`. A
+post goes viral and you're seeing sustained bursts of 40,000 likes/second.
+
+`N = T / C = 40,000 / 800 = 50` shards, and you'd round up and add headroom —
+say 64 shards — to absorb bursts above the sustained average and leave slack
+if `C` degrades slightly under real contention. Each shard now only needs to
+absorb roughly `40,000 / 64 ≈ 625` writes/second, comfortably under the
+800/second ceiling per row.
+
+If the post keeps climbing and bursts hit 80,000/second, you don't touch the
+existing 64 shards — you add 64 more (128 total), and new writes start
+spreading across all 128 shards going forward, dropping per-shard load back
+to roughly `80,000 / 128 ≈ 625` writes/second. The original 64 shards' counts
+are untouched by the resize; the total is still correct as the sum of all
+128 rows, since every shard — old and new — keeps receiving its share of new
+writes from this point on.
+
+<Callout type="warning">
+  A common mistake: choosing the shard for a write using something
+  convenient but non-uniform, like `user_id mod N` or the serving thread's
+  ID, instead of a genuinely random or well-hashed value. `user_id mod N`
+  looks like sharding, but if user IDs were assigned sequentially and a
+  recent signup cohort is disproportionately active (a common pattern after
+  a marketing push), those users' writes cluster onto the same few shards —
+  you've rebuilt the hot-row problem one level down, just spread across
+  fewer rows than before instead of solved. Verify shard load is actually
+  even under real traffic, not just uniform in theory.
+</Callout>
+
+<Quiz
+  lessonId="counters-sharded-counter-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A single database row can sustain roughly 500 writes/second before contention dominates. A counter needs to sustain 12,000 writes/second. Roughly how many shards does it need (ignoring headroom)?',
+      options: [
+        { id: 'a', text: 'About 24 shards', correct: true, explanation: '12,000 / 500 = 24 — dividing the required throughput by the per-row ceiling gives the shard count needed so each shard stays under that ceiling.' },
+        { id: 'b', text: 'About 500 shards', correct: false, explanation: 'That divides the numbers the wrong way around; 500 is the per-row ceiling, not a shard count input by itself.' },
+        { id: 'c', text: 'Exactly 1 shard, since sharding does not change total throughput', correct: false, explanation: 'Sharding exists precisely because splitting write load across independent rows raises total achievable throughput past what one row can sustain.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine trade-offs of storing counter shards in an in-memory store (e.g. Redis) instead of as rows in the primary database? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Higher achievable per-shard write throughput, since disk I/O and lock manager overhead drop out of the hot path', correct: true, explanation: 'In-memory atomic operations avoid the durability and locking overhead a disk-backed row incurs, which is exactly why they sustain more writes per shard.' },
+        { id: 'b', text: 'An explicit durability plan is now needed, since a crash can lose increments that were never persisted', correct: true, explanation: 'Unlike a database row with built-in durability guarantees, an in-memory counter needs its own snapshotting/logging strategy or an accepted risk window.' },
+        { id: 'c', text: 'The counter no longer needs to be summed across shards to get a total', correct: false, explanation: 'Where a shard is stored does not change the fact that a sharded counter is split across N locations — reading the total still requires summing all shards, whether they live in memory or on disk.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'When adding shards to an item whose write volume has grown, the safe approach is to redistribute count values from existing shards into the new ones so load is evenly balanced immediately.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Redistributing existing shard values requires freezing writes and recomputing safely, which is far riskier than needed. The standard approach is to add new, zero-initialized shards and let future writes spread across the enlarged set — existing shard counts are left untouched.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — resharding should only add new shards for future writes. Existing shards keep their already-correct counts; the read path just sums however many shards currently exist.' },
+      ],
+    },
+  ]}
+/>

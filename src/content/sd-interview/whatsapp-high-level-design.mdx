@@ -1,0 +1,240 @@
+---
+title: "High-Level Design"
+module: "Design WhatsApp"
+moduleOrder: 11
+order: 2
+track: "interview"
+summary: "Breaks a real-time chat system into the services that own connections, routing, and durable storage, and traces one message from sender to recipient across them."
+tags: ["whatsapp", "system-design", "architecture", "messaging", "websocket"]
+estMinutes: 12
+cheatsheet:
+  - "Split the design into a connection plane (who's online, on which server) and a message plane (durable storage, routing, fan-out) — they scale differently and fail independently."
+  - "A chat backend is fundamentally a server-push problem, not request/response — clients hold a persistent connection (WebSocket or a raw TCP/MQTT socket) so the server can shove a message down without the client polling."
+  - "Connection servers are stateful and sticky: once a client's socket lands on connection-server instance X, routing that user's messages means finding X first — usually via a session directory in a fast key-value store."
+  - "Write the message to durable storage before attempting delivery, and only after storage succeeds do you ack the sender — losing an already-acked message is a trust-breaking bug users notice immediately."
+  - "One conversation with N participants means N fan-out writes/deliveries, not one — group chat is a multiplier on every step of this pipeline, which is why it gets its own lesson."
+  - "A user with the same account on phone, web, and desktop is really 'one user, three connections' — the routing layer needs to fan a message out to every active session, not pick just one."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson pinned down the numbers: hundreds of millions of daily
+active users, tens of billions of messages a day, and a delivery latency
+budget measured in low hundreds of milliseconds. Those numbers rule out the
+architecture most engineers reach for first — a REST API where the client
+polls "any new messages?" every few seconds. Polling that frequently at that
+scale would mean billions of mostly-empty requests an hour, and it still
+can't deliver a message the instant it's sent. WhatsApp-style chat is a
+**server-push** problem: the server needs a way to reach a specific client
+the moment something happens, which means the architecture has to be built
+around persistent connections from the ground up, not bolted on top of a
+stateless request/response API.
+
+## The connection problem comes first
+
+Before naming a single service, settle how a message actually reaches a
+device that isn't currently asking for anything. Three options, in
+increasing order of how well they fit this problem:
+
+- **Short polling** — client asks "anything new?" every few seconds. Simple,
+  but the request volume is enormous and latency is bounded by the poll
+  interval, not by when the message was actually sent.
+- **Long polling** — client opens a request and the server holds it open
+  until there's something to say (or a timeout). Better latency, but each
+  waiting client still ties up a connection and a request cycle repeats
+  constantly.
+- **Persistent connections** — client opens one long-lived connection
+  (a WebSocket, or a raw TCP socket speaking a lightweight protocol like
+  MQTT) and keeps it open for as long as the app is active. The server
+  pushes a message down the same socket the instant it arrives. This is
+  what real chat systems use, because it's the only option where "message
+  sent" and "message pushed to the recipient" can be milliseconds apart
+  without wasteful request churn.
+
+Persistent connections change the shape of the whole backend: a server
+holding open a socket for a user is now **stateful** — it has to remember
+who's connected to it — which is a fundamentally different scaling problem
+than a stateless HTTP API server that can treat every request as
+independent.
+
+## Major components
+
+### Client apps
+
+Phone, web, and desktop clients each hold one persistent connection when
+active. A single account can have several connections open simultaneously
+(phone plus web, say), which matters for every downstream component: nothing
+in this design should assume "one user equals one active socket."
+
+### Connection gateway (the connection plane)
+
+A tier of stateful servers that terminate persistent client connections,
+handle auth on connect, and do nothing else clever — they're a thin, fast
+layer between the network and the rest of the system. Because a connection
+is sticky to whichever gateway instance accepted it, this tier is scaled by
+adding more instances behind a load balancer that only cares about spreading
+*new* connections evenly; it has no say over where an *existing* connection
+lives.
+
+### Session / presence directory
+
+The piece that answers "which connection-gateway instance (if any) is user
+`U` currently attached to?" Backed by a fast key-value store (something like
+Redis) rather than a relational database, because it's a high-write,
+low-latency lookup table, not a system of record — losing an entry just
+means a brief "reconnect" blip, not lost data. Every connect/disconnect
+updates this directory; every outbound message consults it first. Presence
+semantics (online/offline/last-seen) build on this same directory and get
+their own treatment in the next-but-one lesson.
+
+### Message service
+
+Owns the actual send path: validates a message, assigns it an ID and a
+sequence position, writes it durably, and hands it to the routing layer for
+delivery. This is the one component in the design that must never lose a
+write — everything upstream (retries, dedup, ordering) covered in the next
+lesson assumes the message service got the write right the first time.
+
+### Message store
+
+A durable, horizontally-partitioned store (a wide-column or log-structured
+database fits well) holding message history per conversation, partitioned so
+that a hot group chat doesn't overload a single shard. This is what backs
+"scroll up and see history," multi-device sync (a new device fetches history
+it missed), and offline delivery (undelivered messages wait here until the
+recipient reconnects).
+
+### Routing / delivery layer
+
+Given a message and a recipient's user ID, this layer asks the session
+directory where that user's connections live and pushes the message to each
+one. If the directory says "not connected anywhere," the message stays in
+the message store and delivery is deferred until the recipient's client
+reconnects (at which point it fetches everything it missed) or a push
+notification wakes the app.
+
+### Push notification service
+
+For a recipient whose app is backgrounded or fully closed — no open socket
+at all — this is the only way to reach the device: hand off to
+platform-level push (APNs, FCM) so the OS wakes the app or shows a
+notification. It's a separate concern from in-app delivery and gets its own
+lesson later in this module.
+
+### Media and metadata stores
+
+Photos, videos, and voice notes don't ride through the same path as text —
+they're uploaded to blob storage out of band, and the message that
+references them just carries a URL/handle. Covered in depth two lessons from
+now; for this lesson, the only thing to note is that the message service
+never inlines large binary payloads into the message pipeline itself.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    SenderApp[Sender app] -->|persistent conn| GW1[Connection gateway A]
+    RecipApp[Recipient app] -->|persistent conn| GW2[Connection gateway B]
+    GW1 --> MsgSvc[Message service]
+    MsgSvc --> MsgStore[(Message store: durable, partitioned)]
+    MsgSvc --> Router[Routing / delivery layer]
+    Router --> SessionDir[(Session directory: user to gateway)]
+    Router -->|recipient online| GW2
+    Router -->|recipient offline| PushSvc[Push notification service]
+    PushSvc --> RecipApp
+    GW1 --> SessionDir
+    GW2 --> SessionDir
+`} />
+
+## Worked example: one message, two cases
+
+Trace a single 1:1 message through the boxes above, in both the online and
+offline case. The sender's app has a persistent connection open to
+**gateway A**; it sends the message over that socket. Gateway A forwards it
+to the **message service**, which assigns it an ID, writes it to the
+**message store**, and immediately acks the sender — that ack is what turns
+the message bubble's checkmark solid, and it must not fire before the write
+is durable.
+
+The message service now hands the recipient's user ID to the **routing
+layer**, which asks the **session directory** where that user is connected.
+
+Case one: the recipient is online, attached to **gateway B**. The routing
+layer pushes the message to gateway B, which delivers it down the
+recipient's open socket in well under the interview's target latency budget
+— no polling, no delay beyond one network hop and one lookup.
+
+Case two: the recipient's app is closed and the directory has no entry for
+them. The message already sat down safely in the message store when the
+sender's write succeeded, so nothing is lost — the routing layer instead
+calls the **push notification service**, which wakes the recipient's OS-level
+push channel. When the user opens the app minutes later, their client
+reconnects, and a sync step against the message store fetches everything
+that arrived while they were away.
+
+Notice what didn't have to change between the two cases: the message
+service's write path is identical either way. Online/offline is purely a
+routing-layer decision made *after* durability is already guaranteed — which
+is exactly the property you want to point out out loud in an interview,
+since it's what makes offline delivery a non-event instead of a special
+case bolted on afterward.
+
+<Callout type="warning">
+  A common mistake is drawing one connection-gateway box and treating it
+  like a stateless HTTP server that can be scaled by just adding replicas
+  behind a round-robin load balancer. It can't: a given user's socket lives
+  on exactly one instance, so anything that needs to reach that user has to
+  know *which* instance — that's the whole reason the session directory
+  exists. If your design has connection gateways but no session directory
+  (or equivalent), an interviewer will ask "how does a message sent from
+  gateway A reach a recipient connected to gateway B?" and there won't be an
+  answer. Draw the directory in from the start.
+</Callout>
+
+## Where this leaves you
+
+This lesson named the services and drew the boundary between the connection
+plane (stateful, ties directly to a device) and the message plane (durable,
+partitioned, indifferent to which gateway a user happens to be on). It
+deliberately glossed over the hard parts: what happens when two messages
+arrive out of order, how duplicate sends get deduplicated after a retry, how
+group chats fan a single send out to dozens of recipients, and how presence
+and typing indicators layer on top of the session directory. Those are the
+next two lessons. Media handling and end-to-end encryption — which change
+what actually flows through the message service — come after that.
+
+<Quiz
+  lessonId="whatsapp-high-level-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why do connection gateway servers need a session directory (a user-to-gateway-instance lookup), while a typical stateless REST API tier does not?',
+      options: [
+        { id: 'a', text: "Because a user's persistent connection is pinned to one specific gateway instance, so delivering to that user requires knowing which instance holds their socket.", correct: true, explanation: "Correct — persistent connections are stateful and sticky. A stateless HTTP tier has no equivalent problem because any instance can serve any request." },
+        { id: 'b', text: 'Because REST APIs never need to look up which server a user is on.', correct: false, explanation: "That's true but doesn't explain why chat gateways are different — the reason is that REST servers are stateless per-request, so there's nothing to look up." },
+        { id: 'c', text: 'Because the session directory replaces the need for a durable message store.', correct: false, explanation: 'The session directory and the message store solve different problems — one tracks live connections, the other durably persists message content. Neither substitutes for the other.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are true about the message write path described in this lesson? (Select all that apply.)',
+      options: [
+        { id: 'a', text: "A message is written to durable storage before the sender's app shows it as delivered/acked.", correct: true, explanation: 'Correct — acking before the durable write completes risks the app showing success for a message that was actually lost.' },
+        { id: 'b', text: 'Whether the recipient is online or offline changes how the message is written to the message store.', correct: false, explanation: "It doesn't — the write path is identical either way. Online/offline only affects what the routing layer does *after* the write succeeds." },
+        { id: 'c', text: "If the recipient is offline, the message waits in the durable store until they reconnect or a push notification wakes their app.", correct: true, explanation: 'Correct — durability is guaranteed regardless of recipient connectivity, which is what makes offline delivery reliable rather than best-effort.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A single user account with the chat app open on both a phone and a web browser should be modeled as one persistent connection shared across both surfaces.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Each active surface (phone, web, desktop) typically holds its own persistent connection. Treating it as a single shared connection would mean the routing layer only reaches one of the two devices.' },
+        { id: 'false', text: 'False', correct: true, explanation: "Correct — one account can have multiple simultaneous connections, and the routing/session layer needs to fan a message out to every active one, not just the first it finds." },
+      ],
+    },
+  ]}
+/>

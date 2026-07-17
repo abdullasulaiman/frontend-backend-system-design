@@ -1,0 +1,133 @@
+---
+title: "Consistency, Security, and the CDN Design"
+module: "Content Delivery Network"
+moduleOrder: 11
+order: 4
+track: "concept"
+summary: "Covers the two things a CDN design must get right beyond raw caching — bounding staleness across thousands of edge locations, and stopping the edge from becoming the easiest way to steal or attack your content."
+tags: ["cdn", "consistency", "security", "signed-urls", "edge-computing"]
+estMinutes: 12
+cheatsheet:
+  - "A CDN is eventually consistent by construction — different POPs finish a purge or refresh at different times, so a 'live' window of seconds to tens of seconds where users see different content is normal, not a bug."
+  - "Prefer versioned/hashed asset URLs over relying on purge for consistency: a new URL is a new cache entry everywhere instantly, with no propagation delay."
+  - "For content that must be correct the instant it changes (price, inventory, breaking news), mark it non-cacheable or very-short-TTL and accept the origin load, rather than fighting purge lag."
+  - "Signed URLs/cookies with short expiries are the standard way to gate access to private or paid content at the edge without every request round-tripping to origin."
+  - "Lock the origin down to accept traffic only from the CDN (IP allowlist or a shared secret header) — a signed-URL scheme is worthless if someone can just hit the origin directly."
+  - "Push security checks (auth, geo-restriction, bot filtering) as close to the edge as possible: rejecting a bad request at a POP is nearly free, rejecting it at origin already cost you a hop and origin capacity."
+  - "Multi-CDN failover buys availability but multiplies the number of places your consistency and security rules must be enforced identically — don't treat it as a free win."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The first three lessons in this module got you a working mental model: what a CDN is, how content gets onto it, and how caching and invalidation keep it from serving garbage forever. That's enough to answer "would you use a CDN here?" in an interview. It is not enough to answer the two follow-up questions that separate a pass from a strong pass: *what does a user actually see during the seconds after you publish a change*, and *what stops a CDN — a system explicitly designed to serve your content to anyone, fast, from thousands of locations — from serving it to people you didn't intend, or being used against you*.
+
+Those two concerns, consistency and security, are where CDN design conversations get real. This lesson covers both, then ties them together into a short framework for reasoning about a CDN layer end to end in an interview.
+
+## Consistency: what "up to date" means across thousands of edges
+
+A CDN's whole value proposition is having your content sitting in hundreds or thousands of physical locations. That same fact makes strict consistency impossible in practice — there's no way to atomically update every POP (point of presence) worldwide at the exact same instant, and even a global cache-purge broadcast takes real propagation time across the CDN's internal network.
+
+The practical consequence: after you push a change, there's a window — commonly single-digit seconds, sometimes tens of seconds for a slow or oversized purge — where a POP in Frankfurt is serving the new version while a POP in São Paulo is still serving the old one. This isn't a defect in a particular CDN vendor; it's the physics of "replicate to everywhere, then converge."
+
+Two ways to design around it:
+
+- **Versioned URLs as the primary consistency tool.** Instead of updating `app.js` in place and asking every POP to purge it, ship `app.abc123.js` and change the reference to it. The new URL is a cache miss everywhere the instant a client requests it — no purge, no propagation lag, no stale-version window at all. This is the same cache-busting idea from the previous lesson, but worth calling out here specifically as a *consistency* mechanism, not just a caching one: it sidesteps the propagation problem entirely rather than trying to make purges faster.
+- **Purge/refresh for content that must keep its URL.** Pages, API responses, and anything referenced by a stable, human-visible URL can't be versioned away — you have to purge and accept the propagation window. Know that window's rough size for your CDN and decide whether your product tolerates it (a blog correction: fine; a price change mid-flash-sale: probably not).
+
+For anything where staleness is genuinely unacceptable — account balances, inventory counts, one-time tokens — the right answer is usually "don't cache it at the edge at all," `Cache-Control: no-store` or a TTL of zero, and eat the extra origin load. Fighting a CDN's eventual-consistency model for data that needs strong consistency is a losing battle; routing it around the cache instead is not.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant Client
+    participant Edge as Edge POP
+    participant Origin
+    Client->>Edge: GET /video/42 + signed token
+    Edge->>Edge: verify signature + expiry
+    alt token invalid or expired
+        Edge-->>Client: 403 Forbidden
+    else token valid
+        Edge->>Edge: check cache for object
+        alt cache hit, fresh
+            Edge-->>Client: 200 (from edge cache)
+        else cache miss or stale
+            Edge->>Origin: fetch (origin-shield IP/secret)
+            Origin-->>Edge: 200 + object
+            Edge-->>Client: 200 (cache now warm)
+        end
+    end
+`} />
+
+## Security: the edge is a wide-open front door
+
+A CDN is deliberately built to serve requests from anyone, fast, without hitting your origin. That's exactly the property an attacker or a freeloader wants too. A serious CDN design has to answer four questions.
+
+### Who's allowed to fetch this?
+
+Public assets (a marketing site's CSS) need no gating. Anything private, paid, or licensed needs it at the edge, not just at your app server, or you've defeated the purpose of caching it there. The standard mechanism is a **signed URL or signed cookie**: the origin generates a token (often an HMAC over the resource path plus an expiry timestamp) and the CDN verifies that signature locally, at the POP, before serving from cache. A video-streaming platform issuing a link that's only valid for 6 hours, or an image CDN only serving thumbnails to requests carrying a valid session cookie, are both this pattern.
+
+### Is the transport itself trusted?
+
+TLS should terminate at the edge (so nearby users get a fast, geographically close handshake) with a second, CDN-to-origin TLS leg behind it — "TLS all the way," not "TLS to the edge, plaintext behind it." Certificate management at hundreds of POPs is one of the concrete reasons teams pick a managed CDN over rolling their own edge fleet.
+
+### Can someone bypass the edge and hit origin directly?
+
+This is the single most common gap. If your origin's IP or hostname is discoverable and accepts any request, an attacker skips your signed-URL checks, your rate limiting, and your DDoS scrubbing entirely by going straight to origin. **Origin shielding** — restricting the origin to accept traffic only from the CDN's published IP ranges, or requiring a shared secret header the CDN injects on every forwarded request — closes this. Treat "is the origin locked to CDN-only traffic" as a mandatory checklist item, not an optional hardening step.
+
+### Is the edge itself being used as a weapon?
+
+Because a CDN absorbs huge request volumes by design, it's also your first line of defense against volumetric DDoS: a well-configured CDN can absorb and rate-limit a flood at the edge, where capacity is enormous, rather than letting it reach a comparatively tiny origin fleet. The flip side is **hotlinking** — someone else's site embedding your image or video URL directly, so your CDN bill pays to serve their traffic. Checking the `Referer`/`Origin` header at the edge and rejecting unexpected ones is the standard cheap fix. Geo-restriction (blocking or allowing by country, for content-licensing reasons) is the same idea applied to location instead of referrer.
+
+<Callout type="warning">
+  A very common design mistake: teams implement signed URLs correctly at the CDN layer, feel done, and never lock down the origin. The origin's hostname often leaks — through DNS history, a misconfigured CNAME, error pages, or just being guessable — and once it does, every security control you built into the edge is void, because the origin will happily serve unsigned, unauthenticated requests to anyone who asks. Signed URLs and origin shielding are a pair; shipping one without the other is not actually secure.
+</Callout>
+
+## Worked example: publishing a price change on a global storefront
+
+Say a retailer runs a flash sale and needs a price drop live everywhere within 2 seconds, while product images can lag by up to a minute with no harm. Two different consistency strategies, on purpose:
+
+- **Price**: served from an API response marked `no-store` (or a 1–2 second TTL at most), so every request either bypasses the edge cache or refreshes almost immediately — the "acceptable staleness" here is near zero, so you pay the origin-load cost.
+- **Product images**: served with a long TTL and versioned filenames per image revision (`shirt-v3.jpg`). A photo update ships as a new URL, so there's no purge to wait on and no stale-image window — old pages referencing `shirt-v2.jpg` simply keep working until they're re-crawled or re-rendered.
+
+Security-wise, the storefront's checkout API responses are gated behind signed, short-lived tokens tied to the logged-in session (so a cached response for user A is never replayed to user B), while the product images stay public and cacheable by anyone, with only hotlink protection to stop other sites embedding them directly. One system, two different consistency SLAs and two different access-control postures, chosen deliberately per asset type rather than applied uniformly.
+
+## Quiz
+
+<Quiz
+  lessonId="cdn-consistency-security-and-the-cdn-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A team wants a JS bundle update to be instantly consistent across every edge POP the moment it deploys, with zero stale-version window. What is the most reliable way to achieve that?',
+      options: [
+        { id: 'a', text: 'Issue a global purge for the old bundle URL and wait for it to propagate', correct: false, explanation: 'Purge propagation across thousands of POPs takes real time (seconds to tens of seconds); it cannot guarantee a zero stale-version window.' },
+        { id: 'b', text: 'Reduce the TTL on the bundle to a few seconds', correct: false, explanation: 'A short TTL still leaves a window where some POPs serve the old cached copy until it expires and revalidates — it shrinks the gap but does not eliminate it.' },
+        { id: 'c', text: 'Give the new bundle a new, versioned/hashed URL and update the reference to it', correct: true, explanation: 'A new URL is a cache miss everywhere from the first request — every POP fetches the new content on demand instead of needing to converge on a purge, so there is no stale-version window at all.' },
+        { id: 'd', text: 'Disable caching for the bundle entirely', correct: false, explanation: 'This avoids staleness but sacrifices all the latency and origin-offload benefits of the CDN for that asset — versioned URLs get zero staleness without giving up caching.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are necessary parts of gating private content behind signed URLs at the CDN edge? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The edge POP verifies the signature and expiry before serving from cache', correct: true, explanation: 'This is the actual enforcement point — without it, the "signed URL" is just an unchecked string in the path.' },
+        { id: 'b', text: 'The origin is restricted to accept requests only from the CDN (IP allowlist or shared secret header)', correct: true, explanation: 'Without this, anyone who discovers the origin\'s address can bypass the signed-URL check entirely and hit origin directly.' },
+        { id: 'c', text: 'The signed token has an expiry far enough in the future that it never needs re-issuing', correct: false, explanation: 'The opposite is true — short expiries limit the damage if a token leaks. Long-lived tokens increase risk, they do not improve security.' },
+        { id: 'd', text: 'TLS terminates at the edge so the request and token are encrypted in transit', correct: true, explanation: 'If the token travels in plaintext it can be captured and replayed by anyone observing the network path, defeating the purpose of signing it.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Because a CDN caches content across many geographically distributed POPs, it is generally reasonable to expect brief staleness windows of seconds after a purge, rather than instant global consistency.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Propagating a purge to every POP worldwide takes real network time, so a short staleness window is an expected consequence of the architecture, not a misconfiguration.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Instant global consistency across thousands of physically distributed caches is not achievable with purge-based invalidation — some propagation delay is inherent to the model.' },
+      ],
+    },
+  ]}
+/>

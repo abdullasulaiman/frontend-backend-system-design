@@ -1,0 +1,200 @@
+---
+title: "Designing Client-Side Error Reporting"
+module: "Monitor Client-Side Errors"
+moduleOrder: 15
+order: 2
+track: "concept"
+summary: "Walks through architecting an end-to-end client-side error reporting pipeline, from in-browser capture and batching through ingestion, deduplication, symbolication, and alerting."
+tags: ["error-monitoring", "observability", "client-side", "system-design", "reliability"]
+estMinutes: 13
+cheatsheet:
+  - "Capture at three layers: global handlers (window.onerror, unhandledrejection), framework error boundaries, and manual try/catch at risky call sites — no single layer catches everything."
+  - "Batch and use sendBeacon (or keepalive fetch) on unload so a reporting request never blocks or gets killed by page navigation."
+  - "Fingerprint errors by normalized message plus stack shape (not raw stack text) so the same bug reported from 50,000 devices collapses into one issue, not 50,000."
+  - "Symbolicate minified stack traces server-side against uploaded source maps, keyed by release/build version — never ship source maps to production users."
+  - "Sample and rate-limit at the client before you ever hit the network; it's cheaper to drop 99% of a repeating error client-side than to ingest and dedup it server-side."
+  - "Scrub PII (emails, tokens, form values) from breadcrumbs and payloads at capture time, not after storage — you can't un-store what you never should have collected."
+  - "Design for the reporting pipeline itself to fail open: if ingestion is down, drop and count locally rather than blocking the user's app or crash-looping the reporter."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson laid out why client-side errors are hard to monitor in
+the first place: you don't control the runtime, the network is unreliable,
+minified code obscures stack traces, and a single bug can fire from millions
+of devices at once. This lesson is about the answer to that problem — how
+you'd actually design a system that captures those errors, gets them off the
+device reliably, and turns a flood of raw JavaScript exceptions into a
+short, actionable list of real bugs an engineer can triage.
+
+Think of this as two systems glued together: a lightweight **client SDK**
+that lives inside the app and does the capturing, and a **backend ingestion
+pipeline** that receives, processes, and stores what the SDK sends. Get the
+split right and each side can evolve independently — the SDK stays tiny and
+fast, the backend does the expensive work of making sense of the data.
+
+## What the client SDK has to do
+
+The SDK's job is narrow: catch errors, attach context, and get the payload
+off the device without hurting the user's experience. Four responsibilities
+fall out of that:
+
+**Capture.** No single hook catches every error, so a real SDK layers
+several: a global `window.onerror` for uncaught exceptions, a
+`window.addEventListener('unhandledrejection', ...)` for promise rejections
+that nobody `.catch()`ed, framework-level error boundaries (React error
+boundaries, Vue's `errorHandler`) for errors thrown during render, and
+manual `try/catch` wrapping around risky call sites like third-party script
+execution or `JSON.parse` on untrusted data. Each layer catches a different
+class of failure; skipping any one of them leaves a blind spot.
+
+**Enrich.** A bare stack trace is nearly useless on its own. Before an error
+leaves the device, the SDK attaches: the release/build version, the user
+agent and OS, a session or anonymized user ID, the URL and route at the time
+of the error, and a **breadcrumb trail** — a rolling log of the last N
+clicks, navigations, and network calls leading up to the crash. Breadcrumbs
+are often what actually explains a bug; "TypeError: cannot read property of
+undefined" means nothing alone, but "clicked 'Apply Coupon' → fetch
+`/api/cart` returned 500 → TypeError" tells you exactly where to look.
+
+**Batch, don't stream.** Firing a network request per error is wasteful and
+can itself cause problems (an error handler that throws inside a fetch call
+can loop). Instead, queue errors in memory and flush on a timer (e.g. every
+5 seconds) or when the queue hits a size limit, sending a batch in one
+request. On page unload — where a normal `fetch` can get cancelled mid-flight
+— use `navigator.sendBeacon` (or `fetch` with `keepalive: true`) so the
+browser guarantees the request is attempted even as the page tears down.
+
+**Sample and rate-limit locally, before the network.** If a bug fires on
+every render in a loop, you do not want ten thousand identical reports per
+user per minute. The SDK should recognize a repeating error (by message +
+location) and drop or heavily sample it client-side, keeping only a count.
+This is the cheapest place to control volume — a dropped event costs
+nothing; an ingested-then-deduped event still cost you a network request,
+parsing, and storage before it got thrown away.
+
+## What the backend pipeline has to do
+
+Once batches start arriving from millions of devices, the backend's job is
+to turn noise into signal.
+
+**Ingest at the edge, cheaply.** The first hop should be a lightweight,
+horizontally scaled collector that does almost nothing except validate the
+payload shape, stamp a receive timestamp, and drop it onto a queue (Kafka,
+SQS, or similar). This decouples "surviving a traffic spike" (scale the
+collector) from "processing correctly" (scale the workers behind the
+queue) — the same pattern you'd use for any high-volume ingestion system.
+
+**Deduplicate by fingerprint, not raw text.** Two reports of "the same bug"
+rarely have byte-identical stack traces — line numbers shift between
+minor releases, and memory addresses or object IDs sometimes leak into
+messages. The pipeline computes a **fingerprint**: a hash built from the
+normalized error message (numbers and IDs stripped out) plus the shape of
+the stack (function names and file locations, not exact line-column noise).
+Reports with the same fingerprint become occurrences of one **issue**,
+not a new bug each time. This single step is what turns "50,000 error
+reports last hour" into "3 distinct issues, one of which spiked."
+
+**Symbolicate stack traces.** Production JavaScript is minified, so a raw
+stack trace points at `a.js:1:48213`, not a function name and line an
+engineer recognizes. The build pipeline uploads a **source map** per release
+to the error-reporting backend at deploy time, keyed by release version and
+file hash. When a report comes in tagged with its release version, a
+symbolication worker looks up the matching source map and rewrites the
+stack into real file names, function names, and line numbers before it's
+ever shown to an engineer.
+
+**Alert on trend, not on raw count.** Because errors are dedup'd into
+issues, alerting can compare each issue's occurrence rate against its own
+baseline: a brand-new issue appearing at any volume, or an existing issue's
+rate suddenly doubling, is worth paging on. A steady trickle of a known,
+low-severity issue is not.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    A[Browser: global handlers + error boundaries] --> B[SDK: enrich + breadcrumbs]
+    B --> C[SDK: batch + sample]
+    C -->|sendBeacon / fetch keepalive| D[Edge collector]
+    D --> E[Ingestion queue]
+    E --> F[Fingerprint + dedup worker]
+    F --> G[Symbolication worker]
+    G --> H[Issue store]
+    H --> I[Alerting rules]
+    H --> J[Dashboard / triage UI]
+`} />
+
+## Worked example: sizing the pipeline
+
+Say your app has 5 million daily active users, and historically about 2% of
+sessions hit at least one JS error, averaging 3 errors per affected session
+once one starts (errors often cascade — one failure triggers others
+downstream).
+
+That's roughly `5,000,000 x 0.02 x 3 = 300,000` raw error events per day, or
+about 3.5 events/second sustained — but error traffic is bursty, not flat: a
+bad deploy can spike that 50-100x for the minutes before it's rolled back,
+so the collector tier needs to be sized (and auto-scaled) for a spike of
+tens of thousands of events per second, not the daily average.
+
+Client-side sampling of known repeat errors is what keeps that spike
+survivable. If a single bad deploy causes one error to fire on every page
+load for 10% of active users within a 5-minute window, that's tens of
+thousands of devices each wanting to report the same fingerprint
+repeatedly. Capping each session to, say, the first 5 occurrences of any
+one fingerprint (with a rolling count for the rest) can cut that spike's
+network traffic by an order of magnitude before it ever reaches your
+ingestion queue — the difference between the collector tier calmly
+absorbing a deploy-triggered spike and it falling over at the exact moment
+you need visibility most.
+
+<Callout type="warning">
+  A common mistake: treating the error-reporting pipeline as more important
+  than the app it monitors, so a slow or down ingestion endpoint ends up
+  blocking user interactions (e.g. an error handler that awaits a fetch
+  response before letting execution continue) or crash-looping the SDK
+  itself when the network call to report an error itself throws. Reporting
+  must fail open: if the batch can't be sent, drop it (optionally keeping a
+  local count) and move on. A monitoring system that can degrade the
+  product it's supposed to be watching has the priority exactly backwards.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="cli-err-designing-client-side-error-reporting"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does a well-designed client SDK sample or rate-limit repeating errors locally, before sending anything over the network?',
+      options: [
+        { id: 'a', text: 'Because dropping a duplicate event client-side costs nothing, while sending it first and deduping on the backend still burns a network request, parsing, and queue capacity before the duplicate is discarded.', correct: true, explanation: 'Correct — the cheapest place to control volume is before the network hop; server-side dedup still pays the cost of ingesting the event first.' },
+        { id: 'b', text: 'Because backend deduplication by fingerprint is not technically possible for JavaScript stack traces.', correct: false, explanation: 'Backend fingerprint-based dedup is exactly how the pipeline collapses repeat reports into one issue — it is possible and described in the lesson; the reason to also sample client-side is cost and spike survivability, not backend impossibility.' },
+        { id: 'c', text: 'Because browsers block more than a few network requests per page from the same origin.', correct: false, explanation: 'This isn’t the reason given — modern browsers allow many concurrent requests; the actual motivation is controlling ingestion cost and protecting the pipeline from spikes, not a hard browser request limit.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine reasons the backend fingerprints errors before treating them as "the same issue"? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Line numbers and minor build details can shift between releases even though the underlying bug is unchanged.', correct: true, explanation: 'Correct — normalizing the stack shape rather than matching raw text absorbs this kind of noise across releases.' },
+        { id: 'b', text: 'Messages sometimes embed IDs or memory addresses that differ per occurrence despite representing the same root cause.', correct: true, explanation: 'Correct — stripping variable data like IDs out of the message before hashing is part of what makes fingerprinting effective.' },
+        { id: 'c', text: 'Without fingerprinting, a bug firing on many devices would otherwise show up as one report per device rather than one issue with many occurrences, making triage far harder.', correct: true, explanation: 'Correct — this is the core payoff: dedup turns tens of thousands of raw reports into a handful of triageable issues.' },
+        { id: 'd', text: 'Fingerprinting is required so the browser can compress the payload before sending it.', correct: false, explanation: 'Fingerprinting happens on the backend for deduplication purposes and has nothing to do with client-side payload compression.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Production source maps should be uploaded to the error-reporting backend at deploy time and kept out of what is actually shipped to users\' browsers.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — the backend needs the source map to symbolicate stack traces for engineers, but shipping it to production would let anyone unminify and read your source, so it is uploaded to the backend separately and kept off the public bundle.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Source maps are necessary for symbolication and should exist somewhere, but serving them publicly alongside the production bundle exposes readable source code — the correct design uploads them privately to the error backend instead.' },
+      ],
+    },
+  ]}
+/>

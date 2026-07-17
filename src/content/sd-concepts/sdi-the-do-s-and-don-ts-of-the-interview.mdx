@@ -1,0 +1,137 @@
+---
+title: "The Do's and Don'ts of the Interview"
+module: "System Design Interviews"
+moduleOrder: 2
+order: 2
+track: "concept"
+summary: "Covers the concrete behaviors that make a system design interview go well or badly, independent of how much you know about distributed systems."
+tags: ["interview-technique", "communication", "system-design", "interview-prep"]
+estMinutes: 11
+cheatsheet:
+  - "State assumptions and requirements out loud before drawing anything — an un-scoped design can't be judged as right or wrong."
+  - "Talk while you think. A correct answer delivered in silence scores worse than a slightly messier one narrated clearly."
+  - "Drive the interview: propose a plan for the 40-45 minutes ('requirements, then high-level design, then two deep dives') instead of waiting to be told what's next."
+  - "Defend a choice with one sentence of reasoning and move on — don't spiral into justifying a decision for five minutes."
+  - "When the interviewer interrupts or redirects, that's a signal to follow, not an objection to argue with."
+  - "Never present a single component or a single number as fixed truth — say 'I'd want to confirm this, but assuming X...' and keep moving."
+  - "Leave 3-5 minutes at the end to summarize the design and name its known weaknesses yourself, before the interviewer has to ask."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Two candidates can know the same amount about distributed systems and walk out of the same interview with completely different outcomes. One drew a clean diagram, talked through trade-offs out loud, and finished with time to spare. The other knew just as much, but stayed quiet while thinking, went deep on the wrong component for fifteen minutes, and never got to the part of the design the interviewer actually cared about.
+
+System design interviews aren't graded purely on "did you get the right answer" — there usually isn't one right answer. They're graded on how you think, how you communicate, and how you manage a loosely structured 45 minutes under pressure. That's a skill you can train separately from the technical material, and it's the fastest score improvement available to most candidates. This lesson is a practical checklist of what to do and what to avoid, building on the mindset from the previous lesson on getting ready.
+
+## The do's
+
+### Narrate your thinking
+
+Silence is the single biggest score-killer in this interview format. An interviewer evaluating you in real time has no way to distinguish "thinking carefully" from "stuck" unless you tell them. Say what you're weighing out loud: "I'm deciding between a relational store and a wide-column store here — the access pattern is mostly writes keyed by user ID, so I'm leaning wide-column." That sentence takes ten seconds and gives the interviewer everything they need to follow you, even if they'd have made a different call.
+
+### Scope before you design
+
+Every prompt ("design a URL shortener," "design a ride-hailing dispatch system") is intentionally underspecified. Before drawing a single box, pin down: who are the users, what are the core actions, what's the read/write ratio, what scale (users, requests/sec, data size), and what can be sacrificed if it must be (strong consistency, sub-second latency, exact counts). Two or three minutes here saves you from designing the wrong system entirely — a mistake that's expensive to unwind once you're 20 minutes in.
+
+### Drive the clock yourself
+
+Treat the interview as a shared 40-45 minute budget and propose how to spend it: "I'll spend a few minutes on requirements, sketch the high-level design, then go deep on the two or three parts that matter most — does that work?" Interviewers consistently rate candidates who structure the session higher than candidates who wait passively for the next question, even when the underlying designs are similar in quality.
+
+### Size things with real numbers
+
+Whenever a load or capacity question is even loosely relevant, do the arithmetic out loud instead of gesturing at it. "If we have 5 million daily active users averaging 20 requests each, that's 100 million requests/day, or roughly 1,200 requests/sec average — call it 5,000/sec at peak." You don't need precision; you need to show that your design decisions (how many shards, whether to cache, whether a single database can hold this) are grounded in an actual number rather than a vibe.
+
+### Follow the interviewer's redirects
+
+If an interviewer interrupts to ask about a specific component, that's a strong signal about what they want to evaluate next — not an objection to your design. Answer the question they asked, briefly acknowledge the pivot, and move there. Candidates who plow ahead with their own plan after being redirected read as poor listeners, regardless of how good the ignored material was.
+
+### Name your own design's weaknesses
+
+Near the end, spend a minute stating what you'd revisit with more time: "This design assumes read-after-write consistency isn't required for the feed — if it were, I'd need to rework the caching layer." Naming a weakness yourself reads as seniority. Having the interviewer find it and ask "but what about X?" reads as a gap.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Requirements and scope<br/>2-3 min] --> B[High-level design<br/>8-10 min]
+  B --> C[Deep dive #1<br/>interviewer-chosen or highest-risk area]
+  C --> D[Deep dive #2<br/>second area, or trade-off discussion]
+  D --> E[Wrap-up: recap + known gaps<br/>3-5 min]
+`} />
+
+## The don'ts
+
+### Don't design in silence
+
+Even five minutes of silent thinking while sketching feels much longer to an interviewer who has no visibility into your reasoning. If you need a moment to think, say so explicitly ("give me a second to think through the write path") rather than just going quiet — then narrate as soon as you resume.
+
+### Don't over-defend a single decision
+
+It's fine to pick SQL over NoSQL, or a queue over direct calls, and give one or two sentences of reasoning. It's a problem when a candidate spends five of their forty-five minutes re-litigating that same choice after the interviewer has already accepted it or moved on. State the trade-off, make the call, keep going — you can always revisit it later if new information changes the calculus.
+
+### Don't treat the first idea as final
+
+The first architecture you sketch is a starting point, not a commitment. Strong candidates revise components mid-interview as new requirements surface ("actually, given that we need multi-region writes, I'd swap this for..."). Treating your initial sketch as untouchable, even when it visibly doesn't fit a constraint raised later, is a common way to lose credit you'd otherwise earn.
+
+### Don't skip the numbers entirely
+
+A design with no capacity estimation at all leaves the interviewer unable to tell if you understand *why* you added a cache, a shard, or a queue, versus just knowing those are "the things you add." Even rough, rounded numbers change how a design reads.
+
+### Don't go deep on a low-value component
+
+Time is the scarcest resource in this interview. Spending fifteen minutes on the exact schema of a rarely-touched admin table, while never reaching the core deep dive (say, message ordering in a chat system, or dispatch matching in a ride-hailing system) is a common way for a technically strong candidate to score poorly. If you're unsure where the "interesting" part of the system is, ask the interviewer directly — "Would you like me to go deeper on the write path or the notification delivery?" is a completely normal thing to say.
+
+### Don't forget who the interview is for
+
+The interviewer is trying to build a mental model of how you'd behave designing something on their team. Jargon-dropping without explanation, dismissing a reasonable alternative without reasoning, or refusing to engage with a "what if this component fails?" question all work against that goal — even if your primary design is solid.
+
+## Worked example: the first five minutes, done two ways
+
+Prompt: "Design a system that lets users upload a photo and have it show up in their followers' feeds."
+
+**Candidate A** starts sketching a client, an upload service, a feed service, and a database, narrating box names as they draw, without asking a single question. Two minutes in, the interviewer asks, "what's the expected scale?" — and the candidate hasn't thought about it, guesses "a few thousand users," and has to redo assumptions live.
+
+**Candidate B** opens with: "Before I design anything, let me confirm scope. Is this closer to Instagram-scale — millions of users, feeds are eventually-consistent and can lag by a few seconds — or a smaller app where near-real-time delivery matters more? And are we uploading just photos, or video too?" The interviewer answers: photos only, tens of millions of users, a few seconds of feed lag is fine. Candidate B now sizes it: "Say 20 million daily active users, each posting roughly twice a week and checking their feed 5 times a day — that's about 100 million feed reads/day, call it 1,500/sec average with spikes at peak hours." Only then do they start drawing components, and each one is now justified by a stated constraint.
+
+Both candidates might arrive at similar final architectures. Candidate B's interviewer walks away far more confident in how B would operate on a real team.
+
+<Callout type="warning">
+  The most common failure mode isn't a bad architecture — it's an interviewer who can't tell what you're thinking. If you catch yourself sketching quietly for more than 20-30 seconds, stop and say a sentence about what you're doing, even something as simple as "I'm laying out the main services before connecting them." Silence gets scored as uncertainty far more often than candidates expect.
+</Callout>
+
+<Quiz
+  lessonId="sdi-the-do-s-and-don-ts-of-the-interview"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'An interviewer interrupts your high-level design walkthrough to ask specifically about how you would handle duplicate uploads. What is the best response?',
+      options: [
+        { id: 'a', text: 'Answer the duplicate-upload question directly, then return to your original plan', correct: true, explanation: 'A mid-design interruption is almost always a signal about what the interviewer wants to evaluate next. Answering it directly, then resuming, shows you can follow direction.' },
+        { id: 'b', text: 'Politely explain you will get to that during the deep dive and continue the current explanation', correct: false, explanation: 'This ignores a strong signal from the interviewer about what they want to see next, and can read as not listening.' },
+        { id: 'c', text: 'Restart the design from scratch to fit the new question in from the beginning', correct: false, explanation: 'This wastes time; you can address the question in place without discarding the design you have already built.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are described in this lesson as common mistakes that hurt a score, even when the underlying technical knowledge is solid? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Thinking silently for several minutes while sketching a diagram', correct: true, explanation: 'Silence is called out as the biggest score-killer, since the interviewer cannot tell thinking apart from being stuck.' },
+        { id: 'b', text: 'Spending a disproportionate amount of time defending or re-justifying one already-accepted design choice', correct: true, explanation: 'Over-defending a decision the interviewer has already accepted burns time that should go toward deeper, higher-value parts of the design.' },
+        { id: 'c', text: 'Asking the interviewer directly which part of the system they would like explored more deeply', correct: false, explanation: 'This is presented as a good practice, not a mistake — it helps ensure limited time goes toward what the interviewer actually wants to evaluate.' },
+        { id: 'd', text: 'Stating rough capacity numbers before they have been fully confirmed', correct: false, explanation: 'The lesson recommends doing rough, stated-assumption estimation rather than skipping numbers altogether — it is presented as good practice, not a mistake.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'According to this lesson, the first architecture a candidate sketches should generally be treated as a fixed commitment for the rest of the interview.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The lesson explicitly says the opposite: the first sketch is a starting point, and strong candidates revise it as new requirements surface.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Treating an initial design as untouchable, even when a later constraint no longer fits it, is called out as a way to lose credit unnecessarily.' },
+      ],
+    },
+  ]}
+/>

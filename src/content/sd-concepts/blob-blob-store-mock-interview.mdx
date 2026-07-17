@@ -1,0 +1,138 @@
+---
+title: "Blob Store: Mock Interview"
+module: "Blob Store"
+moduleOrder: 20
+order: 5
+track: "concept"
+summary: "A timed mock interview that pulls requirements, data model, partitioning, and durability decisions together into one end-to-end blob store design."
+tags: ["blob-store", "mock-interview", "system-design", "object-storage", "durability"]
+estMinutes: 14
+cheatsheet:
+  - "Open by pinning down object size distribution and mutability — a photo-upload service and a video-archival system both say 'blob store' but need very different chunking, part-size, and durability choices."
+  - "Separate the metadata path from the data path in your design out loud: a small, strongly consistent index (bucket/key -> object location, size, version) versus the bulk data plane storing the bytes."
+  - "Justify replication vs. erasure coding by durability target and cost, not by memorization — 3x replication is simpler and cheaper on small clusters; erasure coding wins on storage overhead at large scale but costs more CPU and repair complexity."
+  - "Multipart/chunked upload isn't just for big files — it's how you get resumability and parallelism, and it forces you to discuss what happens to partial uploads that never get completed."
+  - "State your consistency model for writes explicitly: read-after-write on the same key is table stakes; cross-region consistency almost always is not, and saying so is a strength, not a gap."
+  - "Close with a capacity estimate (objects/day, bytes/day, replication factor) and at least one failure mode: a disk failing mid-write, a stalled multipart upload, or a hot object saturating one node."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+import MockInterview from '../../components/MockInterview';
+
+The first four lessons in this module handed you the pieces one at a time: what a blob store needs to promise, how objects and metadata are modeled, how data gets spread across nodes durably, and how the whole thing gets assembled. In an actual interview, you get none of that scaffolding. You get one open-ended prompt — "design a storage service for user-uploaded photos" or "design something like S3" — and 45 minutes to build the whole thing out loud while someone evaluates how you think, not just what you know.
+
+This lesson is that exercise. Set a timer, talk through a design before you look at the rubric, and treat the questions below as things a strong candidate raises unprompted.
+
+## How this fits into the interview
+
+"Design a blob store" is rarely the literal ask — it's usually "design the storage layer behind X," where X is a photo-sharing app, a video platform, a backup service, or a general-purpose object store like S3 or GCS. The interviewer wants to see you:
+
+1. Turn "store large files" into concrete numbers — object sizes, upload/read ratio, mutability, and durability target.
+2. Separate concerns cleanly: a metadata index, a data plane that stores bytes, and (usually) a CDN or cache in front of reads.
+3. Make partitioning, replication, and consistency choices that reinforce each other instead of contradicting each other.
+4. Volunteer the failure modes and trade-offs of your own design before being asked.
+
+That fourth point is the real differentiator. Most candidates can draw "client -> API -> storage nodes." Fewer explain, unprompted, what happens when a multipart upload stalls halfway through, or why they picked replication over erasure coding for this specific workload.
+
+## A structure for the 45 minutes
+
+- **Minutes 0–8: requirements.** Object size range (KB thumbnails vs. multi-GB video), read/write ratio, mutability (are objects ever overwritten, or write-once?), durability and availability targets, and rough scale (uploads/day, total bytes stored).
+- **Minutes 8–15: data model and API shape.** Bucket/key naming, metadata (owner, content-type, size, checksum, version) versus the raw bytes, and the put/get/delete/list surface a client actually needs.
+- **Minutes 15–25: partitioning and chunking.** How keys map to storage nodes, how large objects get split into chunks or parts, and how multipart upload works end to end.
+- **Minutes 25–35: replication, durability, and consistency.** Replication factor or erasure coding scheme, cross-node/cross-AZ placement, and what a client can observe immediately after a write.
+- **Minutes 35–45: failure modes and a capacity check.** Node loss, stalled uploads, hot-object handling, and a back-of-envelope storage/throughput estimate.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    A[Clarify requirements: size, mutability, durability] --> B[Data model: metadata index vs data plane]
+    B --> C[Partitioning: key to node mapping, chunking large objects]
+    C --> D[Durability: replication factor or erasure coding]
+    D --> E[Consistency: read-after-write, multipart upload lifecycle]
+    E --> F[Failure modes + capacity estimate]
+`} />
+
+## Questions a strong candidate asks first
+
+A bare prompt like "design a blob store for user photo uploads" rewards candidates who narrow scope before drawing boxes:
+
+- **What's the object size distribution?** A photo service (KBs to low MBs) can treat most uploads as single-shot puts; a video platform (GBs) forces multipart upload and chunked storage into the design from minute one.
+- **Are objects ever mutated after upload, or strictly write-once-read-many?** Write-once simplifies concurrency control enormously — no need to reconcile concurrent overwrites of the same key.
+- **What durability target, and against what failure?** "Survive a single disk failure" and "survive an entire region going dark" imply very different replica counts and placement strategies.
+- **What's the read pattern — mostly recent uploads, or long-tail access to old objects?** This decides whether a CDN/cache in front of the store is load-bearing or a nice-to-have, and whether cold-storage tiering is worth discussing.
+
+Asking these before proposing an architecture is the highest-leverage move available in the first five minutes — and it signals to the interviewer that you don't treat "just store the bytes somewhere" as the whole problem.
+
+## Where candidates lose points
+
+The failure pattern this lesson exists to prevent: a candidate draws a ring of storage nodes, says "we'll replicate three times," and never connects that number to a stated durability target, never distinguishes the metadata path from the data path, and never mentions what happens to an upload that fails halfway through. The design looks correct in isolation and falls apart the moment the interviewer asks "what if a 2 GB upload dies at 80%?" or "how do you know a `GET` right after a `PUT` returns the object you just wrote?"
+
+The fix is narrating the connective tissue between decisions: "I'm splitting uploads over 100 MB into chunked parts *because* a single connection failure shouldn't force a full re-upload of a multi-gigabyte file — the client can resume from the last acknowledged part." That's a stronger sentence than just stating "we support multipart upload."
+
+<Callout type="interview">
+  When two reasonable options exist — replication vs. erasure coding, strong vs. eventual cross-region consistency — say the trade-off out loud and commit to one: "I'll replicate 3x within a region for simplicity and fast rebuild time; if this were a cold-archive tier where storage cost dominates, I'd switch to erasure coding at the cost of slower reconstruction." Ten seconds of narrated trade-off reads as judgment; silently picking one reads as guessing.
+</Callout>
+
+## Worked example: sizing the thing you just designed
+
+Suppose requirements-gathering surfaced this: a photo-sharing app ingesting 5 million uploads/day, average object size 3 MB, with a 3x replication policy and a 5-year retention requirement.
+
+- **Daily raw ingest**: 5,000,000 × 3 MB ≈ 15 TB/day of new object data before replication.
+- **Stored footprint with replication**: 15 TB/day × 3 ≈ 45 TB/day actually written to disk across the cluster.
+- **Retained footprint at steady state**: 45 TB/day × 365 × 5 ≈ 82 PB after five years — a number large enough to justify discussing tiering (hot storage for recent uploads, cheaper cold storage or erasure-coded tiers for objects untouched after, say, 90 days).
+- **Write throughput**: 5,000,000 uploads/day ≈ 58 objects/sec average, but photo apps are bursty — planning for a 5–10x peak multiplier (roughly 300–600 objects/sec at peak) is a reasonable assumption to state explicitly rather than silently designing for the average.
+
+That's the reasoning to produce live: take one number from requirements, turn it into a storage or throughput estimate, and let the estimate justify a design decision (here, that tiering becomes worth mentioning once the five-year number gets into petabytes).
+
+<Quiz
+  lessonId="blob-blob-store-mock-interview"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A candidate is given "design a storage service for user-uploaded videos" with no other detail. What is the strongest first move?',
+      options: [
+        { id: 'a', text: 'Immediately propose erasure coding across storage nodes, since it is the most storage-efficient durability scheme.', correct: false, explanation: 'Erasure coding vs. replication is a trade-off that depends on scale and repair-cost tolerance, neither of which has been established yet — proposing it first skips the reasoning that justifies it.' },
+        { id: 'b', text: 'Ask about object size range, mutability, durability target, and read pattern before proposing any architecture.', correct: true, explanation: 'These answers directly determine whether multipart upload is required, how many replicas are justified, and whether a CDN or cold-storage tier matters — gathering them first lets every later choice be justified rather than assumed.' },
+        { id: 'c', text: 'Pick a fixed 3x replication factor as a safe industry-standard default and move straight to partitioning.', correct: false, explanation: 'It may turn out to be the right number, but choosing it before knowing the durability target or object mutability means it is not actually justified, and it looks that way to an interviewer.' },
+        { id: 'd', text: 'Ask which programming language the storage nodes should be written in.', correct: false, explanation: 'Implementation language is not a system design concern here and has no bearing on any of the architectural decisions being evaluated.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Given a service with objects up to several GB in size and a strict read-after-write requirement on the same key, which design choices are well justified by those two facts? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Splitting large uploads into chunked parts with a resumable multipart upload protocol.', correct: true, explanation: 'Multi-gigabyte objects make a single-shot upload fragile against connection drops — chunking lets the client resume from the last completed part instead of restarting entirely.' },
+        { id: 'b', text: 'Guaranteeing that a GET immediately following a PUT to the same key returns the newly written object.', correct: true, explanation: 'This is exactly what the stated read-after-write requirement demands, so the design must route reads of a just-written key to a location known to have the latest data.' },
+        { id: 'c', text: 'Relying purely on eventual cross-region replication with no same-key read-after-write guarantee.', correct: false, explanation: 'This directly contradicts the stated requirement — eventual-only consistency cannot promise a read immediately after a write on the same key returns the new value.' },
+        { id: 'd', text: 'Storing every object as a single opaque write regardless of size, with no chunking.', correct: false, explanation: 'For multi-gigabyte objects this makes uploads fragile and non-resumable, which is the opposite of what the stated object-size fact should push the design toward.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In this mock-interview format, explicitly separating the metadata index (bucket/key, size, version) from the bulk data plane (the actual bytes) is a minor implementation detail that rarely affects the interviewer\'s assessment.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'This separation is central, not incidental — it explains why metadata can be strongly consistent and queried cheaply while the data plane is optimized for large sequential writes and reads at very different scale.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — naming this split explicitly is one of the clearest signals that a candidate understands why blob stores are architected differently from a general-purpose database, and it sets up cleaner reasoning about consistency and partitioning later.' },
+      ],
+    },
+  ]}
+/>
+
+<MockInterview
+  lessonId="blob-blob-store-mock-interview"
+  client:visible
+  prompt="Design a blob storage service for a photo- and video-sharing application. Users upload media (photos in the low single-digit MBs, videos up to several GB), and the service must serve reads at high volume with low latency, tolerate storage node and disk failures without losing data, and support resumable uploads for large files. Design the system end to end: data model, partitioning, durability strategy, and consistency guarantees. Assume you can ask the interviewer clarifying questions."
+  rubric={[
+    { point: 'Gathers requirements before designing', detail: 'Asks about object size distribution, mutability, durability target, read/write ratio, and expected scale before proposing an architecture.' },
+    { point: 'Separates metadata from data plane', detail: 'Explicitly models a metadata index (key, owner, size, checksum, version, location) as distinct from the bulk byte-storage layer, and explains why each has different consistency and scaling needs.' },
+    { point: 'Designs chunking and multipart upload for large objects', detail: 'Proposes splitting large uploads into parts, describes how a client resumes an interrupted upload, and addresses what happens to incomplete/abandoned uploads.' },
+    { point: 'Justifies a durability strategy against a stated target', detail: 'Chooses replication or erasure coding (or both, per tier) and ties the choice explicitly to the durability requirement and cost/repair trade-off rather than picking a default.' },
+    { point: 'States a concrete consistency model', detail: 'Commits to read-after-write behavior on the same key and is explicit about what is and is not guaranteed across regions or replicas.' },
+    { point: 'Covers failure modes and gives a capacity estimate', detail: 'Describes what happens on a storage node or disk failure, a stalled multipart upload, or a hot object, and backs the design with at least one rough number (storage footprint, write throughput, or replica count).' },
+  ]}
+/>

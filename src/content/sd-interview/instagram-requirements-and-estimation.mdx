@@ -1,0 +1,285 @@
+---
+title: "Requirements and Estimation"
+module: "Design Instagram"
+moduleOrder: 8
+order: 1
+track: "interview"
+summary: "Scopes a photo/video sharing app into functional and non-functional requirements, then derives upload, feed-read, engagement, and storage numbers that show media bytes — not request count alone — as the dominant scaling constraint."
+tags: ["requirements", "capacity-estimation", "media-storage", "interview-framework", "feed"]
+estMinutes: 12
+cheatsheet:
+  - "Two different bottlenecks stack here: request volume (feed opens, likes) and raw byte volume (photo/video bytes). A text-only estimation exercise misses the second one entirely."
+  - "State DAU, uploads/day, feed-opens/day, and average media size explicitly before computing anything — the feed-read:upload ratio and the photo:video split are the numbers every later design choice traces back to."
+  - "Media storage and bandwidth dwarf metadata storage by orders of magnitude — a caption is bytes, a 30-second video is tens of megabytes across its transcoded renditions."
+  - "A single popular post can generate more bandwidth in a day, served from cache/CDN, than the entire platform's fresh upload volume for that day — origin storage is not what serves most reads."
+  - "Durability requirements are not uniform: an uploaded photo must never be silently lost, but a like count or feed rank lagging by seconds is invisible to users."
+  - "Flag the follower/creator skew (a small number of accounts with tens of millions of followers) explicitly in requirements — it's a constraint the feed and scaling lessons design around, not an edge case to bolt on later."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design Instagram" (or any photo/video sharing app) is a favorite interview
+prompt because it looks like a simpler cousin of "Design Twitter" — post
+something, show it to followers — but it hides a second axis of scale that
+text-only feeds don't have: every post carries real weight in bytes. A
+tweet is a few hundred bytes; a single Instagram photo, once you account
+for the thumbnail, feed-resolution, and full-resolution renditions you
+generate for it, is several megabytes, and a short video is tens of
+megabytes across its transcoded copies. Get the requirements phase wrong
+here and you'll spend the rest of the interview reasoning about query
+counts while ignoring the fact that media storage and bandwidth are what
+actually strain the system.
+
+This lesson exists to pin down scope and numbers before any of that gets
+designed. The storage architecture, CDN strategy, and feed design in the
+rest of this module are direct responses to the upload:read ratio, the
+photo:video mix, and the byte volumes established here.
+
+## Step 1: Scope the functional requirements
+
+State scope out loud rather than assuming the whole product is in play. A
+reasonable core for an interview-sized version:
+
+- **Upload a post**: one or more photos, or a short video, with an
+  optional caption, tagged users, and location.
+- **Follow**: one user follows another; following is asymmetric, like
+  Twitter, not a mutual "friend" relationship.
+- **Home feed**: a feed of posts from accounts a user follows, blending
+  recency with some ranking signal.
+- **Like and comment**: lightweight engagement actions attached to a post.
+- **Profile grid**: the list of posts a single account has published.
+- **Stories**: short-lived posts that disappear after 24 hours, shown in
+  a separate strip above the feed.
+
+Explicitly defer, and say so out loud: direct messages, an explore/search
+ranking system, shopping tags, live video, and augmented-reality filters
+are each their own design problem. Naming them and moving on is a strong
+signal in an interview — this module itself defers stories' full design to
+its own lesson later on, rather than trying to design everything on lesson
+one.
+
+### Non-functional requirements
+
+- **Read-heavy, but not purely a request-count problem.** Feeds are
+  loaded far more often than posts are created, but unlike a text feed,
+  each read also pulls back real media bytes — the system has to be fast
+  on both requests per second *and* bandwidth.
+- **Uploaded media must be durable once acknowledged.** Losing a user's
+  photo or video after confirming the upload succeeded is a hard failure
+  users notice immediately and never forgive.
+- **Engagement counters and feed ranking can be eventually consistent.** A
+  like count that's off by a handful for a few seconds, or a feed that
+  reorders slightly between two loads, is invisible to almost everyone.
+- **Feed freshness matters but isn't chat-speed.** A new post from a
+  followed account should reach a feed within roughly a minute, not
+  instantly — this is a looser latency budget than a messaging app, but
+  tighter than a batch report.
+- **Highly skewed creator graph.** A small number of accounts (creators,
+  brands, celebrities) hold a hugely disproportionate share of followers —
+  the same "celebrity problem" from the Twitter case study shows up here
+  and has to be named now, even though the feed-generation lesson is where
+  it gets solved.
+
+## Step 2: Establish the scale
+
+Rough, stated assumptions beat silence. A workable set of numbers for a
+large photo/video sharing platform:
+
+- 500 million daily active users (DAU).
+- Each DAU opens their feed about 10 times per day, loading roughly 20
+  posts per open.
+- 1 in 200 DAU uploads at least one post on a given day; of those uploads,
+  9 in 10 are photos and 1 in 10 is a short video.
+- Each DAU performs about 10 likes and 1 comment per day.
+- An uploaded photo, once you store the thumbnail, feed-resolution, and
+  full-resolution copies, averages about 3 MB total. An uploaded video,
+  once transcoded into two or three renditions for different network
+  conditions, averages about 50 MB total.
+
+<Callout type="tip">
+  Say the numbers out loud before computing anything: "Let's assume 500
+  million DAU, about 20 posts per feed load, 10 loads a day per user, and
+  roughly a 90/10 photo-to-video upload mix — does that match the scale
+  you had in mind?" That turns the estimate into a checkpoint with the
+  interviewer instead of a silent calculation.
+</Callout>
+
+## Step 3: Derive traffic, bandwidth, and storage numbers
+
+Work through uploads, feed reads, engagement, and storage separately —
+each stresses a different part of the system, and media size changes the
+answer in a way pure request counting would miss.
+
+### Upload throughput
+
+- Daily uploads: 500,000,000 divided by 200 is 2,500,000 uploads/day —
+  about 2,250,000 photos and 250,000 videos.
+- Writes per second (average): 2,500,000 divided by 86,400 is about
+  29/sec — small even with a generous 5x peak multiplier (roughly
+  145/sec at peak).
+
+### Feed read throughput
+
+- Daily feed opens: 500,000,000 multiplied by 10 is 5,000,000,000
+  opens/day.
+- Posts served: 5 billion multiplied by 20 is 100 billion post-views/day.
+- Opens per second (average): 5,000,000,000 divided by 86,400 is about
+  58,000/sec; at a 5x peak multiplier, roughly 290,000/sec at peak.
+- That's a read:write ratio of roughly **2,000:1** on requests alone, and
+  the gap widens further once you count individual post-views instead of
+  requests.
+
+### Engagement throughput
+
+- Daily engagement actions: 500,000,000 multiplied by 11 (10 likes plus 1
+  comment) is 5.5 billion actions/day.
+- Actions per second (average): 5.5 billion divided by 86,400 is about
+  64,000/sec; at a 5x peak multiplier, roughly 320,000/sec at peak.
+- Each action is a cheap counter increment or small row insert, not a
+  media read — a different, lighter kind of load than serving feeds.
+
+### Storage
+
+- Daily photo storage: 2,250,000 uploads multiplied by 3 MB is about
+  6.75 TB/day.
+- Daily video storage: 250,000 uploads multiplied by 50 MB is about
+  12.5 TB/day.
+- Combined media storage is roughly 19.25 TB/day, or about 7 PB/year —
+  and video, despite being only 1 in 10 uploads, contributes nearly
+  twice the daily bytes that photos do.
+
+The contrast is the key takeaway: **request-count math alone (uploads,
+feed opens, likes) tells you QPS, but the byte volume of the media itself
+is what actually dictates the storage and CDN architecture.**
+
+<Mermaid client:visible chart={`
+flowchart TB
+    U["2.5M uploads/day\n(~29/sec avg, ~145/sec peak)"] --> P["Photos: 2.25M/day\n~6.75TB/day"]
+    U --> V["Videos: 250K/day\n~12.5TB/day"]
+    P --> ST["Object storage\n~19.25TB/day, ~7PB/year"]
+    V --> ST
+    F["5B feed opens/day\n(~58K/sec avg, ~290K/sec peak)"] --> FD["Feed service\nreads metadata + media refs"]
+    ST -.->|served via CDN, not origin| FD
+    E["5.5B engagement actions/day\n(~64K/sec avg, ~320K/sec peak)"] -.->|like/comment signal| FD
+    style U fill:#4a5568,color:#fff
+    style P fill:#4a5568,color:#fff
+    style V fill:#4a5568,color:#fff
+    style ST fill:#2b6cb0,color:#fff
+    style F fill:#2b6cb0,color:#fff
+    style FD fill:#4a5568,color:#fff
+    style E fill:#4a5568,color:#fff
+`} />
+
+## Step 4: State the resulting design constraints
+
+1. **Media belongs in object storage, not a database, and behind a CDN,
+   not served from origin.** At 290,000 feed-assembly requests/sec, each
+   pulling back roughly 20 posts' worth of media references, origin
+   servers cannot be in the hot path for every image byte — the next
+   lesson builds around blob storage plus edge caching.
+2. **Uploads justify asynchronous processing.** At only ~145 writes/sec
+   peak, there's room to accept an upload, acknowledge it immediately, and
+   do thumbnailing/transcoding as background work rather than blocking the
+   user on it.
+3. **Feed assembly should favor precomputation for typical accounts**,
+   the same conclusion as the Twitter case study, for the same reason: a
+   live query across every followed account on every one of 290,000
+   feed-opens/sec is too expensive to run synchronously.
+4. **The creator/follower skew breaks a uniform fan-out approach** — an
+   account with tens of millions of followers can't be pushed into every
+   follower's precomputed feed the instant it posts. This constraint is
+   named here and solved in the feed-generation lesson.
+5. **Storage and bandwidth capacity planning should be driven by video
+   megabytes, not post counts** — a 10% share of uploads contributing
+   nearly double the daily storage bytes of the other 90% is the number to
+   defend the media pipeline's design with.
+
+## Worked example: sanity-checking a viral video's bandwidth
+
+Suppose one video post goes viral and is viewed 10,000,000 times in a
+single day. Assume an average of 2 MB actually gets served per view once
+you account for adaptive bitrate matching each viewer's connection and
+device.
+
+Bytes served for that one video: 10,000,000 multiplied by 2 MB is
+20,000,000 MB, or about 20 TB in a single day — more than the entire
+platform's total video *upload* storage added system-wide that same day
+(about 12.5 TB, from Step 3). One popular post can, in serving bandwidth
+alone, outweigh everything newly uploaded that day.
+
+That gap is the concrete argument for serving reads from a CDN cache
+close to the viewer instead of re-fetching from origin storage on every
+view: origin storage durably holds the bytes once; it was never meant to
+answer 10 million individual read requests for the same file.
+
+<Callout type="warning">
+  A common mistake is estimating a photo/video sharing app the same way
+  you'd estimate a text feed: count requests per second, size a database,
+  and stop. That ignores the axis that actually defines this system —
+  media byte volume. A design that nails request-per-second capacity but
+  serves every photo view from a single origin store, or stores every
+  video rendition in a row-oriented database, will fall over on bandwidth
+  and storage engineering long before it hits a QPS ceiling. Always
+  estimate bytes-per-upload and bytes-served-per-view alongside requests.
+</Callout>
+
+## Where this leads
+
+The shape derived here — a two-orders-of-magnitude read:write ratio on
+requests, a larger gap once you weigh in bytes, video outweighing photos
+in storage despite being the minority of uploads, and a skewed creator
+graph — is exactly what the next lesson's high-level design responds to:
+an ingestion path that hands off to asynchronous processing, dedicated
+media storage fronted by a CDN, and a feed service built to serve
+precomputed results fast.
+
+<Quiz
+  lessonId="instagram-requirements-and-estimation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'With 500 million DAU each opening their feed 10 times/day, which figure is closest to the average feed-open requests per second the system must sustain?',
+      options: [
+        { id: 'a', text: 'About 58,000/sec', correct: true, explanation: '500,000,000 x 10 = 5 billion opens/day; divided by 86,400 seconds/day is approximately 58,000 opens/sec on average.' },
+        { id: 'b', text: 'About 5,800/sec', correct: false, explanation: 'This undershoots by a factor of 10 — 5 billion divided by 86,400 is close to 58,000, not 5,800.' },
+        { id: 'c', text: 'About 290,000/sec', correct: false, explanation: 'That is the estimated peak figure (average multiplied by a roughly 5x peak multiplier), not the average the question asks for.' },
+        { id: 'd', text: 'About 100,000,000,000/sec', correct: false, explanation: 'This confuses total post-views served per day (100 billion) with a per-second rate; it overshoots by many orders of magnitude.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which conclusions follow correctly from the storage estimate (about 6.75 TB/day of photos vs about 12.5 TB/day of video, from a 90/10 photo-to-video upload split)? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Video contributes more daily storage bytes than photos despite being a smaller share of uploads', correct: true, explanation: 'Correct — 250,000 videos/day at ~50MB each outweighs 2,250,000 photos/day at ~3MB each, even though videos are only 1 in 10 uploads.' },
+        { id: 'b', text: 'Capacity planning should weight video bytes more heavily than raw upload counts', correct: true, explanation: 'Since a small share of uploads (video) drives the larger share of storage bytes, sizing storage on upload counts alone would badly underestimate video-heavy load.' },
+        { id: 'c', text: 'Since photos are 90% of uploads, photo storage must be the dominant cost', correct: false, explanation: 'This is the trap — upload count share and storage-byte share are different things here; video, the minority by count, is the majority by bytes.' },
+        { id: 'd', text: 'Text metadata (captions, tags) is the dominant storage cost at this scale', correct: false, explanation: 'Captions and tags are a handful of bytes per post — a rounding error next to megabytes of photo/video data.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In this estimation, engagement actions (likes and comments) and feed reads impose the same kind of load on the system, so they can be sized and designed for identically.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Incorrect — engagement actions are cheap counter increments or small row writes, while feed reads assemble and return media-heavy post data; they stress different subsystems and need different designs.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — engagement writes are lightweight compared to feed reads, which must pull back media references and are the far more bandwidth-intensive path.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A single video post receives 10 million views in one day, serving roughly 20 TB total, which exceeds the platform-wide daily video upload storage of about 12.5 TB. What does this mainly argue for?',
+      options: [
+        { id: 'a', text: 'Serving popular media from a CDN/cache rather than re-fetching from origin storage on every view', correct: true, explanation: 'When one popular file’s read bandwidth can exceed the day’s entire fresh-upload storage, origin storage clearly cannot be the thing directly answering every view — caching close to viewers is required.' },
+        { id: 'b', text: 'Reducing the number of video renditions stored per upload', correct: false, explanation: 'Rendition count affects upload storage, not the read-bandwidth problem this scenario highlights, which is about serving repeated views efficiently.' },
+        { id: 'c', text: 'Making engagement counters strongly consistent', correct: false, explanation: 'Counter consistency is unrelated to bandwidth for serving video views; this scenario is about read-path bandwidth, not write consistency.' },
+        { id: 'd', text: 'Lowering the upload rate limit for videos', correct: false, explanation: 'Throttling uploads would not address the bandwidth cost of serving an already-uploaded, already-viral video to millions of viewers.' },
+      ],
+    },
+  ]}
+/>

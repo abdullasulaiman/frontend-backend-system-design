@@ -1,0 +1,144 @@
+---
+title: "Why and When to Estimate"
+module: "Back-of-the-Envelope Estimation"
+moduleOrder: 5
+order: 1
+track: "concept"
+summary: "Explains why interviewers ask for rough capacity estimates, what those numbers are actually used for during the rest of the interview, and when in the conversation to reach for them."
+tags: ["estimation", "capacity-planning", "interview-strategy", "back-of-the-envelope"]
+estMinutes: 10
+cheatsheet:
+  - "Estimation isn't a math test — it's a tool for choosing an architecture. If a number doesn't change a design decision, don't bother computing it precisely."
+  - "Do estimation after requirements are scoped and before you commit to an architecture, not before (you don't know what to estimate yet) or after (you've already guessed wrong)."
+  - "Round aggressively to powers of ten and memorize a handful of anchors (seconds/day ~ 86,400 ~ 10^5; 1M, 1B) — precision past one significant figure wastes interview time for no benefit."
+  - "State every assumption out loud before you multiply anything — the interviewer is grading your assumptions and reasoning, not just the final digits."
+  - "The output of estimation is a decision trigger: 'this needs a distributed cache' or 'a single Postgres instance is fine' — always land the number on a concrete architectural consequence."
+  - "Re-estimate after a scope change. If the interviewer adds a requirement (e.g., 'also support video'), your earlier numbers are stale and can silently mislead the rest of the design."
+  - "Skipping estimation entirely is a bigger red flag than getting a number wrong — interviewers read it as an inability to reason about scale."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Two candidates get asked to design a URL shortener. Candidate A jumps straight to drawing boxes: a web server, a database, a cache. Candidate B spends ninety seconds working out that the system needs to handle roughly 1,000 writes per second and 10,000 reads per second, and that the URL-to-ID mapping will grow to a few hundred gigabytes over five years. Candidate B's architecture diagram ends up looking almost identical to Candidate A's — but every box in it is justified. When the interviewer asks "why a cache here?" or "why not just one database server?", Candidate B has an answer rooted in a number. Candidate A is guessing.
+
+That's the entire point of back-of-the-envelope estimation in a system design interview: it turns architectural choices from taste into arithmetic. This lesson covers why interviewers ask for these numbers, what they're actually checking for, and — just as important — when in the interview flow to reach for a calculator (mental or otherwise). The next lesson in this module walks through a full worked example computing QPS, storage, and bandwidth for a real system; this one is about the reasoning behind doing that at all.
+
+## What estimation is actually for
+
+Rough capacity numbers exist to answer one question repeatedly through the rest of the interview: **does this component need to be simple, or does it need to be distributed?** A single relational database on one machine can comfortably handle a few thousand writes per second and hundreds of gigabytes of data. Past that, you start needing replication, partitioning, caching layers, or a different storage engine entirely. Without an estimate, you don't know which side of that line your system falls on — so every design choice you make is either overengineered (a sharded, multi-region setup for a system that would fit on a laptop) or underengineered (a single Postgres instance for a system doing 500,000 writes per second).
+
+Estimation is not a precision exercise. Nobody expects — or wants — three significant figures. The interviewer wants to see you:
+
+- Convert a vague prompt ("design Twitter") into concrete load numbers (users, requests, data size).
+- Reason from stated or reasonably assumed inputs to an order-of-magnitude output.
+- Connect that output to an actual design decision, not leave it as a stray number on the whiteboard.
+
+If you compute "14,300 requests per second" and then never mention it again, you've done the arithmetic but missed the point. The number only matters if it changes what you build next.
+
+## When to estimate: the right moment in the interview
+
+Estimation belongs in a specific window: **after you've scoped requirements, before you commit to an architecture.**
+
+Too early, and you don't know what to estimate — you can't size "write throughput" before you've agreed the system needs writes at all, or nailed down whether it's 10,000 users or 100 million. Too late, and you've already drawn boxes based on a guess; any correction now means redrawing, which reads as disorganized and costs you time you don't have in a 45-minute interview.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    A[Clarify requirements and scope] --> B[Back-of-the-envelope estimation]
+    B --> C[Architecture and component design]
+    C --> D[Deep dive on bottlenecks]
+    B -.re-estimate on.-> E[Scope change mid-interview]
+    E -.-> C
+`} />
+
+A practical signal for "now is the time": you've agreed on the core entities and read/write actions the system supports (e.g., "users post tweets, other users read a timeline"), and you have at least rough scale inputs (total users, daily active users, or an explicit number the interviewer gave you). Once you have those two things, spend two to four minutes on estimation before touching the architecture diagram. Announce that you're doing it — "let me size this before I design it" signals process, which is exactly what's being evaluated.
+
+## Which numbers are worth computing
+
+Not every system needs every kind of estimate. The ones that actually recur across most designs are:
+
+- **Traffic (QPS)** — requests per second for the dominant read and write paths. This tells you whether a single server, a load-balanced fleet, or a globally distributed edge layer is warranted.
+- **Storage** — total data volume, usually projected over a few years of growth. This tells you whether one database node's disk is enough, or whether you need partitioning or cold-storage tiering.
+- **Bandwidth** — bytes per second in and out, especially for media-heavy systems. This tells you whether a CDN or dedicated media pipeline is required, versus serving everything from the app tier.
+- **Memory / cache size** — how much of the "hot" working set could plausibly fit in RAM, which drives whether a cache layer meaningfully helps at all.
+
+You rarely need all four for every system. A chat app cares enormously about concurrent-connection count and message QPS but has fairly small storage growth per user. A video platform cares enormously about storage and bandwidth but has comparatively low QPS. Picking the right one or two numbers to estimate — rather than mechanically running through a checklist — is itself a signal of understanding the system, not just the estimation technique.
+
+<Callout type="tip">
+  A useful test for "should I compute this number": ask yourself what you'd design differently if the answer were 10x higher or 10x lower. If the architecture wouldn't change either way, skip the calculation and move on — you're optimizing for insight per minute, not thoroughness.
+</Callout>
+
+## A quick worked scenario
+
+Say the prompt is "design a service that lets users upload profile photos," and the interviewer tells you there are 50 million monthly active users, and a photo upload happens roughly once a month per active user on average.
+
+That's about 50 million uploads per month. Dividing by roughly 2.5 million seconds in a month (30 days times 86,400 seconds, rounded) gives roughly 20 uploads per second average. That number alone already tells you something: 20 writes per second doesn't need a distributed write path — a single well-provisioned server with a managed object store behind it (for the actual image bytes) handles that without strain.
+
+But average QPS understates peak load. If uploads cluster around evenings in a few time zones, peak traffic might run 5–10x average — so 100–200 uploads per second at peak. Still comfortably within "one API tier behind a load balancer, storage delegated to a blob store" territory; you would not reach for a custom distributed ingestion pipeline here. If the interviewer had instead said 5 billion monthly active users (unrealistic, but hypothetically), that same arithmetic would produce peak QPS in the tens of thousands — and now the conversation about a globally distributed, multi-region upload pipeline is actually justified by the numbers, not just because "it's a system design interview so it must be distributed."
+
+This is the habit to build: every estimate should end with a sentence like "so this rules out X and points toward Y," not just a final digit.
+
+<Callout type="warning">
+  A common mistake is treating estimation as a box to check rather than a decision tool — computing a number, writing it in the corner of the whiteboard, and then designing an architecture that ignores it entirely (e.g., calculating 50 QPS and then still proposing a five-shard, multi-region database "to be safe"). Interviewers notice when the estimate and the design don't agree; it reads as memorized ritual rather than actual reasoning. Always explicitly connect the number back to the choice it justifies.
+</Callout>
+
+## Common failure modes
+
+A few patterns show up repeatedly and cost candidates more than a wrong final number would:
+
+- **Skipping estimation entirely** and jumping straight to architecture. This is worse than getting the arithmetic slightly wrong — it suggests you can't reason about scale at all, which is the actual skill being tested.
+- **Over-precision.** Spending three minutes computing "14,327 requests per second" instead of rounding to "roughly 15,000" wastes interview time on false precision nobody asked for.
+- **Silent assumptions.** Picking a number (like average payload size or read:write ratio) without saying it out loud. The interviewer can't grade reasoning they can't see, and an unstated wrong assumption compounds silently through every downstream number.
+- **Never revisiting the estimate.** If the interviewer changes scope mid-interview ("actually, let's also support video uploads"), your earlier numbers are stale. Strong candidates flag that and redo the relevant piece; weaker candidates keep designing against numbers that no longer apply.
+
+Getting comfortable with *when* to pull out these numbers, and disciplined about connecting them to real decisions, matters more than raw calculation speed. The next lesson builds the actual toolkit — the reference numbers, unit conversions, and step-by-step method for computing QPS, storage, and bandwidth under time pressure.
+
+<Quiz
+  lessonId="estimation-why-and-when-to-estimate"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the primary purpose of back-of-the-envelope estimation in a system design interview?',
+      options: [
+        { id: 'a', text: 'To demonstrate strong mental math skills', correct: false, explanation: 'Precision arithmetic isn\'t the point — rough, defensible order-of-magnitude numbers are what matter, not calculation speed or accuracy to many digits.' },
+        { id: 'b', text: 'To decide whether a component needs to be simple or distributed, and justify architecture choices with numbers', correct: true, explanation: 'Estimation exists to turn design decisions into reasoned arithmetic rather than guesses — the number should always point toward a concrete architectural consequence.' },
+        { id: 'c', text: 'To fill time before the interviewer asks the real design questions', correct: false, explanation: 'Estimation is a substantive part of the interview signal, not filler; skipping straight to design without it is itself a negative signal.' },
+        { id: 'd', text: 'To calculate the exact server count needed in production', correct: false, explanation: 'Interview estimates are rough, order-of-magnitude sizing exercises, not a precise capacity-planning exercise you would actually deploy against.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'mcq',
+      prompt: 'When during the interview is the best time to do back-of-the-envelope estimation?',
+      options: [
+        { id: 'a', text: 'Before any requirements are discussed, as the very first step', correct: false, explanation: 'Without scoped requirements you don\'t yet know what to estimate — you can\'t size traffic or storage for a system whose scope and scale inputs are undefined.' },
+        { id: 'b', text: 'After requirements are clarified and scale inputs are known, before committing to an architecture', correct: true, explanation: 'This is the window where you know enough to compute meaningful numbers, and haven\'t yet locked in design choices those numbers should inform.' },
+        { id: 'c', text: 'Only at the very end, to double-check the finished design', correct: false, explanation: 'Estimating after the architecture is drawn means any mismatch forces a redesign under time pressure, rather than guiding the design from the start.' },
+        { id: 'd', text: 'It should be skipped unless the interviewer explicitly asks for numbers', correct: false, explanation: 'Proactively estimating is expected practice and a positive signal; waiting to be asked misses a chance to demonstrate the skill and can leave your architecture unjustified.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'multi',
+      prompt: 'Which of these are recurring categories of numbers worth estimating for a typical system design prompt? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Traffic (queries per second) for dominant read/write paths', correct: true, explanation: 'QPS is one of the most common drivers of whether you need a single server, a fleet, or a globally distributed layer.' },
+        { id: 'b', text: 'Total storage volume, projected over time', correct: true, explanation: 'Storage growth determines whether a single database node suffices or whether partitioning/cold storage is needed.' },
+        { id: 'c', text: 'The exact programming language the backend should be written in', correct: false, explanation: 'Language choice is an implementation detail unrelated to capacity estimation — it doesn\'t come from QPS, storage, or bandwidth arithmetic.' },
+        { id: 'd', text: 'Bandwidth, especially for media-heavy systems', correct: true, explanation: 'Bandwidth estimates tell you whether you need a CDN or dedicated media delivery path versus serving everything from the app tier.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'boolean',
+      prompt: 'If the interviewer changes the scope of the system mid-interview (for example, adding a new feature), any capacity estimates computed earlier remain valid and don\'t need to be revisited.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A scope change can invalidate earlier load, storage, or bandwidth assumptions — carrying stale numbers forward can silently mislead the rest of the design.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Strong candidates flag that scope changed and re-estimate the affected numbers rather than continuing to design against outdated figures.' },
+      ],
+    },
+  ]}
+/>

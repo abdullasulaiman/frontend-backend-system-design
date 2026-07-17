@@ -1,0 +1,149 @@
+---
+title: "Requirements for Server-Side Error Monitoring"
+module: "Monitor Server-Side Errors"
+moduleOrder: 14
+order: 1
+track: "concept"
+summary: "Defines what a server-side error monitoring system must capture, aggregate, and alert on before you design its architecture."
+tags: ["observability", "error-monitoring", "requirements", "reliability", "alerting"]
+estMinutes: 11
+cheatsheet:
+  - "An error monitoring system has two jobs, not one: capture every error with enough context to debug it, and surface the handful that matter right now — don't design for only one of these."
+  - "Fingerprint errors (not just log lines) so 50,000 occurrences of the same null-pointer exception collapse into one issue with a count, not 50,000 alerts."
+  - "State your ingestion volume as errors/sec at peak, not average — a cascading failure can spike error rates 100x in seconds, and that's exactly when the system must not fall over."
+  - "The monitoring pipeline must degrade independently of the systems it watches: if the app fleet is failing, the pipeline dropping data or crashing too is a design bug, not bad luck."
+  - "Decide your data retention and sampling policy up front (full detail for N days, sampled/aggregated after) — unbounded raw storage of every error is not a viable default."
+  - "Alerting requirements (thresholds, dedup, routing, escalation) are a distinct non-functional requirement from storage/query requirements — write them down separately so they don't get designed as an afterthought."
+  - "A monitoring system that pages someone 200 times for one root cause will get its pages ignored within a week — noise reduction is a correctness requirement, not a nice-to-have."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+An unhandled exception in a checkout service, a `5xx` spike from a downstream timeout, a deploy that quietly breaks one endpoint — none of these show up to the user as a clean crash report. They show up as a log line buried in thousands of others, on one host out of hundreds, at 3 a.m. If nobody sees it, the business finds out from a customer complaint or a revenue dashboard, hours after it started. Server-side error monitoring exists to close that gap: catch the error close to where it happens, tell the right engineer fast, and give them enough context to fix it without re-deriving the failure from scratch.
+
+This is the first lesson in the "Monitor Server-Side Errors" module. Get the requirements right here and the next two lessons — architecture/data flow, and the full system design — are just engineering in service of these constraints. Skip this step and you'll end up designing (or worse, being asked to critique) a system that logs everything but alerts on nothing useful, or alerts on everything and gets ignored.
+
+## Two jobs, often confused for one
+
+A server-side error monitoring system is really solving two different problems that happen to share a pipeline:
+
+1. **Capture** — reliably collect every error, with enough context (stack trace, request ID, host, deploy version, user/tenant) to actually debug it later.
+2. **Surface** — reduce thousands of raw error events down to a small number of actionable *issues*, and get the right one in front of a human fast enough to matter.
+
+Design only for capture and you get a searchable log dump nobody proactively reads. Design only for surfacing and you get alerts with no way to dig into root cause once someone's paged. A real system has to do both, and — as you'll see below — they pull the architecture in different directions (durable storage vs. low-latency aggregation), which is exactly what the next lesson has to reconcile.
+
+## Functional requirements
+
+State these explicitly before sketching any architecture:
+
+- **Ingest an error event.** At minimum: error type/message, stack trace, timestamp, service name, host/instance ID, and a request/trace ID that ties it to the request that caused it. Anything less and an engineer can't reproduce the failure.
+- **Group ("fingerprint") errors into issues.** The same underlying bug (say, a `NullPointerException` in `OrderService.applyDiscount`) will fire on every affected request — potentially thousands of times a minute. The system must collapse those into a single *issue* with an occurrence count, not report 5,000 separate alerts.
+- **Query and browse.** An engineer needs to search by service, time range, error type, deploy version, or affected user, and see a trend (is this issue new, growing, resolved?).
+- **Alert.** Notify on-call when an issue crosses a threshold — first occurrence of a new error type, error rate above a baseline, or a spike correlated with a recent deploy.
+- **Track issue lifecycle.** Mark an issue resolved, ignored, or reopened (it recurred after being marked fixed) — otherwise the same bug re-alerts forever or silently drops off a dashboard.
+
+## Non-functional requirements
+
+This is where the interesting design tension lives.
+
+### Scale and burstiness
+
+Don't just say "high volume" — put a number on it. A mid-size service fleet in steady state might emit a few hundred errors/sec; the same fleet mid-incident (a downstream dependency timing out, a bad deploy) can spike error volume 50-100x in seconds. The ingestion path has to absorb that spike without falling over or silently dropping data — which is precisely the moment the data matters most.
+
+### The monitoring system must not depend on the thing it's watching
+
+If application servers are failing, the error-reporting client running inside them, and the pipeline behind it, must keep working — or at minimum fail *safely* (buffer and retry, or drop with a local counter) rather than compound the outage. A monitoring pipeline that needs the very services it watches to be healthy in order to function is a circular dependency that fails exactly when you need it most.
+
+### Latency for surfacing vs. durability for storage
+
+These pull in different directions:
+
+- **Alerting path** needs to be fast — seconds, not minutes, from "error starts happening" to "on-call is notified." This favors in-memory aggregation and streaming.
+- **Storage/search path** needs to be durable and queryable for days or weeks after the fact, so a postmortem three days later can still pull the exact stack trace. This favors a persistent store optimized for time-range + filter queries, not raw speed.
+
+A design that routes every single error through the same slow, durable write path before alerting will be too slow to page anyone quickly; a design that only aggregates in memory and never persists loses the detail needed for debugging.
+
+### Retention and cost
+
+Raw error volume, kept forever, in full detail, is not a sustainable default — it's a cost and query-performance problem waiting to happen. A realistic requirement: full-fidelity data (every occurrence, full stack trace, full context) for a short window (say 14-30 days), with older data either dropped, sampled, or rolled up into aggregate counts per issue per day.
+
+### Noise reduction as a hard requirement
+
+If the same underlying bug triggers 10,000 events in an hour, alerting once with an accurate count is correct behavior; alerting 10,000 times is a bug in the monitoring system itself, even though every individual alert is technically "true." Deduplication and rate-limiting on alerts are not a nice-to-have layered on top later — they're a core requirement, because an ignored alert channel is equivalent to no monitoring at all.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Error occurs in service] --> B{Capture requirement}
+  B --> C[Full context: stack trace, request ID, deploy version]
+  A --> D{Surface requirement}
+  D --> E[Fingerprint into issue]
+  E --> F[Threshold / new-error check]
+  F -->|crosses threshold| G[Alert on-call, deduped]
+  C --> H[Durable, queryable store]
+  H --> I[Postmortem / debugging]
+`} />
+
+## Worked example: sizing requirements for a mid-size fleet
+
+Say the prompt is "design error monitoring for a fleet of 2,000 backend instances across 150 services." A concrete requirements pass:
+
+- **Baseline volume:** 150 services x ~2 errors/sec average each ~ 300 errors/sec steady state.
+- **Incident spike:** a cascading timeout can push a handful of services to 200 errors/sec each; even 5 affected services spikes ingestion to ~1,000-1,300 errors/sec — call it a 4-5x burst the pipeline must absorb without backpressure onto the app fleet.
+- **Fingerprinting target:** those 1,300 errors/sec during an incident should collapse to a handful of distinct issues (probably 1-3 root causes), not 1,300 alerts.
+- **Alert latency:** a new, previously-unseen error type should page on-call within 60 seconds of its first occurrence; a spike in a known error type should alert within 2-5 minutes (fast enough to catch a bad deploy before it fully rolls out).
+- **Retention:** full detail for 30 days (long enough to cover a sprint's worth of postmortems), daily aggregate counts kept for a year for trend analysis.
+
+Those five numbers — burst ingestion rate, fingerprinting behavior, two different alert-latency targets, and a two-tier retention policy — are exactly what the architecture lesson needs as inputs to decide on a streaming aggregation layer versus a batch one, and what the full design needs to size storage and alerting infrastructure against.
+
+<Callout type="warning">
+  The most common mistake at this stage is writing "capture all errors and alert the team" as if that's one requirement. It's two, with opposite performance characteristics — durable, detailed storage vs. fast, lossy-is-acceptable aggregation for alerting — and conflating them leads to a design that's either too slow to page anyone or too shallow to debug anything once paged. Separate them explicitly before you draw a single box.
+</Callout>
+
+<Quiz
+  lessonId="srv-err-requirements-for-server-side-error-monitoring"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A single bug causes 8,000 occurrences of the same exception within an hour. What should a well-designed error monitoring system do?',
+      options: [
+        { id: 'a', text: 'Fingerprint the occurrences into one issue with an occurrence count, and alert once (or on a rate-limited basis).', correct: true, explanation: 'Grouping by fingerprint and deduplicating alerts is exactly the noise-reduction requirement — one actionable issue, not 8,000 pages.' },
+        { id: 'b', text: 'Send a separate alert for every occurrence so nothing is missed.', correct: false, explanation: 'This is the noisy-alerting failure mode the lesson warns about — it trains on-call to ignore the channel and provides no more useful information than a single deduplicated alert.' },
+        { id: 'c', text: 'Drop all but the first occurrence entirely and discard the rest.', correct: false, explanation: 'Discarding the count loses useful signal (is this getting worse or better?) — the requirement is to aggregate and count, not to throw away data.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are legitimate non-functional requirements to pin down before designing the system? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Peak (burst) ingestion rate during an incident, not just steady-state average', correct: true, explanation: 'Cascading failures can spike error volume dramatically, and that is precisely when the pipeline must not fall over — so peak, not average, is the number that matters for capacity.' },
+        { id: 'b', text: 'How long full-fidelity error data is retained before being sampled or aggregated', correct: true, explanation: 'Unbounded raw retention is a cost and performance problem; a retention/rollup policy is a concrete requirement to state up front.' },
+        { id: 'c', text: 'The specific database vendor used for the error store', correct: false, explanation: 'That is an implementation choice made later in the architecture/design lessons, not a requirement gathered at this stage.' },
+        { id: 'd', text: 'Target alert latency from first occurrence of a new error to on-call notification', correct: true, explanation: 'Alerting speed is a concrete, testable non-functional requirement (e.g. under 60 seconds for a brand-new error type).' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'The error monitoring pipeline should be allowed to depend on the health of the same application servers it is monitoring, since they are usually healthy.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'This creates a circular dependency: exactly when the app fleet is unhealthy (and monitoring matters most) the pipeline could fail too. The monitoring path must degrade independently and fail safely instead.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. The monitoring system must keep functioning, or fail safely (e.g. local buffering/dropping with a counter), even while the services it watches are failing.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why do the "alerting" and "storage/search" requirements pull the design in different directions?',
+      options: [
+        { id: 'a', text: 'Alerting needs low-latency aggregation to page fast; storage needs durability and queryability over weeks, which favors different, slower write paths.', correct: true, explanation: 'Correct — routing every error through a slow durable write before alerting is too slow to page quickly, while an aggregation-only path with no persistence loses debugging detail. The two needs favor different mechanisms.' },
+        { id: 'b', text: 'They do not actually conflict; the same write path optimizes for both equally well.', correct: false, explanation: 'They do conflict in practice: fast in-memory aggregation for alerting and durable long-retention storage for search have different performance and durability trade-offs.' },
+        { id: 'c', text: 'Alerting is only needed for low-severity errors, so it never needs to be fast.', correct: false, explanation: 'Alerting speed matters most for high-severity, novel, or spiking errors — the opposite of "only needed for low severity."' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,151 @@
+---
+title: "Placement, Health Checks, and Global vs. Local Balancing"
+module: "Load Balancers"
+moduleOrder: 8
+order: 3
+track: "concept"
+summary: "Covers where load balancers sit in a request path, how they detect and react to unhealthy backends, and how global (cross-region) balancing differs from local (in-datacenter) balancing."
+tags: ["load-balancing", "health-checks", "gslb", "high-availability", "dns"]
+estMinutes: 12
+cheatsheet:
+  - "A request usually crosses multiple balancing tiers: DNS/GSLB picks a region, an edge or regional L4/L7 LB picks a backend, and sometimes a service mesh sidecar makes the final hop — know which tier a design question is really about."
+  - "Active health checks (LB polls a /health endpoint) catch dead nodes fast but add load; passive health checks (LB watches real request outcomes) are free but slower to react. Production systems usually run both."
+  - "Use separate healthy/unhealthy thresholds (e.g. 3 consecutive fails to eject, 2 consecutive passes to re-admit) — a single-check threshold causes flapping under transient blips."
+  - "A health check endpoint that only checks 'process is up' gives false positives; check the dependencies the request path actually needs (DB, cache, downstream API) without turning the check into a full request replay."
+  - "Global load balancing (GSLB) is coarser and slower than local balancing — DNS TTLs and resolver caching mean cross-region failover takes seconds to minutes, not milliseconds, unless you use anycast."
+  - "Local balancing reacts per-request against a known pool; global balancing routes by region/PoP based on health, latency, or geography, then hands off to that region's local balancer."
+  - "Newly added or just-recovered backends should get traffic ramped up gradually (slow start), not slammed with a full share immediately — a cold instance under full load looks unhealthy and gets ejected again."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Picking a load-balancing algorithm only matters if the load balancer knows which backends are actually alive, and if you've placed the right balancing decision at the right layer of your architecture. A perfect least-connections algorithm is useless if it keeps sending 5% of traffic to a server that's been returning 500s for the last ten seconds, or if your only balancing decision is a single DNS record in front of three continents. This lesson covers the two things that make load balancing actually reliable in production: continuously verifying backend health, and choosing the right scope — global vs. local — for each balancing decision.
+
+## Where balancing decisions actually happen
+
+A single user request usually passes through more than one balancing tier before it reaches application code:
+
+- **Global tier** — routes a client to a region or point of presence (PoP), typically via DNS or anycast IP. This decision is coarse: "send Tokyo users to `ap-northeast-1`."
+- **Edge/regional tier** — an L4 or L7 load balancer (or reverse proxy) in front of a pool of service instances within that region, using an algorithm like round robin or least connections (covered in the previous lesson) to pick one instance per request.
+- **Service-mesh / client-side tier** — inside a microservice architecture, a sidecar proxy or a smart client library often makes a further balancing decision for calls between internal services, sometimes with its own health view separate from the regional LB's.
+
+Interview candidates frequently conflate these tiers — proposing a single "load balancer" for a system that clearly spans multiple regions. Naming the tiers explicitly is a strong signal: it shows you understand that "balance the load" is really several nested decisions, each with a different blast radius and a different reaction time.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  U[Client] --> DNS[Global tier: GSLB / DNS or anycast]
+  DNS --> R1[Region: us-east regional LB]
+  DNS --> R2[Region: eu-west regional LB]
+  R1 --> A1[Instance A - healthy]
+  R1 --> A2[Instance B - unhealthy, ejected]
+  R1 --> A3[Instance C - healthy]
+  R2 --> B1[Instance D - healthy]
+  R2 --> B2[Instance E - healthy]
+`} />
+
+## Health checks: keeping the target list honest
+
+A load balancer's target list is only as good as its most recent health check. There are two complementary mechanisms.
+
+### Active health checks
+
+The load balancer independently polls each backend — usually an HTTP `GET` to a dedicated path like `/healthz`, or a TCP connect — on a fixed interval (commonly every 5-15 seconds), regardless of whether real traffic is flowing. This catches a dead instance even during a lull in traffic, and it's the only option for a freshly added backend that hasn't received real requests yet.
+
+### Passive health checks
+
+The load balancer watches the outcomes of real requests it's already routing — connection failures, timeouts, a burst of 5xx responses — and ejects a backend that crosses an error-rate threshold, without any dedicated probing traffic. This is cheaper (no extra load on backends) and reflects real-world behavior, but it reacts only as fast as traffic arrives, and it can't detect a backend that's dead before it receives its first real request.
+
+Most production setups run both: active checks for baseline liveness, passive checks (sometimes called "outlier detection") to catch degradation that a shallow health endpoint might miss.
+
+### Liveness vs. readiness
+
+It's worth separating two different questions a health check can answer:
+
+- **Liveness**: is the process still running and responsive at all? A failed liveness check usually means "restart this instance."
+- **Readiness**: is this specific instance ready to serve traffic right now? An instance can be alive but not ready — still warming a cache, waiting on a slow dependency, or intentionally draining before shutdown. A failed readiness check means "stop routing new traffic here, but don't necessarily restart it."
+
+A load balancer should route based on readiness, not just liveness — an instance that's up but can't reach its database is "alive" in the process sense yet completely wrong to send traffic to.
+
+### Avoiding flapping
+
+If a load balancer ejects a backend after a single failed check and re-admits it after a single success, a backend near a threshold — say, one that occasionally takes 600ms against a 500ms check timeout — will flap in and out of the pool constantly, causing connection churn and uneven load. The standard fix is asymmetric, multi-check thresholds: for example, require 3 consecutive failures to mark a backend unhealthy, but 2 consecutive successes to mark it healthy again. This adds a small amount of detection latency in exchange for much more stable behavior.
+
+### Slow start after recovery
+
+When a backend rejoins the pool — freshly deployed, just recovered, or just added for scale-out — sending it an immediate full share of traffic can overwhelm it before caches warm up or connection pools establish, causing it to fail its next health check and get ejected again. Slow start ramps traffic to a recovering or new instance gradually (e.g., 10% of its normal share, doubling every 30 seconds) instead of switching it on at 100% immediately.
+
+## Global vs. local balancing
+
+"Local" balancing is what the previous lesson's algorithms (round robin, least connections, consistent hashing) operate on: a load balancer with a live, frequently-updated view of a fixed pool of backends in one datacenter or region, making a fresh decision on every request or connection.
+
+"Global" balancing — often called GSLB (Global Server Load Balancing) — decides which *region* or PoP a client should even talk to, and it works very differently:
+
+- **DNS-based GSLB**: the DNS server for your domain returns different IP addresses (or CNAMEs) depending on the querying resolver's location, current region health, or configured weights — geo-routing, latency-based routing, or weighted failover. The catch: DNS answers are cached by resolvers and clients for the record's TTL (commonly 30-300 seconds), so a region failover isn't instant — clients holding a cached answer keep hitting the bad region until their TTL expires.
+- **Anycast**: the same IP address is announced from multiple physical locations, and network routing (BGP) sends each client's packets to the topologically nearest healthy location. This can fail over in seconds because it's a routing change, not a DNS cache expiry, but it requires owning the IP announcement infrastructure — this is how large CDNs and DNS providers achieve fast global failover, and it's rarely something you build yourself in a typical system design answer.
+
+The practical distinction to carry into an interview: **local balancing is per-request and fast to react** (a bad backend can be pulled from rotation within one health-check interval); **global balancing is per-region/per-resolver and slow to react** (bounded by DNS TTL, unless anycast is in play). Design a system assuming global failover takes real time, and put the fast, fine-grained reaction at the local tier.
+
+## Worked example: a two-region checkout service
+
+Say you run a checkout service in `us-east` and `eu-west`, each with 20 backend instances behind a regional L7 load balancer, fronted by latency-based DNS GSLB with a 60-second TTL.
+
+1. A health check every 5 seconds hits `/healthz` on each instance; the check also pings the instance's connection to its payment-processor dependency, not just "is the process up."
+2. Instance 7 in `us-east` starts timing out on the payment-processor check. The regional LB requires 3 consecutive failures before ejecting it — so it's pulled from rotation after 15 seconds, not on the first blip.
+3. Traffic to `us-east` continues across the remaining 19 instances via least-connections (from the previous lesson) — this is the local tier reacting fast, within seconds.
+4. Separately, if the *entire* `us-east` region degrades (say, an AZ-wide network issue drops health checks across most instances), GSLB updates its DNS answer to stop returning `us-east`'s IP for new queries. But clients and resolvers that cached the old answer within the last 60 seconds keep sending traffic to `us-east` until that TTL expires — global failover here takes up to a minute, not seconds, unless anycast is in use.
+5. Once instance 7 recovers and passes 2 consecutive health checks, it's re-admitted with slow start — ramping from 10% to full share over the next couple of minutes — rather than immediately absorbing a full share of `us-east`'s traffic.
+
+<Callout type="warning">
+  A common and costly mistake: writing a health check endpoint that just returns `200 OK` unconditionally, with no check of the dependencies the request path actually needs. This gives you a false sense of safety — every instance always reports "healthy," so the load balancer keeps sending traffic to instances whose database connection, cache client, or downstream dependency is actually broken, and users see real errors that your health checks never caught. Check the dependencies your request path genuinely needs (without turning the check into a full end-to-end replay that's expensive to run every few seconds), and separate that from liveness checks used only to decide "should this process be restarted."
+</Callout>
+
+<Quiz
+  lessonId="lb-placement-health-checks-and-global-vs-local-balancing"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A backend instance is running and responds to a basic TCP health check, but its connection pool to the database has been exhausted and every real request it serves fails. What does this describe?',
+      options: [
+        { id: 'a', text: 'It fails liveness but passes readiness', correct: false, explanation: 'The reverse is true here: the process is alive (it responds), but it is not ready to correctly serve real traffic.' },
+        { id: 'b', text: 'It passes liveness but fails readiness', correct: true, explanation: 'The process is up and responsive (liveness passes), but it cannot correctly serve requests because of the exhausted DB pool (readiness fails) — exactly the gap a shallow health check misses.' },
+        { id: 'c', text: 'It fails both liveness and readiness', correct: false, explanation: 'A basic TCP check succeeding means liveness is fine; only readiness (the ability to serve real requests) is broken here.' },
+        { id: 'd', text: 'This scenario cannot be detected by health checks at all', correct: false, explanation: 'It can be detected — but only if the health check itself verifies the dependency (e.g. DB connectivity), not just that the process responds to a TCP ping.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these reduce "flapping" (a backend rapidly cycling in and out of the healthy pool)? Select all that apply.',
+      options: [
+        { id: 'a', text: 'Requiring multiple consecutive failed checks before ejecting a backend', correct: true, explanation: 'This filters out single transient blips, which is the main cause of flapping when thresholds are set to 1.' },
+        { id: 'b', text: 'Using a different (typically higher) threshold of consecutive successes to re-admit a backend than the threshold used to eject it', correct: true, explanation: 'Asymmetric thresholds prevent a backend that is barely recovering from bouncing straight back out on its next borderline check.' },
+        { id: 'c', text: 'Lowering the health check interval to run as frequently as possible', correct: false, explanation: 'A shorter interval increases how often checks run but does not by itself prevent flapping — without a multi-check threshold, more frequent checks can actually make flapping worse, not better.' },
+        { id: 'd', text: 'Ramping traffic to a recently re-admitted instance gradually instead of giving it a full share immediately', correct: true, explanation: 'Slow start prevents a just-recovered instance from being overwhelmed immediately and failing its next check, which would otherwise cause another eject/re-admit cycle.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'DNS-based global server load balancing (GSLB) can typically fail traffic away from an unhealthy region just as quickly as a regional L7 load balancer can eject a single unhealthy backend instance.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'DNS answers are cached by resolvers and clients for the record\'s TTL (often 30-300 seconds), so clients holding a cached answer keep hitting the bad region until it expires — meaningfully slower than a local health-check-driven ejection.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Local (regional) balancing reacts within roughly one health-check interval, while DNS-based GSLB is bounded by DNS TTL and resolver caching, which is typically much slower unless anycast routing is used instead.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Which mechanism allows a global load balancing scheme to fail over across regions in seconds rather than being bounded by DNS TTL?',
+      options: [
+        { id: 'a', text: 'Lowering the DNS record TTL to 1 second', correct: false, explanation: 'Many resolvers and client libraries ignore or override very low TTLs, and this still relies on every intermediate cache honoring the new value — it does not reliably guarantee sub-second failover.' },
+        { id: 'b', text: 'Anycast routing, where the same IP is announced from multiple locations and BGP routes each client to the nearest healthy one', correct: true, explanation: 'Anycast failover is a network routing change, not a DNS cache expiry, so it can react in seconds — this is how large CDNs and DNS providers achieve fast global failover.' },
+        { id: 'c', text: 'Increasing the number of backend instances in each region', correct: false, explanation: 'More instances per region improves local capacity and resilience within a region, but does not change how quickly clients stop being routed to an entire unhealthy region.' },
+        { id: 'd', text: 'Switching the regional load balancer from L4 to L7', correct: false, explanation: 'The L4/L7 choice affects how a regional load balancer inspects and routes individual requests within a region; it has no bearing on cross-region DNS/global failover speed.' },
+      ],
+    },
+  ]}
+/>

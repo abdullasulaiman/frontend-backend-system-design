@@ -1,0 +1,236 @@
+---
+title: "Routing and ETA"
+module: "Design Google Maps"
+moduleOrder: 3
+order: 4
+track: "interview"
+summary: "Explains how to turn the road network into a routable graph, why plain shortest-path search doesn't scale to a continental road graph, and how blending historical and live traffic signals turns a shortest path into an accurate, re-routable ETA."
+tags: ["routing", "graph-algorithms", "eta", "traffic", "maps"]
+estMinutes: 13
+cheatsheet:
+  - "Model the road network as a weighted directed graph: intersections are nodes, road segments are edges, and edge weight is travel time, not distance."
+  - "Dijkstra over the raw graph is too slow at continental scale — it explores in every direction from the source with no notion of where the destination is."
+  - "Bidirectional search cuts the explored area by searching from both ends and stopping when the frontiers meet, roughly squaring the speedup over one-directional search."
+  - "Contraction hierarchies do the expensive work offline: precompute shortcut edges over important roads so an online query only touches a tiny fraction of the graph."
+  - "ETA is not the same problem as shortest path — the shortest route by distance is often not the fastest by time once live traffic is factored in."
+  - "Blend three signals for ETA: static road speed limits, historical average speed by time-of-day/day-of-week, and live traffic reports, with live data overriding historical when available."
+  - "Re-routing is just re-running the same query from the driver's current position — treat a live trip as a stream of position updates, each one a candidate trigger for a fresh route computation if the driver deviates."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Ask "how do you find the shortest path in a graph" in an algorithms
+interview and everyone reaches for Dijkstra. Ask "how does Google Maps
+route you across a continent in under a second, with an ETA that's usually
+right within a couple of minutes" and Dijkstra is where the real interview
+starts, not where it ends. The road network for even one country is
+hundreds of millions of edges — running textbook Dijkstra from scratch on
+every route request would take seconds to minutes, not milliseconds, and
+it still wouldn't give you an accurate ETA, because the fastest route
+depends on traffic conditions that change minute to minute.
+
+This lesson covers the two problems candidates conflate: finding a good
+*route* (a graph search problem) and predicting an accurate *ETA* for it (a
+data-fusion and modeling problem). It builds on the road-segment graph
+introduced in the map data model lesson and the ~520 route
+computations/sec estimate from the requirements lesson.
+
+## The road network as a routable graph
+
+A road network maps naturally onto a directed, weighted graph:
+
+- **Nodes** are intersections, on-ramps, forks — anywhere a driver can
+  change direction.
+- **Edges** are the road segments between two nodes, directed (a one-way
+  street is a single edge; a two-way street is two edges, one per
+  direction).
+- **Edge weight** should be travel *time*, not distance. A 2-mile stretch
+  of highway and a 2-mile stretch of school-zone side street are the same
+  distance and wildly different travel times — routing on distance alone
+  produces routes that are "shortest" but not "fastest," which is what
+  users actually want.
+
+Each edge weight is itself a function of a base speed (the road's speed
+limit or typical free-flow speed) adjusted by time-of-day patterns and
+current traffic — more on that below. For now, treat routing as: given
+this weighted graph, find a low-cost path from source to destination.
+
+## Why plain Dijkstra doesn't scale
+
+Dijkstra's algorithm explores the graph in expanding rings outward from
+the source, visiting nodes in order of increasing distance until it reaches
+the destination. On a graph with hundreds of millions of edges, that means
+touching a large fraction of the entire road network for a cross-country
+query — it has no notion of "which direction the destination is in," so it
+wastes enormous effort exploring nodes that are nowhere near the eventual
+path.
+
+Two techniques fix this, and interviewers want to hear you can layer them.
+
+### Bidirectional search
+
+Run Dijkstra simultaneously from the source (forward) and from the
+destination (backward along reversed edges), alternating expansion between
+the two searches. Stop once the two search frontiers meet. Because both
+searches only need to expand roughly half the distance, the explored area
+shrinks dramatically — intuitively, you've replaced "search a circle of
+radius `d`" with "search two circles of radius `d/2`," which covers far
+less area in total. This is a straightforward addition to a standard
+Dijkstra implementation and a reasonable first improvement to propose.
+
+### Contraction hierarchies: precompute the shortcuts
+
+Bidirectional search alone still isn't fast enough for real-time queries
+over a continental graph. The bigger win is doing expensive work
+*offline*, once, rather than per query — this is the same "precompute at
+write time, serve cheaply at read time" instinct that shows up everywhere
+else in this course.
+
+A **contraction hierarchy** ranks nodes by importance (a residential
+side-street intersection is low importance; a highway interchange is high
+importance) and, offline, removes low-importance nodes one at a time,
+adding **shortcut edges** that preserve shortest-path distances between the
+node's remaining neighbors. After this preprocessing, an online query only
+needs to search a small, mostly-high-importance subgraph — it can "jump"
+over long stretches of highway using a single precomputed shortcut edge
+instead of expanding through every intermediate intersection. This is the
+single biggest reason production routing engines return continental
+routes in milliseconds instead of seconds: the hard graph-search work
+happened ahead of time, not during the request.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    A[Route request:\nsource + destination] --> B[Snap points\nto graph nodes]
+    B --> C[Bidirectional search\nover contracted hierarchy]
+    C --> D[Candidate path(s)]
+    D --> E[Apply live traffic\nweights to path edges]
+    E --> F[Route + ETA\nreturned to client]
+`} />
+
+## From shortest path to accurate ETA
+
+Finding *a* path is necessary but not sufficient — the harder, more
+business-critical problem is producing an ETA users can trust. ETA comes
+from blending three layers of signal on top of the graph:
+
+1. **Static road attributes** — speed limit, road class (highway vs.
+   residential), number of lanes. This is the floor: how fast this road
+   could be driven with zero traffic.
+2. **Historical speed patterns** — average observed speed on this segment
+   for this time of day and day of week, built from aggregated past trips.
+   A segment might free-flow at 60 mph at 2am and average 15 mph at 5pm on
+   a weekday — historical data captures that pattern even before any live
+   report comes in.
+3. **Live traffic conditions** — current speed derived from anonymized,
+   aggregated GPS traces of vehicles currently on that segment (the same
+   location-ping stream from the requirements lesson feeds this). When
+   live data is available and statistically confident (enough recent
+   samples on that segment), it overrides the historical estimate; when a
+   segment has too few recent samples to be confident, fall back to the
+   historical estimate rather than a noisy live one.
+
+Route selection and ETA computation are coupled but distinct steps: the
+graph search finds one or more candidate paths using a traffic-aware edge
+weight, then the ETA for the chosen path is the sum of each edge's
+current best time estimate. It's common to compute a small set of
+candidate routes (fastest, and one or two reasonable alternates) and
+present the fastest by current ETA, since "shortest by distance" and
+"fastest right now" frequently disagree — a highway detour a few miles
+longer is routinely faster than a short cut-through during rush hour.
+
+### Re-routing during an active trip
+
+Once a driver accepts a route, the client keeps sending position pings
+(recall the ~104,000 pings/sec system-wide estimate). The server compares
+each ping against the expected route: if the driver deviates — misses a
+turn, or a live traffic event makes the current route meaningfully slower
+than an alternative — it triggers a fresh route computation from the
+driver's current position to the same destination. This is not a special
+algorithm; it's the exact same routing query as the original request, just
+re-run with an updated source node and updated live-traffic weights. The
+only added logic is deciding *when* to trigger it: comparing actual
+progress against the expected route, and re-routing when the deviation or
+the ETA delta crosses a threshold, rather than recomputing on every single
+ping.
+
+## Worked example: rush-hour reroute
+
+A driver requests a route from downtown to the airport, 18 miles away. At
+request time, historical data says this trip typically takes 28 minutes at
+this hour, but live traffic reports show a cluster of slow-moving GPS
+traces on the direct highway segment, consistent with an accident. The
+routing service computes two candidates: the direct highway route, whose
+ETA (using live-adjusted edge weights) comes out to 41 minutes, and a
+surface-street alternate whose ETA is 33 minutes. It returns the alternate
+as the primary route with a 33-minute ETA, and keeps the highway route
+available as a secondary option.
+
+Ten minutes into the trip, live data shows the accident has cleared and
+the highway has returned to its historical speed. The client's next
+several pings show the driver still on the surface-street route, so no
+re-route triggers — but if the driver approaches a junction where the
+now-faster highway is still reachable and meaningfully quicker, the
+service flags it as a suggested re-route rather than forcing a silent
+recalculation, since abruptly changing a driver's route without their
+awareness is a poor experience even when the new route is faster on paper.
+
+<Callout type="warning">
+  A common mistake is treating ETA purely as a graph-shortest-path output
+  and bolting traffic on as an afterthought applied only to the final
+  route. If live traffic weights aren't part of the edge weights *during*
+  the search itself, the algorithm can select a route that looks shortest
+  under free-flow assumptions but is actually the slower choice once
+  traffic is applied — you have to search with traffic-aware weights, not
+  search first and adjust the ETA number after the fact.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="maps-routing-and-eta"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does a road-routing graph weight edges by travel time rather than physical distance?',
+      options: [
+        { id: 'a', text: 'Because travel time better reflects what "fastest route" actually means, since two segments of equal distance can have very different drivable speeds', correct: true, explanation: 'A short school-zone street and a short highway stretch can be the same distance but very different travel times — weighting by time is what makes the shortest-path result the fastest route, not just the geometrically shortest one.' },
+        { id: 'b', text: 'Because distance is harder to compute than time for a road segment', correct: false, explanation: 'Distance is trivial to compute from segment geometry; time requires more input (speed, traffic) but is the more useful weight, not because distance is hard.' },
+        { id: 'c', text: 'Because Dijkstra\'s algorithm only works with time-based weights', correct: false, explanation: 'Dijkstra works with any non-negative edge weights, including plain distance — the choice of time as the weight is a modeling decision, not an algorithmic requirement.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which techniques help a routing engine answer route queries over a continental road graph in milliseconds? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Bidirectional search from both the source and destination', correct: true, explanation: 'Searching from both ends and stopping when the frontiers meet shrinks the explored area versus a single expanding search from the source alone.' },
+        { id: 'b', text: 'Precomputing shortcut edges offline via a contraction hierarchy', correct: true, explanation: 'Contraction hierarchies push the expensive graph-reduction work to an offline preprocessing step, so online queries traverse a much smaller effective graph using precomputed shortcuts.' },
+        { id: 'c', text: 'Running full unidirectional Dijkstra from the source on every request', correct: false, explanation: 'This is the naive baseline the lesson describes as too slow at continental scale, not a technique that achieves millisecond latency.' },
+        { id: 'd', text: 'Re-deriving the entire road graph from raw GPS traces on every query', correct: false, explanation: 'The road graph is built and maintained separately (and much less frequently) from live traffic data; rebuilding it per query would be far too slow and is not how these systems work.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'The fastest route by ETA and the shortest route by distance are always the same route.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False in general — a longer highway detour is routinely faster than a shorter surface-street path once traffic and road speed are accounted for, which is exactly why ETA must be computed with traffic-aware time weights, not raw distance.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — distance and time-based ETA frequently disagree, especially under traffic, which is why routing uses time-weighted edges rather than pure distance.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A driver deviates from their assigned route mid-trip. What is the correct way to model handling this?',
+      options: [
+        { id: 'a', text: 'Detect the deviation from position pings and re-run the same routing query from the driver\'s current location to the original destination', correct: true, explanation: 'Re-routing is not a special algorithm — it is the same graph search re-run with an updated source node and current traffic weights, triggered by comparing actual position against the expected route.' },
+        { id: 'b', text: 'Discard the trip entirely and require the driver to manually re-enter the destination', correct: false, explanation: 'This is unnecessary and a poor user experience — the destination is already known, so only the source and current traffic conditions need to be refreshed for a new query.' },
+        { id: 'c', text: 'Ignore the deviation and continue displaying the original ETA and path unchanged', correct: false, explanation: 'This would leave the driver with a stale, likely-inaccurate ETA and directions that no longer match their actual position.' },
+      ],
+    },
+  ]}
+/>

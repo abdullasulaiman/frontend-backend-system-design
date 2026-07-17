@@ -1,0 +1,139 @@
+---
+title: "Media Storage and Delivery"
+module: "Design Instagram"
+moduleOrder: 8
+order: 3
+track: "interview"
+summary: "Walks through how a photo/video sharing app turns one uploaded file into many precomputed renditions, stores them cheaply and durably, and serves them fast worldwide through a CDN."
+tags: ["media-pipeline", "object-storage", "cdn", "image-processing", "distributed-systems"]
+estMinutes: 12
+cheatsheet:
+  - "Never resize, transcode, or watermark on the read path — precompute every rendition (thumbnail, feed, story, original) once at upload time and serve static files forever after."
+  - "Upload directly from the client to object storage via a pre-signed URL; don't proxy multi-megabyte files through your application servers."
+  - "Content-address blobs by a hash of their bytes so identical reposted images/videos are stored once and referenced by many posts, not duplicated per post."
+  - "Strip or rewrite EXIF data (GPS coordinates especially) during processing — serving the original file's raw EXIF is a real, recurring privacy leak."
+  - "Separate metadata (captions, owner, post-media links) in your database from the actual bytes in object storage; never store binary blobs as database rows."
+  - "Give each rendition its own predictable URL (e.g. mediaId_720.webp) so the CDN can cache each one independently instead of caching one file and transforming it on every request."
+  - "Tier storage by access pattern: hot originals + all renditions on fast storage behind the CDN for recent/popular posts, move rarely-viewed originals to cheaper cold storage after a retention window."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The high-level design from the last lesson drew a box labeled "media service" between the upload API and object storage, and moved on. That box is where most of the real engineering — and most of the interview's depth — actually lives. A single photo or video upload has to become a thumbnail for the grid, a full-resolution version for the feed, a cropped 9:16 version for stories, and (for video) a whole ladder of playable bitrates, all without making the person who just tapped "share" wait for any of it.
+
+Get this stage wrong and two things happen: read latency balloons because every view triggers on-the-fly processing, and storage costs balloon because you're either duplicating identical bytes across posts or never evicting anything. This lesson covers the upload path, the fan-out processing pipeline, how the blobs are actually laid out in storage, and how they get back out to a viewer's phone quickly.
+
+## Precompute renditions, never compute them on read
+
+A photo posted once needs to appear in several places, each with different size and format requirements: a ~150px square thumbnail in the profile grid, a ~1080px version in the main feed, a 1080x1920 crop for stories, and increasingly a next-gen format (WebP or AVIF) with a JPEG fallback for older clients. Video (Reels-style short clips) needs the same idea applied to an adaptive-bitrate ladder — a handful of resolution/bitrate pairs, similar in spirit to how a video platform transcodes a long-form upload, just over a much shorter clip and a narrower ladder.
+
+The one design decision that matters more than any other here: **do this work once, at upload time, not once per view.** A grid screen showing 30 thumbnails should never trigger 30 resize operations — it should fetch 30 already-generated thumbnail files. Resizing or transcoding inline on a read request turns every page view into CPU work and makes your read latency a function of your image-processing queue depth, which is backwards.
+
+## Upload path: get bytes off the client fast, then process asynchronously
+
+1. The client asks the app server for permission to upload. The app server creates a post record in a `pending` state and returns a **pre-signed URL** — a short-lived, scoped credential that lets the client's device upload the raw file directly to object storage.
+2. The client uploads the raw bytes straight to object storage. The app server's process is never in this data path at all — it only issued a URL, so a 20MB photo or a 60MB video clip never touches your API tier's bandwidth or memory.
+3. Object storage fires a completion event (or the client calls back the app server) once the upload finishes, which enqueues a **processing job** on a message queue.
+4. Worker processes pick up the job and fan it out: one sub-task per rendition (thumbnail, feed size, story crop, each format variant; for video, one sub-task per rendition in the bitrate ladder).
+5. Each worker writes its output back to object storage under a predictable key, then updates the post's per-rendition status. Once every required rendition is `ready`, the post transitions from `pending` to `published` and becomes visible in feeds.
+
+This mirrors the same async-processing shape you'd use for any expensive derived-data pipeline: accept fast, acknowledge the user, do the heavy lifting off the request path, and make each step idempotent so a crashed worker can safely retry without producing corrupted or duplicate renditions.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  C[Client] -->|1: request upload URL| A[App Server]
+  A -->|2: pre-signed URL| C
+  C -->|3: PUT raw file| O[(Object Storage)]
+  O -->|4: upload complete event| Q[[Processing Queue]]
+  Q --> W1[Worker: thumbnail]
+  Q --> W2[Worker: feed size]
+  Q --> W3[Worker: story crop]
+  Q --> W4[Worker: video ladder]
+  W1 --> O
+  W2 --> O
+  W3 --> O
+  W4 --> O
+  O --> CDN[CDN Edge]
+  CDN --> Viewer[Viewer's app]
+`} />
+
+## What the processing step actually does
+
+Beyond resizing, the fan-out workers handle a few things worth naming explicitly in an interview:
+
+- **Orientation and EXIF handling.** Phone cameras store rotation as metadata rather than rotating pixels; the pipeline must bake in correct orientation so every downstream renderer agrees. GPS coordinates and device identifiers embedded in EXIF should be stripped or rewritten before the file is ever served — leaving them in place is a genuine, recurring privacy bug (a public post silently exposing where it was taken).
+- **Format transcoding.** Serve modern formats (WebP/AVIF) to clients that support them and JPEG/H.264 to those that don't, decided once at upload time rather than via server-side content negotiation on every request.
+- **Perceptual or content hashing.** Computing a hash of the decoded content (not just the raw bytes) supports both deduplication and abuse detection (matching known-banned images) — and it's cheapest to compute here, while the file is already decoded in memory, rather than as a bolted-on later pass.
+
+## Storage layout: content-addressing and tiering
+
+Store blobs keyed by a hash of their content, not by post ID. If two users upload byte-identical files — a viral meme screenshot, a repost — the hash collides and you store the bytes exactly once, with both posts' metadata rows pointing at the same object key. This single decision can meaningfully cut storage volume on a platform where resharing is common.
+
+Keep metadata and blobs in fundamentally different systems: a database row for a post holds the caption, owner, timestamp, and pointers (keys) to its renditions; the actual pixels live in object storage, never as a blob column in your database. Databases are poor at serving large binary payloads efficiently and even worse at doing it cheaply at scale.
+
+Finally, tier by access pattern. Recent, actively-viewed posts sit on fast storage behind the CDN. Once a post ages past your platform's typical engagement window (most engagement happens in the first hours to days), move the rarely-accessed *original* to a cheaper cold storage class — you still need the original around in case you ever need to reprocess it (new format support, a moderation appeal), but you don't need it on your fastest, most expensive tier indefinitely. Renditions actively being served, by contrast, stay hot as long as the post is publicly viewable.
+
+## Serving reads: CDN caching per rendition
+
+Every rendition gets its own stable, predictable object key (`mediaId_thumb.webp`, `mediaId_1080.webp`, and so on), so the CDN can cache each one as an independent cache entry rather than caching one file and transforming it per request. Public content can be cached with very long TTLs since renditions are immutable once generated. Private accounts complicate this: the standard fix is short-lived signed URLs, generated by the app server after checking the viewer has access, which the CDN edge can validate without a per-request trip back to origin — the same access-control pattern used for gating any CDN-cached content, just applied here to photo/video renditions instead of video segments.
+
+## Worked example: estimating rendition storage
+
+Say the platform ingests 50 million photo uploads a day, averaging 3MB per original. Raw originals alone: 50M x 3MB = 150TB/day. Each original fans out into four renditions (thumbnail, feed, story crop, WebP variant) averaging roughly 1.2MB combined — another 60TB/day, so total fresh storage is on the order of 210TB/day before any dedup or cold-tiering.
+
+Two things move that number a lot in practice. First, content-hash dedup: if even 10% of uploads are reposts of existing content (a conservative estimate for a social platform), that's 15M/day stored as pointers instead of new bytes — real, measurable savings at this volume. Second, cold-tiering originals after, say, a 90-day active window moves the bulk of that 150TB/day off your most expensive storage class permanently, since renditions (not originals) serve almost all ongoing read traffic. Neither optimization is optional at this scale — it's the difference between a storage bill that grows linearly forever and one that plateaus.
+
+<Callout type="warning">
+  A common mistake is designing the media pipeline as "resize on upload" without separating that decision from serving. Precomputing renditions only pays off if reads always hit a static, pre-generated file — if your read path still branches on device type or falls back to on-the-fly transformation "just in case," you've paid the cost of precomputation without getting its latency benefit. Decide the fixed set of renditions up front, generate all of them at upload time, and make every read a direct static-file fetch with no conditional logic.
+</Callout>
+
+<Quiz
+  lessonId="instagram-media-storage-and-delivery"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should image resizing and video transcoding happen at upload time rather than when a viewer requests the content?',
+      options: [
+        { id: 'a', text: 'Because on-the-fly processing on every read would make read latency depend on processing load and multiply CPU cost with every view', correct: true, explanation: 'Precomputing once at upload time turns every read into a cheap static-file fetch instead of a repeated, latency-adding transformation.' },
+        { id: 'b', text: 'Because object storage cannot store more than one version of a file', correct: false, explanation: 'Object storage happily stores many keys per post (one per rendition); that is not a constraint here.' },
+        { id: 'c', text: 'Because CDNs refuse to cache files smaller than the original upload', correct: false, explanation: 'CDNs cache whatever is requested, regardless of relative size to an unrelated original file.' },
+        { id: 'd', text: 'Because pre-signed URLs only work for a single file per post', correct: false, explanation: 'A post can have as many associated object keys and pre-signed URLs as needed; this is not a limiting factor.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine benefits of content-hash-based (content-addressed) storage for media blobs? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Identical reposted files are stored once, not once per post', correct: true, explanation: 'Hashing the content means duplicate uploads resolve to the same object key, so bytes are stored once regardless of how many posts reference them.' },
+        { id: 'b', text: 'It makes EXIF GPS stripping unnecessary', correct: false, explanation: 'Content-hash addressing is unrelated to metadata scrubbing; GPS/EXIF stripping still has to happen explicitly during processing.' },
+        { id: 'c', text: 'It supports matching against known content (e.g. for abuse or copyright detection) using the same hash', correct: true, explanation: 'A hash computed once during processing can double as a lookup key against known-bad or known-duplicate content sets.' },
+        { id: 'd', text: 'It removes the need for a CDN in front of the media', correct: false, explanation: 'Content addressing is a storage/dedup strategy; serving files quickly to distant viewers is still the CDN\'s job regardless of how objects are keyed.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Storing a photo\'s pixel data directly as a binary column in the same database row as its caption and owner metadata is a reasonable default design.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Databases are a poor and expensive fit for large binary payloads at scale; the standard pattern is metadata in the database and pointers to blobs in object storage.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — keep binary media in object storage and store only lightweight metadata (including pointers/keys to the blobs) in the database.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A private account\'s photos still need to be served through a CDN for speed, but must not be viewable by users without access. What is the standard way to reconcile this?',
+      options: [
+        { id: 'a', text: 'Disable CDN caching for all private accounts and serve every request from origin', correct: false, explanation: 'This throws away CDN latency and cost benefits for every private account\'s traffic, which does not scale.' },
+        { id: 'b', text: 'Issue short-lived signed URLs after an access check, which the CDN edge can validate without calling back to origin per request', correct: true, explanation: 'This is the standard pattern: authorization is checked once by the app server and encoded into a time-limited signature the edge validates locally, keeping the content cacheable while still gating access.' },
+        { id: 'c', text: 'Encrypt every rendition with a key shared to all logged-in users', correct: false, explanation: 'A key shared with all logged-in users provides no actual access control between accounts that can and cannot view the content.' },
+        { id: 'd', text: 'Store private account media in a database instead of object storage so it bypasses the CDN entirely', correct: false, explanation: 'This reintroduces the database-as-blob-store anti-pattern and still doesn\'t address CDN-speed delivery, which is the actual requirement here.' },
+      ],
+    },
+  ]}
+/>

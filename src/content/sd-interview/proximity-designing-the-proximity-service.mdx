@@ -1,0 +1,219 @@
+---
+title: "Designing the Proximity Service"
+module: "Design a Proximity Service (Yelp)"
+moduleOrder: 4
+order: 4
+track: "interview"
+summary: "Walks through the internals of the proximity search service itself — how the geospatial index is served, kept fresh, sharded, and queried with an expanding-radius search algorithm."
+tags: ["proximity", "geospatial", "search", "sharding", "caching"]
+estMinutes: 13
+cheatsheet:
+  - "Split storage into two stores with different jobs: a business/place database (source of truth, full CRUD, changes constantly) and a geospatial index (read-optimized, tolerates a few minutes of staleness)."
+  - "Serve the index from memory, not from the primary database — a live radius query against a row-store with a distance calculation in the WHERE clause cannot hit an index and forces a full scan."
+  - "Search with an expanding ring: start at the user's grid cell, check neighboring cells only if you don't have enough candidates yet, and stop as soon as you do — don't scan the whole dataset up front."
+  - "Filter candidates with exact Haversine distance only after the grid narrows the search space — the grid gets you 'roughly nearby,' the distance formula gets you 'actually within radius, sorted.'"
+  - "Buffer or replicate businesses near a shard/cell boundary to neighboring shards, or you'll silently drop real nearby results for users standing right at the edge."
+  - "Decouple index updates from the write path: writes land in the business DB immediately, and a background job (or a queue-driven updater) propagates them into the index within seconds to minutes — don't make every place edit block on an index rewrite."
+  - "Cache at the query level (`geohash prefix, radius, category` as key) for hot areas — downtown search boxes get hit far more than suburbs, and query results are cheap to cache since staleness of a few minutes is fine."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson picked a data structure — geohash or quadtree — for
+answering "what's near this point." That's necessary but not sufficient. An
+interviewer who's satisfied with "I'll use a quadtree" will immediately ask
+the follow-up that actually separates strong candidates from weak ones: where
+does that quadtree *live*, who updates it, what happens when a business
+closes an hour ago, and what does a single search request actually do step
+by step? This lesson answers those questions — it's the service design that
+sits on top of the index structure, not the structure itself.
+
+## Two stores, two very different jobs
+
+A proximity service almost always needs two separate data stores, and
+conflating them is the most common design mistake:
+
+- **The business/place store** — name, address, hours, phone number, photos,
+  category. This is the source of truth. It changes constantly (new
+  businesses, edits, closures) and needs full CRUD with strong consistency —
+  if an owner updates their hours, that update should stick.
+- **The geospatial index** — a structure (geohash grid or quadtree, per the
+  last lesson) mapping location to a set of business IDs, built for one
+  question: "which IDs are near `(lat, lng)`?" It doesn't need every field,
+  just enough to filter and rank — ID, coordinates, maybe category and
+  average rating for pre-filtering.
+
+These have opposite access patterns. The business store is write-heavy per
+record but read by ID (fetch details for one place). The index is read-heavy
+in aggregate (millions of radius queries per day) and only needs to be
+"pretty fresh," not perfectly current — a restaurant that closed ten minutes
+ago showing up in one more search result is a minor UX blemish, not a
+correctness bug. Treating them as one table forces you to pick one
+consistency and performance model for both jobs, and you'll pick badly for
+at least one of them.
+
+## Serving the index
+
+The index needs to answer radius queries in single-digit milliseconds at
+high volume, which rules out hitting the primary relational database per
+query — a live distance calculation in a `WHERE` clause can't use a normal
+B-tree index and degrades into a full table scan as data grows. Instead, the
+index is built and served as its own component:
+
+- **In memory** on dedicated index-server nodes — a geohash-to-business-ID
+  map or a quadtree, small enough per shard to fit in RAM, so lookups are
+  pointer-chasing, not disk I/O.
+- **Sharded by geography** — one shard per region (a set of top-level
+  geohash prefixes, or a quadtree subtree), so no single node holds the
+  whole world and a search only has to touch the one or two shards that
+  cover the query area.
+- **Replicated** within each shard for read throughput and failover, the
+  same way you'd replicate any read-heavy service.
+
+Updates flow separately from reads: a write to the business store (new
+listing, address change, deletion) is appended to a change stream or queue,
+and a background updater applies it to the relevant index shard — inserting,
+moving, or removing that business ID from its grid cell. This keeps writes
+fast (they don't wait on index mutation) and keeps the index eventually
+consistent, typically catching up within seconds to a couple of minutes.
+
+## The search algorithm: expand until you have enough
+
+Given a user's `(lat, lng)` and a target radius, the query doesn't just
+"look up the cell and return everything in it" — that fails in two
+directions. A dense downtown cell might return thousands of businesses when
+the user only wants the closest 20; a sparse rural cell might return zero
+when the nearest coffee shop is actually three cells away. The standard
+approach is an **expanding ring search**:
+
+1. Compute the grid cell (geohash prefix or quadtree leaf) containing the
+   user's point.
+2. Collect candidate business IDs from that cell.
+3. If candidates are fewer than the number of results needed, pull in the
+   immediate neighboring cells too, and repeat — widen one ring at a time.
+4. Stop widening once you have enough candidates or you've hit a sane
+   maximum radius (no point expanding to "nearest pizza place" 200km away).
+5. Only now compute **exact distance** (Haversine formula, which accounts
+   for Earth's curvature) from the user to each candidate, filter out
+   anything actually outside the requested radius, sort by distance, and
+   fetch full details for the top results from the business store.
+
+The grid narrows millions of businesses down to a few dozen or hundred
+candidates cheaply; the exact-distance step, which is more expensive per
+item, only ever runs on that small candidate set — never on the whole
+dataset.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    Client[Client: lat, lng, radius] --> Query[Query service]
+    Query --> Router[Shard router by region]
+    Router --> Shard1[Index shard A: in-memory grid]
+    Router --> Shard2[Index shard B: neighbor region]
+    Shard1 --> Candidates[Candidate business IDs]
+    Shard2 --> Candidates
+    Candidates --> Filter[Haversine filter + sort]
+    Filter --> Details[Fetch details from business store]
+    Details --> Cache[(Query result cache)]
+    Details --> Client2[Response to client]
+`} />
+
+## Handling the boundary problem
+
+Grid-based indexes have a sharp edge: a business sitting one meter on the
+wrong side of a cell (or shard) boundary from the user is, structurally, "in
+a different cell" even though it's the closest option in reality. If your
+expanding-ring search only ever looks at the user's exact cell before
+deciding whether to widen, you can miss it entirely on borderline queries.
+Two common fixes, often used together: always check the 8 (or however many)
+immediate neighboring cells regardless of candidate count, not just when the
+current cell is sparse; and, at the shard level, replicate businesses near a
+shard's edge into the neighboring shard's index too, so a query near the
+boundary doesn't need a cross-shard fan-out just to find something 50 meters
+away.
+
+## Worked example: a 3km search downtown
+
+A user requests restaurants within 3km. Their geohash prefix at a chosen
+precision maps to one grid cell roughly 1.2km across. The query service
+resolves that cell's shard, pulls candidate IDs from that cell plus its 8
+neighbors, and gets 340 candidates — plenty. It computes Haversine distance
+for all 340, drops anything over 3km, sorts the remainder by distance, and
+takes the closest 20. Total work: one shard lookup (in-memory, sub-millisecond),
+one cheap distance calculation over a few hundred items (microseconds each),
+and one batch fetch of 20 full business records by ID from the business
+store — likely already warm in a cache, since popular downtown areas get
+searched constantly. Contrast that with a rural query: the user's cell
+returns 2 candidates, the service widens one ring, still only finds 6, hits
+its configured minimum of 10, widens once more to 15 candidates, and stops
+there rather than expanding indefinitely — it's fine to tell the user
+"nothing else within 20km" once the max-radius cutoff is reached.
+
+<Callout type="warning">
+  A frequent mistake in interviews: describing the geospatial index as
+  something the query hits and stops there, forgetting that the index only
+  stores IDs and rough location — it doesn't have the name, rating, or
+  photos the client needs to render results. Every design needs an explicit
+  second hop from "candidate IDs" to "full business records," and that hop
+  is exactly where you'd add a cache, since the same popular businesses show
+  up as candidates in many different users' searches.
+</Callout>
+
+## Where this leaves you
+
+You now have the full request path: business writes land in the source-of-
+truth store and asynchronously propagate into a sharded, in-memory
+geospatial index; reads run an expanding-ring search against that index to
+get cheap candidates, then apply exact distance filtering and a details
+lookup before returning results. The final lesson in this module takes this
+design further under load — how sharding strategy holds up as write volume
+and query volume both grow, and how the index-rebuild and replication story
+changes at a much larger scale.
+
+<Quiz
+  lessonId="proximity-designing-the-proximity-service"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does a proximity service usually keep the business/place data and the geospatial index as two separate stores instead of one?',
+      options: [
+        { id: 'a', text: 'They have opposite access patterns and different consistency needs — the business store needs strong-consistency CRUD by ID, while the index needs fast, eventually-consistent radius lookups.', correct: true, explanation: 'Correct — forcing one storage and consistency model to serve both jobs means picking badly for at least one of them.' },
+        { id: 'b', text: 'Because relational databases cannot store latitude and longitude values.', correct: false, explanation: 'Relational databases store coordinates fine; the issue is that a live radius query against a row-store scan does not perform at scale, not that the columns cannot exist.' },
+        { id: 'c', text: 'Because the index must always be 100% consistent with the business store or search results would be invalid.', correct: false, explanation: 'The opposite is true — a few minutes of index staleness (a closed business still appearing briefly) is an accepted trade-off, not a requirement to avoid.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are part of a correct expanding-ring search implementation? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Start by collecting candidates from the cell containing the user, and only widen to neighboring cells if there are not enough candidates yet.', correct: true, explanation: 'This is the core of the expanding-ring approach: cheap local lookup first, widen only when needed.' },
+        { id: 'b', text: 'Apply exact Haversine distance filtering only after narrowing to a candidate set from the grid, not against the entire dataset.', correct: true, explanation: 'The grid narrows millions of rows to a small candidate set cheaply; exact distance math only needs to run on that small set.' },
+        { id: 'c', text: 'Stop widening once a maximum sane radius is reached, even if fewer results than requested were found.', correct: true, explanation: 'Unbounded widening in a sparse area would eventually scan huge portions of the index for a marginal result — a max-radius cutoff is a deliberate, correct trade-off.' },
+        { id: 'd', text: 'Always scan the entire geospatial index for every query to guarantee the true nearest result.', correct: false, explanation: 'This defeats the purpose of the grid structure entirely and would not scale to real query volumes.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Because writes to the business store are propagated to the geospatial index asynchronously, a place edit (like an address change) should block until the index update completes, to avoid ever serving a stale index.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Blocking writes on index propagation reintroduces the exact coupling this design avoids, and defeats the point of treating the index as an eventually-consistent read path; a short propagation lag is an accepted trade-off.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — writes should complete against the business store immediately, with index propagation happening in the background within seconds to minutes.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A user standing right at the edge of a grid cell (and near a shard boundary) gets a missing result for the objectively closest restaurant, which sits just across that boundary. What is the standard fix?',
+      options: [
+        { id: 'a', text: 'Increase the precision of the geohash so cells are smaller.', correct: false, explanation: 'Smaller cells make the boundary problem worse, not better — there are more edges relative to the search radius, not fewer.' },
+        { id: 'b', text: 'Always check immediate neighboring cells (and replicate near-boundary businesses to neighboring shards) rather than relying only on the user’s exact cell.', correct: true, explanation: 'Correct — this directly addresses the structural edge problem of grid-based indexes without requiring a full cross-shard fan-out on every query.' },
+        { id: 'c', text: 'Round the user’s coordinates to the center of the nearest cell before searching.', correct: false, explanation: 'This does not solve the boundary problem and introduces inaccuracy into the user’s actual position for no benefit.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,268 @@
+---
+title: "Requirements and Estimation"
+module: "Design Google Maps"
+moduleOrder: 3
+order: 1
+track: "interview"
+summary: "Scopes the mapping and routing problem into map rendering, search, and routing sub-systems, then derives storage and query-rate estimates from map coverage, tile counts, and daily active navigators."
+tags: ["requirements", "capacity-estimation", "maps", "geospatial", "interview-framework"]
+estMinutes: 11
+cheatsheet:
+  - "Split the problem into three sub-systems up front: map rendering (tiles), search (place lookup), and routing (turn-by-turn) — each has a different data shape and scaling story."
+  - "Map data is close to read-only and changes slowly (road networks shift over weeks, not seconds), so aggressive caching and pre-computation are the default, not an optimization added later."
+  - "Estimate tile storage from zoom levels, not raw map area — each zoom level roughly quadruples the tile count, so storage is dominated by the deepest zoom levels you support."
+  - "Active navigation sessions (turn-by-turn) are a small fraction of map views but drive a completely different load: a steady stream of location pings per second per active trip, not one-shot requests."
+  - "State a position-update interval (e.g. every 3-5 seconds) explicitly — it is the single biggest lever on both client battery/bandwidth and backend location-ingestion QPS."
+  - "Distinguish staleness tolerance by data type: traffic/ETA needs near-real-time data, while road geometry and place metadata can be minutes-to-hours stale without anyone noticing."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design Google Maps" sounds like one problem but is really three problems
+wearing a trenchcoat: rendering a map you can pan and zoom, finding a place
+by name or category, and computing a route with a live ETA between two
+points. Candidates who treat it as one big undifferentiated "maps system"
+end up with a design that's vague everywhere instead of solid anywhere. The
+fix, as with any large system design prompt, is to nail requirements and
+scale before drawing a single box — the numbers you produce here decide
+whether you're building a tile-caching problem, a search-index problem, or
+a routing-graph problem, and in which order to prioritize them.
+
+This lesson is that scoping step. The high-level design, data model, and
+routing lessons that follow all build directly on the constraints
+established here.
+
+## Step 1: Scope the functional requirements
+
+In a 45-minute interview you cannot design "everything Google Maps does."
+Propose a core scope and get the interviewer to confirm or redirect:
+
+- **Map viewing**: a user can pan and zoom a map and see roads, buildings,
+  and points of interest rendered smoothly.
+- **Search**: a user can search for a place by name, address, or category
+  ("coffee near me") and get ranked results with locations.
+- **Routing and navigation**: given a start and end point, the system
+  returns one or more routes with an estimated time of arrival (ETA), and
+  can track a user's live position along that route.
+- **Live traffic**: routes and ETAs should reflect current road conditions,
+  not just static road speeds.
+
+Explicitly defer, and say so out loud: street view imagery, public-transit
+schedules, ride-hailing integration, and offline map downloads are all real
+Google Maps features, but each deserves its own design discussion. Naming
+what you're excluding is what tells the interviewer you understand the
+problem's actual size.
+
+### Non-functional requirements
+
+- **Read-heavy, latency-sensitive map viewing.** Tiles must render in well
+  under a second while panning, or the map feels broken — this pushes hard
+  toward caching and CDN-style delivery over computing tiles on demand.
+  Availability matters far more than strict consistency here: a tile that's
+  a day stale is invisible to the user.
+- **Routing must be fast and "good enough," not globally optimal.** Users
+  expect a route back in under a second or two; spending 30 seconds to
+  shave 40 seconds off a 25-minute drive is a bad trade. Correctness
+  (a valid, drivable route) matters more than finding the mathematically
+  shortest path every time.
+- **Live location tracking must be low-latency but can tolerate loss.**
+  Missing one GPS ping out of a stream every few seconds is fine; the
+  client just interpolates. This is a classic case for favoring
+  availability and throughput over strict delivery guarantees.
+- **Road network and place data change slowly; traffic changes constantly.**
+  These have very different staleness budgets and should not be treated as
+  one data-freshness problem.
+
+## Step 2: Establish the scale
+
+Concrete, stated assumptions beat a design built on "big numbers,
+somehow." A reasonable working set for a global, Google Maps-scale service:
+
+- 1 billion monthly active users, 150 million daily active users (DAU).
+- Of those DAU, roughly 20% (30 million) start at least one active
+  navigation session per day (turn-by-turn routing, not just glancing at
+  the map).
+- An average navigation session lasts 20 minutes and sends a location
+  update every 4 seconds.
+- The world's drivable road network is represented as roughly 500 million
+  road segments (edges) once broken into short, routable pieces.
+- The map is rendered as pre-generated tiles across 20 zoom levels (a
+  standard range from whole-world view down to street-level detail).
+
+<Callout type="tip">
+  Say these numbers out loud before you compute anything, and invite a
+  correction: "I'll assume 150 million DAU with about 20% of them actively
+  navigating on a given day — does that match what you had in mind, or
+  should I adjust?" It turns estimation into a checkpoint with the
+  interviewer instead of a monologue they have to silently evaluate.
+</Callout>
+
+## Step 3: Derive the numbers for each sub-system
+
+Work through map viewing, search, and routing/navigation separately —
+lumping them into one QPS number hides which part of the system is
+actually under the most load.
+
+### Map tile storage
+
+Each zoom level roughly quadruples the number of tiles needed to cover the
+same area, since each tile at zoom `n` splits into four tiles at zoom
+`n + 1`. At zoom level 0 the whole world is one tile; by zoom level 20
+(building-level detail in dense areas) the tile count is enormous, though
+in practice you don't pre-render every deep zoom level everywhere — dense
+cities need it, open ocean doesn't.
+
+- Assume an average of 256 KB per rendered tile (vector or raster,
+  compressed) and that, across all 20 zoom levels combined, roughly 5
+  billion tiles are actually pre-rendered and stored once you account for
+  sparse rendering over low-interest areas (oceans, deep wilderness).
+- Total tile storage: 5,000,000,000 tiles multiplied by 256 KB is about
+  1.2 PB.
+
+That number alone tells you tiles belong in blob/object storage behind a
+CDN, not a database — this is nearly identical in shape to the "static,
+cacheable assets at massive scale" problem you'd see designing a video
+platform's read path, just applied to map imagery instead of video
+renditions.
+
+### Search QPS
+
+- Assume 150 million DAU each issue an average of 3 search queries per day
+  (place lookups, "near me" queries, address entry).
+- Daily searches: 150,000,000 multiplied by 3 is 450 million searches/day.
+- Average QPS: 450,000,000 divided by 86,400 seconds is about 5,200
+  queries/sec. With a 5x peak multiplier for commute-hour spikes, peak
+  search load is roughly 26,000 queries/sec.
+
+### Routing and live navigation
+
+- Route requests (the initial "give me a route" call): assume the 30
+  million daily navigators each request 1.5 routes on average (some
+  re-route mid-trip), giving 45 million route computations/day, or about
+  520/sec average — small compared to search, but each one is more
+  compute-heavy (a graph search over the road network) than a simple
+  lookup.
+- Live location pings: 30 million concurrent-ish sessions is the wrong way
+  to think about it — instead, compute total pings across all sessions.
+  Each 20-minute session at one ping per 4 seconds sends 300 pings per
+  session. 30,000,000 sessions multiplied by 300 pings is 9 billion
+  location updates/day, or roughly 104,000 pings/sec on average.
+
+This is the counter-intuitive result worth calling out explicitly in an
+interview: **live location ingestion, not search or route computation, is
+the highest-QPS path in the whole system**, because it's a continuous
+stream per active trip rather than a single request-response.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    T["Map tiles\n~1.2 PB total, read-heavy"] --> C["CDN / tile cache"]
+    S["~26K search queries/sec (peak)"] --> I["Search index"]
+    R["~520 route computations/sec"] --> G["Routing graph service"]
+    L["~104K location pings/sec"] --> P["Location ingestion pipeline"]
+    style T fill:#4a5568,color:#fff
+    style S fill:#2b6cb0,color:#fff
+    style R fill:#2b6cb0,color:#fff
+    style L fill:#9c4221,color:#fff
+`} />
+
+## Step 4: State the resulting design constraints
+
+Turn the estimates into constraints you'll defend later in the interview:
+
+1. **Tiles are a caching/CDN problem, not a compute-on-demand problem** —
+   at 1.2 PB and near-static content, pre-render and cache aggressively;
+   never render a tile per request.
+2. **Location ingestion is the dominant QPS load** — at roughly 104,000
+   pings/sec, this path needs a purpose-built, horizontally scalable
+   ingestion pipeline (think a partitioned message queue keyed by user or
+   trip), not a synchronous database write per ping.
+3. **Routing computation is comparatively rare but expensive per call** —
+   a graph search over hundreds of millions of edges is not something you
+   re-run from scratch on every ping; only the initial route request and
+   occasional re-routes need the heavy computation.
+4. **Freshness requirements vary sharply by data type** — traffic and live
+   position data need near-real-time handling; road geometry and place
+   metadata can lag by minutes to hours with no user-visible impact.
+
+<Callout type="warning">
+  A common mistake is computing one blended "QPS for the maps system" and
+  sizing everything to it. That hides the fact that search, routing, and
+  location ingestion have wildly different volumes and latency budgets — a
+  system sized only for the ~26K search QPS would be crushed by the ~104K
+  location-ping QPS it never accounted for. Always break estimates out per
+  sub-system before combining anything into an infrastructure plan.
+</Callout>
+
+## Worked example: sanity-checking a follow-up
+
+An interviewer might push: "What if we tightened the location-ping
+interval from 4 seconds to 1 second for smoother live tracking?" Re-derive
+rather than guessing: pings per session go from 300 (20 minutes / 4
+seconds) to 1,200 (20 minutes / 1 second), a 4x increase, so location
+ingestion QPS jumps from roughly 104,000/sec to about 416,000/sec — while
+search and routing QPS are completely unaffected, since neither depends on
+ping frequency. That's the right instinct to demonstrate: identify exactly
+which estimate a changed assumption touches, rather than re-computing
+everything from scratch or assuming a global slowdown.
+
+## Where this leads
+
+The three-way split from this lesson — read-heavy cacheable tiles, a
+place-search index, and a routing/tracking path with real-time ingestion —
+is exactly the shape of the high-level architecture in the next lesson: a
+tile-serving layer behind a CDN, a search service over indexed place data,
+and a routing service backed by a road-network graph, with a separate
+ingestion pipeline for live location updates. Keep the QPS gap between
+search (~26K/sec) and location pings (~104K/sec) in mind — it's the reason
+those two paths end up on very different infrastructure.
+
+<Quiz
+  lessonId="maps-requirements-and-estimation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'With 30 million daily navigators each running a 20-minute session and sending a location update every 4 seconds, what is the approximate average location-ping rate across the whole system?',
+      options: [
+        { id: 'a', text: 'About 104,000 pings/sec', correct: true, explanation: 'Each session sends 20 minutes / 4 seconds = 300 pings. 30,000,000 sessions x 300 pings = 9 billion pings/day; divided by 86,400 seconds is about 104,000/sec.' },
+        { id: 'b', text: 'About 30 million pings/sec', correct: false, explanation: 'This confuses the number of sessions with the ping rate — each session sends many pings over its lifetime, not one ping per second per session.' },
+        { id: 'c', text: 'About 520 pings/sec', correct: false, explanation: 'That figure is the estimated route-computation rate (initial route requests), not the location-ping ingestion rate, which is far higher.' },
+        { id: 'd', text: 'About 26,000 pings/sec', correct: false, explanation: 'That is the estimated peak search QPS in this lesson, a different sub-system with a different volume than location ingestion.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasonable non-functional priorities to call out for a mapping and routing system? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Map tiles should be cached and served from a CDN rather than rendered fresh per request', correct: true, explanation: 'Road and building geometry changes slowly, so pre-rendering and caching tiles is far more efficient than computing them on every request.' },
+        { id: 'b', text: 'Every location ping must be durably persisted and never dropped, even under load', correct: false, explanation: 'A single missed ping in a continuous stream is tolerable — the client interpolates position between updates; this is a case for favoring throughput and availability over guaranteed delivery of every ping.' },
+        { id: 'c', text: 'Routing should return a fast, valid route rather than searching exhaustively for the mathematically optimal one', correct: true, explanation: 'Users need a route back in roughly a second or two; a "good enough" route delivered quickly beats a marginally better route that takes much longer to compute.' },
+        { id: 'd', text: 'Road network data and live traffic data have the same staleness tolerance and should be refreshed on the same schedule', correct: false, explanation: 'Road geometry changes over weeks and can be minutes-to-hours stale with no impact; traffic and ETA data need to be far closer to real-time — treating them identically wastes effort on one or under-serves the other.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In this estimation, live location-ping ingestion produces a higher average QPS than place search.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — roughly 104,000 pings/sec average versus roughly 5,200 search queries/sec average (about 26,000/sec at peak), because location tracking is a continuous stream per active trip rather than a single request.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Incorrect in this estimation — location ingestion is the higher-volume path precisely because each active navigation session generates many pings over its duration, not just one request.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why is it useful to estimate QPS separately for map tiles, search, routing, and location ingestion instead of computing one combined number?',
+      options: [
+        { id: 'a', text: 'Because each sub-system has a different data shape, latency budget, and scaling strategy, and a combined number would hide which one dominates load', correct: true, explanation: 'Tiles are cache-heavy static reads, search is a lookup workload, routing is compute-heavy but infrequent, and location ingestion is high-volume streaming writes — collapsing these into one number would obscure that location ingestion, not search, is the largest load.' },
+        { id: 'b', text: 'Because interviewers only ever ask about one sub-system at a time, so a combined estimate is never useful', correct: false, explanation: 'Interviewers commonly probe across sub-systems and follow-ups; the value of separating estimates is architectural clarity, not just matching question format.' },
+        { id: 'c', text: 'Because combined estimates are always mathematically incorrect', correct: false, explanation: 'A combined total is not mathematically wrong, it is just less useful for design decisions — it obscures which sub-system actually drives infrastructure choices.' },
+        { id: 'd', text: 'Because map tiles, search, and routing all have identical QPS by design', correct: false, explanation: 'They do not — this lesson\'s own estimates show meaningfully different QPS across sub-systems (roughly 26K peak search vs. 104K location pings, for example).' },
+      ],
+    },
+  ]}
+/>

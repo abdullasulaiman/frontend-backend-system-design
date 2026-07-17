@@ -1,0 +1,213 @@
+---
+title: "Short-Video Feed: Mock Interview"
+module: "Design YouTube"
+moduleOrder: 1
+order: 7
+track: "interview"
+summary: "A timed mock-interview exercise that adapts the YouTube design into a TikTok/Reels-style short-video feed, stress-testing the feed, prefetch, and ranking-feedback concerns that long-form video design doesn't cover."
+tags: ["mock-interview", "short-video", "feed-ranking", "prefetching", "video"]
+estMinutes: 14
+cheatsheet:
+  - "A short-video feed is consumption-first, not search-first: most watch time comes from an algorithmic feed the user never queried, so feed/ranking service quality matters as much as CDN delivery."
+  - "Prefetch the next 2-3 videos while the current one plays; fetch metadata for 5-10 more. Prefetch too little and you get stalls, too much and you waste bandwidth on videos the user swipes past."
+  - "Short clips mean session view rate is 10-50x a long-form platform's for the same session length, which multiplies feed-service QPS and view-event volume far more than it multiplies storage or transcoding load."
+  - "Close the loop: watch-time and skip signals from playback need to reach the ranking model in seconds to minutes, not hours, or the feed feels stale mid-session."
+  - "State the CAP trade-off out loud: feed ranking can run on eventually-consistent, slightly-stale engagement counts; the video bytes themselves still need durable storage and a fast, consistent CDN lookup."
+  - "Don't redesign transcoding or storage from scratch in this exercise — reference the upload/transcoding and CDN lessons and spend your limited time on what's actually different about a feed."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+import MockInterview from '../../components/MockInterview';
+
+Every lesson so far in this module designed the "watch a specific video"
+path: a user searches or clicks a link, and you serve one piece of content
+well. A short-video feed — think TikTok, YouTube Shorts, Instagram Reels —
+is a different consumption model built on the same storage and delivery
+foundation. Nobody searches for the next clip; the app decides for them,
+and it has to decide fast, over and over, sometimes dozens of times a
+minute. That shift changes what an interviewer will actually probe, and
+it's common enough as a variant prompt that it's worth a dedicated,
+timed run before you sit a real interview.
+
+This lesson is structured as a mock interview: a prompt, a suggested time
+budget, and a scoring rubric, rather than a fresh conceptual deep dive. Treat
+it like the real thing — set a timer, talk out loud (or write your reasoning
+down) as if an interviewer were listening, and only check the rubric after
+you've made your attempt.
+
+## What's actually different from long-form YouTube
+
+Don't restart the whole design from scratch. Upload, transcoding, adaptive
+bitrate streaming, and CDN edge delivery work the same way they do for a
+ten-minute video — reuse everything from the earlier lessons in this
+module. Three things genuinely change for a short-video feed, and they're
+where this mock interview should spend its time:
+
+- **Discovery is push, not pull.** There's no search box in the primary
+  loop. A feed/ranking service decides what to show next, using engagement
+  signals (watch-through rate, replays, likes, skips) rather than a search
+  query.
+- **Prefetching becomes a first-class design concern.** Long-form video
+  buffers ahead within *one* video. A feed has to buffer ahead *across*
+  videos — fetching manifests and priming CDN connections for content the
+  user hasn't chosen yet, so the swipe-to-next transition feels instant.
+- **The feedback loop is tight and continuous.** Every few seconds of watch
+  time or a quick skip is a signal that should influence what the same
+  user sees a few videos later in the same session, not just in tomorrow's
+  batch job.
+
+## Suggested time budget
+
+A realistic 45-minute slot for this variant:
+
+- **5-7 min** — clarify scope (feed only, or also upload/search?) and state
+  the two or three non-functional priorities you'll optimize for.
+- **5 min** — capacity estimate focused on feed QPS and view-event volume,
+  not storage (storage math is the same as long-form YouTube; don't redo
+  it here).
+- **15 min** — high-level architecture: client, feed service, candidate
+  generation, ranking, CDN delivery, event pipeline.
+- **12 min** — deep dive on prefetching and the ranking-feedback loop —
+  this is the part that differentiates a strong answer from a generic one.
+- **remaining time** — trade-offs and failure modes (cold-start users, feed
+  staleness, thundering-herd on a viral clip).
+
+## The feed and prefetch pipeline
+
+The core request/response loop looks different from a single-video watch
+page: the client asks for a *page* of candidate videos, not one video, and
+it starts working through a local buffer well before that buffer runs out.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    A[Client requests next feed page] --> B[Feed Service]
+    B --> C[Candidate Generation - embeddings / ANN lookup]
+    B --> D[Ranking Model - rerank by predicted engagement]
+    C --> D
+    D --> E[Return metadata + CDN manifest URLs, ~10 videos]
+    E --> F[Client feed buffer]
+    F --> G[Player: play current, prefetch next 2-3 manifests]
+    G --> H[Watch-time / skip events]
+    H --> I[Event pipeline]
+    I --> D
+`} />
+
+A few points worth calling out explicitly in the interview:
+
+- **Candidate generation vs. ranking are separate stages.** Generation
+  narrows millions of videos down to a few hundred plausible candidates
+  cheaply (embedding similarity, creator-follow graph, trending pool);
+  ranking is a heavier model that scores that smaller set. Doing heavy
+  ranking over the entire catalog per request doesn't scale.
+- **The client buffer, not just the server, absorbs latency.** If the
+  feed service call takes 150ms, that's fine as long as it happens while
+  the user is still watching video 3 of a 10-video buffer — the client
+  never blocks visibly as long as the buffer stays ahead of playback.
+- **The event pipeline closes the loop asynchronously.** Watch-time and
+  skip events stream into the ranking model's feature store so the *next*
+  feed request for that user reflects what just happened, without making
+  playback itself wait on that write.
+
+## Worked example: sizing the feed service
+
+Say the product has 50 million daily active users, each watching an
+average of 40 short clips (15-30 seconds each) in a 20-minute session, and
+sessions are spread over a 6-hour peak window with a 4x peak-to-average
+multiplier.
+
+Average feed requests per day: 50 million users times roughly 4 feed-page
+fetches per session (assuming the client fetches a batch of 10 videos and
+refills after every 10 watched) gives about 200 million feed-service
+calls a day. Average QPS is 200 million divided by 86,400 seconds, or
+roughly 2,300 requests per second; applying the 4x peak multiplier puts
+peak feed-service load around 9,000 requests per second.
+
+Compare that to view/watch-time events: 50 million times 40 equals 2
+billion watch events a day, versus maybe 50-100 million total video plays
+a day on a long-form platform at similar DAU. That 10-20x gap in
+event volume is the real capacity difference a short-video feed
+introduces — it's not the video bytes stored or transcoded, it's the
+sheer rate of small events and feed-ranking calls the backend has to
+absorb.
+
+<Callout type="interview">
+  A common mistake in this exercise is spending all the deep-dive time on
+  the video pipeline (transcoding ladders, CDN cache-control headers) because
+  it's the part candidates rehearsed for the long-form version of this
+  question. An interviewer asking specifically about a short-video feed
+  wants to hear you reason about candidate generation, ranking latency
+  budgets, prefetch depth, and the watch-event feedback loop — say early
+  on that you're reusing the upload/CDN design from the base case so you
+  can spend your limited time on what's new.
+</Callout>
+
+## Run the mock interview
+
+Set a timer for about 40 minutes. Read the prompt once, take a moment to
+plan your approach, then talk through it end to end — clarify, estimate,
+design, deep-dive, discuss trade-offs — before checking the rubric.
+
+<MockInterview
+  lessonId="youtube-short-video-feed-mock-interview"
+  client:visible
+  prompt="Design the feed for a short-video app (think TikTok or YouTube Shorts): an infinite, algorithmically-ordered stream of 15-60 second clips that autoplay one after another. Assume upload, transcoding, and CDN delivery already exist as separate systems you can reference but don't need to redesign. Focus on how the app decides what to show next, how it keeps playback smooth as the user swipes, and how engagement feeds back into future recommendations."
+  rubric={[
+    { point: 'Scopes the problem correctly', detail: 'Explicitly separates this from the long-form watch-page design, confirms upload/CDN/transcoding are out of scope, and states the feed/ranking/prefetch loop as the actual focus.' },
+    { point: 'Sizes feed and event traffic, not just storage', detail: 'Estimates feed-service QPS and daily watch/skip events from DAU and session behavior, and notices event volume scales much faster than storage or transcoding load for short clips.' },
+    { point: 'Separates candidate generation from ranking', detail: 'Explains why a cheap, high-recall candidate step (embeddings/ANN, following graph, trending pool) has to narrow the catalog before a heavier ranking model scores a small candidate set.' },
+    { point: 'Designs prefetching explicitly', detail: 'Describes a client-side buffer of several upcoming videos, prefetching manifests/first segments a couple of videos ahead of what is currently playing, and reasons about the buffer-depth trade-off (stalls vs. wasted bandwidth).' },
+    { point: 'Closes the engagement feedback loop', detail: 'Explains how watch-time, replay, like, and skip signals flow through an event pipeline back into the ranking model quickly enough to affect the same session, and that this can be eventually consistent without hurting UX.' },
+    { point: 'Handles at least one edge case or failure mode', detail: 'Addresses cold-start (new user/new video with no engagement history), a viral clip causing a thundering herd, or feed staleness when the ranking service is slow or degraded.' },
+  ]}
+/>
+
+<Quiz
+  lessonId="youtube-short-video-feed-mock-interview"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the primary architectural difference between a short-video feed and a long-form "watch this specific video" design?',
+      options: [
+        { id: 'a', text: 'The feed needs a completely different video encoding pipeline', correct: false, explanation: 'Transcoding and adaptive bitrate encoding work the same way regardless of clip length; there is no need to redesign that pipeline for a feed.' },
+        { id: 'b', text: 'Discovery shifts from user-initiated search/click to a server-driven feed, requiring ranking and client-side prefetching across videos', correct: true, explanation: 'The feed decides what plays next instead of the user searching for it, which introduces candidate generation, ranking, and cross-video prefetching as new concerns.' },
+        { id: 'c', text: 'A feed cannot use a CDN because content changes too fast', correct: false, explanation: 'CDNs still serve the video segments; only the metadata/ranking layer that decides which videos to fetch changes.' },
+        { id: 'd', text: 'Short videos do not need durable storage since they are quickly replaced in the feed', correct: false, explanation: 'Durability requirements for uploaded content do not change based on how content is discovered; losing an uploaded video is still a real failure.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasonable justifications for prefetching upcoming videos in a short-video feed client? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It hides feed-service and CDN latency behind the time the user spends watching the current clip', correct: true, explanation: 'As long as the client buffer stays ahead of playback, network round trips for the next videos happen invisibly in the background.' },
+        { id: 'b', text: 'It makes the swipe-to-next transition feel instant instead of showing a loading spinner', correct: true, explanation: 'Having the next video manifest and first segment already fetched is exactly what removes the visible delay on swipe.' },
+        { id: 'c', text: 'It guarantees the ranking model never needs fresh engagement signals', correct: false, explanation: 'Prefetching is about playback smoothness, not a substitute for the feedback loop — the ranking model still needs watch/skip signals to stay relevant.' },
+        { id: 'd', text: 'It eliminates the need for a CDN because videos are cached entirely on the client ahead of time', correct: false, explanation: 'Prefetching a few videos ahead is not full client-side caching of the catalog; the CDN still serves the bulk of segment requests.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'For a fixed number of daily active users and similar total session time, a short-video feed generates roughly the same number of video-play and watch-time events per day as a long-form platform.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Shorter clips mean many more plays fit in the same session length, so the event volume is substantially higher, not the same.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — since each clip is much shorter, a user watches many more of them in the same session time, multiplying view and engagement event volume well above a long-form platform at similar DAU.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the candidate-generation-then-ranking pattern, why not just run the full ranking model over the entire video catalog for every feed request?',
+      options: [
+        { id: 'a', text: 'Ranking models cannot be trained on short videos', correct: false, explanation: 'This is not a modeling limitation; ranking models work fine on short-form engagement signals.' },
+        { id: 'b', text: 'Scoring millions of videos per request with a heavy model is too expensive; a cheap candidate step narrows the set first', correct: true, explanation: 'Candidate generation trades a little precision for speed, narrowing millions of videos to a few hundred so the more expensive ranking model only scores a manageable set per request.' },
+        { id: 'c', text: 'The CDN cannot serve videos that have not been ranked yet', correct: false, explanation: 'CDN delivery is unrelated to ranking; any transcoded video can be served regardless of its rank.' },
+        { id: 'd', text: 'Candidate generation and ranking must always run on the same server to avoid network calls', correct: false, explanation: 'They are typically separate services precisely because they have different latency and compute profiles; colocation is not required.' },
+      ],
+    },
+  ]}
+/>

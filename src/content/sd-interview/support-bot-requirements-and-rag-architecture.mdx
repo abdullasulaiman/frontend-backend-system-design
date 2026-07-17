@@ -1,0 +1,249 @@
+---
+title: "Requirements and RAG Architecture"
+module: "LLM-Powered Customer Support Bot"
+moduleOrder: 18
+order: 1
+track: "interview"
+summary: "Frames the requirements for an LLM-powered support bot and builds the retrieval-augmented generation pipeline — ingestion, embedding, retrieval, and grounded generation — that keeps answers accurate to a company's own knowledge base."
+tags: ["rag", "llm-serving", "vector-search", "system-design", "chat-systems"]
+estMinutes: 12
+cheatsheet:
+  - "RAG's job is to ground the model in facts it wasn't trained on (or that have since changed) by injecting retrieved passages into the prompt at query time — it's a retrieval problem wrapped around a generation problem, not a training problem."
+  - "The knowledge base is chunked, embedded, and indexed offline; only the query embedding and vector search happen on the hot path."
+  - "Chunk size is a trade-off: too small loses context (an answer needs the surrounding paragraph); too large wastes prompt budget and dilutes relevance. 200-500 tokens with overlap is a common starting point."
+  - "Retrieval quality caps generation quality — if the right passage never makes it into the top-k results, no prompting trick recovers it. Spend your design effort on retrieval before you tune the generation prompt."
+  - "Re-ranking a larger candidate set (e.g. top 50 from a fast vector search, cut down to top 5 by a slower cross-encoder) usually beats just increasing k on the vector search alone."
+  - "Every answer should carry citations back to source documents — for a support bot this is both a trust feature for the user and a debugging tool for you."
+  - "Stale or deleted knowledge-base articles are a correctness bug, not just a freshness nuisance: re-indexing has to be triggered by content changes, not left to a nightly batch nobody watches."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design a customer support bot" is one of the fastest-growing prompts in
+system design interviews, because every company with a product now wants
+one, and it forces you past generic LLM-serving concerns into a genuinely
+different problem: how do you get a model to answer accurately about
+*your* product — your refund policy, your API rate limits, your shipping
+cutoffs — none of which it saw enough of during pretraining, and some of
+which changed last week? Fine-tuning a fresh model on your docs every time
+a policy changes doesn't scale. The standard answer is retrieval-augmented
+generation (RAG): keep the model as-is, and feed it the relevant facts as
+context at answer time. This lesson frames the requirements and builds the
+RAG pipeline; the next lesson in this module goes deep on serving it as a
+full support-bot product, including escalation to a human agent.
+
+## Clarifying the requirements
+
+### Functional requirements
+
+- A user asks a question in natural language (in a chat widget, over
+  email, or via an API) about the product, an order, or an account issue.
+- The bot answers using the company's own knowledge base — help-center
+  articles, API docs, policy pages, and (optionally) the specific user's
+  order/account data.
+- Answers should cite the source article(s) they're grounded in.
+- The bot should recognize when it doesn't know the answer, or when the
+  request needs a human (a billing dispute, an account security issue),
+  and escalate instead of guessing.
+- Support staff can add, edit, and remove knowledge-base articles, and
+  those changes should show up in bot answers promptly, not after a
+  multi-day lag.
+
+Explicitly out of scope for this lesson: fine-tuning a custom model,
+voice/phone support, and multi-turn agent tool-use (placing a refund,
+canceling an order on the user's behalf) — worth a sentence in an
+interview, but the deep-dive here is retrieval and grounding.
+
+### Non-functional requirements
+
+- **Answer latency**: a support chat should feel conversational — under
+  ~2-3 seconds to start streaming a response is a reasonable target,
+  which has to include retrieval time, not just generation time.
+- **Groundedness / low hallucination rate**: the dominant quality metric.
+  A wrong answer about a refund policy is worse than a slow one — it's a
+  support ticket and a trust problem, not just a UX complaint.
+- **Freshness**: knowledge changes (a new policy, a fixed bug) should
+  reach the bot within minutes to hours, not require a retraining cycle.
+- **Scale**: a knowledge base of thousands to tens of thousands of
+  articles, serving potentially millions of queries a day at peak.
+- **Auditability**: every answer should be traceable back to which
+  documents were retrieved, for both user trust (citations) and
+  post-incident debugging ("why did it say that?").
+
+<Callout type="tip">
+  Say out loud early: "the model doesn't need to *know* the answer, it
+  needs to be *given* the answer and asked to phrase it." That's the whole
+  RAG mental model, and it reframes the rest of the design around a search
+  problem instead of a model problem.
+</Callout>
+
+## Why RAG instead of fine-tuning
+
+Fine-tuning bakes knowledge into the model's weights through additional
+training — it's expensive, slow to iterate (a new fine-tuning run per
+content change is untenable), and notoriously bad at precise factual
+recall; a fine-tuned model can still confidently state a shipping cutoff
+that's three months stale. RAG instead treats the model as a fixed
+reasoning-and-writing engine and supplies facts as part of the prompt at
+query time, retrieved fresh from a knowledge base that's just data you can
+update instantly. The trade-off: RAG adds a retrieval step and a hard
+latency/quality dependency on search working well, whereas fine-tuning
+(if it works) needs no runtime lookup. For a support bot, where content
+changes constantly and factual precision matters more than stylistic
+nuance, RAG is close to a default choice — most production support bots
+you'll discuss in an interview use it, sometimes layered with a light
+fine-tune purely for tone.
+
+## The RAG pipeline
+
+RAG splits cleanly into an **offline ingestion path** that prepares the
+knowledge base for search, and an **online query path** that runs per
+user question.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  subgraph Offline["Offline: ingestion (runs on content change)"]
+    KB[Knowledge base<br/>articles, docs, policies] --> CH[Chunk into<br/>200-500 token passages]
+    CH --> EMB1[Embed each chunk]
+    EMB1 --> IDX[(Vector index)]
+  end
+  subgraph Online["Online: per query"]
+    Q[User question] --> EMB2[Embed query]
+    EMB2 --> SEARCH[Vector search<br/>top-k candidates]
+    IDX --> SEARCH
+    SEARCH --> RERANK[Re-rank candidates]
+    RERANK --> PROMPT[Build prompt:<br/>question + top passages]
+    PROMPT --> LLM[LLM generation]
+    LLM --> ANS[Answer + citations]
+  end
+`} />
+
+Walk through each stage:
+
+### Ingestion (offline)
+
+- **Chunking**: split each document into passages small enough to be
+  specific (a whole 3,000-word article embedded as one vector loses too
+  much granularity — a search for "refund window" and a search for
+  "return shipping label" both match the same giant blob) but large
+  enough to keep context intact. 200-500 tokens with some overlap between
+  chunks is a reasonable starting point; overlap prevents a fact from
+  being split exactly across a chunk boundary.
+- **Embedding**: run each chunk through an embedding model that maps text
+  to a dense vector such that semantically similar text lands near each
+  other in vector space. This runs once per chunk, offline, in bulk.
+- **Indexing**: store the vectors in a vector index (approximate nearest
+  neighbor structures like HNSW are standard) alongside the chunk text
+  and metadata (source article, last-updated timestamp, product area) so
+  results can be filtered and cited.
+- **Re-indexing on change**: when an article is edited or deleted, its
+  chunks need to be re-embedded and the index updated — this is the
+  mechanism that satisfies the freshness requirement, and it should be
+  triggered by a content-management webhook, not a slow batch job.
+
+### Query time (online)
+
+- **Query embedding**: embed the user's question with the same embedding
+  model used for ingestion (a mismatched model here silently produces
+  poor matches — it's a common integration bug).
+- **Vector search**: fetch the top-k (often 20-50) most similar chunks
+  from the index. This is a fast approximate search, optimized for
+  recall over precision at this stage.
+- **Re-ranking**: run a slower, more accurate model (a cross-encoder that
+  jointly scores the query against each candidate, rather than comparing
+  precomputed vectors) over those top-k candidates to reorder them, then
+  keep only the top 3-5 to actually use. This two-stage "cheap broad
+  search, then expensive narrow re-rank" pattern is the same idea search
+  engines and recommender systems use, applied here to retrieval quality.
+- **Prompt construction**: assemble a prompt containing the user's
+  question plus the retrieved passages (with their source metadata), and
+  an instruction to answer only from the provided context and cite
+  sources.
+- **Generation**: the LLM produces the answer, and the serving layer
+  attaches citations back to the source articles used.
+
+## Worked example: sizing a knowledge base's index
+
+Say the knowledge base has 8,000 articles averaging 1,200 words each.
+At roughly 1.3 tokens per word and a 350-token chunk size with light
+overlap, that's about 1,200 × 1.3 ÷ 300 (net of overlap) ≈ 5 chunks per
+article, so roughly 40,000 chunks total. If the embedding model produces
+1,536-dimensional vectors stored as 4-byte floats, each vector is
+1,536 × 4 ≈ 6KB, so raw vector storage is 40,000 × 6KB ≈ 240MB — small
+enough to fit comfortably in memory on a single node, well before you
+need to think about sharding the index. The real scaling question for
+most support bots isn't index size, it's query volume: at 50 queries/sec
+peak, each needing an embedding call plus a vector search plus an LLM
+generation call, the LLM generation step (hundreds of milliseconds to a
+few seconds) dominates the latency budget by an order of magnitude over
+the sub-50ms vector search — which tells you where to spend optimization
+effort first if the bot feels slow.
+
+<Callout type="warning">
+  A common mistake: treating retrieval as a solved detail and pouring
+  design effort into prompt engineering instead. If the right passage
+  never lands in the top-k candidates — because chunks are too coarse,
+  the embedding model is a poor fit for your domain's vocabulary, or
+  there's no re-ranking stage — the LLM has nothing correct to work with,
+  and no amount of prompt tuning fixes a missing fact. In an interview,
+  spend your deep-dive time on chunking, embedding choice, and re-ranking
+  before you talk about prompt wording.
+</Callout>
+
+## What's next
+
+This lesson covered why RAG fits the support-bot problem and how the
+ingestion and retrieval pipeline works end to end. The next lesson,
+"Designing the Support Bot," takes this pipeline and turns it into a full
+product: the serving architecture around it, handling multi-turn
+conversations, escalating to a human agent, and evaluating answer quality
+in production.
+
+<Quiz
+  lessonId="support-bot-requirements-and-rag-architecture"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why do most LLM-powered support bots use retrieval-augmented generation instead of fine-tuning a model on the knowledge base?',
+      options: [
+        { id: 'a', text: 'Fine-tuning is not technically possible for support content.', correct: false, explanation: 'Fine-tuning is technically possible; it is just poorly suited to frequently changing, precisely-recalled facts and expensive to redo per content change.' },
+        { id: 'b', text: 'RAG lets the knowledge base be updated instantly by changing indexed data, rather than requiring a new training run per change.', correct: true, explanation: 'Correct — RAG keeps the model fixed and injects fresh facts at query time, so editing or adding an article takes effect as soon as it is re-indexed, not after a retraining cycle.' },
+        { id: 'c', text: 'RAG produces lower latency than fine-tuning for every request.', correct: false, explanation: 'RAG adds a retrieval step to the request path, which is additional latency, not less — its advantage is factual freshness and precision, not raw speed.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are true about chunking a knowledge base for RAG? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Chunks that are too large dilute relevance and waste prompt budget.', correct: true, explanation: 'Correct — a giant chunk mixes many topics into one vector, making search less precise, and consumes more of the limited context window per retrieved passage.' },
+        { id: 'b', text: 'Chunks that are too small can lose the surrounding context needed to answer correctly.', correct: true, explanation: 'Correct — an isolated sentence or fragment can be ambiguous or incomplete without the paragraph around it.' },
+        { id: 'c', text: 'Overlap between chunks helps prevent a fact from being split exactly across a chunk boundary.', correct: true, explanation: 'Correct — overlapping chunk boundaries reduce the chance that a key fact is cut in half and missed by both neighboring chunks.' },
+        { id: 'd', text: 'Chunk size has no effect on retrieval quality, only on storage cost.', correct: false, explanation: 'Chunk size directly affects retrieval quality (precision and recall of search), not just storage — this is one of the more consequential tuning knobs in a RAG pipeline.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'If a support bot’s answers are wrong, the fastest fix is usually to rewrite the prompt given to the generation model.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'If the wrong (or no) passages were retrieved in the first place, no prompt rewrite gives the model correct facts to work with — the fix belongs in retrieval, not prompting.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Retrieval quality caps generation quality. Diagnosing whether the right passages made it into the top-k results should come before tuning prompt wording.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the two-stage "vector search then re-rank" pattern, what is the purpose of the re-ranking step?',
+      options: [
+        { id: 'a', text: 'To re-embed the knowledge base with a newer embedding model.', correct: false, explanation: 'Re-embedding the knowledge base is part of ingestion/re-indexing, unrelated to the re-ranking step at query time.' },
+        { id: 'b', text: 'To reorder a broader set of fast-retrieved candidates using a slower, more accurate scoring model, keeping only the best few.', correct: true, explanation: 'Correct — vector search is optimized for fast, broad recall; re-ranking spends more compute on a smaller candidate set to improve precision before it reaches the prompt.' },
+        { id: 'c', text: 'To translate the user’s question into the language of the knowledge base.', correct: false, explanation: 'Re-ranking scores relevance of already-retrieved candidates; it has nothing to do with language translation.' },
+      ],
+    },
+  ]}
+/>

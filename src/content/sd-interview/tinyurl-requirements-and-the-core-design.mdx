@@ -1,0 +1,279 @@
+---
+title: "Requirements and the Core Design"
+module: "Design TinyURL"
+moduleOrder: 9
+order: 1
+track: "interview"
+summary: "Scopes a URL-shortening service into functional and non-functional requirements, then designs the core short-code generation scheme, data model, and redirect flow that everything else in the module builds on."
+tags: ["requirements", "capacity-estimation", "encoding", "data-modeling", "api-design"]
+estMinutes: 13
+cheatsheet:
+  - "State the read:write ratio explicitly before designing anything — redirects (reads) outnumber new-link creation (writes) by orders of magnitude, so the redirect path is what has to be fast and cheap."
+  - "Base62 encoding of a globally unique, monotonically increasing counter is the standard core scheme: no collisions to detect, and short-code length is a direct, computable function of how many links you need to support."
+  - "Hashing the long URL (MD5/SHA-256, truncated) is tempting but reintroduces the exact collision problem a counter avoids — only use it if you have a concrete reason to prefer stateless generation over a shared counter."
+  - "A 301 (permanent) redirect lets browsers cache the mapping and skips your server on repeat visits, which is cheaper but means you lose the click-analytics visibility a 302 gives you on every hit."
+  - "The data model is intentionally boring: short_code, long_url, created_at, optional expires_at — resist adding fields (tags, click counts) that belong in a separate analytics table, not the hot lookup path."
+  - "A 7-character base62 code has 62^7 ≈ 3.5 trillion possible values — compute this number out loud in the interview so the code length isn't an arbitrary choice."
+  - "Custom aliases, analytics, and rate limiting are real requirements but belong in the next design pass, not this one — naming them as deferred is a stronger signal than trying to design everything at once."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design TinyURL" is one of the most commonly asked system design
+questions precisely because it looks trivial — take a long URL, produce a
+short one, redirect on visit — and then quietly tests whether you think
+through data modeling, uniqueness, and read/write asymmetry, or jump
+straight to "just use a hash map." Candidates who treat it as a
+five-minute warm-up tend to hand-wave the one decision that actually
+matters: how do you turn an arbitrarily large space of URLs into a small,
+unique, collision-free code, at scale, without a single point of
+contention on every write?
+
+This lesson builds the core of that design: requirements, capacity
+estimate, the short-code generation scheme, the data model, and the
+request flow for creating and following a short link. The next lesson in
+this module scales this core — sharding, custom aliases, expiration, and
+click analytics all build on the foundation laid here.
+
+## Step 1: Scope the functional requirements
+
+Say the scope out loud rather than assuming the interviewer wants
+everything:
+
+- **Shorten a URL**: given a long URL, return a short one (e.g.
+  `https://tiny.ly/aZ9kLp`).
+- **Redirect**: visiting the short URL sends the client to the original
+  long URL.
+- **Uniqueness**: two different long URLs should (in the common case) map
+  to two different short codes; the same long URL submitted twice may
+  reuse the same code or mint a new one — either is a defensible choice
+  as long as you state which you picked and why.
+
+Explicitly defer: custom user-chosen aliases, link expiration policies,
+per-link click analytics, user accounts and link ownership, and abuse
+detection (spam/phishing link blocking). Each is a real feature — the
+next lesson in this module designs custom aliases and analytics
+specifically — but naming them and moving on, rather than trying to solve
+all of them at once, is what a senior candidate does.
+
+### Non-functional requirements
+
+- **Extremely read-heavy.** Every short link, once created, gets visited
+  far more often than it was created — this shapes the whole system
+  around a fast, cheap read path.
+- **Low-latency redirects.** A redirect should feel instant; nobody
+  tolerates a multi-second pause before a page they clicked on loads.
+- **High availability over strict consistency.** A short link resolving a
+  few seconds late after creation is a minor annoyance; the redirect
+  service being down is a hard outage that breaks every link shared
+  anywhere.
+- **Short codes must be unique and not run out.** The scheme has to
+  guarantee no two active long URLs collide on the same code, and it has
+  to have enough capacity for years of growth without a redesign.
+- **Codes should be reasonably short and non-sequential.** A code space
+  that's too small forces long, ugly URLs (defeats the purpose); codes
+  that are trivially guessable (`1`, `2`, `3`, ...) let anyone enumerate
+  every link in the system, which is a real privacy problem for a public
+  service.
+
+## Step 2: Establish the scale
+
+Reasonable, stated assumptions for a large public shortener:
+
+- 17 million new short links created per day (roughly 500 million/month).
+- A 100:1 read-to-write ratio — each link gets visited about 100 times on
+  average over its lifetime, spread across the redirect traffic.
+- Each stored record (short code, long URL, timestamp, small metadata)
+  is about 500 bytes.
+- The service needs to run for at least 5 years without redesigning the
+  encoding scheme.
+
+<Callout type="tip">
+  Say these numbers out loud as assumptions, not facts: "Let's assume
+  around 17 million new links a day and a 100:1 read:write ratio — does
+  that match the scale you had in mind?" It turns estimation into a
+  checkpoint with the interviewer instead of a silent arithmetic exercise.
+</Callout>
+
+## Step 3: Derive traffic and storage
+
+- **Writes**: 17,000,000 / 86,400 ≈ 200 creates/sec on average; with a 3x
+  peak multiplier, about 600 creates/sec at peak. This is a small number —
+  the write path is not the bottleneck.
+- **Reads**: at a 100:1 ratio, redirects run at roughly 20,000/sec on
+  average, and with a 3x peak multiplier, around 60,000 redirects/sec at
+  peak. This is the number the redirect path has to sustain comfortably.
+- **Storage over 5 years**: 17,000,000/day × 365 × 5 ≈ 31 billion records.
+  At 500 bytes each, that's about 15.5 TB total — large, but well within
+  reach of any standard key-value or relational store, and small enough
+  that storage cost is not the constraint driving the design. The
+  constraint is **request rate on the read path**, not disk space.
+
+## Step 4: Design the short-code generation scheme
+
+This is the decision every TinyURL interview actually hinges on: how do
+you produce a short, unique code for each long URL?
+
+### Option A: Hash the long URL
+
+Run the long URL through MD5 or SHA-256 and take the first 6-8 characters
+of the hex digest (or re-encode those bits in base62). It's simple and
+stateless — no shared counter needed — but it reintroduces the exact
+problem you're trying to solve: two different URLs can hash to the same
+truncated prefix, so you still need a collision-detection step (check if
+the code is taken, and if so, append a salt and rehash). That retry loop
+under load is exactly the kind of contention a cleaner scheme avoids.
+
+### Option B: Base62-encode a unique counter
+
+Maintain a single globally unique, monotonically increasing integer (from
+a database auto-increment column, or better, a dedicated ID-generation
+service handing out non-overlapping ranges to app servers, similar in
+spirit to a distributed sequence generator). Encode that integer in
+base62 (`0-9`, `a-z`, `A-Z` — 62 symbols) to get a short, unique string.
+
+This is the better default: uniqueness is guaranteed by construction, not
+by a hash function's odds and a fallback loop. There's nothing to detect
+or retry — the counter already guarantees no two links get the same code.
+
+<Callout type="note">
+  Handing out **ranges** of IDs to each app server (say, blocks of 1,000)
+  rather than hitting a single counter on every request is what makes
+  this approach scale horizontally — it's the standard fix for "a single
+  counter is a single point of contention," and it's exactly what the
+  next lesson in this module expands on when scaling the write path.
+</Callout>
+
+## Step 5: The data model and API
+
+A single table is enough for the core design:
+
+- `short_code` (string, primary key) — the base62 code.
+- `long_url` (string) — the original destination.
+- `created_at` (timestamp).
+- `expires_at` (nullable timestamp) — reserved for the next lesson, not
+  designed in depth here.
+
+Two endpoints cover the functional requirements:
+
+- `POST /shorten` with the long URL in the body, returns the new short
+  URL.
+- `GET /{short_code}` looks up `long_url` and issues an HTTP redirect.
+
+### 301 vs. 302: a real trade-off, not a detail
+
+A `301 Moved Permanently` lets browsers cache the redirect locally, so
+repeat visits never even hit your server again — cheaper and faster, but
+you lose visibility into every subsequent click since the browser stops
+asking. A `302 Found` forces the browser to check with your server every
+time, costing more redirect traffic but giving a clean signal for every
+visit — which matters once click analytics becomes a requirement, as it
+does in the next lesson. State which one you're picking and why; there's
+no universally "correct" answer here.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    C1[Client: shorten request] --> LB[Load balancer]
+    LB --> W[Shorten service]
+    W --> IDGen[ID generator\nunique counter]
+    IDGen --> Enc[Base62 encode]
+    Enc --> DB[(URL table)]
+    DB --> C1r[Return short URL]
+
+    C2[Client: visits short URL] --> LB2[Load balancer]
+    LB2 --> R[Redirect service]
+    R --> Cache[(Cache: code -> long URL)]
+    Cache -->|hit| C2r[301/302 to long URL]
+    Cache -->|miss| DB
+    DB --> Cache
+`} />
+
+## Worked example: sizing the code length
+
+With the 31-billion-record, 5-year estimate from Step 3, how many
+characters does a base62 code need?
+
+- 62^5 ≈ 916 million — not enough; that's less than 1% of what's needed.
+- 62^6 ≈ 56.8 billion — technically enough capacity, with very little
+  headroom for growth past the 5-year estimate.
+- 62^7 ≈ 3.5 trillion — comfortably covers the 31-billion estimate with
+  over 100x headroom for growth, traffic beyond the original estimate, or
+  a slower-than-expected retirement of old links.
+
+A 7-character code is the concrete, defensible answer here — not because
+"7 looks about right," but because it's the smallest length that clears
+the 31-billion-record estimate with real margin. That's the kind of
+number an interviewer wants to see you compute, not guess.
+
+<Callout type="warning">
+  A common mistake is exposing the raw auto-increment ID (or a trivially
+  reversible encoding of it) directly as the short code. Sequential codes
+  let anyone enumerate every link ever created just by incrementing the
+  counter in the URL bar — a real information-leak and abuse vector, not a
+  theoretical concern. Base62-encoding the counter doesn't by itself fix
+  this if the encoding is a simple bijection anyone can invert; if
+  non-guessability matters, shuffle or offset the counter (e.g. XOR with a
+  fixed key, or use a non-sequential ID source) before encoding it, and say
+  so explicitly when you present the design.
+</Callout>
+
+## Where this leads
+
+The core established here — a counter-based base62 scheme sized to the
+5-year estimate, a single boring table, and separate read/write paths
+sized to a 100:1 ratio — is deliberately minimal. The next lesson,
+"Scaling, Custom Aliases, and Analytics," stresses this foundation:
+sharding the counter and table across databases, a caching layer sized to
+the 60,000/sec peak redirect rate, custom aliases without breaking
+uniqueness, and click analytics without slowing down the redirect path.
+
+<Quiz
+  lessonId="tinyurl-requirements-and-the-core-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why is base62-encoding a unique counter generally preferred over hashing the long URL for short-code generation?',
+      options: [
+        { id: 'a', text: 'It produces shorter codes than any hash-based scheme', correct: false, explanation: 'Code length is a function of the chosen alphabet and how many bits you keep, not of counter vs. hash — a truncated hash can be just as short.' },
+        { id: 'b', text: 'It guarantees uniqueness by construction, avoiding the collision-detection and retry logic a truncated hash needs', correct: true, explanation: 'A monotonically increasing counter can never produce the same value twice, so there is nothing to detect or retry, unlike a truncated hash where two different URLs can collide on the same prefix.' },
+        { id: 'c', text: 'It removes the need for a database entirely', correct: false, explanation: 'Both schemes still need a table mapping short codes to long URLs; the counter approach just avoids collisions in generating the code itself.' },
+        { id: 'd', text: 'It makes the short codes impossible to guess', correct: false, explanation: 'A raw sequential counter encoded in base62 is actually easy to guess/enumerate — this is precisely the pitfall called out in the lesson, and it needs an extra step (like an offset or non-sequential ID source) to fix.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasonable non-functional priorities to state upfront when scoping a URL shortener? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The redirect path must sustain a much higher request rate than the creation path', correct: true, explanation: 'Redirects vastly outnumber creations in the estimate (roughly 100:1), so the read path is what has to be fast and cheap at scale.' },
+        { id: 'b', text: 'A short link resolving correctly a few seconds after creation, rather than instantly, is an acceptable trade-off for availability', correct: true, explanation: 'Favoring availability over strict, instant consistency is a reasonable and commonly stated priority for this kind of system — a brief propagation delay is far less costly than a redirect-service outage.' },
+        { id: 'c', text: 'Every short code should be a directly incremented, easily predictable sequence for simplicity', correct: false, explanation: 'This is the guessability pitfall the lesson calls out explicitly — predictable codes let anyone enumerate every link in the system, which is a real problem for a public-facing service.' },
+        { id: 'd', text: 'Storage capacity for the URL table is the primary scaling constraint over the next 5 years', correct: false, explanation: 'The worked estimate shows storage lands around 15.5 TB over 5 years, which is comfortably small; the actual constraint is the redirect request rate, not disk space.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Using a 301 (permanent) redirect instead of a 302 (temporary) redirect has no real trade-off — it is simply the better choice in every case.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Incorrect — a 301 lets browsers cache the redirect and skip your server on repeat visits (cheaper), but that same caching means you lose per-visit visibility, which matters once click analytics is a requirement.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — 301 vs. 302 is a genuine trade-off between reduced server load/latency (301) and full click-tracking visibility on every visit (302), not a strictly dominant choice.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Given the estimate of about 31 billion records needed over 5 years, why does the lesson land on a 7-character base62 code rather than 6?',
+      options: [
+        { id: 'a', text: 'Because 62^6 (about 56.8 billion) is technically enough but leaves very little headroom for growth beyond the estimate', correct: true, explanation: '62^6 barely clears the 31-billion estimate with little margin, while 62^7 (about 3.5 trillion) clears it with well over 100x headroom for future growth.' },
+        { id: 'b', text: 'Because 6-character codes are not supported by the base62 alphabet', correct: false, explanation: 'Base62 supports any code length; there is no technical restriction to 7 characters specifically — it is a capacity-planning choice, not an alphabet limitation.' },
+        { id: 'c', text: 'Because longer codes redirect faster than shorter ones', correct: false, explanation: 'Redirect speed depends on lookup implementation (indexing, caching), not on the character length of the code itself.' },
+        { id: 'd', text: 'Because 7 characters is the shortest length that is prime-number safe for hashing', correct: false, explanation: 'This scheme is counter-based, not hash-based, so primality is irrelevant; the choice is driven purely by keyspace capacity versus the estimated record count.' },
+      ],
+    },
+  ]}
+/>

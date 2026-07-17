@@ -1,0 +1,223 @@
+---
+title: "Aggregation and Read Paths"
+module: "Sharded Counters"
+moduleOrder: 24
+order: 3
+track: "concept"
+summary: "Covers how to turn N sharded counter values into one fast, correctly-fresh read, using in-memory sums, periodic rollups, and read-time trade-offs."
+tags: ["counters", "aggregation", "caching", "read-path", "eventual-consistency"]
+estMinutes: 11
+cheatsheet:
+  - "A sharded counter's true value is the sum of all its shards — reads always pay an aggregation cost that writes to a single row never do."
+  - "Cache the aggregate (not the shards) with a short TTL; a stale count for 1-5 seconds is invisible to users but cuts read load on the shard table by orders of magnitude."
+  - "A background rollup job that periodically sums shards into a materialized total turns an O(shard count) read into an O(1) cached lookup, at the cost of some staleness."
+  - "Pick shard count as a function of write rate, not read rate — more shards make writes cheaper but every uncached read has to touch more rows."
+  - "For 'exact right now' reads (checkout counts, rate limits), read straight from the shard table and accept the fan-out cost; for 'roughly right' reads (like counts, view counts), read from a cache or rollup."
+  - "Hot-shard rebalancing changes shard count, which invalidates any cached aggregation logic hardcoded to a specific shard count — read the current shard count from config/metadata, don't hardcode it."
+  - "Client-perceived exact counters (e.g. 'this comment has exactly 47 likes, no more') are a UX choice, not a technical requirement — decide whether the product actually needs exactness before you pay for it."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson solved the write side: instead of every increment
+fighting over one row, you spread increments across N shards so no single
+row is ever a bottleneck. But nobody wants to see "shard 3: 812, shard 7:
+1,204, shard 12: 998..." — the product needs one number. A "247K likes"
+counter, a live viewer count, a rate-limit check — all of them need a single
+value back, fast, and the read path is where a sharded design either pays
+off cleanly or quietly reintroduces the bottleneck you just removed. This
+lesson is about turning N shard values into one number without turning every
+read into a full table scan.
+
+## The naive read: sum on demand
+
+The simplest aggregation is also the most honest: on every read, run `SELECT
+SUM(count) FROM counter_shards WHERE counter_id = ?` across all shards for
+that counter. It's always exactly correct at the instant it runs, and it
+needs zero extra infrastructure.
+
+The catch is that this read cost scales with shard count, and shard count
+scales with write volume — the two knobs are coupled. A counter popular
+enough to need 200 shards for its write rate now needs a 200-row aggregation
+for every single read of that counter. If reads outnumber writes (true for
+almost every "like count" or "view count" — far more people see the number
+than change it), you've moved the bottleneck from the write path to the read
+path instead of removing it.
+
+This approach is fine when reads are rare relative to writes, or when the
+counter absolutely must reflect every write instantly (more on that below).
+It's the wrong default for anything read-heavy.
+
+## Caching the aggregate
+
+The standard fix: compute the sum, then cache it for a short window instead
+of recomputing on every read.
+
+- A read first checks a cache (Redis, Memcached, an in-process LRU) keyed by
+  counter ID.
+- On a cache hit, return the cached value immediately — no shard fan-out at
+  all.
+- On a miss (first read, or TTL expired), do the full shard sum, write the
+  result back to the cache with a TTL, and return it.
+
+A 2-5 second TTL is often plenty. Nobody notices that a "1,204 likes"
+counter briefly shows 1,199 while five likes land in the last two seconds —
+but everyone notices if the like button takes 400ms to respond because every
+click triggers a 200-shard sum.
+
+This is the same trade-off every read-through cache makes: you're trading a
+small, bounded amount of staleness for a large reduction in load on the
+underlying store. The shard table still exists as the source of truth; the
+cache just absorbs the read traffic.
+
+## Rollups: precomputing instead of caching
+
+Caching handles *load*, but every cache miss still pays the full fan-out
+cost, and a cache stampede (many misses at once, e.g. after a mass eviction)
+can still hammer the shard table. A **rollup** goes a step further: a
+background job periodically sums all shards for active counters and writes
+the result into a single "current total" row or cache entry, on a fixed
+schedule (every second, every 10 seconds — whatever the product tolerates).
+
+Reads then never touch the shard table at all — they read the rollup value,
+which is always precomputed and always O(1) regardless of shard count. The
+trade-off is the same staleness bound as caching (bounded by the rollup
+interval), but reads are now decoupled entirely from the aggregation cost;
+even a cold read after a cache eviction hits the cheap rollup value, not a
+200-row sum.
+
+Rollups work best when you have a bounded, known set of "hot" counters
+(trending posts, popular products) worth precomputing continuously. For the
+long tail of rarely-read counters, computing a rollup nobody asks for wastes
+work — cache-on-read handles the tail better since it only computes what's
+actually requested.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph Writes
+        W1[Increment] --> S1[(Shard 1)]
+        W2[Increment] --> S2[(Shard 2)]
+        W3[Increment] --> S3[(Shard 3)]
+    end
+    subgraph "Read path"
+        R[Read request] --> C{Cache hit?}
+        C -->|yes| Return[Return cached total]
+        C -->|no| Sum[Sum all shards]
+        Sum --> Store[Write result to cache with TTL]
+        Store --> Return
+    end
+    subgraph "Background rollup"
+        Job[Rollup job, every N sec] --> S1
+        Job --> S2
+        Job --> S3
+        Job --> Total[(Precomputed total)]
+    end
+`} />
+
+## Choosing exactness per counter, not per system
+
+Not every counter needs the same freshness guarantee, and treating "the
+counter system" as one monolithic consistency choice usually overspends on
+counters that don't need it. Split counters into two buckets:
+
+**Approximate is fine**: like counts, view counts, follower counts, trending
+scores. Users have no way to notice a few seconds of staleness, and a slight
+undercount right after a burst of activity is invisible. Cache or roll up
+aggressively here — seconds of staleness for orders-of-magnitude less load
+is a great trade.
+
+**Exactness matters**: inventory counts at checkout, rate-limit counters,
+quota enforcement, anything gating a decision ("can this user still post?",
+"is this the last item in stock?"). Here, a stale read can cause a real bug
+— overselling inventory, letting a rate-limited client through. For these,
+read straight from the shard table (accept the fan-out cost) or use a
+strongly consistent single source alongside the sharded counter for the
+gating decision specifically, and let the sharded value be advisory or
+UI-only.
+
+The key insight: exactness is a per-counter product decision, not a
+system-wide architecture decision. The same counter infrastructure can serve
+both a "247K views" display (rollup, 10s staleness, totally fine) and a
+"3 tickets left" gate (direct shard sum or a separate strongly-consistent
+check) without contradiction.
+
+## Worked example: a live-viewer counter
+
+Say you're building a live-stream viewer counter for a stream with 50,000
+concurrent viewers, sharded across 32 shards to absorb the join/leave
+traffic (each join/leave is `+1`/`-1` to a randomly chosen shard).
+
+Without any aggregation strategy, every page load that needs to display the
+current viewer count triggers a 32-row sum. If the stream's viewer page
+refreshes the count every 2 seconds for all 50,000 viewers, that's 25,000
+reads/second, each doing a 32-shard sum — 800,000 row reads/second just for
+display purposes, dwarfing the actual join/leave write rate.
+
+Instead: run a rollup job every 2 seconds that sums the 32 shards once and
+stores the result in a single Redis key (`stream:123:viewers`). All 25,000
+viewer-facing reads/second now hit that one Redis key — a workload Redis
+handles trivially — instead of the shard table. The displayed count is at
+most 2 seconds stale, which for a live-viewer badge is not just acceptable,
+it's how every major streaming platform actually does this.
+
+<Callout type="warning">
+  A common mistake: building the aggregation logic against a hardcoded shard
+  count (`for i in range(32): sum += get_shard(i)`). Sharded counter systems
+  often rebalance shard count as write volume grows or shrinks for a given
+  counter. If the aggregation code doesn't read the *current* shard count
+  from the same metadata the write path uses, a rebalance silently produces
+  undercounts — reads keep summing the old shard count and miss the new
+  shards entirely. Always derive shard count from the same source of truth
+  the sharding/routing logic uses, never a constant.
+</Callout>
+
+## Summary
+
+The write path (previous lesson) and the read path are solved by different
+mechanisms and optimized for different things: writes get cheap by spreading
+across shards, reads get cheap by avoiding touching all those shards on
+every request. Caching handles load for arbitrary counters at the cost of
+small bounded staleness; rollups go further for known-hot counters, making
+reads O(1) regardless of shard count. The real design skill is deciding,
+counter by counter, whether "roughly right, very fast" or "exactly right,
+slower" is what the product actually needs — most counters want the former,
+and treating every counter like a bank balance wastes the very scalability
+the sharding gave you.
+
+<Quiz
+  lessonId="counters-aggregation-and-read-paths"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A sharded counter uses 100 shards to absorb its write rate. What is the main downside of summing all 100 shards on every read, with no caching or rollup?',
+      options: [
+        { id: 'a', text: 'It makes writes slower because reads and writes contend for the same shards', correct: false, explanation: 'Reads and writes can be independent operations against the shard rows; the read fan-out does not slow down writes directly.' },
+        { id: 'b', text: 'Read cost scales with shard count, so a counter popular enough to need many shards for writes now needs an expensive fan-out for every read', correct: true, explanation: 'This is the core coupling problem: more shards (needed for write scale) directly means a more expensive per-read sum, which is usually the wrong trade-off since reads typically outnumber writes.' },
+        { id: 'c', text: 'It causes the shard values to drift out of sync with each other', correct: false, explanation: 'Summing shards does not affect their individual values or consistency with each other — shards remain independent and correct regardless of how reads aggregate them.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these counters are good candidates for a cached or rolled-up aggregate (bounded staleness acceptable)? Select all that apply.',
+      options: [
+        { id: 'a', text: 'A "likes" count shown on a social media post', correct: true, explanation: 'A few seconds of staleness on a like count is invisible to users and has no functional consequence — a great fit for caching or rollups.' },
+        { id: 'b', text: 'A live-stream concurrent viewer count', correct: true, explanation: 'Viewer counts are inherently approximate in every real product; a couple seconds of staleness is standard and unnoticeable.' },
+        { id: 'c', text: 'A remaining-inventory count used to decide whether checkout can proceed', correct: false, explanation: 'This gates a real decision (oversell risk) — staleness here can cause a correctness bug, so it needs a stronger consistency guarantee than a cached/rolled-up approximate value.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A background rollup job that periodically sums shards into a single stored total makes reads independent of the counter\'s shard count.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Once the rollup has written the precomputed total, reads hit that single value (e.g. one Redis key) regardless of whether the counter has 4 shards or 400 — the fan-out cost is paid once by the rollup job, not per read.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This is what a rollup specifically achieves: reads no longer touch the shard table at all, so shard count stops being a factor in read latency.' },
+      ],
+    },
+  ]}
+/>

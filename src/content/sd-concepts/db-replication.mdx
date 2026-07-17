@@ -1,0 +1,143 @@
+---
+title: "Replication"
+module: "Databases"
+moduleOrder: 9
+order: 2
+track: "concept"
+summary: "Explains why and how systems copy data across multiple nodes, comparing leader-follower, multi-leader, and leaderless replication and the consistency trade-offs each one makes."
+tags: ["replication", "distributed-systems", "databases", "availability", "consistency"]
+estMinutes: 12
+cheatsheet:
+  - "Replication exists for three reasons: durability (survive a disk/node loss), availability (survive a node being down), and read scaling (spread read traffic across copies)."
+  - "Single-leader replication is the default choice: one node accepts writes, followers replay them and serve reads. Simple to reason about, but the leader is a write bottleneck and a failover risk."
+  - "Multi-leader and leaderless designs accept writes on more than one node to survive a leader/region loss or reduce write latency, but both must handle conflicting concurrent writes."
+  - "Synchronous replication guarantees a write survives on more than one node before acknowledging the client, at the cost of latency; asynchronous replication is faster but can lose the last few writes on a leader crash."
+  - "Replication lag is the gap between a write landing on the leader and appearing on a follower — it's the root cause of 'I just posted this, why can't I see it?' bugs."
+  - "Quorum replication (W + R > N) lets a leaderless system tune the consistency/latency trade-off per operation instead of baking one choice into the whole system."
+  - "In an interview, always state which replication topology you'd use and why, then name the specific consistency problem it introduces (stale reads, lost writes, conflicts) and how you'd mitigate it."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A single database server is a single point of failure and a single ceiling on read throughput. Lose that machine's disk and you lose the data; hand it more read traffic than one CPU and one set of disks can serve, and latency climbs no matter how well you've indexed the tables. Replication — keeping multiple copies of the same data on different nodes, ideally in different racks or regions — is how you fix both problems at once. It's also one of the first follow-ups an interviewer asks after you pick a data store in [SQL vs. NoSQL: Choosing a Data Store](/system-design/db-sql-vs-nosql-choosing-a-data-store): "okay, how do you make that durable and available?"
+
+The catch is that copies drift out of sync the moment a write happens on one of them but hasn't yet reached the others. Every replication scheme is really a specific answer to "how do we propagate writes, and what can a reader see while that propagation is in flight?"
+
+## Why replicate at all
+
+Three distinct motivations, and it matters which one you're solving for:
+
+- **Durability**: if a node's disk fails, a replica elsewhere still has the data. This is the baseline reason every production database runs with at least one replica.
+- **Availability**: if the primary node crashes or its data center goes offline, a replica can take over and keep serving traffic instead of the whole system going down.
+- **Read scaling**: reads (which usually outnumber writes by 10:1 or more in typical web apps) can be spread across several replicas instead of hammering one node.
+
+Writes are the hard part regardless of motivation — there's still exactly one true sequence of changes to a given row, and every replica has to agree on that sequence eventually. The three topologies below differ in how many nodes are allowed to define that sequence.
+
+## Single-leader (leader-follower) replication
+
+One node — the leader — accepts all writes. It applies each write locally, then streams the change (either the raw SQL/operation or a lower-level write-ahead log) to one or more followers, which apply it in the same order. Reads can go to the leader for the freshest data, or to followers to spread load — at the cost of possibly reading slightly stale data.
+
+This is the default for a reason: there's only one place writes can conflict with each other (the leader serializes them), so followers never have to resolve a conflict — they just replay a log in order. Most relational databases (Postgres, MySQL) and many NoSQL stores default to this model.
+
+The cost is that the leader is both a write bottleneck and a failover hazard: if it dies, something has to detect that, promote a follower, and repoint clients, and any writes that hadn't yet reached the promoted follower are gone.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    C[Client write] --> L[Leader]
+    L -->|replication stream| F1[Follower 1]
+    L -->|replication stream| F2[Follower 2]
+    R1[Client read] -.->|fresh| L
+    R2[Client read] -.->|possibly stale| F1
+`} />
+
+### Synchronous vs. asynchronous propagation
+
+The leader has a choice about *when* to tell the client "your write succeeded":
+
+- **Synchronous**: wait until at least one follower confirms it has the write, then acknowledge. Guarantees the write survives a leader crash, but every write now pays a network round trip to that follower — costly across regions.
+- **Asynchronous**: acknowledge immediately, ship the write to followers in the background. Fast, but a leader crash right after acknowledging can lose writes that never made it out.
+- **Semi-synchronous**: a middle ground — one follower is synchronous (for durability), the rest are asynchronous (for scale), so you pay the latency cost once, not N times.
+
+Most systems that claim "strongly durable" writes are running at least one synchronous follower; systems optimizing for write latency over strict durability lean asynchronous and accept a small window of possible data loss on failover.
+
+## Multi-leader replication
+
+Here more than one node accepts writes — typically one leader per data center, so users in each region write to their local leader with no cross-region round trip. Leaders replicate to each other and to their own followers.
+
+The problem this solves (write latency for geographically distributed users) is exactly the problem it creates: two leaders can accept conflicting writes to the same record before either has heard from the other. Something has to reconcile that — last-write-wins by timestamp, a merge function, or pushing the conflict to the application layer. This is real complexity, so multi-leader is usually reserved for cases where local write latency genuinely matters (e.g., a collaborative document editor, or a globally distributed e-commerce catalog where each region mostly writes its own rows).
+
+## Leaderless replication and quorums
+
+No node is special; a client write goes to several replicas directly (or through a coordinator), and a read queries several replicas and reconciles the answers. Systems like Dynamo-style stores use a quorum rule: with `N` total replicas, a write is considered successful once `W` of them acknowledge it, and a read queries `R` of them. Choosing `W + R > N` guarantees every read overlaps with the most recent write on at least one replica, giving you a tunable consistency knob per operation instead of one fixed system-wide choice (this is the same quorum idea referenced in the CAP/PACELC lesson's discussion of read-your-writes guarantees).
+
+The trade-off: no single node holds "the truth," so the system needs extra machinery — version vectors, read-repair, anti-entropy background jobs — to converge replicas that disagree, and clients occasionally see conflicting versions of the same key that the application must resolve.
+
+## Replication lag and what it breaks
+
+Whichever topology you pick, if propagation isn't perfectly synchronous everywhere, there's a lag window where a follower hasn't yet applied the latest write. That lag causes specific, nameable bugs:
+
+- **Read-your-writes violations**: a user submits a comment, then reloads the page and it's gone — because the reload hit a follower that hasn't caught up yet. Fix: route a user's own reads to the leader (or a replica known to have caught up) right after they write.
+- **Monotonic read violations**: a user refreshes twice and sees data go "backwards" in time because the second read happened to hit a more-lagged replica than the first. Fix: pin a user's reads to the same replica for a session.
+- **Consistent prefix violations**: replicas apply writes out of causal order (e.g., an answer to a question appears before the question itself, if they're routed through different partitions). Fix: keep causally related writes on the same replication stream/partition.
+
+<Callout type="warning">
+  A common mistake is treating "we have replicas" as equivalent to "we have strong consistency." Adding read replicas for scale is orthogonal to consistency — in fact it usually *weakens* the read-consistency guarantee, because now some fraction of reads hit nodes that are seconds (or, under load, minutes) behind the leader. If a feature needs read-your-writes (e.g., a user editing their own profile), don't assume "we replicate the database" covers it — you need an explicit routing rule for that read path.
+</Callout>
+
+## Worked example: replicating an order-processing database
+
+Say you're running a single-leader Postgres setup for an order-processing service: one leader in `us-east`, two asynchronous followers (one same-region for read scaling, one in `us-west` for disaster recovery). Order writes are roughly 500/sec at peak; reads (order history, tracking pages) are roughly 6,000/sec.
+
+Routing all 6,000 reads/sec to the leader alongside the 500 writes/sec would overload it; splitting reads across the two followers gets each follower to about 3,000 reads/sec, well within a single Postgres replica's comfortable range, and the leader only has to serve writes plus any read-your-writes traffic right after checkout.
+
+The `us-west` follower being asynchronous means a `us-east` regional outage could lose the last few hundred milliseconds of writes — acceptable for this business, since a lost order can be resubmitted by the customer, but not acceptable for, say, a payment-confirmation record. That's the point where you'd add one synchronous follower just for the payment-status table (or move that table to a system with stronger durability guarantees), rather than making the whole database pay synchronous latency for every write.
+
+## Quiz
+
+<Quiz
+  lessonId="db-replication"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'In single-leader replication, why does the leader design avoid write conflicts between replicas?',
+      options: [
+        { id: 'a', text: 'Because only the leader accepts writes, so it alone decides the order writes happen in, and followers just replay that order', correct: true, explanation: 'With one writer, there is a single serialization point. Followers never have to reconcile two conflicting versions of the same write because only one node ever originates writes.' },
+        { id: 'b', text: 'Because followers reject any write that looks like a duplicate', correct: false, explanation: 'Followers do not accept writes from clients at all in this topology — they only replay the leader replication stream, so there is nothing for them to reject or deduplicate.' },
+        { id: 'c', text: 'Because all writes are automatically retried until every replica agrees', correct: false, explanation: 'There is no such automatic cross-replica agreement mechanism in basic leader-follower replication; conflict-freedom comes from having a single write path, not from retries.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are real costs of using synchronous replication for every write? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Higher write latency, since the leader waits for a follower acknowledgment before confirming the write', correct: true, explanation: 'Synchronous replication means the client-visible write latency includes at least one network round trip to a follower, which is the whole point of the durability guarantee, but it is not free.' },
+        { id: 'b', text: 'If the synchronous follower is unreachable, writes can stall or fail entirely', correct: true, explanation: 'A strict synchronous setup that requires the follower to acknowledge has no way to complete a write if that follower cannot be reached, which trades availability for durability.' },
+        { id: 'c', text: 'It guarantees zero replication lag on every follower in the cluster', correct: false, explanation: 'Synchronous replication typically applies to one designated follower for durability; other followers can still be asynchronous and lag behind, so lag is not eliminated cluster-wide.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Adding more read replicas to a single-leader database is generally a way to improve read scalability, not a way to strengthen the consistency guarantees a reader gets.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — more replicas spread out read load, but each replica can lag the leader independently, so more replicas usually means a wider range of possible staleness, not stronger consistency.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Read replicas exist for throughput, not for tightening consistency. Reads that need strong guarantees (like read-your-writes) still need explicit routing, regardless of how many replicas exist.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A leaderless store uses N=3 replicas with W=2 and R=2 for a key. What does the "W + R > N" rule guarantee here?',
+      options: [
+        { id: 'a', text: 'Every read is guaranteed to overlap with at least one replica that has the most recent acknowledged write', correct: true, explanation: 'With W=2 and R=2 out of N=3, any set of 2 replicas read from must share at least one replica with any set of 2 replicas written to, so the read is guaranteed to see the latest write on at least one of the replicas it queries.' },
+        { id: 'b', text: 'Every replica is updated synchronously before any write is acknowledged', correct: false, explanation: 'Only W (2 of 3) replicas need to acknowledge the write for it to succeed; the third can catch up asynchronously afterward — not every replica is required upfront.' },
+        { id: 'c', text: 'Conflicting concurrent writes to the same key can never occur', correct: false, explanation: 'The quorum overlap rule addresses read/write consistency, not concurrent write conflicts. Two clients can still write to the same key at nearly the same time on different replica subsets, which still needs a conflict-resolution mechanism.' },
+      ],
+    },
+  ]}
+/>

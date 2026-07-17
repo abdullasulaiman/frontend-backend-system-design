@@ -1,0 +1,143 @@
+---
+title: "Consistency: CAP and PACELC"
+module: "Non-Functional Characteristics"
+moduleOrder: 4
+order: 6
+track: "concept"
+summary: "Explains what consistency really means for a distributed system, and uses CAP and its sharper successor PACELC to reason about the trade-offs a partition forces on you."
+tags: ["consistency", "cap-theorem", "pacelc", "distributed-systems", "trade-offs"]
+estMinutes: 12
+cheatsheet:
+  - "CAP only applies during a network partition: you choose Consistency (reject/stall requests on the minority side) or Availability (serve requests, risk stale/divergent reads). You cannot have both once nodes can't talk to each other."
+  - "CAP says nothing about the normal case — that's PACELC's job: even without a Partition, you trade Latency against Consistency (PC/EL, PA/EL, PC/EC, PA/EL are the four combinations)."
+  - "Strong consistency (linearizability) means every read sees the latest acknowledged write, as if there were only one copy of the data — it costs coordination and latency."
+  - "Eventual consistency means replicas converge given enough time with no new writes — cheap and fast, but readers can briefly see stale or out-of-order data."
+  - "'Availability' in CAP is a narrow, formal guarantee (every live node answers every request) — don't confuse it with the everyday 'uptime' sense of availability from the earlier lesson in this module."
+  - "Pick the consistency model per data type, not per system: a bank balance and a 'likes' counter in the same app can legitimately use different models."
+  - "In an interview, naming CAP is table stakes; naming PACELC and the concrete latency/consistency knob (e.g. quorum size, read-your-writes guarantee) is what separates a senior answer."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every distributed data store eventually forces you to answer one question: when two replicas disagree, which one is right? Get this wrong in an interview and you'll confidently describe a system that either can't survive a network blip or silently serves stale money balances. Consistency is the non-functional property that governs this — and CAP plus PACELC are the two tools every senior engineer reaches for to reason about it out loud.
+
+This lesson picks up where [Availability](/system-design/nfr-availability) and [Fault Tolerance and Redundancy](/system-design/nfr-fault-tolerance-and-redundancy) left off: those lessons cover staying up and surviving failures at the node level. Consistency is about what happens to the *data* once you've replicated it across multiple nodes to get that availability and fault tolerance in the first place.
+
+## What "consistency" means here
+
+In everyday conversation, "consistent" just means "reliable" or "not buggy." In distributed systems it has a precise meaning: given multiple copies (replicas) of the same data, how much can they disagree, and for how long?
+
+At one extreme, **strong consistency** (formally, linearizability) means the system behaves as if there were only one copy of the data. Any read that starts after a write has been acknowledged is guaranteed to see that write, and every client sees writes in the same order. This is the easiest model to reason about — it matches how a single database on one machine behaves — but enforcing it across replicas that live in different racks or regions requires coordination on every write, which costs latency.
+
+At the other extreme, **eventual consistency** only promises that if writes stop, replicas will converge to the same value *eventually* — no bound on how long "eventually" takes. In between sits a spectrum: read-your-writes consistency (you always see your own writes, even if you might see someone else's stale value), bounded staleness (replicas lag by at most N seconds), and causal consistency (writes that are causally related are seen in order, unrelated ones can reorder).
+
+None of these is "the right one." A stock ticker can tolerate eventual consistency; an account balance during a transfer usually can't.
+
+## CAP: the theorem that names the trade-off
+
+The CAP theorem, as commonly used in interviews, says: when a network partition occurs — some nodes literally cannot talk to others — a distributed system must choose between:
+
+- **Consistency (C)**: every node that does respond gives the same, up-to-date answer. To guarantee this during a partition, nodes on the minority side must refuse to serve some requests (they can't confirm they have the latest data).
+- **Availability (A)**: every live node keeps answering every request, even if it can't reach the rest of the cluster. To guarantee this, you accept that a minority-side node might answer with stale or soon-to-be-overwritten data.
+
+Partition tolerance (P) isn't really a third option you get to skip — in any system spread across more than one machine, partitions *will* happen (a switch fails, a cable gets cut, a region drops off the internet). So CAP in practice is really a choice between CP and AP **during a partition window**. A single-node database is trivially CA, but that's not an interesting distributed-systems statement — it's just "one computer doesn't partition from itself."
+
+<Mermaid client:visible chart={`
+flowchart TD
+    P["Network partition splits the cluster"] --> Q{"Minority-side node gets a request"}
+    Q -->|"Choose Consistency"| C["Refuse or stall the request\nuntil partition heals\n(e.g. can't reach quorum)"]
+    Q -->|"Choose Availability"| A["Serve the request anyway\nusing local, possibly stale data"]
+    C --> R1["Result: no stale reads,\nbut reduced availability"]
+    A --> R2["Result: system stays responsive,\nbut replicas can diverge"]
+`} />
+
+A concrete example: say you run a 5-node cluster and a network split leaves 2 nodes cut off from the other 3. A **CP** system (like a strongly-consistent config store — think ZooKeeper or etcd) requires a majority quorum (3 of 5) to accept writes, so the 2-node minority stops accepting writes entirely until the partition heals. An **AP** system (like a shopping-cart service backed by a Dynamo-style store) keeps both sides writable; a customer on either side can keep adding items, and the two carts get merged or reconciled once the network heals.
+
+## Why CAP alone isn't enough — enter PACELC
+
+CAP's biggest weakness as an interview tool: it only describes behavior **during a partition**, and partitions are (hopefully) rare. It says nothing about the trade-off you're making every single normal day when there's no partition at all. That's the gap PACELC closes.
+
+PACELC, coined by Daniel Abadi, extends the statement: **if there is a Partition (P), you trade Availability (A) vs Consistency (C); Else (E), even with no partition, you trade Latency (L) vs Consistency (C)**.
+
+That "Else" branch is the part CAP misses. Even when every node is healthy and reachable, a system that wants strong consistency still has to coordinate — get acknowledgment from a quorum, or route everything through a single leader — and that coordination costs latency. A system willing to accept weaker consistency can skip that coordination and respond faster.
+
+This gives four practical combinations:
+
+- **PC/EC**: consistent during a partition and consistent normally, always paying the latency cost for coordination (e.g. a system requiring synchronous majority acknowledgment on every write, like many configurations of a strongly consistent SQL replica set).
+- **PA/EL**: available during a partition and low-latency normally, favoring speed and uptime over strict correctness at every point in time (e.g. Dynamo-style stores, most CDNs and caches).
+- **PC/EL**: consistent during a partition but low-latency normally — an unusual combination, since it means only paying the coordination cost when things go wrong.
+- **PA/EC**: available during a partition but consistent (and slower) normally — also uncommon, but describes systems that relax guarantees only under failure while otherwise coordinating tightly.
+
+Most real systems you'll discuss in an interview land on PC/EC or PA/EL, because those two are the "coherent" choices — pick a philosophy (correctness-first or speed-first) and apply it whether or not a partition is happening.
+
+## Applying this in an interview
+
+The strongest answers don't just label a system "CP" or "AP" — they identify *which data* needs which guarantee, because most real systems mix both:
+
+- Inventory counts or payment ledgers usually need strong consistency (or at least serializable transactions) — overselling a limited-stock item or double-charging a card is a real cost.
+- Social feed likes, view counters, or presence indicators ("user is typing...") can be eventually consistent — a like count off by one for a few hundred milliseconds harms nobody.
+- Session/auth tokens often want read-your-writes: you should immediately see your own password change reflected, even if other observers can lag.
+
+Naming the specific mechanism also signals seniority: quorum reads/writes (`W + R > N` guarantees you read at least one up-to-date replica), a single-writer/leader design for a shard, or a conflict-resolution strategy like last-write-wins or CRDTs for AP systems that must merge concurrent writes.
+
+<Callout type="warning">
+  A common mistake is treating "CAP" and "the CAP theorem's Availability" as the same thing as the everyday "high availability" property from earlier in this module. CAP's "A" is a narrow, formal guarantee — every non-failed node answers every request, with no bound on how stale the data can be. A system can have excellent uptime (rarely down) while still being CP and, during a live partition, deliberately refusing some requests to protect consistency. Don't let an interviewer's "so this system isn't available?" question rattle you — clarify which sense of "available" is meant.
+</Callout>
+
+## Worked example: choosing a model for a URL shortener's click counter
+
+Say you're designing a URL shortener and need to track click counts per short link. Two candidate approaches:
+
+1. **Strongly consistent counter**: every click increments a row in a single-leader relational database, and every read for the count queries that leader. Simple to reason about, always accurate — but every click write and every dashboard read adds a network hop to that leader, and if the leader's region has an outage, clicks and reads both fail until failover completes.
+2. **Eventually consistent counter**: each region keeps a local counter, clicks increment it locally, and a background job periodically sums the shards into a displayed total. Clicks never block on cross-region coordination, and a regional outage only affects that region's counters, not the global write path — but the displayed count can lag reality by the aggregation interval (say, 10 seconds).
+
+For a click counter, option 2 is almost always the right call: nobody needs the exact count to the millisecond, and the PA/EL trade-off (available, low-latency, eventually correct) buys you resilience and speed for a metric that tolerates staleness well. If the same system also tracks *billing* for a paid tier based on click volume, that billing tally likely wants stronger guarantees — which is exactly the "different data, different model" point from above.
+
+<Quiz
+  lessonId="nfr-consistency-cap-and-pacelc"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'According to the CAP theorem, what must a distributed system choose between specifically when a network partition is happening?',
+      options: [
+        { id: 'a', text: 'Consistency and availability', correct: true, explanation: 'CAP describes the choice during an active partition: guarantee every response is up-to-date (consistency) or guarantee every live node keeps responding (availability), but not both.' },
+        { id: 'b', text: 'Latency and throughput', correct: false, explanation: 'Latency vs. consistency is the trade-off PACELC adds for the non-partition case, not what CAP itself describes.' },
+        { id: 'c', text: 'Durability and scalability', correct: false, explanation: 'CAP is specifically about consistency and availability under partition; durability and scalability are separate non-functional properties covered in other lessons.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'boolean',
+      prompt: 'The CAP theorem tells you how a system should behave when there is no network partition and everything is healthy.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'CAP is explicitly a statement about behavior during a partition. It is silent on the normal, no-partition case.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — CAP only constrains behavior while a partition is occurring. PACELC extends the idea to describe the latency-vs-consistency trade-off that exists even when there is no partition.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'multi',
+      prompt: 'Which of these are reasonable candidates for eventual consistency rather than strong consistency? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A "likes" counter on a social media post', correct: true, explanation: 'Being off by a small amount for a short window has essentially no cost, so the lower latency and better availability of eventual consistency is worth it.' },
+        { id: 'b', text: 'A bank account balance used to authorize a withdrawal', correct: false, explanation: 'Stale reads here can let a withdrawal succeed against money that is not actually available, which is a real financial and correctness cost — this needs strong consistency or serializable transactions.' },
+        { id: 'c', text: 'A "user is typing..." presence indicator in a chat app', correct: true, explanation: 'This is inherently transient and approximate information; a brief lag or a missed update has no meaningful downside.' },
+        { id: 'd', text: 'A seat inventory count for the very last seat on a flight', correct: false, explanation: 'Overselling the final seat because two regions both thought it was available is exactly the failure mode strong consistency (or a coordinated reservation step) prevents.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A system is designed to always route writes through a single coordinator that waits for majority acknowledgment, whether or not a partition is happening. Which PACELC classification best fits?',
+      options: [
+        { id: 'a', text: 'PC/EC — consistent under partition, and consistent (accepting the latency cost) the rest of the time too', correct: true, explanation: 'Always paying for majority coordination, partition or not, is the defining trait of PC/EC: consistency is prioritized in both the partition and non-partition cases.' },
+        { id: 'b', text: 'PA/EL — available under partition, and low-latency the rest of the time', correct: false, explanation: 'PA/EL describes systems that skip coordination to stay fast and available; this system always coordinates for consistency, which is the opposite choice.' },
+        { id: 'c', text: 'This scenario cannot be described using PACELC', correct: false, explanation: 'PACELC is built exactly to classify this scenario — the "Else" branch covers the coordination cost paid during normal, no-partition operation.' },
+      ],
+    },
+  ]}
+/>

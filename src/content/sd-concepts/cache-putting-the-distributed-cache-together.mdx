@@ -1,0 +1,143 @@
+---
+title: "Putting the Distributed Cache Together"
+module: "Distributed Cache"
+moduleOrder: 16
+order: 5
+track: "concept"
+summary: "Walks a request end to end through a distributed cache — placement, write policy, eviction, invalidation, and sharding acting together — and shows what breaks when one piece is designed in isolation."
+tags: ["distributed-cache", "system-design", "distributed-systems", "sharding", "architecture"]
+estMinutes: 12
+cheatsheet:
+  - "A cache read touches four decisions in order: which shard owns the key (consistent hashing), whether it's a hit or miss, who repopulates on a miss (cache-aside vs read-through), and what TTL/eviction policy keeps it there."
+  - "A cache write touches the same shard lookup, plus your write policy (write-through, write-behind, or write-around) and an invalidation step so other readers don't serve the stale value."
+  - "Cache stampede (a.k.a. thundering herd) is what happens when a hot key expires and every one of its concurrent readers misses at once and hammers the database — fix it with request coalescing (singleflight), a short lock, or staggered/jittered TTLs, not by making the cache bigger."
+  - "Replication for a distributed cache is usually about read throughput and hot-key relief, not durability — losing a cache node should degrade latency, not lose data, because the source of truth is the database behind it."
+  - "Pick your invalidation strategy (TTL-only, explicit invalidate-on-write, or pub/sub broadcast) before you pick your eviction policy — invalidation decides correctness, eviction just decides what falls out first."
+  - "When narrating this in an interview, trace one read and one write through routing, hit/miss handling, and invalidation end to end — that single narration is what shows the pieces actually form one system, not four disconnected slides."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Over the last four lessons you picked apart a distributed cache one concern at a time: where it sits relative to the app and the database, how writes get applied, how consistency and invalidation are handled, and how the cache itself is sharded and replicated across nodes. Each of those, on its own, is a clean two-minute answer. What actually gets tested in a system design interview is whether you can wire them together into one request path without contradicting yourself — say "write-behind" in one breath and "strong consistency" in the next, and an interviewer will (rightly) push back.
+
+This lesson is that assembly step. No new mechanism gets introduced here; instead we trace a single read and a single write through the full stack, see exactly where each earlier lesson's decision gets invoked, and work through a sizing example that shows how a bad interaction between eviction and invalidation turns into a production incident.
+
+## The read path, start to finish
+
+Follow a single `GET(key)` issued by an application server:
+
+1. **Routing.** The client library hashes `key` (typically consistent hashing with virtual nodes, from the sharding lesson) to find which cache node owns it. This is a local computation — no network round trip to "find" the shard.
+2. **Hit check.** The client asks that node for `key`. If present and unexpired, that's a cache hit — return it. This is the fast path and, in a healthy system, the overwhelming majority of requests.
+3. **Miss handling.** On a miss, *who* fills the cache matters. In a cache-aside design, the application itself queries the database, then writes the result back into the cache before returning. In read-through, the cache library does that transparently, so the application only ever talks to the cache. Either way, this is the moment a cold or evicted key gets re-populated.
+4. **Backfill and TTL.** The newly written entry gets a TTL (and possibly jitter — see below) so it participates in eviction and expiry the same as everything else on that node.
+
+## The write path, and where invalidation happens
+
+A `PUT(key, value)` follows the same routing step, then diverges based on the write policy chosen earlier in the module:
+
+- **Write-through**: the cache node writes to the database synchronously before acknowledging the client. Simple to reason about, adds write latency.
+- **Write-behind**: the cache acknowledges immediately and flushes to the database asynchronously in batches. Faster writes, but a cache-node crash before flush can lose data — which is exactly why this lesson keeps stressing that cache replication is not a substitute for the database being the durable source of truth.
+- **Write-around**: the write goes straight to the database and skips the cache; the next read is a deliberate miss that repopulates via the normal read path.
+
+Whichever policy you chose, the write must also settle what happens to *other* copies of that key elsewhere in the system: invalidate the local entry, and if there's an application-tier cache in front of this distributed layer (or multiple regions each with their own cache), broadcast an invalidation message over pub/sub so those copies don't keep serving the old value until their TTL happens to expire.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant App as App server
+    participant Ca as Cache node (shard for key)
+    participant DB as Database
+    participant Pub as Invalidation pub/sub
+    App->>Ca: GET(key)
+    Ca-->>App: miss
+    App->>DB: SELECT ... WHERE key
+    DB-->>App: value
+    App->>Ca: SET(key, value, ttl)
+    Note over App,Ca: read path repopulates on miss
+    App->>DB: UPDATE ... WHERE key
+    App->>Ca: DEL(key)
+    App->>Pub: publish invalidate(key)
+    Pub-->>Ca: other shards/regions drop key too
+`} />
+
+## Where eviction and sharding quietly interact
+
+Eviction (LRU, LFU, or TTL-based expiry) decides what falls out of a single node when it's full or a key has aged out. Sharding decides which node a key lives on in the first place. They look independent, but a design that ignores their interaction breaks in a specific, predictable way: **hot keys**.
+
+If one key (a viral post, a trending product, a celebrity's profile) gets disproportionate traffic, it lives on exactly one shard under plain consistent hashing — and that shard's memory and CPU absorb all of that key's load while every other shard sits idle. Two earlier-lesson tools fix this together, not separately: replicate the hot key onto multiple nodes (so reads fan out across replicas instead of one node), and use an eviction policy that resists cheap churn (LFU over strict LRU) so a hot key isn't accidentally evicted by a burst of one-time-read cold keys.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    A[Request for key] --> B[Hash to shard]
+    B --> C{Hit?}
+    C -->|Yes| D[Return cached value]
+    C -->|No| E[Load from DB]
+    E --> F[Write to cache with TTL + jitter]
+    F --> D
+    D --> G{Key is hot?}
+    G -->|Yes| H[Replicate across N nodes<br/>route reads round-robin]
+    G -->|No| I[Stays on single shard]
+`} />
+
+## Worked example: a stampede after a TTL expiry
+
+Say a product page's price and inventory blob is cached under one key, read roughly 20,000 times per second, with a 60-second TTL for freshness. At second 60, the key expires. Under a naive cache-aside implementation, all ~20,000 requests that land in the next few milliseconds see a miss simultaneously, and all ~20,000 issue the same query to the database at once — a cache stampede. The database, which was comfortably serving zero load for this key (because the cache was absorbing it), now takes a 20,000-request spike it was never sized for, and can fall over.
+
+Three fixes, and you should be able to name all three in an interview:
+
+- **Request coalescing (singleflight)**: the first request that misses acquires a short-lived lock for that key and fetches from the database; every other concurrent request for the same key waits on that fetch instead of issuing its own, then all of them read the result once it lands.
+- **Jittered TTL**: instead of every replica of a popular key expiring at exactly 60 seconds, randomize it (e.g. 55 to 65 seconds) so expiries spread out instead of clustering at one instant.
+- **Background refresh**: proactively refresh a hot key shortly before it expires (e.g. at 50 seconds) so it never actually goes cold from the client's point of view.
+
+None of these are eviction-policy or sharding fixes — they're invalidation-and-refill fixes — which is exactly the point: assembling the cache correctly means knowing which lesson's toolbox a given failure mode belongs to.
+
+<Callout type="warning">
+  A common mistake: treating "add more cache nodes" as the answer to a cache stampede. More nodes shard the *keyspace* more finely, but a stampede is concentrated on one hot key that already lives on one node (or a small replica set) — extra unrelated shards don't help at all. The fix is request coalescing, jitter, or background refresh on that specific key's expiry behavior, not horizontal scale-out of the cluster.
+</Callout>
+
+<Quiz
+  lessonId="cache-putting-the-distributed-cache-together"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A hot key is getting disproportionate read traffic and its single shard is CPU-saturated while other shards are idle. Which combination of earlier concepts addresses this?',
+      options: [
+        { id: 'a', text: 'Replicate the hot key across multiple nodes and use an eviction policy (e.g. LFU) that resists evicting it under cold-key churn', correct: true, explanation: 'Replication spreads the read load for that one key across nodes, and a frequency-aware eviction policy stops one-time cold reads from pushing the hot key out — the two work together.' },
+        { id: 'b', text: 'Add more shards to the consistent hashing ring', correct: false, explanation: 'More shards spread the overall keyspace more finely, but a single hot key still resolves to one shard (or one replica set) under consistent hashing — adding unrelated shards does not relieve that key\'s hotspot.' },
+        { id: 'c', text: 'Switch the write policy from write-through to write-behind', correct: false, explanation: 'Write policy governs how writes reach the database, not how read load for a hot key is distributed — it does not address a read-side hotspot.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which techniques directly reduce the impact of a cache stampede when a popular key expires? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Request coalescing so only one concurrent miss triggers a database fetch', correct: true, explanation: 'Coalescing (singleflight) collapses thousands of simultaneous misses into a single database query, with other waiters reading the result once it lands.' },
+        { id: 'b', text: 'Jittering TTLs so replicas of the same hot key do not all expire at the same instant', correct: true, explanation: 'Jitter spreads expirations over a window instead of a single instant, which prevents the simultaneous miss spike that causes a stampede.' },
+        { id: 'c', text: 'Switching the eviction policy from LRU to LFU', correct: false, explanation: 'Eviction policy decides what gets removed when a node is full — it does not control what happens at the moment a specific key\'s TTL expires, which is the actual stampede trigger.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Replicating a key across multiple cache nodes in a distributed cache is primarily meant to guarantee durability if a node crashes.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Cache replication is mainly about spreading read load and relieving hot keys — the database behind the cache is the durability guarantee, not the cache tier itself.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Losing a cache node should mean a latency hit (more misses go to the database) rather than lost data, because the cache is not the system of record.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In a write-behind cache policy, what is the specific risk that makes it unsuitable for data that cannot tolerate loss?',
+      options: [
+        { id: 'a', text: 'A cache-node crash before the batched write flushes to the database can lose that write entirely', correct: true, explanation: 'Write-behind acknowledges the client before the database write happens, so anything still sitting in the flush buffer when a node dies is gone unless there is separate durable logging.' },
+        { id: 'b', text: 'It always incurs higher read latency than write-through', correct: false, explanation: 'Write-behind is a write-path decision and has no direct effect on read latency for keys already cached.' },
+        { id: 'c', text: 'It requires the cache to be sharded differently than write-through does', correct: false, explanation: 'Sharding/routing is independent of which write policy is chosen — the same consistent-hashing scheme works under any of the three policies.' },
+      ],
+    },
+  ]}
+/>

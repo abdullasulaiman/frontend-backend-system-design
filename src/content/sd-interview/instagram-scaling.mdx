@@ -1,0 +1,226 @@
+---
+title: "Scaling"
+module: "Design Instagram"
+moduleOrder: 8
+order: 5
+track: "interview"
+summary: "Walks through how an Instagram-style app scales its social graph, post metadata, and hot posts past a single-database design, covering sharding keys, celebrity/hot-key handling, counters, and multi-region deployment."
+tags: ["scalability", "sharding", "caching", "hot-key", "system-design"]
+estMinutes: 13
+cheatsheet:
+  - "Instagram's read:write ratio is roughly 100:1 or higher — design the read path (caching, replicas) first, then make the write path just fast enough not to bottleneck it."
+  - "Shard posts and the social graph by user_id, not post_id — most queries ('this user's posts', 'who does this user follow') are scoped to one user, so user_id sharding keeps them single-shard."
+  - "A celebrity account is a hot-key problem twice over: fan-out-on-write would flood millions of follower timelines at post time, and a single post's like/comment counter can take tens of thousands of writes per second."
+  - "Fix hot counters by sharding the counter itself (N sub-counters summed on read) or batching increments through a queue, not by adding read replicas — replicas don't help a single hot row."
+  - "Use consistent hashing (or a lookup service) for shard assignment so adding capacity moves a small fraction of keys, not the whole dataset."
+  - "Push read traffic off the primary with replicas and caches, but don't cache-invalidate on every write to a hot post — that just moves the hot-row problem into the cache layer instead of solving it."
+  - "Multi-region reduces latency for global users but adds real complexity: decide up front which data is per-region (media, feeds) versus globally consistent (username uniqueness, auth) before designing replication."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The earlier lessons in this module got you a working design: a data model,
+a media pipeline, and a feed that assembles posts efficiently. None of that
+survives contact with real traffic unmodified. A single Postgres instance
+holding users, posts, follows, likes, and comments works fine for a few
+thousand users; it falls over well before a million. This lesson is about
+the specific things that break as an Instagram-style app grows, and the
+specific techniques — not "add more servers" — that fix each one. Interviewers
+use this section to check whether you can reason about a system under load,
+not just describe it at rest.
+
+## The traffic shape: reads dwarf writes
+
+Instagram-style apps are read-heavy by a wide margin. A typical user opens
+the app, scrolls a feed, taps into a handful of profiles, and watches a few
+Stories — dozens of reads — for every one post, like, or comment they
+create. That asymmetry should drive every scaling decision:
+
+- **Optimize the read path aggressively** with caching and replicas, because
+  that's where the volume is.
+- **Keep the write path simple and fast**, but don't over-invest in write
+  throughput at the expense of read latency — most requests are reads.
+
+This mirrors the point made in the Feed and Stories lesson about
+precomputing timelines for most users: precomputation is a read-path
+optimization that trades some write-side work (fan-out) for much cheaper,
+much more frequent reads.
+
+## Sharding the social graph and post data
+
+Once posts, likes, comments, and follow edges don't fit on one database,
+you need a sharding key. The natural choice is `user_id`:
+
+- **Posts** are stored keyed by the author's `user_id`, so "get this user's
+  posts" (profile grid, post ownership checks) stays a single-shard query.
+- **The social graph** (`follows` edges) is stored keyed by the follower's
+  `user_id`, so "who does this user follow" — the query that drives feed
+  assembly — is also single-shard.
+- **Likes and comments** are trickier, since a like row references both the
+  liker and the post. Most designs shard likes/comments by the `post_id`
+  of the target, since the dominant query is "get all likes/comments for
+  this post," not "get all likes this user has ever given."
+
+Sharding by a random or auto-incrementing ID instead would scatter a single
+user's or post's data across every shard, turning nearly every common query
+into a scatter-gather across the cluster — exactly the pattern the Quora and
+Twitter modules' scaling lessons warn about for their own domains.
+
+Use consistent hashing (or a shard-map service that tracks which range/hash
+owns which shard) rather than a fixed `user_id modulo N` scheme. A fixed
+modulo scheme means adding one shard reshuffles almost every key; consistent
+hashing moves only the fraction of keys that need to move.
+
+## Taming hot keys: celebrities and viral posts
+
+A hot key is a single row or shard receiving disproportionate traffic. Two
+show up constantly in this system:
+
+**A celebrity's follower list.** The Feed and Stories lesson already covers
+why fan-out-on-write breaks for accounts with tens of millions of followers
+(one post would trigger tens of millions of writes) and how a hybrid
+fan-out model avoids it — that's the fix, so it isn't repeated here. The
+scaling-specific point is: identify these accounts ahead of time (a follower
+count threshold is enough) and route them onto the read-time-merge path
+automatically, rather than discovering the failure mode in production.
+
+**A viral post's like/comment counter.** Even without celebrity fan-out,
+a single post can receive tens of thousands of likes per minute if it goes
+viral — every like is a write to roughly the same row (or a small set of
+rows) holding that post's counter, which serializes writes and creates lock
+contention regardless of how many replicas you have. Replicas don't help
+here because they don't take writes; you need to shard or batch the hot row
+itself.
+
+## Counters at scale
+
+Like counts, view counts, and comment counts are the counters most likely
+to become hot. Two complementary techniques:
+
+1. **Sharded counters.** Instead of one `like_count` row per post, keep N
+   sub-counters (say, 10-20) per post, and increment a randomly chosen
+   sub-counter on each like. Reading the total sums the sub-counters. This
+   spreads write load across N rows instead of one, at the cost of a
+   slightly more expensive read (which is fine, since reads of a count are
+   cheap regardless).
+2. **Batched/async increments.** Route like events through a queue and have
+   a stream consumer aggregate them over a short window (e.g. one second)
+   before applying a single batched update. The UI can show an optimistic
+   local increment immediately, so the user never perceives the lag.
+
+Combine both for the hottest posts: batch first to cut write volume by
+orders of magnitude, then shard whatever write volume remains.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    Client[Client] --> LB[Load Balancer]
+    LB --> API[Stateless API Tier]
+    API -->|profile/post read| Cache[Cache: hot posts, profiles]
+    Cache -->|miss| Replica[(Read Replicas, sharded by user_id)]
+    API -->|like/comment write| Queue[Event Queue]
+    Queue --> Aggregator[Batch Aggregator]
+    Aggregator -->|sharded counter update| Primary[(Primary Shards, sharded by user_id/post_id)]
+    Primary --> Replica
+    API -->|media| CDN[CDN / Object Storage]
+`} />
+
+## Scaling the service tier and going multi-region
+
+Keep the API tier stateless so any instance can serve any request, and put
+a load balancer in front so you scale horizontally by adding instances, not
+by resizing one machine. Beyond a certain scale, most Instagram-scale
+systems split into services by responsibility — a media service, a graph
+service, a feed service, a notifications service — so each can scale, deploy,
+and fail independently, rather than one monolith scaling as a unit for the
+sake of its busiest component.
+
+Multi-region deployment cuts latency for a global user base (serving an
+Asian user from a US-only data center adds real round-trip time to every
+request) but forces a decision: what data must be globally consistent
+(usernames must be unique account-wide; you can't have the same handle
+registered in two regions), and what data can be regional and eventually
+consistent (a user's feed, cached media, most read replicas). Get this
+split wrong and you either pay a consistency tax on every request or ship a
+bug where two regions disagree about who owns a username.
+
+## Worked example: a post crosses 10 million likes in an hour
+
+Say an account with 40 million followers posts something that goes
+viral, gathering 10 million likes over the next hour — an average of about
+2,800 likes/second, with bursts well above that during peak minutes.
+
+Without sharded or batched counters: every like is a write to one row.
+At 2,800 writes/second to a single row, the database serializes those
+writes and lock contention alone would push per-write latency into the
+hundreds of milliseconds, and the row becomes a bottleneck the rest of the
+system waits behind.
+
+With the design above: likes flow into a queue and get aggregated per
+one-second window, so the database sees maybe 20-50 sub-counter updates per
+second (one per active shard of the counter, not one per like) — three
+orders of magnitude fewer writes. The client shows the like immediately via
+optimistic UI update, and the authoritative count catches up within a
+second. Fan-out for this post already runs on the hybrid read-time-merge
+path (per the Feed and Stories lesson), so the 40 million followers'
+timelines were never touched by the post's creation at all — only readers
+who scroll to it trigger the merge, spreading that cost across each
+follower's own read request instead of concentrating it at post time.
+
+<Callout type="warning">
+  A common mistake: reaching for "add a read replica" to fix every scaling
+  problem. Replicas relieve read pressure on the primary, but they do
+  nothing for a single hot row under write pressure — every replica still
+  has to apply the same serialized stream of writes to that row. If an
+  interviewer describes a viral post's counter or a celebrity's follower
+  list falling over, the fix is sharding or batching the hot key itself,
+  not scaling out reads.
+</Callout>
+
+<Quiz
+  lessonId="instagram-scaling"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'For an Instagram-style app, which sharding key keeps the common "get this user\'s posts" and "who does this user follow" queries within a single shard?',
+      options: [
+        { id: 'a', text: 'user_id', correct: true, explanation: 'Sharding posts and follow edges by the owning user_id keeps queries scoped to one user inside a single shard, avoiding scatter-gather.' },
+        { id: 'b', text: 'post_id', correct: false, explanation: 'Sharding by post_id would scatter a single user\'s posts randomly across shards, turning a profile-grid query into a cluster-wide scatter-gather.' },
+        { id: 'c', text: 'A random UUID generated at insert time', correct: false, explanation: 'A random key gives even distribution but no locality — related rows (one user\'s posts, one user\'s follows) end up scattered across shards.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'A single post\'s like counter is receiving thousands of writes per second during a viral moment. Which changes actually relieve that hot-row pressure? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Split the counter into N sub-counters and sum them on read', correct: true, explanation: 'Sharding the counter spreads writes across N rows instead of serializing them all on one, which directly relieves hot-row contention.' },
+        { id: 'b', text: 'Batch like events through a queue and apply aggregated updates on a short interval', correct: true, explanation: 'Batching reduces the number of database writes by orders of magnitude, which is exactly what a hot row needs.' },
+        { id: 'c', text: 'Add more read replicas for the posts table', correct: false, explanation: 'Replicas absorb read traffic, but every replica still must apply the same volume of writes to the same hot row — this does not fix the problem.' },
+        { id: 'd', text: 'Increase the primary database\'s instance size', correct: false, explanation: 'A bigger instance can push the ceiling higher but does not remove the fundamental serialization of writes to one row; it delays the problem rather than solving it.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Using a fixed user_id modulo N scheme to assign shards is just as good as consistent hashing when you need to add shard capacity later.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A fixed modulo scheme reshuffles almost every key when N changes, forcing a massive data migration; consistent hashing only moves the fraction of keys that need to move.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — consistent hashing (or an explicit shard-map service) is preferred specifically because it minimizes data movement when capacity is added or removed.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why does Instagram-style scaling generally optimize the read path more aggressively than the write path?',
+      options: [
+        { id: 'a', text: 'Writes are technically impossible to scale in relational databases', correct: false, explanation: 'Writes can be scaled through sharding, batching, and queues — the reasoning is about traffic proportion, not a technical impossibility.' },
+        { id: 'b', text: 'The read:write ratio is typically 100:1 or higher, so caching and replicas address where most requests actually go', correct: true, explanation: 'Because reads vastly outnumber writes (scrolling feeds, viewing profiles/Stories versus occasional posts/likes), the read path carries most of the load and yields the biggest win from caching and replicas.' },
+        { id: 'c', text: 'Writes never need to be fast since users do not notice write latency', correct: false, explanation: 'Users do notice slow posting or liking; the point is relative investment, not that write latency is irrelevant.' },
+      ],
+    },
+  ]}
+/>

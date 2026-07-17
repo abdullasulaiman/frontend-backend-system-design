@@ -1,0 +1,221 @@
+---
+title: "Scaling and Offline Support"
+module: "Design Google Docs"
+moduleOrder: 13
+order: 5
+track: "interview"
+summary: "Covers the two scaling problems specific to collaborative editors — the hot-document fan-out bottleneck and offline clients that reconnect after hours of local edits — and how the collaboration model from earlier lessons makes both tractable."
+tags: ["scalability", "offline-first", "collaborative-editing", "sharding", "google-docs"]
+estMinutes: 13
+cheatsheet:
+  - "Scaling document count is easy (shard by document ID); scaling one hot document is the hard problem, because every editor's socket is fanned out from the same single sequencer that owns that document."
+  - "Fan-out cost grows as editors times edit rate, not as document count — a 500-person all-hands doc can outproduce the CPU/network budget of the single machine sequencing it long before your cluster runs out of capacity elsewhere."
+  - "Fix hot documents by batching/coalescing broadcasts (send every 20-50ms, not per keystroke) and by adding a fan-out tier so the sequencer broadcasts to a handful of relay nodes instead of thousands of sockets directly — never by adding more sequencers for the same document."
+  - "Offline support means: queue operations locally against a known base version, keep editing against that local state, and resync when the connection returns — never block typing on network reachability."
+  - "CRDTs tolerate long offline windows well because merging doesn't depend on how many operations happened in between; OT's transform cost and correctness risk both grow with the size of the gap, so bound how long a client can stay offline before forcing a full resync."
+  - "On reconnect, the server replays everything the client missed since its last known version, and the client's queued local operations get merged against that replayed history using the same OT/CRDT logic used for live concurrent edits — resync is not a special case, it's the general case run on a bigger batch."
+  - "Never silently drop a client's queued offline edits because the gap is 'too big' — degrade to a smaller, explicit action (flag a manual merge, or fork a copy) instead of losing user work without telling them."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every design so far in this module has quietly assumed two things: that a
+document has a handful of concurrent editors, and that every client stays
+connected. Neither holds at Google Docs' actual scale. Some documents — a
+company-wide OKR doc, a live event run-of-show, a viral shared spreadsheet —
+get hundreds or thousands of people looking at them at once. And every
+client, no matter how good your WebSocket infrastructure is, will lose its
+connection sometimes: a laptop lid closes, a phone drops onto cellular, a
+flight takes off. A design that only works with five editors and a perfect
+network isn't a real design. This lesson covers the two problems that show
+up once you relax those assumptions, and both problems turn out to lean
+directly on decisions made earlier in this module.
+
+## The scaling problem isn't "more documents" — it's "one huge document"
+
+Scaling the number of documents is the easy part of this system, and it's
+worth saying so explicitly: shard by document ID, spread sequencers and
+storage across as many machines as you have documents-worth of load, and a
+typical CRUD-style scaling story applies. That is not where collaborative
+editors get into trouble.
+
+The hard problem is a single document with an unusually large number of
+simultaneous editors. Recall from the architecture lesson that one document
+is owned by exactly one sequencer, which broadcasts every accepted operation
+to every connected client on that document. That fan-out cost scales with
+`editors times edit rate`, not with how many documents exist in the system.
+
+Do the arithmetic on a genuinely hot document: 500 people have a live
+planning doc open during an all-hands, each producing roughly 2 operations
+per second during active typing bursts (keystrokes, cursor moves that carry
+metadata, occasional formatting). That's 1,000 incoming operations per
+second into one sequencer, and — because every operation gets broadcast to
+every other open connection — up to 500,000 outbound messages per second
+out of that same single process. No single machine's network stack or
+socket-management loop comfortably sustains that, and you can't fix it by
+adding more sequencers, because a document can only have one sequencer
+without reintroducing the divergent-state problem from the architecture
+lesson.
+
+### Fixing hot-document fan-out
+
+Three techniques compose well here, and none of them change who owns the
+document:
+
+- **Batch broadcasts.** Instead of pushing every operation to every client
+  the instant it's sequenced, coalesce operations arriving within a small
+  window (20-50ms) into one message per client. A user typing at normal
+  speed produces far fewer network round-trips than keystrokes, and nobody
+  perceives 30ms of batching as lag.
+- **Add a fan-out tier.** Instead of the sequencer holding a direct
+  connection to every one of 500 clients, it broadcasts once to a small
+  number of relay nodes, each of which fans out to its own slice of
+  connected clients. The sequencer's job shrinks to "sequence and send N
+  copies" where N is the relay count, not the editor count.
+- **Degrade gracefully past a threshold.** Past some editor count (say,
+  100+ simultaneous active editors), many products switch very-large
+  documents into a lighter-weight mode — visible presence for everyone, but
+  full live-cursor detail only for a recently-active subset — because the
+  UI value of showing 500 live cursors is close to zero anyway.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    Seq[Sequencer - owns doc D] --> R1[Relay node 1]
+    Seq --> R2[Relay node 2]
+    Seq --> R3[Relay node 3]
+    R1 --> C1[~150 editors]
+    R2 --> C2[~150 editors]
+    R3 --> C3[~150 editors]
+`} />
+
+Notice what didn't change: there is still exactly one sequencer for
+document D, still one canonical order of operations, still the same
+OT/CRDT merge logic from earlier lessons. Scaling a hot document is a
+fan-out and batching problem layered on top of the architecture, not a
+different architecture.
+
+## Offline support: the client keeps a private branch
+
+The second scaling axis isn't about load at all — it's about time. A client
+that loses connectivity shouldn't stop working. The user is still typing;
+the editor still needs to feel instant. The only thing that changes is that
+outgoing operations can't reach the sequencer yet.
+
+The mechanism is a straightforward extension of the optimistic-apply
+pattern from the architecture lesson: the client keeps applying its own
+operations locally and queuing them (persisted to local storage, not just
+memory, so a closed tab doesn't lose them) instead of sending them
+immediately. Each queued operation still carries its base version — the
+document state the client believed was current when it made the edit. The
+client can keep doing this indefinitely; nothing about local editing
+requires a live connection.
+
+### Reconnecting: resync is just a bigger merge
+
+When connectivity returns, the client doesn't need a special "offline
+recovery" protocol — it runs the same merge logic used for live concurrent
+edits, just against a bigger batch. The client tells the sequencer its last
+known version; the sequencer replays every operation accepted since then;
+and the client's queued local operations get transformed (OT) or merged
+(CRDT) against that replayed history, exactly like reconciling one
+concurrent edit, except there might be forty of them instead of one.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant C as Client (was offline)
+    participant S as Sequencer
+    C->>C: queue local ops while disconnected
+    Note over C: baseVersion stays pinned at 57
+    C->>S: reconnect, send lastKnownVersion=57
+    S->>C: replay ops 58..112 (from other editors)
+    C->>C: merge queued ops against replayed history
+    C->>S: send resolved/transformed queued ops
+    S->>C: broadcast final merged state to all clients
+`} />
+
+This is exactly where the collaboration model choice from earlier in the
+module stops being an abstract trade-off and starts mattering concretely.
+A CRDT's merge doesn't care how many operations happened in the gap — union
+the sets, done — so it tolerates a client being offline for hours without
+extra risk. OT's transform step has to walk the client's queued operations
+through every operation in the gap one at a time; a bigger gap means more
+transform calls and more chances to hit an edge case the transform function
+didn't handle cleanly. Real OT-based systems bound this by forcing a full
+resync (discard the transform chain, refetch a fresh snapshot, then
+reapply only operations still meaningfully "unsent") once the gap crosses
+some threshold, rather than transforming across an unbounded history.
+
+## Worked example: three hours on a flight
+
+Say a user opens a document, boards a flight, and edits offline for three
+hours, producing 40 queued operations against `baseVersion=200`. Meanwhile,
+five other collaborators keep editing normally, and by the time the flight
+lands the document is at `baseVersion=650` — 450 operations happened while
+this client was gone.
+
+On reconnect, the client sends `lastKnownVersion=200`. The sequencer streams
+back all 450 missed operations. Under a CRDT, the client's 40 queued
+operations already carry stable IDs relative to their neighbors, so merging
+them into the now-much-longer document is a constant amount of work per
+operation regardless of the 450-operation gap — the client renders the
+merged result and sends its 40 operations up, done. Under OT, each of the 40
+queued operations has to be transformed against some slice of those 450
+intervening operations before it's safe to apply, which is real
+computational work and real risk surface; most production OT systems handle
+this by snapshotting the document at reconnect and replaying only what's
+needed to get the queued operations into a valid final position, rather
+than transforming through all 450 one by one.
+
+<Callout type="warning">
+  A common mistake is treating offline support as "queue writes and retry
+  when online," the same pattern used for a typical CRUD app's failed API
+  calls. That pattern assumes each write is independent and safe to replay
+  as-is. A document editor's queued operations are not independent — they
+  are relative to a base version that may be completely stale by the time
+  the client reconnects, and naively replaying them against the current
+  document (instead of resolving them through the transform/merge step)
+  silently corrupts text or drops other editors' concurrent work. Offline
+  resync must go through the same collaboration-model logic as live
+  editing, not around it.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="docs-scaling-and-offline-support"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A single document has 500 simultaneous editors and the system is falling behind. What is the correct fix?',
+      options: [
+        { id: 'a', text: 'Add a second sequencer to share the load for that document', correct: false, explanation: 'A document can only have one logical sequencer/owner without reintroducing the divergent-base-state corruption problem from the architecture lesson. Adding a second owner for the same document is not a valid fix.' },
+        { id: 'b', text: 'Batch broadcasts and add a fan-out tier of relay nodes between the sequencer and connected clients', correct: true, explanation: 'This reduces the sequencer\'s direct fan-out load without changing who owns the document\'s ordering — exactly the fix described in this lesson for hot-document fan-out.' },
+        { id: 'c', text: 'Shard the document\'s operation log across more machines', correct: false, explanation: 'The bottleneck here is broadcast fan-out to connected clients, not storage throughput for the log — sharding storage does not address that.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements about reconnect/resync after an offline editing session are accurate? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The client tells the server its last known version so the server can replay everything accepted since then', correct: true, explanation: 'This is the core of the resync protocol described in this lesson: the gap is defined by the client\'s last known version versus the server\'s current version.' },
+        { id: 'b', text: 'Resync uses fundamentally different merge logic than live concurrent editing', correct: false, explanation: 'The opposite is emphasized in this lesson: resync reuses the same OT/CRDT merge logic as live editing, just applied to a larger batch of missed operations.' },
+        { id: 'c', text: 'A CRDT-based system tolerates a long offline gap more gracefully than an OT-based system, because merging does not depend on how many operations happened in between', correct: true, explanation: 'Correct — CRDT merges are a set union regardless of gap size, while OT has to transform the queued operations through each intervening operation, which grows with the gap.' },
+        { id: 'd', text: 'Queued offline operations should be discarded if the client was offline for more than a few minutes', correct: false, explanation: 'The lesson\'s pitfall callout warns against silently dropping queued edits; a large gap should trigger a more careful resync or an explicit user-facing merge step, not silent data loss.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Scaling the number of documents a system supports is generally a harder problem than scaling a single document with an unusually large number of simultaneous editors.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'This lesson argues the reverse: scaling document count is a standard sharding problem, while a single hot document with hundreds of concurrent editors creates a fan-out bottleneck on its one sequencer that requires specific techniques (batching, relay tiers) to fix.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the hot single-document case is the harder, more specific problem this lesson focuses on, precisely because it cannot be solved by the usual "add more shards" approach.' },
+      ],
+    },
+  ]}
+/>

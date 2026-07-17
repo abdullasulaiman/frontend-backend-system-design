@@ -1,0 +1,238 @@
+---
+title: "Why Distributed Monitoring Matters"
+module: "Distributed Monitoring"
+moduleOrder: 13
+order: 1
+track: "concept"
+summary: "Explains why distributed systems need dedicated monitoring infrastructure and introduces the core signals (metrics, logs, traces, alerts) that make failures visible before they become outages."
+tags: ["monitoring", "observability", "reliability", "distributed-systems", "alerting"]
+estMinutes: 11
+cheatsheet:
+  - "In a single-server world you can SSH in and look; in a distributed system no single machine has the whole picture — monitoring is the substitute for that missing view."
+  - "Four core signals: metrics (cheap, aggregated numbers over time), logs (detailed per-event records), traces (a request's path across services), and alerts (rules that turn signals into pages)."
+  - "MTTD (mean time to detect) and MTTR (mean time to recover) are the metrics that matter for an incident — good monitoring shrinks both, especially MTTD."
+  - "Symptom-based alerts (elevated error rate, slow latency) page humans; cause-based signals (CPU, queue depth) are for debugging once paged, not for waking someone up on their own."
+  - "Partial failure is the default failure mode at scale — a fleet of 500 hosts has some fraction unhealthy at almost any moment, so aggregate percentiles, not single-host state, are the unit of health."
+  - "Monitoring itself needs to survive the outage it's watching for — it should be a separate deployment/failure domain from the system it observes."
+  - "Cardinality (unique label combinations) is the main cost driver in metrics systems; unbounded labels like raw user IDs can blow up storage and query latency."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A single server that starts failing is easy to notice: SSH in, run `top`,
+tail a log file, and the problem is usually right in front of you. A
+distributed system doesn't offer that luxury. When a request touches a load
+balancer, three microservices, a cache, and a database replica, "is the
+system healthy" stops being a question one person can answer by looking at
+one machine. At 5 hosts you might get away with manually checking things. At
+500 hosts serving traffic across three regions, a slow but silent failure in
+one dependency can degrade the whole system for hours before anyone notices
+— unless something is watching continuously and telling you when to look.
+
+That "something" is a monitoring system, and it's one of the pieces of
+infrastructure that separates a system that merely works in a demo from one
+that survives production. This lesson covers why monitoring becomes
+mandatory at scale, what signals it needs to collect, and the pitfalls that
+turn a monitoring system into background noise instead of a safety net. The
+next two lessons in this module get into the mechanics of collecting and
+storing that data, and the architecture of a monitoring system end to end.
+
+## What changes when a system becomes distributed
+
+In a monolith on one box, failure is usually total: the process crashes, or
+it doesn't. In a distributed system, failure is partial and constant. At any
+given moment, some small fraction of a large fleet is having a bad time —
+a disk is slow, a network link is dropping packets, a garbage collection
+pause is stalling one JVM instance. None of that is unusual; it's the normal
+operating condition of a big fleet. The question isn't "is anything broken"
+(something almost always is) but "is enough broken to matter, and is it
+getting worse."
+
+That reframing is why distributed monitoring is a different problem from
+"check if the server is up." You need:
+
+- **Visibility across machines you don't individually track.** Nobody
+  should need to know which of 500 hosts is unhealthy by name; the system
+  should say "2% of requests are failing" and let you drill down from there.
+- **Aggregation over time and across the fleet.** A single slow request
+  means nothing; a p99 latency that jumped from 200ms to 2 seconds across
+  the fleet over the last 5 minutes means something is actively going wrong.
+- **A way to distinguish "the whole system is unhealthy" from "one dependency
+  is unhealthy but we're compensating."** Retries and failover can mask a
+  failing dependency from users while quietly eating your error budget —
+  monitoring is often the only way this gets caught before it turns into a
+  bigger outage.
+
+## The four signals: metrics, logs, traces, alerts
+
+Most monitoring systems are built from four kinds of signal, each answering
+a different question and priced differently in storage and query cost.
+
+**Metrics** are numeric measurements aggregated over time — request count,
+error rate, CPU utilization, queue depth — usually recorded as a time series
+with a name and a set of labels (e.g. `http_requests_total` labeled by
+`service` and `status_code`). They're cheap to store and fast to query
+because they're pre-aggregated, which makes them the right tool for
+dashboards and for triggering alerts. What they can't do is tell you *why*
+one specific request failed.
+
+**Logs** are detailed, timestamped records of individual events — a request
+came in, an exception was thrown, a cache miss occurred. They're the most
+detailed signal and the most expensive to store and search at volume,
+because you're keeping the raw event, not an aggregate. Logs are where you
+go once a metric tells you something's wrong and you need to know exactly
+which requests, users, or error messages were involved.
+
+**Traces** follow a single request as it hops across services, recording how
+long each hop took and where it went. In a system with a dozen
+microservices, a trace is often the only way to answer "why did this one
+request take 3 seconds" when no individual service looks obviously slow in
+isolation — the time is hiding in the sum of many small, individually
+acceptable delays, or in one slow hop buried three services deep.
+
+**Alerts** are rules layered on top of metrics (and sometimes logs) that
+turn "the data says X" into "a human should look at this now." Alerting is
+where monitoring becomes actionable — collecting the other three signals
+without alerting on them just produces a very detailed record of an outage
+nobody was told about while it was happening.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    A[Service instances] -->|emit| B[Metrics]
+    A -->|emit| C[Logs]
+    A -->|emit| D[Traces]
+    B --> E[Time-series storage]
+    C --> F[Log storage / search index]
+    D --> G[Trace storage]
+    E --> H[Dashboards]
+    E --> I[Alerting rules]
+    I --> J[On-call engineer paged]
+    J -->|drills into| F
+    J -->|drills into| G
+`} />
+
+## Detection speed is the point
+
+The real payoff of monitoring shows up in two numbers incident responders
+track: **MTTD** (mean time to detect — how long between something breaking
+and someone finding out) and **MTTR** (mean time to recover — how long from
+detection to the fix being live). Monitoring's main job is shrinking MTTD.
+You can't start fixing a problem you don't know exists, and in a fleet of
+hundreds of machines, "someone happened to notice" is not a detection
+strategy.
+
+A useful way to frame alert design: distinguish **symptom-based** signals
+from **cause-based** signals. Symptoms are things users actually feel —
+elevated error rate, slow response time, failed checkouts. Causes are the
+underlying resource state — high CPU, a full disk, a saturated connection
+pool. Page on symptoms, because that's what tells you users are affected;
+keep cause-based signals available for the engineer who gets paged to
+diagnose *why*, but don't wake someone up because CPU crossed 80% if nothing
+downstream is actually degraded yet. A server can run hot for hours with
+zero user impact if it's provisioned with headroom.
+
+## Worked example: catching a slow leak before it's an outage
+
+Say you run a checkout service behind a load balancer, backed by a payments
+API and an inventory database. One deploy introduces a subtle bug: a
+database connection isn't released after a specific, rare error path. Each
+occurrence leaks one connection from the pool.
+
+Without monitoring, here's how this plays out: connections leak slowly,
+nobody notices, and three days later the pool is exhausted, every checkout
+request stalls waiting for a connection, and customers start abandoning
+carts before anyone on the team even opens a laptop. Detection happens when
+support tickets pile up — MTTD measured in hours, and the root cause is
+buried under three days of unrelated deploys.
+
+With monitoring in place: a metric tracks `db_pool_connections_in_use` as a
+percentage of pool size, and an alert fires when it stays above 80% for 10
+minutes. The graph shows a slow, steady climb starting right after the bad
+deploy — a saw-tooth pattern replaced by a monotonic ramp. The on-call
+engineer gets paged well before exhaustion, correlates the ramp's start time
+against the deploy log, and rolls back the one suspect deploy. MTTD drops
+from days to minutes, and the incident never reaches a user-visible outage
+at all. The bug is the same in both scenarios — the only difference is
+whether anything was watching the trend.
+
+<Callout type="warning">
+  A common mistake: building elaborate dashboards and skipping alerting,
+  on the theory that "we'll just check the dashboard." Nobody checks a
+  dashboard continuously, and the incidents that matter most tend to start
+  outside business hours. If a signal is important enough to graph, ask
+  whether it's important enough to alert on — and if it is, write the
+  alert rule, don't just add another panel. The inverse mistake is just as
+  common: alerting on every metric that *can* fire, which trains engineers
+  to ignore pages (alert fatigue) until the one page that mattered gets
+  dismissed along with the noise.
+</Callout>
+
+<Callout type="note">
+  Watch cardinality — the number of unique label combinations a metric can
+  take. A metric labeled by `service` and `region` might have a few dozen
+  combinations; the same metric labeled by raw `user_id` can have millions,
+  and most time-series databases store and index every unique combination
+  separately. High-cardinality labels are one of the fastest ways to make a
+  monitoring system itself expensive and slow — a theme the next lesson
+  covers in more depth.
+</Callout>
+
+## Where this module goes next
+
+This lesson made the case for monitoring and named the four signals at a
+conceptual level. The next lesson, Metrics, Push vs. Pull, and Storage,
+digs into how metrics specifically get collected (services pushing data out
+vs. a central system pulling it in) and how time-series data gets stored
+efficiently at scale. The module then closes with Designing a Monitoring
+System, which walks through architecting a monitoring pipeline end to end —
+collection, storage, alerting, and dashboards — as you'd be asked to in an
+interview.
+
+<Quiz
+  lessonId="mon-why-distributed-monitoring-matters"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does monitoring become a first-class design concern once a system spans many machines, rather than just "nice to have"?',
+      options: [
+        { id: 'a', text: 'Because no single machine or engineer can directly observe the whole system’s health anymore, and partial failure becomes the normal state rather than the exception.', correct: true, explanation: 'Exactly the shift: at scale you cannot manually inspect every host, and some fraction of a large fleet is unhealthy at almost any given moment, so you need aggregated, continuous visibility instead.' },
+        { id: 'b', text: 'Because distributed systems have more code, and more code always needs more monitoring.', correct: false, explanation: 'Code volume isn’t the driver — a large monolith can have plenty of code too. The real driver is that health can no longer be observed from one vantage point.' },
+        { id: 'c', text: 'Because cloud providers require monitoring to be enabled for billing purposes.', correct: false, explanation: 'This isn’t a billing requirement; monitoring is a design necessity for detecting and diagnosing failures, independent of any provider billing model.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements correctly distinguish metrics, logs, and traces?',
+      options: [
+        { id: 'a', text: 'Metrics are pre-aggregated numeric time series, which makes them cheap and fast for dashboards and alerting.', correct: true, explanation: 'Correct — aggregation is exactly what makes metrics storage- and query-efficient compared to raw event data.' },
+        { id: 'b', text: 'Logs store detailed per-event records and are typically more expensive to store and search at volume than metrics.', correct: true, explanation: 'Correct — logs keep the raw event detail rather than an aggregate, which costs more in storage and search time.' },
+        { id: 'c', text: 'A trace follows a single request across multiple services and is the best tool for finding which hop added latency to one slow request.', correct: true, explanation: 'Correct — tracing exists specifically to reconstruct a request’s path and per-hop timing across service boundaries.' },
+        { id: 'd', text: 'Metrics and logs are interchangeable, so a system only needs to implement one of them.', correct: false, explanation: 'They answer different questions and have different cost profiles — metrics tell you something is wrong in aggregate, logs tell you the specific details of individual events. Most production systems need both.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A well-designed on-call alert should typically page a human whenever any individual resource metric, such as CPU usage on one host, exceeds a fixed threshold.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'That describes cause-based, single-host alerting, which tends to produce noisy pages with no clear user impact (a hot but healthy server is not an incident). Symptom-based signals, like elevated error rate or latency, are the better trigger for paging.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — alerting on raw resource metrics per host causes alert fatigue. Page on symptoms users actually feel (errors, latency, failed requests), and keep resource-level metrics available for diagnosis once someone is already responding.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the checkout-service connection-leak example, what specifically shrank MTTD (mean time to detect)?',
+      options: [
+        { id: 'a', text: 'An alert fired when database pool utilization stayed above a threshold for several minutes, well before the pool was fully exhausted.', correct: true, explanation: 'Correct — the alert caught the trend early, turning a multi-day silent leak into a page within minutes of the pattern becoming visible.' },
+        { id: 'b', text: 'The team added more application logging around the checkout flow after the incident occurred.', correct: false, explanation: 'Added logging after the fact would help future incidents, but it does not explain how this specific incident’s detection time was reduced — that came from an alert firing on a leading metric.' },
+        { id: 'c', text: 'Customers reported failed checkouts through support tickets, prompting an engineer to investigate.', correct: false, explanation: 'That’s the slow, no-monitoring path described in the example, which produces a long MTTD measured in days, not the fast path the alert enabled.' },
+      ],
+    },
+  ]}
+/>

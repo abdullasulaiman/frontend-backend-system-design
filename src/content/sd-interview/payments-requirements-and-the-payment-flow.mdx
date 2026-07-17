@@ -1,0 +1,262 @@
+---
+title: "Requirements and the Payment Flow"
+module: "Design a Payment System"
+moduleOrder: 15
+order: 1
+track: "interview"
+summary: "Scopes a payment system's functional and non-functional requirements, then walks the end-to-end flow of authorizing, capturing, and settling a payment across a merchant, a payment gateway, and card networks or banks."
+tags: ["requirements", "payments", "distributed-transactions", "state-machines", "api-design"]
+estMinutes: 13
+cheatsheet:
+  - "Correctness beats latency and even availability here — a payment system that occasionally rejects a valid charge is fine; one that occasionally double-charges or loses money is not shippable."
+  - "Separate authorization (hold funds, check they exist) from capture (actually move money) — this two-phase split is why refunds, partial captures, and delayed shipping workflows work at all."
+  - "Every payment is a state machine (created -> authorized -> captured -> settled, with failed/voided/refunded branches) — draw it before designing tables or APIs, because most edge cases are just uncovered states or transitions."
+  - "The payment system is a client of banks and card networks, not the source of truth for money movement — its job is to record intent and outcome accurately and reconcile with the external systems it doesn't control."
+  - "Never let the client control final state: the client submits a payment attempt, but only a callback/webhook from the gateway or bank confirms it succeeded, since the network call can fail after the money already moved."
+  - "Use a durable, append-friendly payment_intents (or transactions) table with a status column and a full history, not just a single mutable row per payment — you'll need the history for disputes, refunds, and debugging."
+  - "Idempotency and reconciliation are big enough topics to be their own lesson — here, just make sure your API design leaves room for an idempotency key on every write."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design a payment system" shows up in interviews for a reason that has
+nothing to do with checkout pages: it's one of the few prompts where a
+wrong design has a dollar sign attached to it. A newsfeed that shows a
+stale post is a bug. A payment system that runs the same charge twice, or
+that shows a customer's order as "paid" when the bank actually declined
+it, is a lawsuit. That constraint changes almost every default instinct
+you have from other system design problems — retries, caching, eventual
+consistency, and "just fire and forget" all need to be rethought when
+money is what's moving.
+
+This lesson scopes the problem and builds the mental model you'll use for
+the rest of the module: what the system actually has to guarantee, who
+the external parties are, and the state machine a single payment moves
+through from the moment a customer clicks "Pay" to the moment cash
+actually lands in a merchant's bank account. The next lesson in this
+module, "Idempotency, Ledgers, and Reconciliation," goes deep on the
+mechanisms that make this flow safe under retries and failures — this
+lesson is about getting the shape of the problem right first.
+
+## What are we actually building?
+
+Assume the prompt is: "Design a payment system that lets an e-commerce
+platform charge a customer's credit card for an order." Concretely, that
+system needs to:
+
+- Accept a payment request from a merchant's checkout flow (amount,
+  currency, order ID, and a reference to the customer's payment method).
+- Talk to an external **payment gateway** (think Stripe, Adyen, or a
+  direct connection to a card network) to actually move money — your
+  system almost never touches raw card numbers or moves funds itself.
+- Track the state of that payment reliably, even if your service crashes,
+  the network times out, or the gateway is slow to respond.
+- Support **refunds** and **partial captures** (e.g. an order ships in two
+  boxes on two different days, and you only capture funds for each box
+  when it ships).
+- Reconcile what your system recorded against what the bank and gateway
+  actually settled, so discrepancies get caught instead of silently
+  costing someone money.
+
+Say explicitly in the interview that you are **not** designing a bank, a
+card network, or a PCI-compliant card vault — you're designing the
+orchestration layer between a merchant's app and those external systems.
+Naming that boundary early shows you understand what's in scope.
+
+## Functional requirements
+
+- A merchant can create a **payment** for an order: amount, currency,
+  customer, and payment method.
+- The system **authorizes** the payment (confirms funds are available and
+  places a hold) before doing anything the merchant can see as "success."
+- The system **captures** an authorized payment (actually moves the
+  money), either immediately or later, and supports partial captures.
+- The system supports **voids** (cancel an authorization before capture)
+  and **refunds** (reverse a completed capture, fully or partially).
+- Merchants and customers can query a payment's current status and
+  history.
+- The system **reconciles** its records against the gateway's/bank's
+  settlement reports on a regular cadence.
+
+## Non-functional requirements
+
+- **Correctness over availability.** If you have to choose, a payment
+  system should fail loudly and refuse to charge rather than risk a
+  double-charge or a lost charge. This is the opposite bias from most
+  consumer systems, where "show something, even if slightly stale" is
+  fine.
+- **Exactly-once effect, not exactly-once delivery.** Networks will retry
+  requests, gateways will send duplicate webhooks, and clients will
+  double-click "Pay." The system must guarantee that no matter how many
+  times the same logical request arrives, the customer is charged once.
+  (This is the idempotency problem — flagged here, solved in depth next
+  lesson.)
+- **Auditability.** Every state transition needs a durable, queryable
+  trail — regulators, disputes, and your own future debugging sessions
+  all need it.
+- **Latency**: authorization should typically complete in under 2-3
+  seconds so checkout doesn't feel broken, but it's fine for settlement
+  and reconciliation to be asynchronous and take hours.
+- **Security and compliance**: card data itself should never touch your
+  servers in raw form — tokenize it at the client or via the gateway's
+  hosted fields, and let PCI-DSS scope stay with the gateway.
+
+<Callout type="interview">
+  If the interviewer doesn't specify a domain, pick one (card payments for
+  e-commerce is the easiest to reason about) and say so out loud, rather
+  than trying to design a system generic enough for cards, bank transfers,
+  and wallets simultaneously. You can mention those as extensions once the
+  core flow is solid.
+</Callout>
+
+## The payment state machine
+
+Every payment request should map onto an explicit state machine, not a
+boolean "success/failure" flag. A typical shape:
+
+- **Created** — request received and validated, nothing sent externally
+  yet.
+- **Authorized** — the gateway/bank confirmed funds exist and placed a
+  hold; no money has moved yet.
+- **Captured** — funds have actually been moved from the customer to the
+  merchant (fully or partially).
+- **Settled** — the captured funds have cleared through the banking
+  network into the merchant's account (this step is usually asynchronous
+  and batched, often happening hours or a day later).
+- **Failed** — authorization or capture was declined or errored.
+- **Voided** — an authorization was canceled before capture.
+- **Refunded** — a captured payment was reversed, fully or partially,
+  after the fact.
+
+Draw this on the whiteboard rather than skip it: most hard edge cases in a
+payments interview ("cancel after paying but before shipping?", "two boxes
+ship on different days?") are just questions about which transitions are
+legal and when. Splitting **authorize** from **capture** is the single
+most important decision in this whole system — it's what makes delayed
+fulfillment, partial shipments, and expiring holds possible at all.
+
+<Mermaid client:visible chart={`
+stateDiagram-v2
+    [*] --> Created
+    Created --> Authorized: gateway approves hold
+    Created --> Failed: gateway declines
+    Authorized --> Captured: capture (full or partial)
+    Authorized --> Voided: cancel before capture
+    Authorized --> Failed: hold expires
+    Captured --> Settled: bank clears funds
+    Captured --> Refunded: refund (full or partial)
+    Settled --> Refunded: refund after settlement
+`} />
+
+## The end-to-end request flow
+
+Walk through a single card payment from checkout to settlement:
+
+1. The customer's browser or app collects card details and tokenizes them
+   client-side via the gateway's SDK — your servers receive only a token,
+   never the raw card number.
+2. The merchant's backend calls your payment system's `create payment`
+   API with the amount, currency, order ID, and the token, including a
+   client-generated **idempotency key**.
+3. Your system persists a `Created` payment record, then calls the
+   gateway's authorize endpoint.
+4. The gateway talks to the card network and issuing bank, gets an
+   approve/decline decision, and returns it (usually within a second or
+   two).
+5. Your system records `Authorized` or `Failed` and returns the result to
+   the merchant, who shows the customer an order confirmation (or a
+   decline message).
+6. Later — immediately, or when the order actually ships — the merchant
+   triggers a **capture**. Your system calls the gateway's capture
+   endpoint for the authorized amount (or less, for a partial capture)
+   and records `Captured`.
+7. The gateway batches captured transactions and settles them with the
+   bank, typically overnight; your system receives a **webhook** or
+   pulls a **settlement report** confirming funds actually cleared, and
+   updates the record to `Settled`.
+8. If a refund is issued, your system calls the gateway's refund endpoint
+   and records `Refunded`, referencing the original capture.
+
+<Callout type="warning">
+  A common mistake: treating the synchronous API response from "create
+  payment" as the final word on whether the customer was charged. Gateway
+  calls can time out *after* the charge has already gone through on the
+  bank's side — your server never sees the success response, but the
+  customer's card was charged. If you retry blindly on timeout, you risk a
+  double charge; if you assume failure and don't retry, you risk telling
+  the customer "payment failed" when it actually succeeded. The fix is an
+  idempotency key on every write, plus treating "unknown" as its own
+  state that gets resolved by querying the gateway or waiting for its
+  webhook — never treat "no response" as equivalent to "failed."
+</Callout>
+
+## Worked example: sizing the write path
+
+Say the platform processes 500,000 orders a day, each producing on
+average 1.3 payment-system writes (one authorize, plus a capture on about
+30% of orders needing a separate capture step for delayed shipping, plus a
+smaller number of refunds and retries). That's roughly 650,000 writes/day,
+about 7.5 writes/second average. Payments cluster around business hours
+and sale events, so a realistic peak-to-average ratio of 5-8x puts peak
+load around 40-60 writes/second — a volume any relational database with
+proper indexing handles comfortably. The hard part isn't throughput, it's
+correctness under retries and partial failures, which is exactly why
+idempotency and reconciliation get a dedicated lesson next.
+
+## Quick recap
+
+You now have: the requirements a payment system must satisfy, the
+external boundary (gateway/bank do the actual money movement), the state
+machine every payment moves through, and the end-to-end flow from
+checkout to settlement. The next lesson builds on this exact state
+machine to solve the two problems only hinted at here — making every
+write safe to retry, and proving after the fact that your ledger matches
+what actually happened at the bank.
+
+<Quiz
+  lessonId="payments-requirements-and-the-payment-flow"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does a payment system typically split "authorize" and "capture" into two separate steps instead of moving money in one step?',
+      options: [
+        { id: 'a', text: 'It lets the system confirm funds are available and place a hold, then move the actual money later or in parts (e.g. per shipment)', correct: true, explanation: 'Correct — this split enables delayed fulfillment, partial shipments, and canceling before any money actually moves.' },
+        { id: 'b', text: 'It reduces the number of API calls the merchant needs to make', correct: false, explanation: 'The opposite is true — splitting into two steps adds an API call, not removes one. The benefit is functional, not about call count.' },
+        { id: 'c', text: 'It is required by all card networks regardless of use case', correct: false, explanation: 'Many simple transactions (e.g. buying a digital good) capture immediately after authorization in a single logical step. The split is a design choice enabled by the network, not a hard requirement for every payment.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are legitimate non-functional requirements to call out explicitly for a payment system? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Correctness (no double charges, no lost charges) is prioritized over raw availability', correct: true, explanation: 'Correct — for money movement, refusing to act under uncertainty is usually safer than guessing and risking an incorrect charge.' },
+        { id: 'b', text: 'Every state transition should be durably recorded for auditability', correct: true, explanation: 'Correct — disputes, refunds, and regulatory audits all depend on a full history, not just the current status.' },
+        { id: 'c', text: 'Settlement with the bank must complete within the same HTTP request as authorization', correct: false, explanation: 'Settlement is normally an asynchronous, batched process that can take hours; forcing it into the synchronous checkout request would make checkout unacceptably slow.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'If a merchant\'s server never receives a response from the payment gateway after calling "authorize," it is safe to assume the charge failed and let the customer retry.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False — the request may have succeeded on the gateway/bank side even though the response never arrived. Assuming failure and retrying blindly risks a double charge.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — a missing response means "unknown," not "failed." The system should resolve it via an idempotency key, a status query to the gateway, or a webhook, rather than guessing.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the payment state machine, what does a "Voided" state represent?',
+      options: [
+        { id: 'a', text: 'An authorization that was canceled before any capture happened', correct: true, explanation: 'Correct — voiding releases a hold on funds before money actually moves, distinct from a refund which reverses money that already moved.' },
+        { id: 'b', text: 'A captured payment that was reversed after settlement', correct: false, explanation: 'That describes a refund, not a void. Voids only apply to authorizations that have not yet been captured.' },
+        { id: 'c', text: 'A payment that failed gateway validation and was never authorized', correct: false, explanation: 'That is the "Failed" state, reached directly from "Created" — voiding requires having reached "Authorized" first.' },
+      ],
+    },
+  ]}
+/>

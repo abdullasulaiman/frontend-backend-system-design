@@ -1,0 +1,130 @@
+---
+title: "Scaling and Hot Users"
+module: "Design Twitter"
+moduleOrder: 6
+order: 5
+track: "interview"
+summary: "Covers what happens after the push/pull fan-out split — hot keys, hot partitions, viral-counter contention, and traffic isolation for the accounts and tweets that break averages."
+tags: ["hot-partition", "caching", "sharding", "backpressure", "scalability"]
+estMinutes: 12
+cheatsheet:
+  - "A follower-count threshold decides push vs. pull fan-out, but it doesn't fix hot keys, hot partitions, or counter contention — those need their own mitigations."
+  - "A hot key is one ID (a viral tweet, a celebrity's user row) hammered by traffic disproportionate to any other key on the same cache or DB node — sharding by key doesn't help because the key itself is the problem."
+  - "Fix hot keys by replicating the value across multiple cache nodes (or an in-process local cache) so no single node serves all the reads for one ID."
+  - "Fix hot partitions by adding a random or secondary suffix to the shard key for known-hot rows, spreading their writes/reads across several partitions instead of one."
+  - "Never update a like/retweet counter as one row incremented by every request — shard the counter across N sub-keys and sum them, or batch increments and flush periodically."
+  - "Isolate hot-user traffic into its own queues/worker pools and cache tier so a viral spike degrades gracefully (stale counts, delayed fan-out) instead of taking down shared infrastructure for everyone else."
+  - "Tier transitions (an account crossing the push/pull threshold) need a defined migration path — re-evaluate periodically, and don't drop or duplicate tweets already sitting in followers' precomputed timelines."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson solved the celebrity fan-out problem with a push/pull threshold: small accounts get fanned out on write, huge accounts get pulled at read time. That's necessary, but it's not sufficient. A hybrid fan-out design tells you *which accounts* skip the write storm — it says nothing about what happens when a single tweet ID, a single user row, or a single counter becomes the most-requested piece of data on the entire platform. That's a different failure mode, and it's the one that actually takes services down in production: not "too many users" in aggregate, but one specific key getting hit at a rate no single node can serve.
+
+This lesson works through that problem at three layers — caching, storage partitioning, and counters — plus how to isolate hot traffic so it degrades gracefully instead of taking shared infrastructure down with it.
+
+## Hot keys aren't a sharding problem
+
+Sharding distributes load by spreading *different* keys across *different* nodes, on the assumption that traffic is roughly even across keys. A hot key breaks that assumption: one key (a viral tweet's ID, a celebrity's user record) receives orders of magnitude more traffic than any other key on the same shard. Sharding doesn't help here — the hot key still lives on exactly one node, however you've partitioned the keyspace, because a consistent-hash or range-based scheme routes every request for that ID to the same place by design.
+
+Concretely: your tweet-content cache stores each tweet under `tweet:<id>`. A normal tweet gets fetched a few hundred times as it's read out of a handful of followers' timelines. A viral tweet from a huge account gets fetched by tens of millions of timeline renders within minutes, all mapping to the same cache key on the same node. That node's network and CPU capacity, not the cluster's aggregate capacity, becomes the bottleneck.
+
+The fix is to stop treating that key as if it lived on one node:
+
+- **Replicate the hot value across several cache nodes** and route reads round-robin (or by request hash) across the replicas, instead of always hitting the one node the standard hashing scheme picks.
+- **Add a local, in-process cache** in front of the distributed cache for the small set of currently-hot IDs — a request that never leaves the app server is the cheapest possible read.
+- **Detect "hot" automatically** with a request-rate counter per key (or per shard) so replication kicks in without a human flipping a flag mid-incident.
+
+## Hot partitions: the same problem one layer down
+
+The identical issue shows up in storage, not just cache. If you shard tweets or follower lists by user ID, every row belonging to one user — including a celebrity's entire follower list or engagement history — lands on one partition. A partition holding a 100-million-follower account's data takes disproportionate read and write load compared to a partition holding a thousand ordinary accounts, even though both partitions hold "one shard's worth" of rows by count.
+
+The standard mitigation is to split known-hot rows further: append a random or hashed suffix (say, 0–19) to the shard key for a hot user's follower-list entries, so that one logical list is physically spread across 20 partitions instead of 1. Reads have to fan out across those 20 partitions and merge results, which is more expensive per read than a single-partition lookup — but it's a bounded, known cost, versus one partition melting under unbounded load. This is the same push/pull trade-off from the previous lesson, recurring one layer down: spread cost predictably now, rather than let it concentrate unpredictably later.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  Req[Read: viral tweet content] --> Local{In local app cache?}
+  Local -- hit --> Fast[Return, no network hop]
+  Local -- miss --> Dist[Distributed cache tier]
+  Dist --> Detect{Key flagged hot?}
+  Detect -- no --> Single[Single cache node]
+  Detect -- yes --> Replicas[Read from replica set, round-robin]
+  Single --> Coalesce{Concurrent miss for same key?}
+  Replicas --> Return[Return to caller]
+  Single --> Return
+  Coalesce -- yes --> Wait[Join in-flight DB fetch]
+  Coalesce -- no --> DB[(Fetch from origin DB, populate cache)]
+  DB --> Return
+  Wait --> Return
+`} />
+
+That last piece in the diagram — **request coalescing** — matters as much as replication. On a cache miss for a hot key (say, right after the cache entry expires), thousands of concurrent requests can all miss at once and all hammer the origin database for the identical row. Coalescing means the first miss triggers one database fetch, and every other concurrent request for that same key waits on that in-flight fetch instead of issuing its own — turning a thundering herd into a single query.
+
+## Counters at viral scale
+
+Like and retweet counts are the clearest example of "small data, huge contention." A viral tweet's like counter might receive tens of thousands of increment operations per second. Modeling it as one row with one integer column, updated with `UPDATE ... SET likes = likes + 1`, serializes every one of those writes against a single row lock — the database becomes a queue of one.
+
+Two standard fixes, usually combined:
+
+- **Shard the counter itself.** Instead of one row, keep N sub-counters (say, 20) for the same tweet, and increment a randomly chosen one per like event. The displayed count is the sum across all N, computed periodically or cached and refreshed on a short TTL — reads don't need to be perfectly real-time to the millisecond.
+- **Batch increments in memory before flushing.** A stream-processing layer (or even an in-memory buffer per app instance) accumulates increments for a short window (a few hundred milliseconds) and flushes one batched update instead of one write per like. This trades a small, bounded staleness for a large reduction in write volume.
+
+Exact real-time counts down to the last like are rarely a real product requirement — "approximately 48.3k likes, updated within a couple of seconds" is what users actually see on any large platform, and that's exactly the looseness that makes sharded, batched counters acceptable.
+
+## Isolating hot traffic so it degrades gracefully
+
+Everything above reduces the *cost* of hot keys, but you should also isolate their *blast radius*. Route pull-tier reads (celebrity timeline merges), fan-out jobs, and counter updates for known-hot accounts through separate queues and worker pools from normal traffic. If a sudden viral spike does overwhelm that isolated tier, the failure mode is "hot content is briefly stale or delayed" — not "the whole platform's write path backs up because one queue is saturated." Circuit breakers that fall back to a cached, slightly-stale value (an old like count, a timeline that's a few seconds behind) are far better than a request that hangs waiting for a system under load to respond exactly.
+
+## Worked example: a tweet goes viral
+
+Say an account with 80 million followers posts a tweet that gets picked up by news outlets and starts trending. Within 10 minutes, 30 million distinct users open the app and their timeline reads pull in that tweet. That's roughly 50,000 tweet-content lookups per second for one tweet ID, sustained for minutes — several orders of magnitude above the "a few hundred reads" a normal tweet sees.
+
+Without hot-key handling, all 50,000 requests/second hit one cache node keyed on that tweet ID, and that node's network interface saturates well before the cluster's aggregate cache capacity is anywhere near its limit. With detection and replication across, say, 10 cache replicas plus per-app-server local caching absorbing a large fraction of reads before they even reach the distributed tier, that 50,000/second gets spread thin enough that no single node sees more than a few thousand requests/second — solidly within normal operating range. The fix isn't more total capacity; it's making sure the existing capacity is actually reachable by the requests that need it.
+
+<Callout type="warning">
+A common mistake is believing the push/pull fan-out threshold from the previous lesson "solves scaling for celebrities" and stopping there. It solves the *write* fan-out problem. It does nothing about the *read* side: a pull-tier tweet is still one row, one cache key, one database record, and every follower's timeline read still has to fetch it. Teams that only address fan-out often get blindsided the first time a pull-tier tweet goes viral, because the read path was never designed for a single key receiving tens of thousands of requests per second. Hot-key and hot-partition handling is a separate, necessary piece of the design — mention it explicitly even if the interviewer only asked about fan-out.
+</Callout>
+
+<Quiz lessonId="twitter-scaling-and-hot-users" client:visible questions={[
+  {
+    id: 'q1',
+    kind: 'mcq',
+    prompt: 'Why doesn\'t sharding a cache or database by key solve the hot-key problem?',
+    options: [
+      { id: 'a', text: 'Because sharding always routes a given key to the same node, so a disproportionately popular key still concentrates all its traffic on one node', correct: true, explanation: 'Correct — sharding spreads different keys across different nodes, but one specific key still lives on exactly one node regardless of scheme, so its traffic can\'t be spread that way.' },
+      { id: 'b', text: 'Because sharding only works for write-heavy workloads, not read-heavy ones', correct: false, explanation: 'Sharding is used for both read- and write-heavy workloads; that\'s not why it fails to address hot keys.' },
+      { id: 'c', text: 'Because sharding requires the follower-count threshold from the fan-out lesson to already be in place', correct: false, explanation: 'The two are unrelated. Sharding is a storage/cache partitioning technique; the fan-out threshold is a decision about push vs. pull for the write path.' },
+    ],
+  },
+  {
+    id: 'q2',
+    kind: 'multi',
+    prompt: 'Which of these are valid ways to reduce contention on a viral tweet\'s like counter? (Select all that apply.)',
+    options: [
+      { id: 'a', text: 'Split the counter into several sub-counters and sum them for display', correct: true, explanation: 'Correct — sharding the counter spreads increment operations across multiple rows instead of serializing them all on one.' },
+      { id: 'b', text: 'Batch increments in memory for a short window before flushing a single update', correct: true, explanation: 'Correct — batching trades a small amount of staleness for a large reduction in write volume against the underlying store.' },
+      { id: 'c', text: 'Require every like to update the row synchronously so the count is always exact to the millisecond', correct: false, explanation: 'This is the opposite of a fix — it\'s the design that causes the row-lock bottleneck in the first place. Exact real-time counts aren\'t a real requirement for a like counter.' },
+    ],
+  },
+  {
+    id: 'q3',
+    kind: 'boolean',
+    prompt: 'Request coalescing means that when a cache entry expires, the first request to miss triggers one database fetch, and other concurrent requests for the same key wait on that fetch instead of each querying the database themselves.',
+    options: [
+      { id: 'true', text: 'True', correct: true, explanation: 'Correct — coalescing prevents a thundering herd of identical concurrent queries by having only one in-flight fetch per key, with other requests joining it.' },
+      { id: 'false', text: 'False', correct: false, explanation: 'This is exactly what request coalescing does — it collapses many simultaneous misses for the same key into a single origin fetch.' },
+    ],
+  },
+  {
+    id: 'q4',
+    kind: 'mcq',
+    prompt: 'A team has implemented the push/pull fan-out threshold from the previous lesson and considers the celebrity-scaling problem solved. What have they likely missed?',
+    options: [
+      { id: 'a', text: 'Nothing — the threshold fully addresses both read and write scaling for high-follower accounts', correct: false, explanation: 'The threshold only addresses write fan-out. It says nothing about a single tweet, user row, or counter becoming a hot key/partition under read load.' },
+      { id: 'b', text: 'That a pull-tier tweet is still a single row/cache key, and can still receive far more read traffic per second than any single node or partition can serve', correct: true, explanation: 'Correct — the fan-out threshold decides push vs. pull for writes, but a pull-tier tweet can still go viral on reads, requiring separate hot-key and hot-partition handling.' },
+      { id: 'c', text: 'That the threshold value itself needs to be a prime number for correct hashing', correct: false, explanation: 'The threshold is just a follower-count cutoff for choosing fan-out strategy; it has no relationship to hashing or prime numbers.' },
+    ],
+  },
+]} />

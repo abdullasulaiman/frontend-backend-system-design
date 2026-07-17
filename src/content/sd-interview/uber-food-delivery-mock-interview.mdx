@@ -1,0 +1,140 @@
+---
+title: "Food Delivery: Mock Interview"
+module: "Design Uber"
+moduleOrder: 5
+order: 7
+track: "interview"
+summary: "Applies everything from the ride-hailing design — matching, live location, ETA/pricing, and state machines — to a fresh prompt (design a food delivery platform) through a timed, self-graded mock interview."
+tags: ["mock-interview", "food-delivery", "uber", "system-design", "interview-framework"]
+estMinutes: 12
+cheatsheet:
+  - "Food delivery is a three-sided marketplace (customer, restaurant, courier), not a two-sided one like ride-hailing — every design decision has to account for the restaurant's prep time as a third variable."
+  - "The order is the thing with a lifecycle, not the courier — model placed, accepted, preparing, ready-for-pickup, picked-up, delivered, cancelled as one state machine, same discipline as the Uber trip state machine."
+  - "Matching a courier too early wastes their time waiting at the restaurant; matching too late adds delay after food is ready — the right anchor is predicted food-ready-time, not order-placed-time."
+  - "Batching (one courier, multiple pickups/drop-offs) is the food-delivery-specific optimization that ride-hailing mostly doesn't need — it trades a few minutes of extra wait for meaningfully better courier utilization."
+  - "Reuse the ride-hailing building blocks directly: geospatial index for nearby couriers, a durable order ledger separate from high-churn location pings, and an ETA service that composes multiple independent estimates (prep time + travel time)."
+  - "A strong close names what you'd cut for a v1 (e.g. no batching, single restaurant per order) and what breaks first at 10x scale (usually the matching/dispatch service during a lunch-rush spike, not storage)."
+---
+
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+import MockInterview from '../../components/MockInterview';
+
+You've spent six lessons building a ride-hailing system from the ground up:
+estimating load, splitting services along the location/trip planes, matching
+riders to drivers, streaming location updates, and pricing a trip with a
+live ETA. The real test of whether you actually learned the *transferable*
+skill — not just memorized "Uber's architecture" — is whether you can point
+that same toolkit at a system that looks similar on the surface but has a
+different core constraint. Food delivery is that test. It reuses almost
+every building block from this module, but it adds a third party (the
+restaurant) whose behavior you don't control and can't instrument the way
+you can a driver's GPS.
+
+This lesson is a full mock interview: a prompt, a rubric, and a
+self-graded reflection — no walkthrough. Treat it like the real thing: 35–40
+minutes, out loud, on a whiteboard or blank doc, before you look at the
+rubric.
+
+## Why this isn't just "Uber with food"
+
+It's tempting to answer this prompt by copy-pasting the ride-hailing design
+and renaming "driver" to "courier." That gets you most of the way but misses
+the part interviewers are actually probing for: can you spot where the new
+domain's constraints change the design, not just its vocabulary?
+
+Three differences matter:
+
+- **A third actor with its own latency.** A driver in the Uber design is
+  either available or busy — a binary you can query instantly. A restaurant
+  has a *prep time* that varies by dish, kitchen load, and time of day, and
+  you usually only get a soft estimate from the restaurant's system (or none
+  at all). Your matching and ETA logic both depend on a number you can't
+  measure directly and have to predict.
+- **Matching has a timing dimension, not just a spatial one.** Ride-hailing
+  matching is "find the nearest available driver, now." Food delivery
+  matching is "find a courier who will arrive at the restaurant close to
+  when the food is actually ready" — match too early and the courier idles
+  in a parking lot; match too late and the food sits under a heat lamp
+  losing quality and losing you the customer.
+- **Batching is a first-class optimization, not a nice-to-have.** A courier
+  can reasonably carry two or three orders picked up from restaurants near
+  each other and dropped off along a similar route. Ride-hailing has an
+  analogous idea (pooled rides) but it's optional; in food delivery,
+  batching is often the difference between a courier network that's
+  profitable and one that isn't, because delivery fees rarely cover a
+  single dedicated trip per order.
+
+Everything else — the geospatial index for "who's nearby," the durable
+order/trip ledger, the separation of high-churn location pings from
+low-churn state transitions, the ETA service composing multiple estimates —
+carries over directly from the earlier lessons in this module.
+
+## The order lifecycle, as a state machine
+
+Just like the Uber trip, the food delivery order is the entity with a
+lifecycle worth modeling explicitly as one row with a status column, not as
+scattered booleans across three services.
+
+<Mermaid client:visible chart={`
+stateDiagram-v2
+    [*] --> Placed
+    Placed --> Accepted: restaurant confirms
+    Placed --> Cancelled: restaurant rejects / times out
+    Accepted --> Preparing
+    Preparing --> ReadyForPickup: kitchen marks ready
+    ReadyForPickup --> PickedUp: courier confirms pickup
+    Accepted --> CourierAssigned: dispatch matches courier
+    CourierAssigned --> PickedUp
+    PickedUp --> Delivered: courier confirms drop-off
+    Placed --> Cancelled: customer cancels
+    Delivered --> [*]
+    Cancelled --> [*]
+`} />
+
+Notice `CourierAssigned` can happen concurrently with `Preparing` — that's
+the "match against predicted ready-time, not actual ready-time" idea from
+above, represented directly in the state machine as a branch that doesn't
+wait for `ReadyForPickup`.
+
+## A worked scenario to reason through out loud
+
+Say a customer places an order at a restaurant with a quoted 18-minute prep
+time. If dispatch waits until the food is physically ready before searching
+for a courier, you add the courier's full travel-to-restaurant time on top
+of the 18 minutes — a real delivery might then take 35–40 minutes end to
+end. Instead, dispatch should start searching for a courier roughly
+`prep_time - avg_courier_travel_time_to_restaurant` minutes after the order
+is accepted, so the courier's arrival and the food's readiness land close
+together. Get this offset wrong in either direction and you either pay for
+idle courier time or add pure waiting time to every order — worth walking
+through with concrete numbers if the interviewer asks "how do you decide
+when to dispatch."
+
+<Callout type="interview">
+  A strong signal in this interview is naming the failure mode of getting
+  the dispatch timing wrong, in both directions — not just describing the
+  happy path. Interviewers are listening for "what happens when the
+  restaurant's prep-time estimate is wrong," since that's the crux of why
+  this problem differs from ride-hailing matching.
+</Callout>
+
+## Your turn
+
+Set a timer, talk through your design, and only look at the rubric after
+you've committed to an approach — the self-scoring is far more useful if
+you don't peek early.
+
+<MockInterview
+  lessonId="uber-food-delivery-mock-interview"
+  client:visible
+  prompt="Design a food delivery platform (think Uber Eats/DoorDash): customers order from nearby restaurants, the restaurant prepares the food, and a courier picks it up and delivers it. Cover requirements and scale, the major services, how you match and dispatch couriers, how you compute a delivery ETA, and how you'd extend the design to batch multiple orders onto one courier."
+  rubric={[
+    { point: 'Scopes the three-sided marketplace explicitly', detail: 'Names customer, restaurant, and courier as distinct actors with different data and latency profiles up front, instead of defaulting to a two-sided ride-hailing mental model.' },
+    { point: 'Models the order as an explicit state machine', detail: 'Defines states (placed, accepted, preparing, ready, picked up, delivered, cancelled) and says which service owns the transition, mirroring the trip-state-machine discipline from the high-level design lesson.' },
+    { point: 'Times courier dispatch against predicted food-ready-time, not order-placed-time', detail: 'Explains that matching too early wastes courier wait time at the restaurant and matching too late adds delay after food is ready, and proposes dispatching based on an estimated prep-time offset.' },
+    { point: 'Reuses the location/trip-plane split correctly', detail: 'Puts courier GPS pings in a high-churn, loss-tolerant store and order state transitions in a durable ledger, same separation as the ride-hailing design, rather than treating them as one data store.' },
+    { point: 'Addresses batching as a deliberate extension', detail: 'Describes at least one concrete approach to grouping multiple orders per courier trip (e.g. matching orders from nearby restaurants with compatible ready-times and overlapping drop-off routes) and the trade-off it makes (utilization vs. per-order delivery time).' },
+    { point: 'Identifies the actual bottleneck at scale and a fallback for restaurant unreliability', detail: 'Names lunch/dinner-rush spikes in the matching/dispatch service (not storage) as the likely first bottleneck, and describes a fallback for when a restaurant is slow or non-responsive (e.g. stale prep-time estimates, no confirmation API).' },
+  ]}
+/>

@@ -1,0 +1,221 @@
+---
+title: "Case Examples of Notable Outages"
+module: "Lessons from System Failures"
+moduleOrder: 20
+order: 4
+track: "interview"
+summary: "Walks through composite, industry-representative outage scenarios — a config push, a certificate expiry, a capacity cliff, and a dependency loop — and extracts the reusable resilience lesson each one teaches."
+tags: ["outages", "postmortems", "resilience", "case-study", "reliability"]
+estMinutes: 13
+cheatsheet:
+  - "A single bad config push can take down a fleet in seconds if there's no canary stage and no automatic rollback trigger tied to error-rate metrics."
+  - "Certificate and credential expiry is a scheduled failure with a known date — track expiry as a monitored metric (days-until-expiry), not a calendar reminder on one person's calendar."
+  - "Capacity cliffs (thread pools, connection pools, file descriptors) fail suddenly at 100% and look like a random crash — graph headroom against a hard ceiling, not just absolute usage."
+  - "A shared dependency (auth service, config store, DNS) turns an isolated failure into a global one — ask 'what does everything depend on' before asking 'what could fail.'"
+  - "Retries without backoff and jitter turn a brief blip into a self-sustaining overload — a service that recovers for 200ms can be knocked back down by its own clients' retry storm."
+  - "The most expensive minute in an outage is usually spent figuring out what changed, not fixing it — a visible, filterable change log for deploys/configs/flags cuts that minute dramatically."
+  - "'It hasn't failed yet' is not the same as 'it can't fail' — the scenarios below are all cases where a system had run fine for months before the triggering condition finally occurred."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The earlier lessons in this module gave you vocabulary and frameworks:
+failure modes, cascading failures and backpressure, postmortems and
+resilience patterns. This lesson is where that vocabulary gets tested
+against something closer to reality. Interviewers love asking "tell me
+about an outage you've seen or can imagine, and what would have prevented
+it" — not to test your memory of a specific incident, but to see whether you
+can reason about failure the way someone who has actually operated a
+production system does.
+
+The four scenarios below are composite, industry-representative situations
+built from patterns that show up across public postmortems from many
+companies — not accounts of any single named incident. Each one is small
+enough to hold in your head and general enough that you'll recognize the
+shape of it in almost any large system.
+
+## Scenario 1: the bad config push
+
+A team ships a routing-rule change to a fleet of edge proxies. The change
+looks trivial — a new header-matching rule — and it deploys everywhere at
+once because "it's just config, not code, so it doesn't need the full
+release pipeline." One of the rules has a typo that makes it match every
+request instead of the intended subset. Within seconds, every proxy in the
+fleet starts routing all traffic to a debug backend that can't handle real
+load. The fleet-wide error rate goes from near-zero to over 90% in under a
+minute.
+
+**What went wrong structurally**: config was treated as lower-risk than
+code, so it skipped canarying, staged rollout, and automated rollback —
+the exact safety nets code changes had. But config can break a system just
+as completely as code, often faster, because it usually deploys in one
+shot to every host.
+
+**The fix that generalizes**: treat config changes with the same rollout
+discipline as code — canary to a small percentage of the fleet first, watch
+an error-rate or latency SLO for a fixed bake time, and auto-roll-back if
+that SLO is breached, all before touching the rest of the fleet. The
+mechanism doesn't care whether the artifact is a binary or a JSON file.
+
+## Scenario 2: the certificate that expired on schedule
+
+An internal service-to-service TLS certificate expires at 3 a.m. on a
+Tuesday. Every caller that validates certificates starts rejecting the
+connection immediately — not a slow degradation, an instant hard failure,
+because from a random Tuesday morning at 2:59 the cert is valid and at 3:00
+it categorically is not. The service depending on it goes fully unavailable
+until someone notices, manually rotates the cert, and redeploys.
+
+**What went wrong structurally**: this failure was entirely predictable —
+the expiry date was known the day the certificate was issued — but nothing
+in the system watched that date. The only "alert" was a person's calendar
+reminder that got missed during a busy sprint.
+
+**The fix that generalizes**: any resource with a known expiry (certs,
+API keys, OAuth tokens, DNS TTLs, license keys) should be monitored as a
+first-class metric — "days until expiry" — with alerting well before the
+deadline (e.g. 30 and 7 days out) and, where possible, automated rotation
+so a human never has to remember a date at all.
+
+## Scenario 3: the capacity cliff
+
+A service's database connection pool is sized for its typical load with a
+comfortable-looking margin — say, using 60 of 100 connections most of the
+time. A marketing campaign drives a traffic spike that's only about 1.8x
+normal. That should be fine at first glance, but each of those requests
+also happens to take slightly longer under the higher concurrency, so
+connections are held longer, and the pool hits 100/100. Every new request
+now queues for a connection that never frees up fast enough, latencies
+balloon, upstream timeouts fire, and those upstream callers retry — adding
+even more demand for the exhausted pool. The service looks "down" even
+though CPU and memory are both under 40%.
+
+**What went wrong structurally**: the team monitored CPU and memory, which
+looked healthy, but the actual limiting resource — connection pool slots —
+was invisible on the dashboard until it was already at its hard ceiling.
+Pools, thread counts, and file descriptor limits fail like a cliff, not a
+slope: fine at 95%, catastrophic at 100%.
+
+**The fix that generalizes**: identify every hard-ceiling resource in the
+request path (connection pools, thread pools, semaphores, fd limits, queue
+depths) and graph headroom against that ceiling explicitly, with alerting
+well before 100%, not just aggregate CPU/memory which can look fine while a
+narrower resource is fully saturated.
+
+## Scenario 4: the shared dependency
+
+A company's authentication service is used by dozens of otherwise unrelated
+internal services to validate incoming requests. The auth service takes a
+routine dependency upgrade that turns out to have a memory leak; it slows
+down under load and starts timing out. Because every one of those
+downstream services calls auth synchronously on the hot path with no
+fallback, they all start failing at roughly the same time — checkout,
+search, notifications, admin tools — even though none of those services
+had anything wrong with them individually. What looks like a dozen
+simultaneous unrelated failures is really one shared dependency's failure,
+fanned out.
+
+**What went wrong structurally**: no one had mapped "what does almost
+everything in this system depend on" as its own hazard category, separate
+from "what could each individual service do wrong." A shared dependency
+failing is structurally different from an individual service failing —
+the blast radius is the whole dependency graph, not one node in it.
+
+**The fix that generalizes**: identify shared, load-bearing dependencies
+(auth, config/feature-flag stores, DNS, a shared message bus) explicitly,
+and give callers a way to degrade instead of hard-failing when that
+dependency is slow — a short cached auth decision, a stale-but-served
+config value, a circuit breaker that fails open for read-only paths. This
+connects directly to the backpressure and circuit-breaker patterns from
+the earlier lessons in this module; a shared dependency is exactly where
+those patterns earn their keep.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    A[Trigger] --> B{What kind of change?}
+    B -->|Config push, no canary| C[Fleet-wide instant failure]
+    B -->|Known expiry date, unmonitored| D[Hard cutover at deadline]
+    B -->|Traffic spike near a hard ceiling| E[Cliff: fine at 95%, dead at 100%]
+    B -->|Shared dependency slows down| F[Fan-out failure across unrelated services]
+    C --> G[Root cause: skipped staged rollout]
+    D --> H[Root cause: no expiry monitoring]
+    E --> I[Root cause: monitored the wrong metric]
+    F --> J[Root cause: no shared-dependency hazard map]
+`} />
+
+## Worked example: reasoning through it live
+
+Suppose an interviewer says: "Our order-processing service went from
+healthy to fully down in about 90 seconds, with no code deploy in the prior
+24 hours. Walk me through how you'd investigate and what you'd check first."
+
+A strong answer doesn't jump to a guess — it works the "no code deploy"
+constraint immediately: if code didn't change, the candidates are
+config/flag changes, a dependency's behavior changing, a scheduled event
+(cert/key expiry, a cron job, a quota reset), or a capacity threshold being
+crossed by organic traffic growth. You'd check, in roughly this order: any
+config or feature-flag change in the last hour (cheapest to check, most
+common cause), any alert on a shared dependency (auth, DNS, database,
+queue) around the failure time, and any resource metric that's pinned at
+its ceiling (connection pool, thread pool, disk) rather than just CPU.
+That reasoning path — constraint first, cheap checks first, ceiling
+metrics not just aggregate ones — is the actual skill being tested, more
+than landing on the "correct" cause.
+
+<Callout type="interview">
+  When asked to talk through an outage, resist the urge to invent an
+  elaborate, novel failure. Interviewers are checking whether you reach
+  for the boring, high-frequency causes first (bad config, expired
+  credential, exhausted pool, dependency fan-out) before reaching for
+  exotic ones. Narrate your triage order out loud — it shows judgment,
+  not just knowledge.
+</Callout>
+
+<Quiz
+  lessonId="failures-case-examples-of-notable-outages"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A fleet went from healthy to 90% error rate within a minute right after a routing-config change was pushed to every host simultaneously. What is the single most direct structural fix?',
+      options: [
+        { id: 'a', text: 'Add more CPU capacity to the fleet', correct: false, explanation: 'The failure was a correctness bug in the config, not a capacity limit — more CPU would not have prevented every host from applying the same bad rule.' },
+        { id: 'b', text: 'Roll config changes out via canary plus a bake time with an automatic rollback trigger, the same as code deploys', correct: true, explanation: 'Config was deployed fleet-wide in one shot with no staged rollout or automated rollback, which is exactly what let one bad rule take down the whole fleet at once.' },
+        { id: 'c', text: 'Move the routing rules into application code instead of config', correct: false, explanation: 'The risk is the deployment discipline (all-at-once, no canary, no rollback trigger), not whether the artifact is called "config" or "code" — a code change deployed the same reckless way would fail the same way.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are examples of a capacity-cliff style failure, where a resource is fine near its limit and catastrophic at it? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A database connection pool hitting 100/100 connections under a modest traffic increase', correct: true, explanation: 'Pools fail like a hard ceiling: requests queue for a slot that never frees fast enough once the pool is fully occupied, unlike a gradual slowdown.' },
+        { id: 'b', text: 'A service that gets slightly slower as CPU usage rises from 40% to 70%', correct: false, explanation: 'This is a gradual degradation proportional to load, not a sudden cliff at a hard ceiling — the hallmark of a capacity cliff is a sharp discontinuity at the limit, not a slope.' },
+        { id: 'c', text: 'A file-descriptor limit being reached, after which every new connection attempt is refused', correct: true, explanation: 'File descriptors are a hard OS-enforced ceiling — the service works normally until the limit, then every new connection fails outright.' },
+        { id: 'd', text: 'A thread pool that queues a burst of requests and hits its maximum size, after which new requests are rejected', correct: true, explanation: 'Thread pools have a fixed maximum; usage under that maximum looks fine, and hitting the maximum causes an abrupt rejection of new work rather than a gradual slowdown.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'If a service depends on a shared authentication service that starts timing out, the correct mitigation is always for the auth service itself to be scaled up, since the failure originates there.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Scaling the origin service is one option, but the more robust fix is on the caller side: callers of a shared dependency should be able to degrade gracefully (cached decisions, fail-open for read paths, circuit breakers) so one dependency slowing down does not fan out into failures across every unrelated downstream service.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — resilience against a shared dependency\'s slowness belongs primarily to the callers (degrade gracefully, circuit-break, cache), not solely to scaling the dependency itself, because you cannot guarantee every shared dependency will always be fast.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A service goes fully down at exactly 3:00 a.m. with no deploy, no traffic spike, and no alert from any dependency in the prior hour. Which cause fits this pattern best?',
+      options: [
+        { id: 'a', text: 'A retry storm from downstream callers', correct: false, explanation: 'A retry storm typically follows some other initial degradation and builds up over time; it does not usually produce an instantaneous, precisely-timed hard cutover with no preceding signal.' },
+        { id: 'b', text: 'A gradual memory leak reaching its limit', correct: false, explanation: 'A memory leak produces a slow ramp toward failure (rising memory, gradually worsening latency), not an instantaneous cutover at an exact clock time.' },
+        { id: 'c', text: 'A certificate, key, or token reaching its expiry timestamp', correct: true, explanation: 'Expiry-based failures are the classic case of an instantaneous, precisely-timed hard cutover — everything is valid one second and categorically invalid the next, matching a service going from healthy to fully down at an exact moment with no other precipitating signal.' },
+      ],
+    },
+  ]}
+/>

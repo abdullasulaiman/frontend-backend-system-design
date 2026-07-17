@@ -1,0 +1,229 @@
+---
+title: "Scaling and Bottlenecks"
+module: "Design YouTube"
+moduleOrder: 1
+order: 6
+track: "interview"
+summary: "Walks through where a video platform's architecture actually breaks under real traffic - hot content, database contention, counter writes, and transcoding backlogs - and the concrete techniques used to relieve each one."
+tags: ["scalability", "caching", "sharding", "hot-key", "backpressure"]
+estMinutes: 13
+cheatsheet:
+  - "Adding read replicas does not fix a hot-key problem - if every request targets the same shard key (one viral video_id), every replica of that shard still takes the full hit equally."
+  - "Defend against hot keys in layers: CDN edge cache, then a per-instance local cache, then request coalescing (single-flight) in front of the distributed cache, so a cache-miss stampede never reaches the database as a thundering herd."
+  - "Move view/like counters off the synchronous read/write path - batch increments in memory or a stream and flush periodically; an exact count updated on every request turns a hot row into a write bottleneck."
+  - "Shard metadata by video_id (or a hash of it), not by upload time or category - the latter creates hot shards for trending content, the former spreads any single video's writes onto one shard but keeps overall load balanced across many videos."
+  - "Decouple transcoding from upload with a queue, and autoscale workers off queue depth, not off request rate - upload bursts (regional evenings, viral events) are common and the queue is what absorbs them instead of the API tier."
+  - "Read-your-writes matters even in an eventually-consistent system: route a user's own reads to the primary (or a cache invalidated on write) for a short window after they act, so they don't see stale state on their own upload or comment."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every design so far in this module has assumed traffic behaves the way the
+back-of-envelope numbers suggest: smoothly distributed, roughly uniform load
+per video, per user, per shard. Real traffic doesn't behave that way. A
+handful of videos get 90% of the views. A creator posts a clip that gets
+picked up by a news outlet and goes from 200 views/hour to 200,000
+views/minute in under ten minutes. A regional evening peak dumps twenty
+thousand uploads on your transcoding fleet within the same hour every day.
+None of these are edge cases - they're the normal operating conditions of a
+video platform at scale, and this is usually where an interview shifts from
+"draw the architecture" to "now it's getting hammered, what breaks first and
+what do you do about it."
+
+This lesson takes the architecture built up over the last four lessons -
+metadata service, blob storage, transcoding pipeline, CDN - and asks where
+each piece buckles under skewed, bursty, real-world load, and what you
+actually add to keep it standing.
+
+## The hot-key problem: when caching alone isn't enough
+
+The most common trap is treating "add a cache" as a universal fix. A cache
+absolutely helps when load is spread across many keys - a thousand
+distinct videos each getting a thousand requests/sec is exactly what a
+distributed cache cluster is built for, since that load is naturally
+sharded across cache nodes by key.
+
+It stops helping the moment one key (one video_id) is the target of the
+overwhelming majority of traffic. If a single viral video pulls 200,000
+requests/sec, every one of those requests hashes to the *same* cache node
+and the *same* database shard behind it. Adding more replicas of that shard
+doesn't help - each replica still serves the identical key at the identical
+rate, so you've multiplied capacity for a problem that isn't about
+aggregate capacity, it's about concentration on one node.
+
+The fix is defense in depth, applied in the order a request actually
+travels:
+
+1. **CDN edge cache** absorbs almost all of it for video *segments* (see
+   the streaming lesson) - but metadata requests (view count, like count,
+   comment list) for that same video still have to go somewhere.
+2. **A local, in-process cache on each app server** serves the hottest
+   handful of keys out of memory with no network hop at all - a small LRU
+   cache of the top few hundred video_ids by recent traffic catches most of
+   a viral spike before it leaves the box.
+3. **Request coalescing (single-flight)** in front of the distributed
+   cache: when a key is missing or its TTL just expired, only the *first*
+   concurrent request for that key is allowed to go fetch it from the
+   database; every other concurrent request for the same key waits on that
+   one in-flight fetch and shares the result. Without this, a cache
+   expiry on a hot key causes thousands of simultaneous requests to all
+   miss at once and all hit the database together - a self-inflicted
+   thundering herd.
+4. **Sharding by video_id hash** keeps this contained to one hot shard
+   instead of one hot database - the rest of the system is unaffected, and
+   you can add targeted capacity (a dedicated replica, a pinned cache
+   entry with no TTL) to just that shard if it's identified as
+   persistently hot.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    C["Millions of clients\nwatching a viral video"] --> CDN["CDN edge cache\n(video segments)"]
+    CDN -->|metadata miss| APP["App server\nlocal in-process cache"]
+    APP -->|miss| SF["Request coalescer\n(single-flight per key)"]
+    SF -->|one fetch, many waiters| DIST["Distributed cache\n(sharded by video_id)"]
+    DIST -->|miss, rare| DB["Metadata DB shard\nfor that video_id"]
+`} />
+
+## Counters are a bottleneck of their own
+
+View counts, like counts, and comment counts look like simple integers but
+are a classic hidden bottleneck. If every single view increments a row in
+the metadata database synchronously, that row becomes a hot write target
+under exactly the same viral scenario - now it's write contention, not read
+contention, and writes to a single row don't parallelize the way reads
+from replicas do.
+
+The standard fix is to stop treating these as exact, synchronous counters.
+Batch increments in memory (or in a stream like Kafka) per video_id and
+flush an aggregate delta to the database every few seconds, rather than
+one write per view. For "likes," this is usually fine to show as
+eventually consistent - a user doesn't need to see the count update
+within milliseconds of their own click. For genuinely approximate metrics
+like unique viewers, a probabilistic structure (HyperLogLog) trades exact
+precision for a fixed, tiny memory footprint regardless of scale.
+
+## Upload bursts and transcoding backlog
+
+The write side has its own scaling story, decoupled from the read side by
+design (see the upload/transcoding lesson). The bottleneck here isn't a
+hot key - it's burstiness. Uploads cluster around regional evenings and
+around real-world events (a live sports moment, a product launch), so a
+transcoding fleet sized for average throughput will queue up a large
+backlog the moment a burst hits.
+
+Because upload already sits behind a queue, this is more tractable than
+the read-side hot-key problem: autoscale transcoding workers off queue
+depth (not off API request rate, which barely moves during an upload
+burst), and prioritize the queue so that, say, a paid/verified creator's
+video or a video predicted to be high-traffic gets transcoded ahead of a
+backlog of low-view-count uploads. Users tolerate "your video is
+processing" for a few extra minutes far better than they tolerate a
+playback failure, so pushing delay into the queue rather than into the
+read path is the correct trade.
+
+## Replication lag and read-your-writes
+
+Read replicas fix aggregate read capacity but introduce lag - a write to
+the primary might take tens to hundreds of milliseconds to appear on a
+given replica. That's invisible for other users watching an unrelated
+video, but it's very visible to the one user who just uploaded a video or
+posted a comment and refreshes the page to see it missing. The usual fix
+is a short-lived affinity: route that specific user's reads to the primary
+(or to a cache entry explicitly invalidated on write) for a brief window
+after they act, then let them fall back to normal replica routing once the
+write has almost certainly propagated.
+
+## Worked example: a video goes viral
+
+Say a 2-minute clip normally gets 50 views/sec, comfortably served by one
+cache node and one database shard. A news outlet embeds it and, within
+eight minutes, it's at 150,000 views/sec - a 3,000x jump on one video_id.
+
+Without any of the above: the video's cache entry's TTL expires mid-spike,
+150,000 concurrent requests all miss at once, all hit the same database
+shard simultaneously, and that shard's connection pool and CPU saturate -
+taking down metadata lookups for every *other* video that happens to share
+the shard, an outage with a much wider blast radius than the one video that
+caused it.
+
+With the layered defenses: the local per-server cache absorbs most of it
+immediately since the same app servers keep re-serving the same hot
+video_id from memory. On the TTL expiry, the request coalescer ensures
+exactly one request repopulates the distributed cache while the other
+149,999 wait on that result instead of re-querying the database. The
+database shard sees, at most, a handful of requests instead of 150,000 -
+and because sharding is by video_id, every other shard (every other video)
+never notices this happened at all.
+
+<Callout type="warning">
+  A common mistake is announcing "we'll add more read replicas" as the
+  fix for any read-scaling problem without asking whether the load is
+  spread across many keys or concentrated on one. More replicas divide
+  load that's already distributed across keys - they do nothing for a
+  single hot key, because every replica of a shard serves that same key at
+  the same rate. State explicitly in the interview that you're
+  distinguishing "more aggregate reads, evenly spread" from "one video_id
+  taking almost all the traffic," since the fix (more replicas vs. request
+  coalescing and local caching) is different for each.
+</Callout>
+
+## Where this leads
+
+Scaling problems in a video platform rarely show up as "the whole system
+is slow" - they show up as one hot shard, one saturated queue, or one row
+under write contention, with everything else running fine. Diagnosing
+*which* resource is concentrated (a key, a shard, a queue, a row) is what
+determines the right fix, and that diagnostic instinct is exactly what the
+final lesson in this module - a mock interview on a short-video feed - will
+ask you to demonstrate live.
+
+<Quiz
+  lessonId="youtube-scaling-and-bottlenecks"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A single video goes viral and its cache entry expires mid-spike, causing 100,000 concurrent requests to all miss at once. Which technique specifically prevents this from becoming a thundering herd on the database?',
+      options: [
+        { id: 'a', text: 'Adding more read replicas of the database shard', correct: false, explanation: 'Every replica of the shard holding that video_id would still receive the identical concentrated load - replicas divide load spread across many keys, not load concentrated on one key.' },
+        { id: 'b', text: 'Request coalescing (single-flight), so only the first miss fetches from the database while other concurrent requests wait on that result', correct: true, explanation: 'Coalescing collapses the 100,000 simultaneous misses into a single database fetch, which is exactly what stops a cache expiry from becoming a stampede.' },
+        { id: 'c', text: 'Increasing the cache TTL to a very large value for all videos', correct: false, explanation: 'A blanket long TTL delays the problem and risks serving stale data broadly - it does not address what happens when the entry does eventually expire under load, and it is not targeted at the hot key.' },
+        { id: 'd', text: 'Switching the metadata database from SQL to a NoSQL store', correct: false, explanation: 'The storage engine choice does not change the fact that one key is receiving concentrated concurrent traffic - the coalescing/caching strategy matters far more than the database family here.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are effective responses to a viral video overwhelming its shard? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A local, in-process cache on each app server for the hottest handful of video_ids', correct: true, explanation: 'Serving the hottest keys out of process memory removes a large fraction of the traffic before it ever needs a network hop, directly reducing pressure on the hot shard.' },
+        { id: 'b', text: 'Sharding metadata by video_id hash rather than by category or upload time', correct: true, explanation: 'Hashing by video_id spreads different videos across many shards, so one hot video only ever saturates its own single shard rather than an entire category or time-bucket shard shared by many videos.' },
+        { id: 'c', text: 'Making the view-count increment synchronous and strongly consistent on every single request', correct: false, explanation: 'This makes the problem worse - a synchronous write to a hot row on every one of the concentrated requests adds write contention on top of read contention, exactly the opposite of what is needed.' },
+        { id: 'd', text: 'Request coalescing so concurrent cache misses for the same key share one origin fetch', correct: true, explanation: 'This is the core defense against a cache-expiry-triggered thundering herd on the shard behind a single hot key.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Autoscaling the transcoding worker fleet based on incoming API request rate is a reliable way to absorb upload bursts.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Upload API request rate barely changes during a burst - each upload is one request that then sits in a queue; the signal that actually reflects backlog is queue depth, not front-door request rate.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct - transcoding workers should autoscale off queue depth (how much backlog is waiting), since the upload API request rate does not reflect how much processing work is actually queued up behind it.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A user uploads a video and immediately refreshes their profile page, but the video is missing because the read hit a replica that has not yet caught up. What is the standard fix for this specific problem?',
+      options: [
+        { id: 'a', text: 'Make all reads across the entire system go to the primary database at all times', correct: false, explanation: 'This defeats the purpose of read replicas and would reintroduce the exact read-scaling bottleneck replicas exist to solve, for every user on every read.' },
+        { id: 'b', text: 'Briefly route that specific user\'s own reads to the primary (or an invalidated cache) right after their write, then fall back to normal replica routing', correct: true, explanation: 'This "read-your-writes" affinity is scoped narrowly - only the acting user, only for a short window - so it fixes the visible staleness without giving up the aggregate benefit of read replicas for everyone else.' },
+        { id: 'c', text: 'Tell the user to wait several minutes before checking their profile', correct: false, explanation: 'This is a workaround, not a fix, and produces a poor user experience for something solvable with routing logic on the read path.' },
+        { id: 'd', text: 'Remove read replicas entirely so there is only one copy of the data', correct: false, explanation: 'This eliminates replication lag by eliminating the read-scaling benefit replicas provide in the first place - a much larger cost than the narrow problem being solved.' },
+      ],
+    },
+  ]}
+/>

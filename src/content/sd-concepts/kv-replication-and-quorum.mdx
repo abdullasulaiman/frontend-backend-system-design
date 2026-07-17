@@ -1,0 +1,147 @@
+---
+title: "Replication and Quorum"
+module: "Key-Value Store"
+moduleOrder: 10
+order: 3
+track: "concept"
+summary: "Explains why a distributed key-value store copies data across multiple nodes and how quorum reads and writes let you tune the consistency, latency, and availability trade-off on a per-request basis."
+tags: ["replication", "quorum", "key-value-store", "consistency", "availability"]
+estMinutes: 12
+cheatsheet:
+  - "Replication factor N is how many copies of each key-value pair exist; it protects against node loss and spreads read load, but every extra replica is extra write cost and storage."
+  - "Quorum reads and writes are governed by R and W: pick R + W > N to guarantee every read set overlaps every write set, so at least one replica you read from has the latest write."
+  - "W = N gives the strongest durability per write but the worst availability — one dead replica blocks every write until it recovers or is replaced."
+  - "W = 1 gives the fastest, most available writes but the weakest durability — a single node crash before replication catches up can lose the write."
+  - "R + W > N does not guarantee linearizability by itself — clocks skew, networks reorder messages, and concurrent writes can still leave replicas with conflicting versions (next lesson's problem)."
+  - "Coordinator-based writes fan out to all N replicas and return once W acknowledge; the rest replicate asynchronously in the background (hinted handoff, read repair, or anti-entropy)."
+  - "Tune R and W per operation, not just per cluster: a profile write might use W=1 for speed while a payment-adjacent read uses R=N for safety."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The [previous lesson](/system-design/kv-consistent-hashing-and-data-partitioning) solved *where* a key lives: consistent hashing maps each key to a position on a ring, and the node whose range covers that position owns it. But "owns it" on a single node is a single point of failure — that node's disk fails, or its process crashes mid-deploy, and every key it held is gone. A distributed key-value store's whole reason for existing is to survive exactly that kind of failure, which means every key has to live on more than one machine. This lesson is about how many copies to keep, how to keep them in sync well enough to be useful, and how to tune reads and writes so you're not always paying the same latency-versus-correctness tax.
+
+## Replication factor: how many copies, and where
+
+The **replication factor**, usually called `N`, is the number of nodes that hold a copy of each key. A common production default is `N = 3`: enough to survive one node failure with a copy still available, and a second failure during recovery, without needing a majority of a much larger set to be reachable.
+
+Given the ring from the last lesson, the natural placement rule is: a key's **coordinator** is the first node reached walking clockwise from the key's hash position (same as before), and its replicas are the next `N - 1` *distinct physical* nodes walking further clockwise. "Distinct physical" matters — if you're using virtual nodes so one physical machine owns many ring positions, naively taking the next `N - 1` ring positions can land you back on the same physical box twice, which defeats the point of replication. Real implementations skip virtual-node positions that map to a physical node already in the replica set.
+
+Placement also usually respects failure domains: if you have three availability zones, you want the three replicas spread one-per-zone, not all three in a zone that loses power together. This is a detail interviewers like to hear named explicitly — "I'd replicate across AZs, not just across nodes" signals you're thinking about correlated failure, not just node count.
+
+## Quorum: not every replica has to agree, every time
+
+If every read waited for all `N` replicas and every write waited for all `N` acknowledgments, you'd get strong consistency but terrible availability — one slow or dead replica blocks every operation. If every read and write only touched one replica, you'd get great availability but replicas could silently diverge and readers could see stale data indefinitely.
+
+**Quorum** is the middle ground: define `W` (how many replicas must acknowledge a write before it's considered successful) and `R` (how many replicas a read must query before returning a result), and choose them so that:
+
+```
+R + W > N
+```
+
+The intuition: if a write only needs `W` acknowledgments, it might have landed on any `W`-sized subset of the `N` replicas. If a read queries any `R`-sized subset, and `R + W > N`, then by the pigeonhole principle those two subsets *must* overlap by at least one node — meaning at least one replica the read touches definitely saw the write. The read returns the highest version among the `R` replicas it heard from, which is guaranteed to include the latest write.
+
+With `N = 3`, the classic choice is `R = 2, W = 2` — `2 + 2 = 4 > 3`, so overlap is guaranteed, and both reads and writes only need a majority, not all three replicas, to respond. That's the sweet spot most systems (Dynamo, Cassandra, Riak-style stores) default to.
+
+### The extremes are useful too
+
+- **`W = N`** (write to every replica): strongest per-write durability, but a single unreachable replica blocks every write. Good for data where losing an ack'd write is unacceptable and write volume is low.
+- **`W = 1`**: fastest, most available writes — you only need one node up. Weakest durability: if that one node crashes before the write replicates further, it's gone.
+- **`R = N`**: every read touches every replica — strong read guarantees, but a read is only as fast as the slowest replica, and one dead node blocks all reads too.
+- **`R = 1`**: fastest reads, but you might read a replica that hasn't seen the latest write yet — a stale read.
+
+Nothing forces the same `R` and `W` for every operation in a cluster. A system can let each request specify its own consistency level: a low-stakes profile-picture update might use `W = 1` for speed, while a read on an account balance uses `R = N` for safety.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant C as Client
+    participant Co as Coordinator
+    participant R1 as Replica 1
+    participant R2 as Replica 2
+    participant R3 as Replica 3
+    C->>Co: PUT(key, value)
+    Co->>R1: replicate write
+    Co->>R2: replicate write
+    Co->>R3: replicate write
+    R1-->>Co: ack
+    R2-->>Co: ack
+    Note over Co: W=2 reached, respond now
+    Co-->>C: write success
+    R3-->>Co: ack (arrives late, no one waits)
+`} />
+
+## How writes actually propagate
+
+The client (or a load balancer) sends the write to any node, which acts as **coordinator** for that request — it doesn't have to be one of the `N` replicas itself. The coordinator forwards the write to all `N` replicas in parallel and waits only for `W` acknowledgments before replying success to the client. The remaining `N - W` replicas are still being written to in the background; the coordinator doesn't block the client on them.
+
+That background completion matters for correctness, not just cleanup — the store still promises all `N` replicas will eventually hold the write. Two mechanisms make that promise real:
+
+- **Hinted handoff**: if a target replica is temporarily unreachable, the coordinator writes a "hint" to a different, reachable node — "this write belongs to replica X, deliver it once X is back." When X recovers, the hint is replayed to it. This keeps writes succeeding even during a replica outage without losing the intent to fully replicate.
+- **Read repair and anti-entropy**: when a read notices replicas disagree (one has an older version), it can push the newer version to the stale replica right then (read repair), and a background job periodically compares replicas wholesale and reconciles differences even for keys nobody has read recently (anti-entropy, often via Merkle trees to diff efficiently — the next lesson covers how "newer" gets decided).
+
+## Worked example: sizing quorum for a session store
+
+Say you're designing the session store behind a login system, expecting 50,000 writes/sec (session creation and refresh) and 200,000 reads/sec (session validation on every API call), with `N = 3` replicas per key.
+
+If you pick `W = 3, R = 1`: writes are slow and fragile (need all 3 replicas up, and every write pays the latency of the slowest of three), but reads are fast and can hit any single replica. Given reads outnumber writes 4-to-1 here, this looks appealing for throughput — but a single lost node stalls every session write cluster-wide, which is a bad trade for something as core as login.
+
+If you pick `W = 2, R = 2` instead: `2 + 2 = 4 > 3`, so you keep the read-your-writes guarantee (a user who just refreshed their session won't see a stale "logged out" read), writes tolerate one replica being briefly unreachable, and reads tolerate the same. The latency cost is that both paths now wait for the second-fastest of three replicas instead of the fastest — typically a few milliseconds more at the tail, which is a fine price for not stalling logins during a single-node blip.
+
+`W = 1, R = 1` would be tempting for raw speed, but `1 + 1 = 2`, which is not greater than `3` — no overlap guarantee, so a session refresh on one replica could be invisible to a validation read that happens to hit a different replica moments later. For a login system, that's a user getting incorrectly logged out. `R = 2, W = 2` is the right call here.
+
+<Callout type="warning">
+  A common interview mistake: stating "`R + W > N` gives strong consistency" as if that settles the matter. It gives you an **overlap guarantee** — the read set and write set share at least one node — which prevents *some* staleness. It does not give you linearizability. Clock skew across nodes, concurrent writes from two clients racing each other, and network reordering can still leave replicas holding conflicting versions of the same key with no inherent ordering between them. Quorum tells you a read will see *a* version that's at least as new as some acknowledged write; it doesn't tell you which of two concurrent writes should "win." That's a separate problem — conflict resolution and versioning — covered in the next lesson.
+</Callout>
+
+## Applying this in an interview
+
+When you introduce replication, name three things explicitly rather than just saying "we replicate the data": the replication factor `N` and why you picked it, the failure-domain-aware placement (per-AZ or per-rack, not just per-node), and your default `R`/`W` split with the arithmetic (`R + W > N`) spelled out. Then be ready to flex it: most interviewers will follow up with "what if you need faster writes" or "what if a replica is down" — that's your cue to talk about lowering `W`, hinted handoff, and the durability you're trading away to get there.
+
+<Quiz
+  lessonId="kv-replication-and-quorum"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'With a replication factor of N = 5, which R/W combination guarantees that every read overlaps every write?',
+      options: [
+        { id: 'a', text: 'R = 2, W = 2', correct: false, explanation: '2 + 2 = 4, which is not greater than 5, so there is no guaranteed overlap between the read set and write set.' },
+        { id: 'b', text: 'R = 3, W = 3', correct: true, explanation: '3 + 3 = 6 > 5, so by the pigeonhole principle any 3-node read set and any 3-node write set out of 5 replicas must share at least one node.' },
+        { id: 'c', text: 'R = 1, W = 1', correct: false, explanation: '1 + 1 = 2, far below N = 5 — a read and a write could easily land on completely disjoint replicas, giving no consistency guarantee at all.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are real costs of setting W = N (every replica must acknowledge a write)? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A single unreachable replica blocks all writes', correct: true, explanation: 'Requiring every replica to ack means the write cannot succeed at all until every replica, including any currently-down one, responds.' },
+        { id: 'b', text: 'Write latency is bounded by the slowest replica instead of the fastest', correct: true, explanation: 'The coordinator must wait for the last (slowest) of the N acknowledgments before returning success, not just the first W.' },
+        { id: 'c', text: 'Reads become impossible', correct: false, explanation: 'W governs write acknowledgment only; reads still proceed independently based on whatever R is configured.' },
+        { id: 'd', text: 'The replication factor N effectively decreases', correct: false, explanation: 'W = N changes how many acknowledgments a write needs, not how many copies of the data exist — N stays the same.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Satisfying R + W > N guarantees that concurrent writes from two different clients will be resolved in a consistent, non-conflicting order.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'R + W > N only guarantees that a read set and a write set overlap by at least one node — it says nothing about how two concurrent, conflicting writes get ordered or merged. That is a separate conflict-resolution problem.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the quorum overlap guarantee protects against a read missing an already-acknowledged write, but concurrent writes can still produce conflicting versions across replicas that quorum math alone does not resolve.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A coordinator node cannot reach one of the three replicas for a key it just wrote, but the write still needs to eventually land there. Which mechanism handles this?',
+      options: [
+        { id: 'a', text: 'Hinted handoff', correct: true, explanation: 'The coordinator stores a hint on a reachable node describing the write and its intended destination, then replays it to the original replica once that replica becomes reachable again.' },
+        { id: 'b', text: 'Consistent hashing', correct: false, explanation: 'Consistent hashing decides which nodes are responsible for a key in the first place; it does not handle delivering a write to a temporarily unreachable node.' },
+        { id: 'c', text: 'Raising the replication factor N', correct: false, explanation: 'Increasing N adds more copies going forward but does not deliver an already-attempted write to a replica that was down at write time.' },
+      ],
+    },
+  ]}
+/>

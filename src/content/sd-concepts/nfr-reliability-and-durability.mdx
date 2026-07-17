@@ -1,0 +1,135 @@
+---
+title: "Reliability and Durability"
+module: "Non-Functional Characteristics"
+moduleOrder: 4
+order: 2
+track: "concept"
+summary: "Explains reliability and durability as distinct non-functional properties — one about a system behaving correctly, the other about data never being lost — and the mechanisms interviewers expect you to name for each."
+tags: ["reliability", "durability", "replication", "fault-tolerance", "non-functional-requirements"]
+estMinutes: 11
+cheatsheet:
+  - "Reliability is about correct, uninterrupted *behavior*; durability is about data *survival*. A system can be reliable but not durable (in-memory cache that never corrupts data but loses it on restart) or durable but briefly unreliable (a database that's down for maintenance but never loses a committed write)."
+  - "MTBF (mean time between failures) and MTTR (mean time to recovery) are the two levers of reliability — you can improve reliability by failing less often (raise MTBF) or by recovering faster (lower MTTR)."
+  - "Durability is bought with replication (copies of data in multiple places) and persistence (writing to storage that survives process/machine restarts) — memory alone gives you neither."
+  - "'Write acknowledged' must mean 'durable', not just 'received'. Decide explicitly whether an ack fires after an in-memory write, an fsync to local disk, or a quorum of replicas — each has a different data-loss blast radius."
+  - "Availability answers 'is the system responding right now?'; reliability answers 'is it responding *correctly* over time?' A system can be up (available) while silently corrupting or dropping data (unreliable)."
+  - "Redundancy is necessary but not sufficient for durability — replicating from a corrupted primary just gives you multiple corrupted copies. Pair replication with checksums, versioning, and backups that are isolated from the live write path."
+  - "In interviews, always state your durability target as a number: RPO (recovery point objective, how much data you can afford to lose) and RTO (recovery time objective, how long you can afford to be down) turn a vague promise into a design constraint."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Imagine a payments service that processes a `$50` charge, returns a `200 OK` to the client, and then the disk holding that record fails five seconds later with no replica anywhere else. The client saw success. The money moved. But the record of it is gone. Was the system "reliable"? In the everyday sense, sure — it responded correctly to the request. But it wasn't **durable**, and that distinction is exactly what interviewers are probing when they ask about it separately from availability.
+
+Reliability and durability get lumped together constantly, but they answer different questions, fail in different ways, and are bought with different engineering investments. Getting them straight — and being able to name the concrete mechanisms behind each — is table stakes for any system design conversation that touches data.
+
+## Reliability: does the system do the right thing, consistently?
+
+Reliability is the probability that a system performs its intended function correctly over a given period, without producing wrong results, silent corruption, or unhandled crashes. It's a broader claim than availability. A service can be "up" (accepting connections, returning `200`s) while being unreliable — returning stale data, double-charging a customer, or dropping half the requests in a retry storm.
+
+Two numbers drive how reliable a system feels in practice:
+
+- **MTBF (mean time between failures)** — how long, on average, the system runs before something breaks. Higher is better.
+- **MTTR (mean time to recovery)** — how long it takes to detect a failure and restore correct behavior once one happens. Lower is better.
+
+These two levers matter because reliability isn't really "never fails" — at scale, with enough servers, disks, and network links, something is *always* failing somewhere. Real reliability engineering accepts that and optimizes for failing rarely and recovering fast, rather than chasing an unachievable zero-failure system.
+
+### Mechanisms that raise reliability
+
+- **Redundancy** — no single component's failure should take down the whole system (covered in depth in the Fault Tolerance and Redundancy lesson in this module).
+- **Health checks and automated failover** — detect a broken instance in seconds, not after a human notices a support ticket, and route traffic away from it.
+- **Idempotent operations** — a client retry after a timeout shouldn't double-apply an action. An idempotency key on a payment request means retrying is safe even if the first attempt actually succeeded server-side.
+- **Circuit breakers and backpressure** — a failing dependency shouldn't cause the caller to retry harder and harder until it also falls over.
+- **Graceful degradation** — serving a slightly stale recommendation list beats serving a `500`. A reliable system fails *partially* and *predictably*, not completely.
+
+## Durability: once accepted, does the data survive?
+
+Durability is a narrower, sharper claim: once the system has acknowledged a write, that data will still be there later — even across process crashes, disk failures, power loss, or an entire data center going dark. Durability is a promise about persistence of state, not about the system staying responsive.
+
+This is why durability and availability can trade off in opposite directions from what people expect. A system can sacrifice availability to protect durability — refusing writes during a network partition rather than risk accepting data it might later lose (see the Consistency: CAP and PACELC lesson for why that refusal is sometimes the correct choice). Conversely, a system that stays "available" by accepting writes into memory and acknowledging them before persisting can look great on uptime dashboards while quietly being one crash away from data loss.
+
+### Mechanisms that buy durability
+
+- **Write-ahead logging (WAL)** — append the write to an on-disk log *before* acknowledging it, so a crash mid-update can be replayed from the log instead of losing the change.
+- **fsync / flush to disk** — an OS-level write buffer isn't durable until it's actually flushed to physical storage; acknowledging before `fsync` trades durability for latency.
+- **Replication** — keep copies of the data on multiple machines, ideally in multiple availability zones or regions, so one machine's disk failure isn't data loss.
+- **Quorum writes** — acknowledge a write only after N of M replicas confirm it, so losing any single replica still leaves the data recoverable elsewhere.
+- **Backups and snapshots** — a point-in-time copy stored somewhere isolated from the live write path, protecting against bugs or bad deploys that corrupt data *correctly* replicated everywhere.
+- **Checksums and versioning** — detect silent corruption (a flipped bit on disk) rather than durably replicating garbage with full confidence.
+
+<Callout type="warning">
+  A common mistake: treating "the write returned success" as proof the data is durable. An in-memory database that acknowledges instantly and flushes to disk every 30 seconds is fast, but a crash in that window loses everything written since the last flush. Always ask, and answer explicitly in an interview: what exactly does the acknowledgment mean — buffered in memory, flushed to local disk, or confirmed by a quorum of replicas? Each answer has a very different amount of data you're willing to lose.
+</Callout>
+
+## How they compose in a real write path
+
+The diagram below shows where a single write can be considered "acknowledged" at different points, and what happens to durability at each stage if the primary node dies immediately after.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  C[Client write] --> P[Primary node]
+  P -->|"1: in-memory only"| ACK1[Ack -- least durable]
+  P --> WAL[Write-ahead log on disk]
+  WAL -->|"2: local fsync done"| ACK2[Ack -- survives process crash]
+  WAL --> R1[Replica A]
+  WAL --> R2[Replica B]
+  R1 --> Q{Quorum reached?}
+  R2 --> Q
+  Q -->|"3: yes"| ACK3[Ack -- survives node loss]
+`} />
+
+Notice that stage 1 and stage 2 both happen on the same physical machine — they protect against different failure modes (process crash vs. nothing) but neither survives that machine's disk failing entirely. Only stage 3, once a quorum of independent replicas has the write, survives losing any single node.
+
+## Worked example: sizing durability for an order service
+
+Say you're designing the order-write path for an e-commerce checkout service doing 500 orders/second at peak. Product asks: "we can't ever lose a confirmed order." Translate that into concrete numbers before picking a mechanism:
+
+- **RPO (recovery point objective) = 0** — zero acceptable data loss for a confirmed order. This rules out async replication where the primary acks before any replica has the data; a primary failure right after the ack would lose orders that were already confirmed to customers.
+- **RTO (recovery time objective) = 30 seconds** — if the primary dies, a standby must be promoted and taking traffic within 30 seconds, or checkout appears down.
+
+Given RPO = 0, the design needs synchronous quorum writes: the primary must wait for at least one other replica (in a 3-node setup, a quorum of 2-of-3) to confirm the write before returning success to the client. This costs latency — the write now waits on a network round trip to another node, typically adding a few milliseconds to tens of milliseconds depending on replica placement — but it's the only way to honor "zero lost orders" if the primary's disk dies a moment later.
+
+Contrast this with an analytics event pipeline logging page views for a dashboard: losing a few seconds of events during a rare failover is an acceptable trade for lower latency and cost, so async replication (ack after local write, replicate in the background) is the right, cheaper choice there. The lesson: durability requirements aren't universal — state RPO/RTO per data type, and let that number drive the mechanism, not the other way around.
+
+## How this fits with the rest of the module
+
+- **Availability** (previous lesson) is about the system responding at all; reliability and durability are about it responding *correctly* and never losing what it already promised to keep.
+- **Fault Tolerance and Redundancy** (next-but-one lesson) is the toolbox of techniques — replication, retries, isolation — that reliability and durability both lean on; this lesson names the *properties*, that one covers the *mechanisms* in depth.
+- **Consistency: CAP and PACELC** explains why a durable, quorum-based system sometimes has to say "no" to a write during a partition rather than risk losing it later.
+
+## Quiz
+
+<Quiz lessonId="nfr-reliability-and-durability" client:visible questions={[
+  {
+    id: 'q1',
+    kind: 'mcq',
+    prompt: 'A database acknowledges a write as soon as it is applied to an in-memory buffer, flushing to disk every 10 seconds. What is the main risk this creates?',
+    options: [
+      { id: 'a', text: 'Reads immediately after the write may return stale data', correct: false, explanation: 'Reading your own recent write is a consistency concern, not what this buffering setup primarily risks — the buffer is applied in memory right away, so reads would typically see it.' },
+      { id: 'b', text: 'A crash within that 10-second window can silently lose acknowledged writes', correct: true, explanation: 'Correct. The client was told the write succeeded, but until it is flushed to persistent storage (or replicated), a crash loses it — an availability metric would look fine while a durability guarantee was quietly broken.' },
+      { id: 'c', text: 'The system becomes unavailable during the flush', correct: false, explanation: 'Flushing a buffer to disk periodically does not typically make the system stop accepting requests; the risk here is data loss on crash, not downtime.' },
+    ],
+  },
+  {
+    id: 'q2',
+    kind: 'multi',
+    prompt: 'Which of the following genuinely improve durability of committed writes? (Select all that apply.)',
+    options: [
+      { id: 'a', text: 'Requiring a quorum of replicas to confirm a write before acknowledging it', correct: true, explanation: 'Correct. This ensures the data exists on multiple independent nodes before the client is told it succeeded, so a single node failure cannot lose it.' },
+      { id: 'b', text: 'Adding more application server instances behind a load balancer', correct: false, explanation: 'More stateless application servers improve capacity and availability for handling requests, but do nothing for whether already-acknowledged data survives a storage failure.' },
+      { id: 'c', text: 'Writing to a write-ahead log with fsync before acknowledging the client', correct: true, explanation: 'Correct. This ensures the write is on persistent storage before the client is told it succeeded, so a process crash right after can be recovered by replaying the log.' },
+      { id: 'd', text: 'Adding a longer request timeout on the client', correct: false, explanation: 'A longer timeout changes how patient the client is, but has no effect on whether the server-side write is actually persisted anywhere durable.' },
+    ],
+  },
+  {
+    id: 'q3',
+    kind: 'boolean',
+    prompt: 'A system that is highly available (responds to requests almost 100% of the time) is therefore also reliable.',
+    options: [
+      { id: 'true', text: 'True', correct: false, explanation: 'False — a system can respond quickly and constantly while still returning incorrect results, corrupting data, or silently dropping writes. Availability measures responsiveness; reliability measures correctness of behavior over time.' },
+      { id: 'false', text: 'False', correct: true, explanation: 'Correct. Availability and reliability are distinct: a service that is always up but occasionally returns wrong answers or loses updates is available but not reliable.' },
+    ],
+  },
+]} />

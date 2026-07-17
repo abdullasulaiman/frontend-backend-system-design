@@ -1,0 +1,143 @@
+---
+title: "How the Building Blocks Fit Together"
+module: "Concluding the Building Blocks"
+moduleOrder: 25
+order: 1
+track: "concept"
+summary: "Zooms out from the individual building-block deep dives to show the recurring patterns and composition rules that let you assemble them into a coherent, interview-ready architecture."
+tags: ["building-blocks", "architecture-patterns", "system-design", "distributed-systems"]
+estMinutes: 12
+cheatsheet:
+  - "The building blocks share a small set of recurring mechanisms — partitioning, replication, quorum, idempotency, backpressure — learn those mechanisms once and you can reason about any block, not just the one it was introduced with."
+  - "A request rarely touches one block; it touches a chain (DNS, then CDN, then load balancer, then rate limiter, then service, then cache, then database, then maybe a queue). Draw the chain before you draw any single box in detail."
+  - "Every block you add for one requirement (availability, latency, durability) usually costs you something on another axis (consistency, operational complexity, cost) — state the trade-off out loud instead of listing blocks."
+  - "Data-plane blocks (cache, database, queue, blob store) and control-plane blocks (load balancer, rate limiter, monitoring) fail differently — data-plane failures lose or serve wrong data, control-plane failures overload or misroute it. Design recovery for both."
+  - "Idempotency and deduplication show up at almost every seam — client retries, load balancer retries, queue redelivery, replicated writes — because at-least-once delivery is the default in distributed systems, not the exception."
+  - "When an interviewer says 'now make it handle 10x traffic,' the answer is rarely 'add a bigger machine' — it's usually 'shard this block' or 'cache in front of that one,' applying patterns you already know rather than inventing new components."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've now walked through the building blocks one at a time: DNS and load balancing at the edge, caches and CDNs for speed, SQL and NoSQL stores and blob storage for durability, message queues and pub-sub for decoupling, rate limiters and unique ID generators and search and logging and monitoring for the cross-cutting concerns. Each of those lessons deliberately isolated one component so you could learn its job and trade-offs cleanly. That's not how an interview question actually arrives, though — nobody asks you to "design a cache." They ask you to design a URL shortener, a ride-hailing dispatch system, or a chat app, and the whole exercise is picking the right subset of blocks and wiring them together correctly.
+
+This lesson is the seam between the two halves of this course. It doesn't introduce a new block — it steps back and shows the patterns that repeat *across* every block you've studied, so that when you move into full case studies next, you're combining familiar mechanisms instead of starting from zero on every problem.
+
+## The inventory, one line each
+
+Before combining anything, it helps to have the whole set in view at once. Here's every block from this module, reduced to its one-sentence trade-off:
+
+| Block | Core trade-off |
+|---|---|
+| DNS | Resolves names to addresses; caching (TTL) trades update speed for lookup speed. |
+| Load balancer | Spreads requests across servers; algorithm choice trades fairness/simplicity against session affinity. |
+| CDN | Serves cacheable content from the edge; trades a bit of staleness for large latency and origin-load wins. |
+| Cache | Fast key-based reads in front of a slower store; trades consistency for latency. |
+| SQL database | Strong consistency and flexible queries; trades write throughput and horizontal scale for that flexibility. |
+| NoSQL / key-value store | Scales writes and simple lookups horizontally; trades flexible querying and (often) strong consistency to get there. |
+| Blob store | Durable storage for large, immutable objects; trades fine-grained updates for scale and cost efficiency. |
+| Message queue | Decouples producer from consumer; trades immediate processing for durability and load-leveling. |
+| Pub-sub | Fans one event out to many independent consumers; trades simple point-to-point delivery for broadcast flexibility. |
+| Rate limiter | Protects a service from overload; trades some rejected legitimate traffic for protecting the rest. |
+| Unique ID generator | Produces IDs without a central bottleneck; trades perfectly sequential IDs for distributed generation. |
+| Search index | Fast full-text/filtered lookups; trades write-time indexing cost for query-time speed. |
+| Logging & monitoring | Visibility into what's happening; trades storage/compute cost for the ability to detect and debug failures. |
+
+None of these trade-offs is new information if you did the earlier lessons — the point of tabulating them together is to notice that they're all answering the same underlying question: *what am I willing to give up to get more of what I need right now?*
+
+## The patterns that repeat across blocks
+
+The more interesting observation is that the blocks aren't just a list of unrelated trade-offs — a handful of mechanisms show up again and again, just applied to different data:
+
+- **Partitioning / sharding.** Databases shard by key range or hash; caches shard the keyspace across nodes; queues partition by topic/key for ordered, parallel consumption. It's the same idea every time: split data across nodes so no single node is the bottleneck.
+- **Replication and quorum.** Databases replicate for durability and read scaling; caches replicate for availability; even DNS "replicates" via multiple authoritative servers. Whenever you replicate, you inherit the same question: how many copies must agree before you call a write or read successful?
+- **Idempotency and deduplication.** A load balancer retries a failed request; a queue redelivers an unacknowledged message; a client retries a timed-out call. All of these assume at-least-once delivery, which means every one of your write paths needs to tolerate being executed twice.
+- **Backpressure.** Rate limiters push back at the edge; queues absorb bursts so downstream services don't fall over; a cache existing at all is a form of backpressure on the database. Different placement, same goal: protect a slower or more expensive resource from a faster or cheaper one.
+- **Cache-style staleness trade-offs.** This isn't limited to the block literally called "cache" — a CDN, a search index, and a read replica are all serving slightly-stale copies of a source of truth in exchange for speed or scale.
+
+Once you see these five mechanisms, most "how would you handle X at scale" interview follow-ups become a matter of naming which mechanism applies, not inventing something new.
+
+## Composing blocks into one request path
+
+Here's a composite request path for a system under real load — say, a checkout flow during a flash sale — showing several blocks working together instead of in isolation:
+
+<Mermaid client:visible chart={`
+flowchart TD
+    C[Client] --> LB[Load balancer]
+    LB --> RL[Rate limiter]
+    RL --> APP[Checkout service]
+    APP --> Cache[(Cache: product/price)]
+    APP --> DB[(Database: orders)]
+    APP --> Q[[Queue: order events]]
+    Q --> W[Worker: payment + email]
+    APP --> IDGen[Unique ID generator]
+    MON[Monitoring] -.watches.-> LB
+    MON -.watches.-> APP
+    MON -.watches.-> Q
+`} />
+
+Notice what each block is doing here and why it's there, not just that it's present: the rate limiter sits right after the load balancer because you want to reject excess load as early and cheaply as possible; the cache absorbs repeated reads of the same product/price data so the database only sees writes and cache misses; the queue exists specifically so that slow, non-critical-path work (charging a card asynchronously via a payment provider callback, sending a confirmation email) doesn't hold the customer's checkout request open; the ID generator produces order IDs without a single point of contention; and monitoring watches all of it, because during a flash sale is exactly when you'll need to see which layer is under stress.
+
+## Worked example: scaling one path under load
+
+Say this checkout flow currently handles 200 requests per second comfortably, and marketing tells you Black Friday will bring 20x that — 4,000 requests per second, most of it concentrated in a 30-minute window. Walk it block by block instead of reaching for "bigger machines":
+
+- **Load balancer**: already horizontally scalable — add more app instances behind it, no redesign needed.
+- **Rate limiter**: needs to move from a single in-process counter to a **distributed** rate limiter (shared state in a fast store) so the limit is enforced correctly across many app instances, not per-instance.
+- **Cache**: the product/price cache was fine at 200 requests per second; at 4,000 requests per second a single cache node may become the new bottleneck, so it gets sharded across multiple cache nodes by product ID.
+- **Database**: order writes are the one path that can't be cached away — this is where you'd add write-side protections (the rate limiter, plus the queue below) rather than trying to make the database itself 20x faster.
+- **Queue**: this is the star of the scaling story. Instead of processing payment synchronously, accepting the order and pushing "process payment" onto a queue lets the checkout service return quickly and lets payment workers scale independently, smoothing the burst instead of transmitting it straight to a payment provider's API.
+- **Unique ID generator**: already designed for distributed generation, so it doesn't need to change.
+
+Nothing here is a new building block — it's the same inventory, applied with the sharding, replication, and backpressure patterns from the previous section.
+
+<Callout type="warning">
+  A common mistake once you know the individual blocks well: reaching for the same "add a cache, add a queue" combo on every problem without checking whether it fits the requirement. A queue that decouples a slow write is great advice for sending a confirmation email; it's actively harmful advice for confirming payment success to the user synchronously, where the customer needs to know *right now* whether their card was charged. Composition means picking the right mechanism for *this* seam, not applying your favorite two blocks everywhere.
+</Callout>
+
+<Quiz
+  lessonId="bb-outro-how-the-building-blocks-fit-together"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A team notices their in-process, per-instance rate limiter is letting through far more total traffic than intended once they run many app instances behind a load balancer. What is the underlying issue and fix?',
+      options: [
+        { id: 'a', text: 'The rate limit value itself is too high and should simply be lowered', correct: false, explanation: 'Lowering the number does not fix the structural problem — each instance would still enforce its own independent limit, so the aggregate ceiling still scales with instance count.' },
+        { id: 'b', text: 'Each instance enforces its own local limit, so the effective total limit scales with instance count; the fix is a distributed rate limiter with shared state', correct: true, explanation: 'This is exactly the partitioning/replication pattern showing up again: without shared state across instances, a per-instance mechanism cannot enforce a global limit.' },
+        { id: 'c', text: 'Rate limiting should be removed entirely since load balancers already prevent overload', correct: false, explanation: 'A load balancer distributes traffic; it does not cap total traffic volume or protect a service from being overwhelmed by legitimate-looking requests.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are examples of the "idempotency / at-least-once delivery" pattern showing up across different building blocks? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A message queue redelivering a message because the consumer did not acknowledge it in time', correct: true, explanation: 'Redelivery on missing acknowledgment is the queue applying at-least-once delivery, which means the consumer must handle duplicate processing safely.' },
+        { id: 'b', text: 'A client retrying an API call after a network timeout, without knowing whether the first attempt actually succeeded', correct: true, explanation: 'Client-side retries are the most common source of duplicate requests reaching a service, which is why write endpoints need idempotency keys or equivalent handling.' },
+        { id: 'c', text: 'A CDN serving a cached copy of an image instead of fetching it from the origin server', correct: false, explanation: 'Serving cached content is the staleness/speed trade-off, not a delivery-retry or duplication concern — no risk of duplicate processing is involved here.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'When scaling a system to handle significantly more traffic, the right first move is usually to introduce entirely new building blocks the design didn\'t need before, rather than applying scaling patterns (sharding, replication, queuing) to the blocks already in place.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Scaling almost always comes from applying the same recurring patterns — sharding a cache, adding a distributed rate limiter, moving synchronous work onto a queue — to the existing inventory, not inventing unrelated new components.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. The worked example in this lesson scales a checkout flow 20x by sharding, distributing, and queuing existing blocks, without introducing anything new.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the composite checkout flow diagram, why does the order-processing service push payment handling onto a queue instead of calling the payment provider synchronously?',
+      options: [
+        { id: 'a', text: 'Queues are always faster than a direct API call', correct: false, explanation: 'A queue does not make the payment call itself faster — it changes when and how that work happens relative to the user-facing request, not the call\'s raw latency.' },
+        { id: 'b', text: 'It decouples the user-facing request from a slower, non-critical-path step, so the checkout response returns quickly and payment workers can be scaled independently', correct: true, explanation: 'This is the core reason to introduce a queue: let the synchronous path stay fast while slower or bursty work is smoothed out and processed asynchronously by workers that scale on their own.' },
+        { id: 'c', text: 'It guarantees the payment will always succeed on the first attempt', correct: false, explanation: 'A queue provides durability and load-leveling for the request to process payment — it says nothing about whether the payment provider itself accepts the charge.' },
+      ],
+    },
+  ]}
+/>

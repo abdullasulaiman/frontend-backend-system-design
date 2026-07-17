@@ -1,0 +1,127 @@
+---
+title: "Common Failure Modes"
+module: "Lessons from System Failures"
+moduleOrder: 20
+order: 1
+track: "interview"
+summary: "Catalogs the recurring ways distributed systems break in production so you can name and mitigate them explicitly in a design interview."
+tags: ["reliability", "failure-modes", "distributed-systems", "resilience", "outages"]
+estMinutes: 12
+cheatsheet:
+  - "Sort failures into four buckets: infrastructure (host/AZ/network), resource exhaustion (CPU, memory, connections, disk), dependency failures (slow or down downstream), and bad deploys/config."
+  - "A slow dependency is worse than a dead one — dead fails fast, slow ties up threads and connections until the caller exhausts its own resources."
+  - "Retries without a cap or backoff turn a small downstream blip into a self-inflicted traffic spike (a retry storm) on top of an already-struggling service."
+  - "Partial failure is the default in distributed systems, not the exception — design for 'some replicas/instances are unreachable right now,' not just 'up or down.'"
+  - "Gray failure (the component reports healthy but serves errors/slow responses to real traffic) evades simple liveness checks — you need request-level success-rate and latency signals, not just ping/health endpoints."
+  - "Name the specific failure mode you're defending against in an interview ('I'm adding a timeout here because the payments service can go slow-but-alive') rather than gesturing at 'resilience' in the abstract."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every system design interview eventually asks some version of "what happens when this breaks?" Candidates who've only ever designed the happy path stall here — they reach for a vague "we'd add redundancy" and move on. Candidates who can name the *specific* way a component tends to fail, and explain why that failure mode matters for the design in front of them, stand out immediately.
+
+This lesson is a field guide to how real systems actually fail — not a single dramatic "the data center burned down" scenario, but the everyday, recurring patterns that cause the vast majority of production incidents. Later lessons in this module build directly on this vocabulary: [Cascading Failures and Backpressure](/system-design/design/failures-cascading-failures-and-backpressure) walks through how one of these failure modes propagates through a system, [Postmortems and Resilience Patterns](/system-design/design/failures-postmortems-and-resilience-patterns) covers how teams respond and harden after the fact, and [Case Examples of Notable Outages](/system-design/design/failures-case-examples-of-notable-outages) maps real incidents back to the categories you'll learn here.
+
+## What counts as a "failure mode"
+
+A failure mode is a specific, recognizable *way* a component stops doing its job correctly — not just "it's down." Down is actually the easy case: a dead process fails fast, callers get a clean connection-refused error, and load balancers route around it. Most production pain comes from failures that are messier than binary up/down:
+
+- **Total failure**: the component is unreachable or crashed. Easy to detect, easy to route around.
+- **Partial failure**: some instances, some shards, or some regions are affected while others work fine. Requests to the same logical service get inconsistent results depending on which instance they land on.
+- **Degraded / gray failure**: the component is technically "up" — it passes health checks — but serves errors, stale data, or dramatically slower responses to real traffic. This is the hardest to detect because naive monitoring (is the process alive? does `/health` return 200?) says everything is fine.
+
+Keeping this three-way distinction in mind is useful in an interview: when you say "add a health check," an interviewer will often push on whether that health check would actually catch a gray failure. Usually it wouldn't, and saying so proactively is a strong signal.
+
+## The main categories
+
+### Infrastructure and hardware failures
+
+Disks fail, NICs flake, hosts get reclaimed by the underlying platform, and entire availability zones lose power or network connectivity. Individually these are low-probability events, but at the scale of thousands of hosts, *something* in this category is happening at almost any given moment — reliability engineering treats "a disk will fail today" as a certainty, not a risk. The design implication: no single host, disk, or AZ can be a required dependency for the system to keep serving traffic.
+
+### Resource exhaustion
+
+A component doesn't need to crash to fail — it can simply run out of a resource it needs: CPU, memory, open file descriptors, database connections, thread-pool slots, or disk space. Resource exhaustion is dangerous because it's often self-reinforcing: as a service gets slower under memory pressure, requests queue up, which increases memory pressure further (more in-flight requests being buffered), which makes it slower still. A connection pool that maxes out doesn't reject new requests cleanly — it queues them until callers time out, so the failure looks like slowness everywhere rather than a clear error.
+
+### Dependency and downstream failures
+
+A service is only as healthy as the things it depends on, and those dependencies fail in two importantly different ways:
+
+- **Fail fast**: the dependency returns an error or refuses the connection immediately. Annoying, but the caller's own resources (threads, connections) are freed quickly.
+- **Fail slow**: the dependency accepts the request but takes far longer than usual to respond (or never responds). This is worse — the caller's thread, connection, and any locks it holds stay tied up waiting, and under enough load the caller runs out of *its own* resources purely because it's blocked waiting on someone else. This is the seed of a cascading failure, covered in depth in the next lesson.
+
+### Bad deploys and configuration errors
+
+A large fraction of real incidents trace back not to hardware or load at all, but to a change: a new release with a bug, a config flag flipped incorrectly, a schema migration that locks a table longer than expected, or a certificate that wasn't rotated before it expired. These are worth calling out separately because the mitigation is different from the others — the fix is process (staged rollouts, canaries, fast rollback) rather than architecture.
+
+### Load-related failure modes
+
+Some failures only appear under specific traffic shapes rather than steady-state load:
+
+- **Thundering herd**: a large number of clients wake up and retry (or reconnect, or re-request a cache-expired key) at the same instant, overwhelming a service that could easily have handled the same requests spread over time.
+- **Hot key / hot partition**: load isn't actually evenly distributed even though aggregate capacity looks fine — one shard, one cache key, or one customer's traffic concentrates on a single node and saturates it while its neighbors sit idle.
+- **Retry storms**: callers retrying a failing or slow dependency multiply the load on that dependency at exactly the moment it can least handle more, often turning a brief blip into a sustained outage.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    A[Failure Modes] --> B[Infrastructure]
+    A --> C[Resource Exhaustion]
+    A --> D[Dependency Failures]
+    A --> E[Bad Deploys / Config]
+    A --> F[Load-Related]
+    B --> B1[Disk / host / AZ loss]
+    C --> C1[CPU, memory, connection pool, disk]
+    D --> D1[Fail fast vs fail slow]
+    E --> E1[Bug, config flag, cert expiry]
+    F --> F1[Thundering herd, hot key, retry storm]
+`} />
+
+## Worked example: a slow downstream call taking down a healthy service
+
+Say you're designing an order-checkout service that calls a fraud-scoring service synchronously before confirming an order. Under normal load, fraud-scoring responds in 50ms and checkout handles 2,000 requests per second using a pool of 400 worker threads (each request occupies a thread for roughly its full round-trip, so ~200ms of buffer per thread comfortably covers it).
+
+Now the fraud-scoring service hits a garbage-collection pause and starts responding in 4 seconds instead of 50ms — it hasn't crashed, so its health check still returns healthy. Checkout's worker threads are now each tied up for 4 seconds instead of 200ms, a 20x increase in occupancy time. At the same 2,000 requests/second arrival rate, the number of concurrently-in-flight checkout requests explodes past 400, the thread pool saturates, and new checkout requests start queueing. Within a few seconds, checkout itself starts timing out for callers — a change in a dependency's *latency*, not its availability, has produced an outage in a service that never had a bug shipped and never lost a host.
+
+This is exactly why fail-slow dependency failures deserve special attention: nothing in this scenario trips a naive alert ("fraud-scoring is up," "checkout hasn't crashed") until customers are already seeing errors. A bounded timeout on the fraud-scoring call (say, 300ms) plus a fallback (approve conservatively, or queue for async review) converts this from an outage into a brief, contained degradation.
+
+<Callout type="warning">
+  The most common mistake candidates make is treating "the service might be down" as the only failure to defend against, then proposing retries and redundant instances as if that covers it. Retrying a fail-slow dependency without a strict timeout and a cap on attempts makes things *worse*, not better — you multiply load on an already-struggling service exactly when it can least absorb it. Always pair "what if this dependency is slow" with a bounded timeout and a concrete fallback, not just "what if this dependency is down."
+</Callout>
+
+<Quiz
+  lessonId="failures-common-failure-modes"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A downstream service is passing its health checks but taking 5 seconds to respond instead of its usual 50ms. Which failure category best describes this?',
+      options: [
+        { id: 'a', text: 'Total failure', correct: false, explanation: 'Total failure means the component is unreachable or crashed — this service is reachable and technically up.' },
+        { id: 'b', text: 'Gray / degraded failure', correct: true, explanation: 'The component reports healthy but serves real traffic far slower (or with errors) than normal — this is exactly the gray-failure pattern that naive health checks miss.' },
+        { id: 'c', text: 'Bad deploy', correct: false, explanation: 'Nothing here indicates a recent code or config change was the cause; a slow-but-healthy dependency can also result from load, GC pauses, or resource exhaustion elsewhere.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are examples of load-related failure modes discussed in this lesson? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A single cache key receiving disproportionate traffic and saturating one node', correct: true, explanation: 'This is a hot key / hot partition failure — uneven load concentration even when aggregate capacity looks sufficient.' },
+        { id: 'b', text: 'Thousands of clients reconnecting at the same instant after a brief network blip', correct: true, explanation: 'This is a thundering herd — synchronized retries overwhelming a service that could handle the same requests spread over time.' },
+        { id: 'c', text: 'A certificate expiring because it was never rotated', correct: false, explanation: 'This is a configuration/operational failure, not a load-related one — it would occur regardless of traffic volume.' },
+        { id: 'd', text: 'Callers retrying a failing dependency so aggressively that it never gets a chance to recover', correct: true, explanation: 'This is a retry storm — retries amplifying load on a struggling dependency at the worst possible time.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A dependency that fails fast (returns an error immediately) is generally easier to handle than one that fails slow (accepts requests but responds very slowly).',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Fail-fast releases the caller\'s threads/connections immediately; fail-slow ties up caller resources until a timeout, which can exhaust the caller\'s own capacity and cascade into a second outage.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Fail-slow is the harder case in practice — it consumes caller resources (threads, connections) for the duration of the delay, which is exactly how one dependency\'s slowdown becomes a second service\'s outage.' },
+      ],
+    },
+  ]}
+/>

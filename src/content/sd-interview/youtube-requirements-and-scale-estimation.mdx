@@ -1,0 +1,267 @@
+---
+title: "Requirements and Scale Estimation"
+module: "Design YouTube"
+moduleOrder: 1
+order: 1
+track: "interview"
+summary: "Frames the video-platform problem by scoping functional and non-functional requirements, then derives storage, bandwidth, and QPS numbers from a hypothetical user base."
+tags: ["requirements", "capacity-estimation", "video", "scalability", "interview-framework"]
+estMinutes: 12
+cheatsheet:
+  - "Separate upload traffic from watch traffic early — watch requests can outnumber uploads by 100-1000x, and the two paths need completely different scaling strategies."
+  - "A read-heavy, write-once workload (upload once, watch millions of times) means you should optimize the read path aggressively — caching and CDN placement matter more than write throughput."
+  - "Always estimate storage for the *encoded output*, not just the raw upload — multiple resolutions and bitrates from transcoding can add up to 3-5x the original file size stored per video."
+  - "Peak QPS, not average QPS, sizes your fleet — a 5-10x peak-to-average multiplier is a reasonable assumption unless the interviewer gives you a real traffic curve."
+  - "State your assumptions out loud (DAU, watch time, upload rate) before you start multiplying — the numbers matter less than showing you know which numbers matter."
+  - "Availability and durability are different guarantees: a five-nines read path can coexist with an occasional slow upload, but losing an uploaded video (durability) is rarely acceptable."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design YouTube" (or its short-form cousin, "Design TikTok") is one of the
+most common system design prompts because it forces you to reason about
+almost every hard problem in distributed systems at once: massive
+write-once/read-often data, expensive asynchronous processing, global
+content delivery, and a search/discovery layer on top. Most candidates lose
+points in the first five minutes — not because they don't know CDNs or
+transcoding, but because they jump straight to drawing boxes without
+pinning down what they're actually building or how big it needs to be.
+
+This lesson is about that first five minutes: turning a vague prompt into a
+concrete, numbered problem statement. Everything in the rest of this module
+— the data model, the upload pipeline, the CDN strategy — is a direct
+response to the numbers and constraints you establish here.
+
+## Step 1: Scope the functional requirements
+
+A video platform is a huge surface area. In an interview you have roughly
+45 minutes total, so the first job is to agree on scope with your
+interviewer rather than silently assuming everything is in play. A
+reasonable core scope to propose:
+
+- **Upload**: a creator uploads a video file with a title, description, and
+  thumbnail.
+- **Watch**: any user can stream a video, with playback that adapts to
+  their network conditions (adaptive bitrate).
+- **Browse / discover**: a home feed and a search box that return relevant
+  videos.
+- **Engagement**: likes, comments, and view counts.
+
+Explicitly call out what you're deferring, and say so out loud: live
+streaming, monetization/ads, recommendation-ranking ML, and content
+moderation are all real parts of YouTube, but each is a system design
+problem on its own. Naming them and setting them aside is a signal of
+seniority — it shows you can scope a problem instead of getting lost in it.
+
+### Non-functional requirements
+
+These matter as much as the feature list, because they drive every
+architectural decision downstream:
+
+- **Availability over consistency for watch traffic.** If a view counter
+  is off by a few hundred for a minute, nobody notices. If playback is
+  down, users notice immediately. Bias the read path toward AP (in
+  CAP terms) — eventual consistency is fine for counters and comments.
+- **Durability for uploaded content is non-negotiable.** Losing a
+  creator's only copy of a video is a much worse failure mode than a
+  stale count, so uploads need strong replication guarantees even while
+  reads stay eventually consistent.
+- **Low latency start-of-playback.** Users expect a video to start
+  playing in a second or two; buffering or long start-up delay is the
+  single biggest driver of abandonment.
+- **Global reach, variable bandwidth.** Viewers are everywhere, on
+  everything from fiber to spotty mobile data — the system has to serve
+  the same video at multiple quality levels.
+
+## Step 2: Establish the scale
+
+Vague requirements produce vague designs. Even rough, stated assumptions
+let you reason concretely. Here's a workable set of numbers for a
+large-scale (YouTube-sized, not a startup MVP) video platform — you'd
+adjust these live based on what the interviewer tells you, but this is the
+right *shape* of estimate to produce:
+
+- 1 billion total registered users, 200 million daily active users (DAU).
+- Each DAU watches an average of 5 videos per day, each video roughly 10
+  minutes long.
+- 1 in 10,000 DAU uploads a video per day (a very small fraction of users
+  are creators).
+- Average uploaded video: 10 minutes long, roughly 500 MB raw before
+  transcoding.
+
+<Callout type="tip">
+  In an interview, always say your assumptions out loud before computing
+  anything: "Let's assume 200 million DAU and a 100:1 read-to-write ratio —
+  does that sound reasonable to you, or do you have numbers in mind?" This
+  turns a monologue into a collaborative step and gives the interviewer a
+  chance to redirect you if they had a different scale in mind.
+</Callout>
+
+## Step 3: Derive traffic and storage numbers
+
+With those assumptions, work through the two traffic types separately —
+they stress completely different parts of the system.
+
+### Upload throughput
+
+- Daily uploads: 200,000,000 DAU multiplied by 1/10,000 equals 20,000
+  videos uploaded per day.
+- Uploads per second (average): 20,000 divided by 86,400 seconds is about
+  0.23 per second — trivially low on average, but uploads spike around
+  regional evenings, so provision for a peak multiplier of 5-10x, i.e.
+  roughly 1-2 uploads/sec at peak. This is a small number precisely
+  because uploading is rare compared to watching.
+- Daily raw upload volume: 20,000 videos multiplied by 500 MB equals 10 TB
+  of raw video ingested per day.
+
+### Watch (read) throughput
+
+- Daily video views: 200,000,000 DAU multiplied by 5 views equals 1
+  billion views per day.
+- Views per second (average): 1,000,000,000 divided by 86,400 is about
+  11,600 views/sec. At a 5x peak multiplier, that's roughly 58,000
+  views/sec at peak — this is the number your CDN and edge caching layer
+  has to absorb, and it dwarfs the upload path by four to five orders of
+  magnitude.
+
+This asymmetry is the single most important scale fact in this whole
+problem: **you will design the read path for ~50,000+ requests/sec, and
+the write (upload) path for a couple of requests/sec.** That's why video
+platforms lean so heavily on CDNs and caching rather than trying to scale
+a single origin to handle every view.
+
+### Storage
+
+Transcoding a source video into multiple resolutions and bitrates (say
+144p through 1080p, plus maybe 4K for some content) for adaptive
+streaming multiplies the stored footprint. A conservative rule of thumb is
+that the full set of transcoded renditions plus the original costs
+roughly 3x the original file size in storage — this varies a lot with
+codec and rendition ladder, but 3x is a reasonable interview estimate.
+
+- Daily stored volume: 10 TB raw multiplied by 3 is about 30 TB/day of
+  total storage added (original plus renditions).
+- Over one year: 30 TB multiplied by 365 is roughly 11 PB/year.
+
+That number alone tells you object storage (not a traditional database or
+local disk) is the only viable choice for video bytes, and that a
+metadata layer (titles, owners, view counts, transcoding status) has to
+be a separate, much smaller system pointing at those objects — a split
+we'll build out in the next lesson.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    U["20K uploads/day\n(~1-2/sec peak)"] --> S["Storage growth\n~30 TB/day, ~11 PB/year"]
+    V["1B views/day\n(~58K views/sec peak)"] --> R["Read path\nCDN + edge caching"]
+    S -.->|feeds| R
+    style U fill:#4a5568,color:#fff
+    style V fill:#2b6cb0,color:#fff
+    style S fill:#4a5568,color:#fff
+    style R fill:#2b6cb0,color:#fff
+`} />
+
+## Step 4: State the resulting design constraints
+
+Turn the numbers into constraints you'll defend in the rest of the
+interview:
+
+1. **Read:write ratio is roughly 50,000:1** at these assumptions
+   (11,600 views/sec versus 0.23 uploads/sec, on average) — everything
+   downstream should be optimized for cheap, cacheable reads over fast
+   writes.
+2. **Storage is dominated by encoded video bytes, not metadata** — a
+   relational database sized for metadata (titles, users, comments) is
+   irrelevant next to the petabyte-scale blob storage problem.
+3. **Upload can tolerate latency; playback can't** — transcoding a video
+   can reasonably take minutes in the background, but the user pressing
+   play needs sub-second response.
+4. **Global distribution is mandatory, not optional** — at tens of
+   thousands of views/sec spread worldwide, a single-region origin would
+   need an unrealistic amount of egress bandwidth and would add
+   cross-continent latency to every playback.
+
+<Callout type="warning">
+  A common mistake is spending ten interview minutes computing precise
+  storage and QPS numbers to two decimal places, as if precision itself
+  earns credit. It doesn't — interviewers care that you picked the right
+  *drivers* (DAU, watch time, read:write ratio) and derived a
+  directionally correct order of magnitude, then used it to justify a
+  design decision. A wildly wrong assumption stated clearly and used
+  correctly beats a precise calculation that never gets used for anything.
+</Callout>
+
+## Worked example: sanity-checking a follow-up
+
+Interviewers often probe with a follow-up like: "What if this were
+TikTok-style short video instead — 30-second clips, uploaded much more
+often?" Re-run the same method rather than starting over: if the average
+watch length drops from 10 minutes to 30 seconds but users watch far more
+clips per session (say 50 instead of 5), your views/sec estimate goes up
+roughly 10x while your per-video storage cost drops by roughly 20x
+(shorter clips, smaller files). Net effect: more requests hitting your
+read path and metadata layer, but a lighter storage footprint per item —
+which is exactly why short-video platforms invest even more heavily in
+feed-ranking and caching than in storage engineering. That's a good
+signal to give an interviewer: showing you can re-derive constraints
+under a changed assumption, not just recite the first set of numbers.
+
+## Where this leads
+
+The read-heavy, upload-light, storage-massive shape we just derived
+directly drives the high-level architecture in the next lesson: a
+metadata service backed by a database, a separate blob storage tier for
+video bytes, an asynchronous transcoding pipeline sitting between upload
+and storage, and a CDN in front of everything read-related. Keep these
+numbers in your head as you move on — every design choice from here
+should trace back to "why" in terms of the constraints above.
+
+<Quiz
+  lessonId="youtube-requirements-and-scale-estimation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Given 200 million DAU each watching 5 videos/day, which figure represents the average views-per-second the read path must sustain?',
+      options: [
+        { id: 'a', text: 'About 11,600 views/sec', correct: true, explanation: '200,000,000 x 5 = 1,000,000,000 views/day; divided by 86,400 seconds/day is approximately 11,600 views/sec on average.' },
+        { id: 'b', text: 'About 1,160 views/sec', correct: false, explanation: 'This is off by a factor of 10 — dividing 1 billion by 86,400 gives roughly 11,600, not 1,160.' },
+        { id: 'c', text: 'About 200,000 views/sec', correct: false, explanation: 'This overshoots by roughly 20x; it would only be correct if every DAU watched a video every second, which is not what the assumption states.' },
+        { id: 'd', text: 'About 58,000 views/sec', correct: false, explanation: 'This is the estimated peak figure (average times a 5x peak multiplier), not the average — a useful number, but not the one this question asks for.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasonable non-functional priorities to state upfront for a video platform like this? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Uploaded video content must be durable — losing a creator\'s only copy is unacceptable', correct: true, explanation: 'Durability of the source asset is a hard requirement; there is often no second copy anywhere else once a creator uploads.' },
+        { id: 'b', text: 'View counters must be strongly consistent across all replicas at all times', correct: false, explanation: 'View/like counters are a classic case for eventual consistency — being off by a small margin briefly is an acceptable trade for availability and throughput.' },
+        { id: 'c', text: 'Playback should start with low latency, even if that means trading off strict consistency elsewhere', correct: true, explanation: 'Fast start-of-playback is one of the most user-visible quality signals; the system should bias toward availability and low latency on the read path.' },
+        { id: 'd', text: 'The system should treat every region identically with a single central origin serving all playback requests', correct: false, explanation: 'The opposite is true — global reach at high view volume requires distributing content close to viewers (CDN/edge), not centralizing it in one origin.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Because transcoding produces several resolution/bitrate renditions per video, total stored bytes per video are typically several times larger than the original uploaded file.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — a rendition ladder for adaptive streaming (multiple resolutions and bitrates) commonly adds up to roughly 3x the original file size in total stored bytes, though the exact multiplier depends on the codec and ladder chosen.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Incorrect — storing multiple resolutions and bitrates alongside (or instead of) the original is exactly why per-video storage footprint grows well past the size of the single uploaded file.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'What is the main architectural implication of a read:write ratio on the order of hundreds of thousands to one for this system?',
+      options: [
+        { id: 'a', text: 'The upload path and the watch path should be optimized equally, since both matter to users', correct: false, explanation: 'Given the ratio, the vast majority of load and cost comes from reads; treating both paths as equally load-bearing wastes engineering effort on the far smaller upload path.' },
+        { id: 'b', text: 'The system should be designed primarily around cheap, cacheable, horizontally distributed reads, with uploads handled as a comparatively low-volume asynchronous path', correct: true, explanation: 'With reads outnumbering writes by orders of magnitude, caching, CDN placement, and read scaling dominate the design, while uploads can tolerate more relaxed, asynchronous processing.' },
+        { id: 'c', text: 'A single relational database can serve both metadata and video bytes at this scale', correct: false, explanation: 'Video bytes at petabyte scale need object/blob storage, not a relational database, regardless of the read:write ratio.' },
+        { id: 'd', text: 'The read:write ratio has no real bearing on the architecture and is only useful for capacity planning of servers', correct: false, explanation: 'The ratio directly shapes core design choices like caching strategy, CDN investment, and how asynchronous the upload pipeline can be — it is far more than a server-count input.' },
+      ],
+    },
+  ]}
+/>

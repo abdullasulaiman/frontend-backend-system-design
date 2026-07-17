@@ -1,0 +1,259 @@
+---
+title: "Requirements and Estimation"
+module: "Design Typeahead Suggestion"
+moduleOrder: 12
+order: 1
+track: "interview"
+summary: "Scopes a typeahead/autocomplete service into read-path suggestion serving and a decoupled offline ranking pipeline, then derives per-keystroke request QPS and index storage from daily search volume."
+tags: ["requirements", "capacity-estimation", "typeahead", "autocomplete", "interview-framework"]
+estMinutes: 11
+cheatsheet:
+  - "Typeahead's real load multiplier is per-keystroke fan-out: one submitted query can trigger 5-10+ suggestion requests on the way to being typed, so size QPS off requests, not off completed searches."
+  - "The read path (serving suggestions) and the write path (learning what's popular) run on completely different clocks — reads happen on every keystroke in real time; ranking data is rebuilt on a batch cadence (minutes to hours), never synchronously per request."
+  - "Never compute top-k completions live per request from raw counters — precompute a prefix-to-top-k structure offline and serve it from memory; the latency budget (well under 100ms) rules out on-the-fly aggregation."
+  - "Staleness is invisible to users (a suggestion list that's an hour old still looks correct); missing or slow suggestions are not — favor availability and aggressive caching over strict freshness."
+  - "The distinct-query corpus and its counters are cheap to store (well under a gigabyte at tens of millions of entries); the real storage design question is how aggressively you prune the prefix index, not raw scale."
+  - "Re-derive, don't guess, when an assumption changes: halving the client debounce window roughly doubles suggestion-request QPS but leaves the query-log write rate and corpus size completely untouched."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Typeahead looks like the simplest feature in the product — a dropdown under
+a search box — which is exactly why it's a good interview prompt. It hides
+a nasty combination of constraints: it fires on almost every keystroke
+across your entire user base, each response has to land in a fraction of
+the time a normal page load gets, and yet the thing it's serving (which
+queries are "popular" right now) barely changes minute to minute. Get the
+scoping wrong and you'll spend the rest of the interview designing a
+database that can't possibly answer fast enough.
+
+This lesson sets up that scoping: what the system must do, how big it is,
+and — critically — how far apart its read and write paths sit from each
+other. The trie-based data structure, ranking model, and full architecture
+in the rest of this module all build on the numbers established here.
+
+## Step 1: Scope the functional requirements
+
+State the core scope and let the interviewer redirect:
+
+- **Return top-k suggestions for a prefix.** As a user types, the system
+  returns a short, ranked list (say, 5-10 items) of likely completions for
+  whatever has been typed so far.
+- **Rank by relevance.** Initially, relevance means historical popularity —
+  how often a given query has been searched. (Personalization and
+  context-aware ranking get their own lesson later in this module.)
+- **Update over time.** Newly popular or trending queries should surface
+  within a reasonable window (minutes to hours), not instantly and not
+  never.
+- **Serve across languages/locales at a basic level.** Prefix matching
+  should work for the character sets the product supports.
+
+Explicitly defer: spelling correction and fuzzy/typo-tolerant matching,
+personalized ranking signals (past searches, location, session context),
+and voice-input parsing. Each is a legitimate deep-dive but would blow the
+scope of a single session — flag them and move on. (The next lesson covers
+the trie/data-structure question this scope implies; the one after covers
+ranking beyond raw popularity.)
+
+### Non-functional requirements
+
+- **Latency has to feel instant.** Because a request fires on nearly every
+  keystroke rather than once per page view, the server-side budget needs
+  to be tight — think comfortably under 100ms, so the round trip plus
+  client rendering still feels immediate.
+- **Reads vastly outnumber writes, and the two are decoupled.** Suggestion
+  lookups happen continuously in real time; the underlying popularity data
+  only needs to change on a batch cadence. Treat these as two different
+  systems with two different consistency and latency requirements, not one
+  system doing double duty.
+- **Availability and staleness tolerance beat strict freshness.** A
+  suggestion list built an hour ago still looks correct to the user; a
+  slow or missing dropdown does not. Favor caching and availability over
+  guaranteeing the absolute latest counts.
+- **The system must scale horizontally on the read side.** Per-keystroke
+  fan-out means suggestion-serving load grows with typing activity, not
+  just with the number of searches actually submitted.
+
+## Step 2: Establish the scale
+
+State assumptions out loud and invite correction:
+
+- 100 million daily active users of the search product.
+- Each user completes about 3 searches a day, so 300 million submitted
+  queries/day.
+- Average query length is about 20 characters.
+- The client debounces keystrokes (waits briefly for typing to pause, and
+  skips firing until at least 2 characters are typed) rather than sending
+  a request on every single character. That cuts what would otherwise be
+  up to ~18 raw keystroke events per query down to an average of 6 actual
+  suggestion requests sent per completed query typed.
+- The corpus of distinct historical queries worth tracking for suggestions
+  is about 20 million entries.
+
+<Callout type="tip">
+  Say it out loud: "I'll assume 100 million daily users doing about 3
+  searches each, with the client firing roughly 6 debounced suggestion
+  requests per query typed — does that match the scale you had in mind?"
+  A quick confirmation here means every number that follows is defensible.
+</Callout>
+
+## Step 3: Derive the numbers for each sub-system
+
+### Suggestion-read QPS (the hot path)
+
+- 300,000,000 queries/day times 6 requests/query gives 1,800,000,000
+  suggestion requests/day.
+- Average QPS: 1,800,000,000 divided by 86,400 seconds is about
+  20,800 requests/sec.
+- Search traffic has a daytime/nighttime curve rather than sharp bursts
+  like a flash sale, so a 3x peak multiplier is reasonable: roughly
+  62,500 requests/sec at peak.
+
+### Query-log write rate (the cold path)
+
+- Only completed, submitted queries get logged for future ranking — not
+  every keystroke request. That's 300,000,000/day, or about
+  3,470 writes/sec on average — appended sequentially, not requiring any
+  synchronous update to the serving structure.
+- The key relationship: **suggestion reads outnumber query-log writes by
+  exactly the per-query fan-out factor — 6-to-1 here** — purely because
+  every submitted query generates several suggestion requests on the way
+  to being typed, but only one log entry once it's submitted.
+- Critically, the serving structure itself is *not* updated per write.
+  Counts accumulate in the log, and a batch job periodically (say, hourly)
+  recomputes top-k completions and rebuilds the structure the read path
+  serves from. The online read path never touches a raw counter.
+
+### Storage: query corpus vs. serving index
+
+- The counters themselves are tiny: 20,000,000 distinct queries at roughly
+  40 bytes each (query text, an id, a count) is under 1 GB — trivial to
+  hold entirely in memory, even replicated for redundancy.
+- The serving structure (a prefix-indexed lookup annotated with each
+  prefix's current top-k) is the real design question, but even a rough
+  upper bound stays modest: after merging shared prefixes across a
+  20-million-query corpus (many queries share common prefixes like "how
+  to" or "best "), a pruned structure that only materializes prefixes with
+  meaningful traffic lands in the single-digit-to-low-tens-of-gigabytes
+  range — small enough to replicate fully across many serving nodes for
+  both redundancy and low-latency locality, unlike, say, a full-text
+  search index measured in terabytes.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    K["~20,800/sec avg, ~62,500/sec peak\nKeystroke suggestion requests"] --> S["Suggestion service\n(reads precomputed index)"]
+    Q["~3,470/sec\nSubmitted queries"] --> L["Query log"]
+    L --> A["Batch ranking job\n(hourly-ish rebuild)"]
+    A --> S
+    style K fill:#2b6cb0,color:#fff
+    style S fill:#2b6cb0,color:#fff
+    style Q fill:#9c4221,color:#fff
+    style L fill:#9c4221,color:#fff
+    style A fill:#4a5568,color:#fff
+`} />
+
+## Step 4: State the resulting design constraints
+
+1. **The read path must be served from a precomputed, in-memory structure**
+   — at 20,800 requests/sec average (62,500 at peak) with a sub-100ms
+   budget, computing top-k completions live per request is off the table.
+2. **Decouple index rebuilding from the request path entirely** — the
+   batch job that recomputes rankings from the query log runs on its own
+   schedule and swaps in a new version of the serving structure; the read
+   path is never blocked on, or aware of, that process.
+3. **Favor availability and heavy caching** — client-side local caches for
+   recently-seen prefixes, CDN/edge caching for common ones, and multiple
+   in-memory replicas of the serving structure all pay off here, since
+   staleness costs nothing visible but a slow or dropped response does.
+4. **Storage is not the hard constraint; pruning policy is** — the raw
+   corpus and counters are cheap at any reasonable scale; the actual
+   sizing decision is how aggressively you prune low-traffic prefixes out
+   of the serving structure so it doesn't grow unbounded as the corpus
+   grows.
+
+<Callout type="warning">
+  A common mistake is sizing this system off "searches per day" alone, the
+  way you'd size a normal API. That misses the per-keystroke fan-out
+  entirely — the number that actually determines your server fleet is
+  suggestion *requests*, which ran roughly 6x higher than submitted
+  queries in this estimate purely from client-side debounced fan-out. The
+  opposite mistake is just as common: because the system "learns" from
+  user behavior, candidates sometimes assume it's write-heavy. It's the
+  reverse — reads dominate by orders of magnitude, and the write side is
+  intentionally lagging and batched, never on the request's critical path.
+</Callout>
+
+## Worked example: sanity-checking a follow-up
+
+Suppose the interviewer asks: "What if we tightened the client debounce
+window so it fires twice as often — 12 requests per query instead of 6?"
+Re-derive rather than guess: suggestion requests/day go from 1.8 billion to
+3.6 billion, so average QPS roughly doubles, from ~20,800/sec to
+~41,600/sec, and peak goes from ~62,500/sec to ~125,000/sec. Nothing else
+moves: the query-log write rate stays at ~3,470/sec (still one log entry
+per *submitted* query, unaffected by how many suggestion requests it took
+to get there), and the corpus size and serving-index size are unchanged,
+since neither depends on how chatty the client is. Naming precisely which
+number a changed assumption touches — and which ones it leaves completely
+alone — is what separates a candidate who understands the system from one
+who's just re-running the same multiplication.
+
+## Where this leads
+
+The split this lesson establishes — a very high-QPS, latency-critical read
+path serving a precomputed structure, decoupled from a modest, batch-driven
+write path that reshapes that structure on its own schedule — is the shape
+every later lesson in this module builds on. The next lesson covers the
+trie (and trie variants) that make the read path fast; the one after covers
+how "top-k" gets decided once you move past raw popularity counts.
+
+<Quiz
+  lessonId="typeahead-requirements-and-estimation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'With 300 million completed queries a day and an average of 6 debounced suggestion requests fired per query typed, what is the approximate average suggestion-request rate?',
+      options: [
+        { id: 'a', text: 'About 20,800 requests/sec', correct: true, explanation: '300,000,000 times 6 is 1,800,000,000 requests/day; dividing by 86,400 seconds gives about 20,800 requests/sec.' },
+        { id: 'b', text: 'About 3,470 requests/sec', correct: false, explanation: 'That is the query-log write rate (one entry per submitted query), not the suggestion-request rate, which is 6x higher due to per-keystroke fan-out.' },
+        { id: 'c', text: 'About 125,000 requests/sec', correct: false, explanation: 'That is closer to the peak rate under a doubled fan-out factor (12 requests/query) from the worked example, not the average rate at the original 6-requests/query assumption.' },
+        { id: 'd', text: 'About 3,600,000,000 requests/sec', correct: false, explanation: 'That confuses the daily request total (1.8 billion) with a per-second rate; dividing by seconds in a day is required to get requests/sec.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasonable non-functional priorities for a typeahead service? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The read path should tolerate suggestion data that is minutes to hours stale', correct: true, explanation: 'Staleness is invisible to the user — a popularity-ranked list built an hour ago still looks correct — so trading strict freshness for availability and speed is the right call.' },
+        { id: 'b', text: 'Every suggestion request should recompute top-k directly from raw query counters to guarantee up-to-the-second accuracy', correct: false, explanation: 'That reintroduces expensive live computation on the hot path, which the sub-100ms latency budget cannot afford at tens of thousands of requests/sec — precompute offline instead.' },
+        { id: 'c', text: 'The suggestion-serving path should be able to scale horizontally independent of how the ranking data gets rebuilt', correct: true, explanation: 'Because the read and write paths run on very different clocks (real time vs. batch), the serving layer needs to scale on its own to absorb keystroke-driven load without being coupled to the rebuild job.' },
+        { id: 'd', text: 'Losing a suggestion response for a few users during a brief outage is as unacceptable as losing a payment transaction', correct: false, explanation: 'A missed suggestion is a minor UX blemish, not a correctness failure like a lost payment — this system should favor availability and speed over the kind of strict guarantees a payment or trip-assignment system needs.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In this lesson\'s estimate, the query-log write rate is higher than the suggestion-request read rate.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The opposite is true — reads (~20,800/sec) run about 6x higher than log writes (~3,470/sec), because each submitted query generates several suggestion requests via keystroke fan-out but only one log entry.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — suggestion reads dominate query-log writes by the per-query fan-out factor (6-to-1 in this estimate), which is the central insight of this lesson\'s numbers.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why does this lesson recommend rebuilding the suggestion-serving structure on a batch schedule rather than updating it synchronously on every submitted query?',
+      options: [
+        { id: 'a', text: 'Because the read path needs a stable, precomputed structure it can serve from a memory lookup within a tight latency budget, and staleness of a few minutes to hours is invisible to users, so there is no benefit to paying for synchronous updates', correct: true, explanation: 'The whole point of decoupling is that the read path stays fast and simple (serve from memory) while the ranking data changes on a cadence users cannot perceive anyway — synchronous updates would only add latency risk for no visible gain.' },
+        { id: 'b', text: 'Because the query log is too large to process more than once an hour on any available hardware', correct: false, explanation: 'The batch cadence is a design choice driven by staleness tolerance and decoupling the hot path, not a hardware limitation — the log volume here (a few thousand writes/sec) is not large by distributed-systems standards.' },
+        { id: 'c', text: 'Because suggestion requests and query-log writes must never touch the same storage system for security reasons', correct: false, explanation: 'There is no such security constraint in this scenario; the reason for separating the paths is latency and load isolation, not access control.' },
+        { id: 'd', text: 'Because personalized ranking requires an hourly batch job by definition', correct: false, explanation: 'Personalization is a separate topic covered in a later lesson and is not the reason for batching here — the batch cadence is about decoupling read latency from write/rebuild cost, independent of whether ranking is personalized.' },
+      ],
+    },
+  ]}
+/>

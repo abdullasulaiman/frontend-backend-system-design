@@ -1,0 +1,272 @@
+---
+title: "Requirements and Estimation"
+module: "Design a Proximity Service (Yelp)"
+moduleOrder: 4
+order: 1
+track: "interview"
+summary: "Scopes a Yelp-style nearby-places service into its core search and listing-management features, then derives read/write QPS and storage estimates that show why proximity search is a read-heavy, small-dataset, index-bound problem."
+tags: ["requirements", "capacity-estimation", "proximity-search", "geospatial", "interview-framework"]
+estMinutes: 11
+cheatsheet:
+  - "Scope the core loop first: given a location and a radius, return ranked nearby places — everything else (reviews, photos, personalization) is a follow-on feature, not the core problem."
+  - "Proximity search is extremely read-heavy: business listings change rarely, but every user opens the app and searches nearby constantly, so read:write ratios of several hundred to one are typical."
+  - "Business/listing metadata is usually small in aggregate (tens of gigabytes for tens of millions of places) — the hard part is never raw storage, it's answering radius queries fast at high QPS."
+  - "A naive lat/lng bounding-box filter is not a geospatial index — it degrades badly at scale and distorts near the poles, since a degree of longitude covers less physical distance as latitude increases."
+  - "Search area scales with the square of the radius, not linearly — tripling the radius means roughly nine times as many candidate places to rank, even though the number of results returned stays the same."
+  - "State your assumptions (place count, DAU, searches per user, default radius) out loud before computing anything — the interviewer should be able to correct a wrong assumption before it propagates into every downstream number."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Find good sushi near me" looks like a trivial database query until you
+have to make it fast at scale. A user opens the app expecting a ranked
+list of restaurants sorted by how close they are — not by a text match on
+the word "sushi," and not from a table scan over every business on the
+continent. That's the core of a proximity service like Yelp: locate
+businesses (or drivers, listings, any geotagged entity) within a radius of
+a point, and rank them by distance and relevance, fast and at volume.
+
+Before touching any indexing structure or service design, scope what "the
+system" covers and put real numbers on how much traffic and data it
+handles. Those numbers decide almost everything downstream: whether a
+simple index suffices or you need a specialized geospatial one, whether
+the bottleneck is storage or query throughput, and how the write path
+(adding and updating listings) differs from the read path (searching).
+This lesson is that scoping step — the high-level design, indexing, and
+scaling lessons that follow all lean on the constraints set here.
+
+## Step 1: Scope the functional requirements
+
+Propose a core feature set and confirm it with the interviewer rather than
+assuming you both mean the same thing by "Yelp":
+
+- **Nearby search**: given a user's location (or a searched location) and
+  a radius, return a ranked list of businesses within that radius,
+  optionally filtered by category ("coffee," "plumber," "sushi").
+- **Ranking**: results are ordered primarily by distance, though a real
+  system blends in rating and relevance — for this lesson, treat distance
+  as the primary signal and note that ranking blending is a design detail
+  for later.
+- **Business detail view**: viewing a single business's full profile
+  (hours, address, phone, aggregate rating).
+- **Business listing management**: a business owner (or an admin pipeline)
+  can add a new listing or update an existing one's location, hours, or
+  category.
+
+Explicitly defer, and say so out loud: review text and photo storage,
+personalized recommendations, real-time chat, and ride-hailing-style live
+driver matching are all real extensions of "find something nearby," but
+each is its own design problem. Naming what's out of scope signals you
+understand the size of the problem, not just its name.
+
+### Non-functional requirements
+
+- **Low, predictable read latency.** A search should return in well under
+  a second — treat 200ms as the budget for the search path end to end.
+  Users abandon a search UI that feels sluggish.
+- **Read-heavy by a wide margin.** Businesses open, close, and move
+  rarely; users search constantly. Design for a read:write ratio in the
+  hundreds-to-one range, not something closer to 1:1.
+- **Availability and eventual consistency over strict consistency.** If a
+  business updates its hours and it takes a minute to show up for every
+  searcher, nobody notices. Favor an always-available search path over one
+  that blocks on strong consistency guarantees.
+- **Geospatially skewed load.** Search volume clusters where businesses
+  cluster — dense urban cores generate far more query and data density per
+  square mile than rural areas, and this skew is spatial, not just
+  temporal (it also has a strong time-of-day component: lunch and dinner
+  hours spike volume in a given city).
+
+## Step 2: Establish the scale
+
+Pick concrete numbers and state them as assumptions to be corrected, not
+facts:
+
+- 50 million monthly active users (MAU), 10 million daily active users
+  (DAU).
+- Each DAU performs an average of 5 nearby searches per day (browsing
+  categories, re-searching after moving, checking a few options before
+  picking one).
+- 50 million business listings in the system.
+- 20,000 new business listings added per day; 100,000 existing listings
+  updated per day (hours, address corrections, category changes).
+- Default search radius is 5 miles, returning the top 20 ranked results
+  per query.
+
+<Callout type="tip">
+  Say the numbers out loud before computing anything: "I'll assume 10
+  million DAU, 5 searches per user per day, and 50 million total business
+  listings — does that match the scale you have in mind?" This turns
+  estimation into a checkpoint with the interviewer instead of a silent
+  monologue they have to evaluate after the fact.
+</Callout>
+
+## Step 3: Derive the core numbers
+
+### Search QPS
+
+- Daily searches: 10,000,000 DAU multiplied by 5 searches is 50,000,000
+  searches/day.
+- Average QPS: 50,000,000 divided by 86,400 seconds is about 580
+  queries/sec.
+- Peak QPS: search traffic spikes hard around lunch and dinner in any
+  given time zone. A 4x peak multiplier is reasonable, putting peak load
+  at roughly 2,300 queries/sec.
+
+### Write QPS
+
+- Daily writes: 20,000 new listings plus 100,000 updates is 120,000
+  writes/day.
+- Average write QPS: 120,000 divided by 86,400 is about 1.4 writes/sec.
+
+That puts the read:write ratio at roughly 580 to 1.4 — over 400:1. This is
+the single most important shape of the problem: almost all engineering
+effort goes into making the read (search) path fast and scalable, while
+the write path can be comparatively simple and doesn't need to optimize
+for throughput.
+
+### Storage
+
+- A core business record (ID, name, category, address, latitude/longitude,
+  phone, hours, aggregate rating) runs about 500 bytes. 50,000,000 records
+  multiplied by 500 bytes is 25 GB.
+- A geospatial index entry per business (the structure that maps a
+  location to nearby business IDs, covered in the next lesson) adds
+  roughly another 100 bytes per business, or about 5 GB.
+
+Both numbers are small — tens of gigabytes total, not the petabyte scale
+of map tiles or video. That's a useful, counter-intuitive takeaway: **a
+proximity/listings service is rarely storage-bound.** The challenge is
+answering "what's near this point" fast at a few thousand queries per
+second, not fitting the data somewhere — the core dataset comfortably
+fits in memory across a modest cluster.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    S["Search requests\n~580/sec avg, ~2.3K/sec peak"] --> API["Search API"]
+    API --> IDX["Geospatial index\n~5 GB, in-memory"]
+    IDX --> DB["Business records\n~25 GB"]
+    W["Listing writes\n~1.4/sec"] --> WAPI["Write API"]
+    WAPI --> DB
+    WAPI --> IDX
+    style S fill:#2b6cb0,color:#fff
+    style W fill:#9c4221,color:#fff
+    style IDX fill:#4a5568,color:#fff
+`} />
+
+## Step 4: Turn estimates into design constraints
+
+1. **The read path dominates every design decision.** At a 400:1
+   read:write ratio, optimize aggressively for search latency and
+   throughput; the write path just needs to be correct and eventually
+   consistent, not blazing fast.
+2. **The dataset is small enough to live in memory.** 25-30 GB of business
+   data plus index overhead means a well-designed system can serve most or
+   all of this from RAM across a small cluster — the bottleneck is query
+   pattern, not disk I/O or total bytes.
+3. **A naive bounding-box or full-table filter won't hit the 200ms
+   budget.** At ~2,300 peak queries/sec against a growing candidate set
+   per query, you need a structure purpose-built for "find nearby points"
+   rather than a linear scan with a distance check on every row.
+4. **Writes can propagate on a relaxed schedule.** Since business updates
+   are rare and staleness of a minute or two is invisible to users, the
+   write path can favor simplicity and availability over synchronous,
+   strongly consistent index updates.
+
+<Callout type="warning">
+  A common mistake is reaching straight for `WHERE lat BETWEEN x1 AND x2
+  AND lng BETWEEN y1 AND y2` and calling it a proximity search. Two
+  problems: first, a naive bounding box on raw latitude/longitude columns
+  can't be indexed efficiently by a standard B-tree once you filter on
+  both dimensions at once, so it degrades toward a full scan as the table
+  grows. Second, a degree of longitude represents a different physical
+  distance depending on latitude — a box that's correct in size near the
+  equator is far too wide near the poles. Both problems point to the same
+  fix: use a structure designed for two-dimensional locality (covered in
+  the geospatial indexing lesson), not a plain range filter on two
+  independent columns.
+</Callout>
+
+## Worked example: what changes if the radius triples?
+
+Suppose an interviewer asks: "What if we increase the default search
+radius from 5 miles to 15 miles?" The number of searches per day doesn't
+change — users still search 5 times a day on average — so average and
+peak QPS stay at roughly 580/sec and 2,300/sec. What changes is the amount
+of work each query does.
+
+Search area scales with the square of the radius: tripling the radius (5
+to 15 miles) multiplies the covered area by 3 squared, or 9x. Assuming
+businesses are distributed with roughly similar density, the number of
+candidate businesses a query has to consider before ranking the top 20
+also grows roughly 9x. The response still returns the same 20 results, but
+the underlying index now has to prune a much larger candidate set within
+the same 200ms budget.
+
+This is the distinction worth stating explicitly in an interview: **QPS
+alone doesn't capture query cost.** A radius change that leaves request
+volume untouched can still meaningfully increase the work per request,
+and that's exactly the kind of change that should push you toward a
+tiered or adaptive indexing structure rather than a fixed-resolution grid
+that either wastes cells in sparse areas or gets overloaded in dense ones.
+
+## Where this leads
+
+Two numbers from this lesson carry into the rest of the module: the
+roughly 400:1 read:write ratio, which justifies optimizing almost
+exclusively for the search path, and the fact that the core dataset (tens
+of gigabytes) is small enough to keep largely in memory. Both point toward
+the same next question — what data structure actually answers "which
+businesses are near this point" efficiently at a few thousand queries per
+second — which is exactly what the geospatial indexing lesson covers next.
+
+<Quiz
+  lessonId="proximity-requirements-and-estimation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'With 10 million DAU each performing 5 nearby searches per day, what is the approximate average search QPS?',
+      options: [
+        { id: 'a', text: 'About 580 queries/sec', correct: true, explanation: '10,000,000 DAU x 5 searches = 50,000,000 searches/day; divided by 86,400 seconds is about 580/sec.' },
+        { id: 'b', text: 'About 2,300 queries/sec', correct: false, explanation: 'That is the estimated peak QPS after applying a 4x peak multiplier for lunch/dinner spikes, not the average.' },
+        { id: 'c', text: 'About 1.4 queries/sec', correct: false, explanation: 'That figure is the estimated average write QPS (new listings plus updates), a much lower-volume path than search.' },
+        { id: 'd', text: 'About 50,000,000 queries/sec', correct: false, explanation: 'That is the total number of searches per day, not a per-second rate — it still needs to be divided by the number of seconds in a day.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasonable non-functional priorities for a nearby-places search service? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Favor availability and eventual consistency for business listing updates over strict, synchronous consistency', correct: true, explanation: 'A business hours change that takes a minute to propagate to search results is invisible to users; blocking search availability for strict consistency is not worth the cost.' },
+        { id: 'b', text: 'Design the search path to comfortably return results in well under a second', correct: true, explanation: 'Search is the dominant, latency-sensitive path in this system; a sluggish nearby search directly hurts the core user experience.' },
+        { id: 'c', text: 'Optimize the write path for maximum throughput since listing updates are the primary load', correct: false, explanation: 'The opposite is true — this lesson\'s own estimate puts the read:write ratio at roughly 400:1, so search reads, not listing writes, are the dominant load to optimize for.' },
+        { id: 'd', text: 'Treat search load as evenly distributed across geography, since users are spread out globally', correct: false, explanation: 'Search volume is spatially skewed — it clusters wherever businesses and population density cluster (dense urban cores vs. rural areas), plus a separate time-of-day skew around meal times.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Tripling the search radius (for example, from 5 miles to 15 miles) roughly triples the number of candidate businesses a query needs to consider, assuming uniform business density.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Search area scales with the square of the radius, not linearly. Tripling the radius multiplies the covered area by 3 squared, or 9x, not 3x.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — because area scales with radius squared, tripling the radius multiplies the candidate area (and roughly the candidate business count, under uniform density) by about 9x.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Given roughly 25-30 GB of business and index data for 50 million listings, but a 200ms search latency budget at thousands of queries per second, what is the actual engineering bottleneck this system needs to solve?',
+      options: [
+        { id: 'a', text: 'Answering "what is near this point" quickly at high query volume, not fitting the data in storage', correct: true, explanation: 'At tens of gigabytes, the dataset comfortably fits in memory across a modest cluster — the hard problem is query pattern and latency at scale, which is why a purpose-built geospatial index matters far more than raw storage capacity.' },
+        { id: 'b', text: 'Finding enough disk capacity to store all business records', correct: false, explanation: 'Roughly 25-30 GB total is a small amount of data by modern standards and is not a storage capacity problem.' },
+        { id: 'c', text: 'Keeping the write path fast enough to handle listing updates', correct: false, explanation: 'Writes run at roughly 1.4/sec on average in this estimate — far too low a volume to be the system\'s bottleneck compared to the read path.' },
+        { id: 'd', text: 'Compressing business records to reduce network bandwidth', correct: false, explanation: 'At 500 bytes per record and 20 results per query, response payload size is not the limiting factor here; query latency against the index is.' },
+      ],
+    },
+  ]}
+/>

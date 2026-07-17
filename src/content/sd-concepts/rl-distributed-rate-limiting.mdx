@@ -1,0 +1,213 @@
+---
+title: "Distributed Rate Limiting"
+module: "Rate Limiter"
+moduleOrder: 19
+order: 3
+track: "concept"
+summary: "Explains why counting requests gets hard once a rate limiter runs on many servers, and how shared state, sticky routing, and approximate counting solve it."
+tags: ["rate-limiting", "distributed-systems", "redis", "consistency", "scalability"]
+estMinutes: 12
+cheatsheet:
+  - "A rate limiter with per-server local counters lets a client get N times the limit by spreading requests across N servers behind a load balancer."
+  - "Sticky sessions fix the correctness problem but reintroduce the load-balancing problem: one very active client pins one server unevenly."
+  - "A shared store (Redis/Memcached) gives one global counter per key, but every request now pays a network round trip and the store becomes a new single point of contention."
+  - "Lua scripts or Redis's built-in atomic ops (INCR + EXPIRE, or a sorted set for sliding windows) avoid check-then-act races between concurrent requests hitting the same key."
+  - "Local caching with periodic sync trades strict accuracy for lower latency — good enough for abuse prevention, wrong for billing-grade quotas."
+  - "Under network partitions, decide explicitly: fail open (allow, protect availability) or fail closed (deny, protect the backend) — this is a CAP-style trade-off, not a bug to fix."
+  - "Consistent hashing (route by client key, not round robin) shrinks the problem back toward the single-server case without needing a shared store at all."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson covered token bucket, leaky bucket, and fixed/sliding
+windows as if a rate limiter were one process holding one counter in memory.
+That's true for a single instance — and false for almost every real
+deployment. A rate limiter for a public API sits behind a load balancer with
+tens or hundreds of identical instances, and the algorithm you picked doesn't
+matter if the counting itself is wrong. This lesson is about that counting
+problem: how do independent processes agree on "how many requests has this
+client made in the last second" without serializing every request through one
+machine.
+
+## The problem: local counters lie
+
+Say your limit is 100 requests/minute per API key, enforced with an in-memory
+token bucket on each server. A load balancer spreads traffic round robin
+across 10 servers. A client can now send 1,000 requests/minute — 100 to each
+server — and every single server will honestly report "this client is under
+its limit." Each instance is correct in isolation; the system as a whole is
+not enforcing the limit it advertises.
+
+This isn't a rare edge case — it's the default outcome of combining
+per-server state with any load balancer that isn't aware of the rate limiter's
+keys. You have three broad ways out: pin each client to one server, share the
+counter, or accept approximate enforcement.
+
+## Option 1: Sticky routing (make local state correct again)
+
+If the load balancer routes every request for a given client key (API key,
+user ID, IP) to the *same* server — via consistent hashing on that key,
+rather than round robin — then that server's local counter is once again the
+true count for that client. No shared store, no network hop, no new
+bottleneck. This is the cheapest fix when it's available.
+
+The catch: it pushes the "hot key" problem onto individual servers. A client
+key that generates disproportionate traffic (a big customer, a misbehaving
+script) now loads one server instead of being spread out, and if that server
+restarts, its in-memory counters vanish — the client effectively gets a free
+reset. Consistent hashing also complicates capacity changes: adding or
+removing a server reshuffles which keys land where, and you need the hash
+ring (see the Load Balancing module) to keep that reshuffling minimal.
+
+## Option 2: Shared counter store (make the state actually global)
+
+The more common production answer: move the counter out of each server's
+memory and into a shared, fast store — typically Redis — keyed by
+`client_id:window`. Every server, regardless of which one the load balancer
+picked, increments and reads the *same* counter for a given client and time
+window.
+
+This fixes correctness cleanly but introduces new problems:
+
+- **Every rate-limit check is now a network round trip.** At high QPS this
+  store must be fast (sub-millisecond) and itself horizontally scalable —
+  it's now on the hot path of every single request in your system, not just
+  the requests that get rejected.
+- **Concurrent updates need atomicity.** Two servers reading the counter,
+  both seeing "99, still under 100," and both incrementing, can let 101
+  through. Plain `GET` then `SET` from your application code has this race.
+  Redis's `INCR` is atomic for a simple fixed-window counter; for anything
+  more elaborate (sliding window, token bucket with a refill calculation) you
+  push the whole check-and-update as a single Lua script so Redis executes
+  it atomically server-side, with no read-modify-write gap for another
+  request to slip into.
+- **The store is now a shared dependency for the whole fleet.** If it's
+  down or slow, every rate-limited endpoint is affected, not just one
+  server's worth of traffic. This is why the fail-open/fail-closed decision
+  below matters so much more here than in the single-server case.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    C1[Client A request] --> LB[Load balancer]
+    C2[Client A request] --> LB
+    LB --> S1[Server 1]
+    LB --> S2[Server 2]
+    S1 <--> R[(Shared counter store<br/>Redis: key = clientA:window)]
+    S2 <--> R
+    R --> D{count less than limit?}
+    D -->|yes| A1[Allow, INCR count]
+    D -->|no| A2[Reject 429]
+`} />
+
+## Option 3: Approximate counting (trade accuracy for speed)
+
+If a shared store's latency or throughput cost is unacceptable, you can loosen
+the guarantee instead of tightening the architecture. Two common approximate
+strategies:
+
+- **Local counters with periodic reconciliation.** Each server keeps its own
+  in-memory counter and pushes deltas to the shared store every N
+  milliseconds (or pulls the global count) instead of syncing on every
+  request. This turns every rate-limit check back into a cheap local memory
+  read, at the cost of the global count lagging reality by up to N
+  milliseconds — a client can briefly overshoot the limit by roughly (fleet
+  size x local burst allowance) before the fleet catches up.
+- **Probabilistic data structures.** For very high cardinality (millions of
+  distinct client keys) or where "roughly right" is fine, a sketch structure
+  can approximate per-key counts in a fixed memory footprint. This is
+  overkill for a typical per-user API limiter but shows up in abuse-detection
+  and DDoS-mitigation systems counting billions of distinct keys.
+
+The right trade-off is entirely about what the limit *protects*. A limit
+protecting your backend from overload can tolerate a client sneaking through
+110 requests instead of 100 — the backend barely notices. A limit that's
+actually a billing quota ("100 free API calls, then you pay") cannot tolerate
+that slack; get that one wrong and you're giving away paid usage for free.
+
+<Callout type="warning">
+  A common mistake in system design interviews: proposing "just put a Redis
+  counter in front of it" as if that alone solves distribution, without
+  addressing the two things that actually make it correct. First, the
+  increment-and-check must be atomic (a Lua script or `INCR`, never separate
+  `GET` then `SET` calls from application code) — otherwise concurrent
+  requests race past the limit exactly like uncoordinated local counters did.
+  Second, you must state what happens when Redis is slow or unreachable: failing
+  closed (deny everything) turns a rate-limiter outage into a full API outage;
+  failing open (allow everything) turns it into an unprotected backend during
+  exactly the traffic spike you built the limiter for. Naming this trade-off
+  explicitly is what separates a strong answer from a hand-wave.
+</Callout>
+
+## Worked example: sizing the shared store
+
+Say you're rate limiting 500,000 active API keys at up to 100 requests/minute
+each, and every request needs a limiter check. Peak traffic is 200,000
+requests/second across the fleet.
+
+With a naive "one Redis round trip per request" design, your Redis cluster
+now needs to sustain 200,000 ops/sec of atomic increment-and-check just for
+rate limiting — on top of whatever else it's used for. A single Redis node
+comfortably handles low hundreds of thousands of simple ops/sec, so this is
+plausible on dedicated hardware but leaves no headroom, and Redis itself
+becomes a component you now have to make highly available (replication,
+failover) purely to keep serving traffic.
+
+Compare that to the local-counter-with-reconciliation approach: if each
+server syncs deltas every 100ms instead of every request, and you have 50
+servers, you've cut shared-store traffic from 200,000 ops/sec to roughly
+500/sec (50 servers x 10 syncs/sec), at the cost of each client being able to
+transiently exceed its limit by up to (its share of traffic across 50 servers
+x 100ms of unsynced local counting) — typically a handful of extra requests,
+not hundreds. For abuse prevention, that's almost always an acceptable price
+for a 400x reduction in shared-store load.
+
+## Quiz
+
+<Quiz
+  lessonId="rl-distributed-rate-limiting"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A rate limiter enforces 100 requests/minute per API key using an in-memory counter on each of 20 servers behind a round-robin load balancer. What is the practical effect for a client that can spread its calls across all servers?',
+      options: [
+        { id: 'a', text: 'The client is still capped at 100 requests/minute total, since the limit is defined per API key.', correct: false, explanation: 'The limit is defined per key, but each server only knows its own local count — nothing enforces the sum across servers.' },
+        { id: 'b', text: 'The client can achieve close to 2,000 requests/minute, since each server independently allows up to 100.', correct: true, explanation: 'Round robin spreads the client\'s requests across all 20 servers, and each one independently permits up to 100/minute before its own local counter trips.' },
+        { id: 'c', text: 'The load balancer detects the shared API key and merges the counts automatically.', correct: false, explanation: 'A standard load balancer routes by policy (round robin, least connections, etc.); it has no built-in awareness of application-level rate-limit keys.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are real costs introduced by moving rate-limit counters into a shared store like Redis (compared to per-server local counters)? Select all that apply.',
+      options: [
+        { id: 'a', text: 'Every rate-limit check now costs a network round trip.', correct: true, explanation: 'The counter is no longer in the checking server\'s own memory, so each check has to reach the shared store over the network.' },
+        { id: 'b', text: 'The shared store becomes a dependency whose own availability now affects every rate-limited request.', correct: true, explanation: 'If the store is down or slow, every server\'s ability to check the limit is affected — it is a new shared failure point on the hot path.' },
+        { id: 'c', text: 'It becomes impossible to enforce sliding-window algorithms, only fixed windows.', correct: false, explanation: 'Sliding windows work fine against a shared store — a sorted set keyed by timestamp is a common Redis-based implementation of a sliding window.' },
+        { id: 'd', text: 'Concurrent increments from different servers can race unless the check-and-increment is atomic.', correct: true, explanation: 'A plain read-then-write from application code has a gap where two servers can both see "under limit" and both allow a request that pushes the count over. This needs an atomic primitive (INCR, or a Lua script).' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'When a shared rate-limit store becomes unreachable, failing closed (rejecting all requests) is always the safer choice compared to failing open (allowing all requests).',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Failing closed turns a rate-limiter outage into a full API outage for every user, even well-behaved ones — that is often worse than the abuse risk of briefly failing open, depending on what the limiter protects.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. It is a genuine trade-off: fail closed protects the backend but takes down the whole API during a store outage; fail open keeps the API available but removes protection exactly when a spike might be happening. The right choice depends on what the limit is protecting.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A team routes requests using consistent hashing on the client\'s API key instead of round robin, and keeps rate-limit counters in server-local memory. What problem does this reintroduce that a shared store does not have?',
+      options: [
+        { id: 'a', text: 'Concurrent increments from different servers racing past the limit.', correct: false, explanation: 'That race is specific to multiple servers sharing one counter for the same key. With consistent hashing, only one server ever handles a given key, so there is no concurrent-increment race for that key.' },
+        { id: 'b', text: 'A single high-traffic client key concentrating load on one server, and losing its count if that server restarts.', correct: true, explanation: 'Pinning a key to one server for correctness means that server absorbs all of that key\'s traffic (a hot-key/hot-server problem), and an in-memory counter is lost on restart, effectively resetting that client\'s usage.' },
+        { id: 'c', text: 'The need for every request to make a network round trip to check the limit.', correct: false, explanation: 'The opposite is true — with local counters, checks are in-memory and fast; the network round trip is the cost of the shared-store approach, not this one.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,229 @@
+---
+title: "Algorithms: Token Bucket, Leaky Bucket, and Windows"
+module: "Rate Limiter"
+moduleOrder: 19
+order: 2
+track: "concept"
+summary: "Compares the five algorithms rate limiters actually use in production — token bucket, leaky bucket, fixed window, sliding log, and sliding window counter — on burst tolerance, accuracy, and memory cost."
+tags: ["rate-limiting", "algorithms", "throttling", "distributed-systems"]
+estMinutes: 13
+cheatsheet:
+  - "Token bucket: tokens refill at a steady rate into a capped bucket; a request is allowed if a token is available. Allows bursts up to bucket capacity, then throttles to the refill rate."
+  - "Leaky bucket: requests join a fixed-size queue drained at a constant rate. Smooths output to a strict constant rate but adds queueing latency and can drop new requests when the queue is full."
+  - "Fixed window counter is cheap (one counter per window) but lets up to 2x the limit through at a window boundary, since two adjacent windows are independent."
+  - "Sliding window log is exact (stores every request timestamp) but memory cost grows with request volume — expensive at high QPS."
+  - "Sliding window counter approximates the sliding log with O(1) memory by blending the previous window's count, weighted by overlap, with the current window's count."
+  - "Pick token bucket when bursts are fine (most APIs); leaky bucket when downstream needs a constant processing rate; sliding window counter when boundary accuracy matters more than a few bytes of memory."
+  - "The algorithm choice is orthogonal to where state lives — that's the distributed-counters problem, covered next."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson settled *what* to enforce — a limit like 100 requests per
+minute per user, with a documented response when it's exceeded. This lesson
+is about *how* to enforce it. That "how" is a single counting algorithm, and
+it turns out there are only a handful of real choices, each with a distinct
+personality: some let traffic burst, some flatten it to a dead-constant rate,
+some are exact but memory-hungry, some are approximate but cheap. Pick the
+wrong one and you'll either reject legitimate bursty clients or let a client
+blow through your limit by 2x right at a window boundary — a bug that looks
+fine in testing and shows up in production under real traffic patterns.
+
+## The trade-off every algorithm makes
+
+Every rate-limiting algorithm answers three questions differently:
+
+- **Does it allow bursts**, or does it force a perfectly smooth rate?
+- **How much memory** does it need per client to track state?
+- **How accurate** is it at the edges — specifically, at window boundaries?
+
+There's no universally "best" algorithm — the right one depends on whether
+your downstream system tolerates bursts (most do, within reason) or needs a
+strictly constant input rate (a legacy batch processor, a fixed-capacity
+worker pool).
+
+## Token bucket
+
+Each client (or API key, or IP) gets a bucket with a maximum capacity of `N`
+tokens. Tokens are added at a fixed refill rate — say 10 tokens/second — up
+to that cap. Every incoming request tries to remove one token; if a token is
+available, the request is allowed and the token is consumed. If the bucket is
+empty, the request is rejected (or queued, depending on design).
+
+The key property: a client that's been idle accumulates tokens up to the
+cap, so it can burst up to `N` requests instantly, then settles into the
+steady refill rate. This matches how real clients behave — a mobile app that
+syncs after being backgrounded, a batch job that fires 20 calls back-to-back
+then goes quiet. Token bucket is the default choice for most public APIs
+(it's what Stripe's and AWS's public docs describe their own limiters as
+resembling) because it's forgiving of natural burstiness without abandoning
+the average-rate guarantee.
+
+Implementation is cheap: per client you store `(tokens, last_refill_timestamp)`.
+On each request, compute elapsed time since `last_refill_timestamp`, add
+`elapsed * refill_rate` tokens (capped at `N`), then check and decrement.
+
+## Leaky bucket
+
+Leaky bucket flips the mental model from "credits you spend" to "a queue you
+drain." Requests arrive and join a fixed-size queue (the "bucket"). A
+background process pulls requests off the queue and processes them at a
+strictly constant rate — the "leak." If the queue is full when a new request
+arrives, that request is dropped (or rejected upfront).
+
+The output rate is perfectly smooth no matter how bursty the input is — that's
+the whole point. This is the right fit when the *downstream* system genuinely
+needs a constant rate: a fixed pool of workers calling a third-party API that
+enforces its own strict per-second cap, or a network link you don't want to
+saturate in spikes. The cost is added latency (a request sits in the queue
+waiting its turn) and a queue that needs its own capacity limit, which is
+another parameter to tune.
+
+Token bucket and leaky bucket are often confused because both use a
+"bucket" metaphor, but they optimize for opposite things: token bucket
+optimizes for *client experience under bursts*, leaky bucket optimizes for
+*downstream rate smoothness*.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph TB["Token bucket"]
+        direction LR
+        R1[Refill: +1 token/100ms] --> Bucket1((Bucket, cap 10))
+        Req1[Request] -->|has token?| Bucket1
+        Bucket1 -->|yes: consume, allow| Allow1[Allowed]
+        Bucket1 -->|no: reject| Deny1[429]
+    end
+    subgraph LB["Leaky bucket"]
+        direction LR
+        Req2[Request] -->|queue full?| Queue((Queue, cap 10))
+        Queue -->|drain at fixed rate| Worker[Process request]
+        Queue -->|full: reject| Deny2[429]
+    end
+`} />
+
+## Fixed window counter
+
+The simplest approach: divide time into fixed windows (e.g. one-minute
+buckets aligned to the clock), keep a single counter per client per window,
+increment on each request, and reject once the counter hits the limit. Reset
+the counter to zero when a new window starts.
+
+It's cheap — one integer per client — and easy to reason about. The problem
+is the boundary: nothing stops a client from sending the full limit in the
+last instant of one window and the full limit again in the first instant of
+the next. A 100-req/min limit can let through nearly 200 requests in a
+one-second span straddling the boundary, because the two windows are counted
+completely independently.
+
+## Sliding window log
+
+Fix the boundary problem with brute force: store a timestamp for every
+request in a sorted structure (per client). On each new request, drop
+timestamps older than `now - window_size`, then check if the remaining count
+is under the limit. This is exact — there is no boundary artifact, because
+the "window" always means the trailing `N` seconds relative to *this*
+request, not a fixed clock-aligned bucket.
+
+The cost is memory and computation that scale with request volume: a client
+sending 1000 req/sec needs 1000 timestamps live in the window at any time.
+At scale, that's real memory pressure across millions of clients — the exact
+tension you'd surface when comparing algorithms in an interview.
+
+## Sliding window counter (the practical middle ground)
+
+This is the approximation almost every production rate limiter actually
+ships: keep the cheap fixed-window counters (previous window's count and
+current window's count), but estimate the "true" sliding count as a weighted
+blend:
+
+```
+estimated_count = current_window_count
+                + previous_window_count * (overlap_fraction_with_current_window)
+```
+
+If you're 30% of the way into the current window, you weight 70% of the
+previous window's count plus all of the current window's count. This is not
+exact — it assumes requests were spread evenly across the previous window,
+which is rarely perfectly true — but it's a very good approximation with
+O(1) memory (two counters instead of a growing log), and it eliminates the
+"double the limit at the boundary" failure mode that plain fixed windows have.
+
+## Worked example: 100 requests/minute under a burst
+
+Take a limit of 100 req/min and a client that sends 100 requests at
+`0:00:59` (the last second of a clock-aligned minute) and another 100 at
+`0:01:01` (the first two seconds of the next minute):
+
+- **Fixed window**: both batches are allowed — 100 in window `[0:00,0:01)`,
+  100 in window `[0:01,0:02)`. That's 200 requests in a 2-second span, double
+  the intended rate.
+- **Sliding window log**: at `0:01:01`, the trailing 60-second window is
+  `[0:00:01, 0:01:01]`, which includes the first batch (all at `0:00:59`) and
+  the second batch — the log correctly counts ~200 requests in that trailing
+  window and starts rejecting well before the second batch completes.
+- **Sliding window counter**: roughly agrees with the log here, weighting in
+  most of the previous window's count since the client is only ~2 seconds
+  into the new window — it throttles the second batch much earlier than the
+  fixed window would.
+- **Token bucket** sized at capacity 100 with a matching refill rate would
+  allow the first burst (spending all 100 tokens), then have almost no
+  tokens left for the second burst two seconds later — behaving similarly to
+  the sliding approaches, because token bucket's "credit" naturally tracks a
+  trailing window rather than a clock-aligned one.
+
+This is why fixed window is the one algorithm you should be suspicious of by
+default: it's the only one of the five with a real correctness gap, not just
+a different personality.
+
+<Callout type="warning">
+  A common mistake is treating "sliding window log" as strictly better and
+  always reaching for it. It's exact, but the per-request timestamp storage
+  means a single abusive or misconfigured client sending thousands of
+  requests per second can blow up memory for *that client's* rate-limiter
+  state — an availability risk you've introduced trying to fix an accuracy
+  edge case. In practice, sliding window counter gives you 95% of the
+  accuracy at a small, bounded, constant memory cost, and is the better
+  default unless you have a specific reason (compliance, billing precision)
+  to need an exact count.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="rl-algorithms-token-bucket-leaky-bucket-and-windows"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A downstream third-party API enforces a strict, constant per-second call rate with no tolerance for bursts. Which rate-limiting algorithm best matches that constraint on your side?',
+      options: [
+        { id: 'a', text: 'Token bucket', correct: false, explanation: 'Token bucket deliberately allows bursts up to the bucket capacity — the opposite of a strictly constant output rate.' },
+        { id: 'b', text: 'Leaky bucket', correct: true, explanation: 'Leaky bucket queues requests and drains them at a fixed rate, producing a smooth, constant output regardless of how bursty the input is — exactly what a rate-intolerant downstream needs.' },
+        { id: 'c', text: 'Fixed window counter', correct: false, explanation: 'Fixed window still allows bursts within a window (and worse, across a boundary) — it does not smooth output to a constant rate.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'boolean',
+      prompt: 'A fixed window counter can allow up to roughly twice the configured limit through in a short span that straddles a window boundary.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Because each window is counted independently, a client can exhaust the limit at the very end of one window and immediately exhaust it again at the start of the next, doubling the effective rate briefly.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This is a well-known correctness gap in fixed window counters — the boundary is not protected because adjacent windows share no state.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'multi',
+      prompt: 'Which statements about sliding window log vs. sliding window counter are accurate?',
+      options: [
+        { id: 'a', text: 'Sliding window log is exact; sliding window counter is an approximation.', correct: true, explanation: 'The log tracks every request timestamp exactly; the counter blends two fixed-window counts and assumes even distribution within the previous window, which is an approximation.' },
+        { id: 'b', text: 'Sliding window log uses O(1) memory per client regardless of request volume.', correct: false, explanation: 'The opposite is true — the log stores a timestamp per request within the window, so memory grows with request volume. The counter is the O(1)-memory option.' },
+        { id: 'c', text: 'Sliding window counter eliminates the fixed-window boundary problem entirely with no accuracy trade-off.', correct: false, explanation: 'It greatly reduces the boundary problem but is still an approximation (it assumes even request distribution in the prior window) — not a perfect fix.' },
+        { id: 'd', text: 'Sliding window counter is a reasonable default when exact counts are not a hard requirement.', correct: true, explanation: 'It gives most of the accuracy benefit of the log with small, bounded memory per client, which is why production systems commonly default to it.' },
+      ],
+    },
+  ]}
+/>

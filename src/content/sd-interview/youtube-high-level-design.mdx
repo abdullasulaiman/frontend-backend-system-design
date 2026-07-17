@@ -1,0 +1,208 @@
+---
+title: "High-Level Design"
+module: "Design YouTube"
+moduleOrder: 1
+order: 2
+track: "interview"
+summary: "Walks through the major components of a YouTube-style platform and how the upload and watch paths split into two very different pipelines."
+tags: ["video-streaming", "system-design", "architecture", "cdn", "scalability"]
+estMinutes: 12
+cheatsheet:
+  - "Split the system into two pipelines with different SLAs: the upload/transcode path (write-heavy, latency-tolerant, can take minutes) and the watch path (read-heavy, latency-critical, must respond in milliseconds)."
+  - "Never serve video bytes from your own origin at scale — object storage plus a CDN is not optional, it's the only way playback bandwidth stays affordable."
+  - "Keep video metadata (title, description, channel, view count) in a database separate from the video bytes themselves (object storage) — they scale differently and fail independently."
+  - "View counts and watch-time stats should be aggregated asynchronously (batched writes from a queue), not incremented synchronously on every playback request."
+  - "The recommendation/ranking service reads from a precomputed index or feature store — it should never do a live join across the whole video catalog on the request path."
+  - "A single upload fans out into many derived artifacts: multiple resolutions, multiple codecs, thumbnails, captions — design the transcoding stage as a pipeline of independent, parallelizable jobs, not one monolithic step."
+  - "Draw the boundary between 'control plane' (metadata, search, recommendations) and 'data plane' (video bytes moving through storage and CDN) early — it clarifies which parts need strong consistency and which just need to be fast."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Once you've pinned down requirements and scale — as we did in the previous
+lesson — the next move in the interview is to sketch a system that could
+plausibly hit those numbers. This is the moment where a lot of candidates
+freeze up, because "design YouTube" feels too big to draw on a whiteboard in
+five minutes. The trick is to notice that a video platform isn't one system —
+it's two systems glued together by a shared catalog: a pipeline for getting
+video *in*, and a pipeline for getting video *out* to millions of viewers.
+Keeping that split explicit is what turns an overwhelming problem into a
+manageable one.
+
+## Start from the two paths, not the boxes
+
+Before drawing any component, say out loud (or write on the board) that
+uploads and playback have almost nothing in common operationally:
+
+- **Upload path**: low volume compared to views, tolerant of multi-minute
+  latency, write-heavy, needs heavy CPU work (transcoding) done once per
+  video.
+- **Watch path**: enormous volume, latency-critical (a viewer expects
+  playback to start in under a second), overwhelmingly read-heavy, and the
+  same bytes get served to millions of different viewers unchanged.
+
+This asymmetry is the single biggest design decision in the whole system: you
+optimize the two paths completely differently, and you should never let a
+slow upload-side operation sit anywhere near the read path that serves
+playback.
+
+## The major components
+
+A reasonable high-level design breaks into these pieces:
+
+- **Client** (web, mobile, TV app) — plays video via an adaptive bitrate
+  player, calls APIs for metadata, search, comments, and recommendations.
+- **API / edge layer** — a set of stateless services behind a load balancer
+  handling auth, request routing, and rate limiting.
+- **Upload service** — accepts raw video files (often via resumable/chunked
+  upload), writes them to a staging bucket, and enqueues a transcoding job.
+- **Transcoding pipeline** — a fleet of workers (often a job queue plus
+  autoscaled compute) that takes a raw upload and produces multiple
+  resolutions/bitrates/codecs, thumbnails, and extracted captions. Covered in
+  depth in the "Video Upload, Transcoding, and Storage" lesson.
+- **Object storage** — durable blob storage (the S3/GCS-style store) holding
+  both the raw upload and every transcoded rendition.
+- **CDN** — caches and serves the transcoded video segments close to
+  viewers; this is what actually absorbs the read traffic. Covered in depth
+  in "Streaming and CDN Delivery."
+- **Metadata database** — titles, descriptions, channel ownership,
+  visibility, per-rendition storage pointers, and denormalized counters like
+  view count.
+- **Search index** — a separate index (inverted index / search engine)
+  built from metadata, kept eventually consistent with the database.
+- **Recommendation / ranking service** — reads precomputed features and
+  serves a ranked list for the home page and "up next"; it's fed by an
+  offline pipeline, not computed live from raw events.
+- **Comments / social service** — its own read/write path, since comments
+  have very different consistency and volume characteristics than video
+  metadata.
+- **Analytics / counters pipeline** — ingests playback events (view started,
+  watch time, likes) through a queue and aggregates them in the background.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph Upload path
+        U[Uploader] --> UP[Upload Service]
+        UP --> RAW[(Raw Storage)]
+        UP --> Q[Transcode Queue]
+        Q --> TC[Transcoding Workers]
+        TC --> OBJ[(Rendition Storage)]
+        TC --> META[(Metadata DB)]
+    end
+    subgraph Watch path
+        V[Viewer] --> API[API / Edge]
+        API --> METAREAD[(Metadata DB)]
+        API --> REC[Recommendation Service]
+        V --> CDN[CDN]
+        CDN --> OBJ
+    end
+    META -.async index update.-> SEARCH[Search Index]
+`} />
+
+## Walking the two paths end to end
+
+**Upload path.** A creator's file goes to the upload service, which streams
+it into raw storage and immediately returns success to the client — it
+doesn't wait for transcoding. That kicks off a job on a queue. Transcoding
+workers pull the job, produce renditions (say, 240p through 4K, in a couple
+of codecs), write each rendition to object storage, and write pointers plus
+final metadata (duration, available resolutions, thumbnail URL) into the
+metadata database. Only once metadata says "ready" does the video become
+visible to viewers. Search indexing and recommendation feature extraction
+happen asynchronously off of that same metadata write, not synchronously in
+the upload request.
+
+**Watch path.** A viewer opens a video page. The client calls the API for
+metadata (title, channel, available renditions, an initial recommendations
+list) — this is a small, latency-sensitive read against the metadata
+database, usually behind a cache. The player then requests video *segments*
+directly from the CDN using URLs derived from that metadata, not through your
+application servers at all. This is the part people get wrong most often:
+your API layer should never be in the hot path for actual video bytes — it
+only ever hands out pointers. The CDN, backed by object storage on a cache
+miss, does 100% of the bandwidth-heavy work.
+
+## Worked example: tracing a single "watch" request
+
+Say a video suddenly goes viral and jumps to 2 million concurrent viewers.
+Trace what happens with the split above in mind:
+
+1. Each viewer's client hits the API layer once for metadata — that's 2
+   million small, cacheable reads. Put a cache (e.g., an in-memory or Redis
+   layer) in front of the metadata database keyed by video ID, and this
+   barely dents the database, since the metadata for a given video is
+   identical for every viewer.
+2. Each client then streams video segments from the CDN, not from your
+   servers. The CDN's edge caches already hold the popular renditions after
+   the first few requests, so object storage sees a tiny fraction of the 2
+   million requests — effectively just the cache-fill traffic.
+3. Playback events (watch time, view increments) get pushed onto a queue
+   instead of writing to the metadata database synchronously per viewer. A
+   background aggregator batches those into periodic counter updates, so the
+   database sees thousands of batched writes instead of 2 million individual
+   `UPDATE` statements.
+
+Without steps 1–3, a viral video would mean 2 million requests slamming a
+single database row and 2 million requests hitting your storage origin
+directly — exactly the kind of design that collapses in an interview
+follow-up question ("what happens when this video goes viral?").
+
+<Callout type="warning">
+  A common mistake is drawing one big "backend" box that handles uploads,
+  serves metadata, *and* streams video bytes. That box would need to scale
+  for both a low-QPS, CPU-heavy workload (transcoding) and a massive,
+  bandwidth-heavy workload (playback) at the same time, with completely
+  different scaling knobs. Always separate the control plane (metadata,
+  search, recommendations — needs correctness and reasonable latency) from
+  the data plane (video bytes — needs raw throughput and lives in object
+  storage plus a CDN, not your application servers).
+</Callout>
+
+## What this lesson set up
+
+This lesson is deliberately a skeleton: it names the components and shows how
+traffic flows through them, but doesn't yet dig into schemas, transcoding
+internals, or CDN cache strategy — those get their own lessons next. The one
+idea worth carrying forward is the upload/watch split: almost every follow-up
+question in a video-platform interview ("how do you handle a re-upload?",
+"how do you avoid re-encoding on every request?", "how does seeking work?")
+is really asking you to reason about which of the two paths is involved and
+what its latency and volume characteristics are.
+
+<Quiz
+  lessonId="youtube-high-level-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should video bytes be served through a CDN plus object storage rather than through the same API servers that handle metadata requests?',
+      options: [
+        { id: 'a', text: 'Because object storage is cheaper per gigabyte than a database', correct: false, explanation: 'Cost is a factor, but the real reason is traffic shape: video playback is a massive bandwidth workload that would overwhelm application servers sized for request/response metadata traffic.' },
+        { id: 'b', text: 'Because playback is a bandwidth-heavy, cacheable workload that would overwhelm application servers if routed through them', correct: true, explanation: 'Correct. Metadata requests are small and latency-sensitive; video segments are large and highly cacheable. Separating them lets each scale on its own terms — the CDN absorbs bandwidth, the API layer stays lightweight.' },
+        { id: 'c', text: 'Because object storage supports SQL queries and application servers do not', correct: false, explanation: 'Object storage is a blob store, not a queryable database — that is unrelated to why it is used for video bytes.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: "Which of these should happen asynchronously (off the critical request path) rather than synchronously during a viewer's playback request?",
+      options: [
+        { id: 'a', text: "Incrementing the video's view count in the metadata database", correct: true, explanation: 'View/watch-time updates should be queued and aggregated in batches; doing a synchronous write per viewer does not scale to millions of concurrent viewers.' },
+        { id: 'b', text: "Updating the search index after a new upload's metadata is saved", correct: true, explanation: 'Search indexing is fed by metadata changes but runs on its own eventually-consistent pipeline, not inline with the write that creates the video.' },
+        { id: 'c', text: "Returning the requested video's title and available resolutions to the player", correct: false, explanation: 'This is a direct read the client needs immediately to start playback — it belongs on the synchronous request path, ideally served from a cache.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In a well-designed video platform, transcoding must finish before the upload service can return a success response to the uploader.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Transcoding can take minutes for a long video. Making the uploader wait for it would mean holding an HTTP connection open far too long — the upload service should acknowledge receipt and enqueue a background job instead.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. The upload service returns success once the raw file is safely stored and a transcoding job is enqueued; transcoding, indexing, and making the video visible all happen asynchronously afterward.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,111 @@
+---
+title: "What a CDN Is and Why It Matters"
+module: "Content Delivery Network"
+moduleOrder: 11
+order: 1
+track: "concept"
+summary: "Introduces the CDN as a globally distributed cache that serves content from a location physically close to the user, and explains the latency, load, and reliability problems that solves."
+tags: ["cdn", "latency", "caching", "networking", "scalability"]
+estMinutes: 11
+cheatsheet:
+  - "A CDN is a network of edge servers, geographically spread out, that cache and serve content from a location close to the requesting user instead of always going back to your origin."
+  - "The core win is physics: light in fiber takes roughly 5ms per 1,000km round trip, so a user 12,000km from your origin pays 100ms+ of unavoidable latency no matter how fast your servers are — an edge node nearby removes most of that."
+  - "A CDN also absorbs load: a cache hit at the edge never reaches your origin, so origin capacity only needs to handle cache misses and uncacheable traffic, not total request volume."
+  - "Static, rarely-changing assets (images, video, JS/CSS bundles, downloads) are the easy case; dynamic and personalized responses need more care and are covered in later lessons on push/pull and invalidation."
+  - "A cache hit ratio directly trades off against staleness risk — the more aggressively you cache, the more you must think about invalidation, which is why this module treats caching and invalidation as its own lesson."
+  - "CDNs also double as a first line of defense against traffic spikes and some DDoS patterns, since attack traffic gets absorbed and rate-limited at edge nodes instead of hitting the origin directly."
+  - "Don't reach for a CDN as a fix for slow business logic or a slow database — it only helps with the transfer of content that can be cached or brought closer to the user."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Say your origin servers run in a single AWS region in Virginia, and they serve a product page efficiently — 20ms to generate the response. A user in Virginia gets that page in well under 50ms. A user in Singapore, on the same infrastructure, pays over 200ms of network round-trip time before your server even starts working, then another 200ms to send the response back. Your code didn't get slower; the speed of light didn't get faster. No amount of optimizing your application server closes that gap, because the bottleneck isn't compute — it's distance.
+
+This is the problem a **content delivery network (CDN)** exists to solve. It's one of the first tools engineers reach for once a service has users spread across a continent or the globe, and it shows up constantly in system design interviews — anywhere a design needs to serve images, video, static assets, or even API responses to a geographically distributed audience, "put a CDN in front of it" is a serious, expected part of the answer, not a hand-wave.
+
+## What a CDN actually is
+
+A CDN is a distributed network of servers — often called **edge servers**, **edge nodes**, or **points of presence (PoPs)** — deployed in many physical locations around the world, often dozens to hundreds of them, positioned close to where users actually are (major cities, internet exchange points, ISP peering locations). Each edge node keeps a cached copy of content that would otherwise have to come from your **origin server**, which is wherever your actual application and its data live.
+
+When a user requests something, their request gets routed (usually via DNS or Anycast routing) to the nearest or best-performing edge node rather than directly to your origin. If that edge node already has the content cached, it serves it immediately — the request never leaves the user's region. If it doesn't have the content, it's a **cache miss**: the edge node fetches the content from the origin (or from another edge node, depending on the CDN's internal topology), caches a copy for next time, and returns it to the user. Every subsequent nearby request benefits from that cached copy until it expires or is invalidated.
+
+Commercial CDNs (Cloudflare, Akamai, Fastly, CloudFront, and others) run this edge infrastructure as a service — you don't build your own PoPs in 100 cities. You point your DNS or your asset URLs at the CDN, configure caching rules, and the CDN's existing global footprint does the rest.
+
+## The two problems a CDN solves
+
+It's worth naming both explicitly, because interviewers will probe whether you understand a CDN as more than "a cache":
+
+- **Latency.** Physical distance has a hard, physics-imposed cost. Light in fiber-optic cable travels at roughly two-thirds the speed of light in a vacuum, which works out to about 5ms of one-way delay per 1,000km, before accounting for routing hops, congestion, and TLS handshakes that each add their own round trips. A user 12,000km from your origin is paying well over 100ms of network delay alone, on every request, before your server does any work. An edge node 200km away instead of 12,000km away turns that into single-digit milliseconds. No application-level optimization fixes this — it's a placement problem, not a compute problem.
+- **Origin load.** Every request an edge node serves from cache is a request your origin never sees. If 95% of requests for a viral video are cache hits at the edge, your origin only has to handle the other 5% (cache misses, plus anything explicitly uncacheable) rather than the full traffic volume. This is why CDNs matter for scalability and cost, not just for perceived speed — they let a modest origin footprint support a traffic volume that would otherwise require a much larger, more expensive origin fleet.
+
+A useful mental model: a CDN turns "serve every user from one place" into "serve every user from the nearest cached copy, and only fall back to one place when necessary." That reframing is most of what makes CDNs powerful.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  U1[User in Sao Paulo] --> E1[Edge Node - Sao Paulo]
+  U2[User in Tokyo] --> E2[Edge Node - Tokyo]
+  U3[User in Berlin] --> E3[Edge Node - Frankfurt]
+  E1 -->|cache hit| U1
+  E2 -->|cache miss, fetch once| O[Origin Server - Virginia]
+  E3 -->|cache hit| U3
+  O --> E2
+  E2 -->|cached now| U2
+`} />
+
+Notice Tokyo's request is the only one that actually reaches the origin in this picture — and only because it was a miss. Sao Paulo and Berlin get served entirely from nearby edge caches, with the origin never involved at all for those requests.
+
+## What belongs on a CDN
+
+The easiest and most common case is **static content**: images, videos, downloadable files, and built JS/CSS bundles. These don't change per-request or per-user, so a cached copy at the edge is exactly as correct as fetching it fresh from the origin every time — you get the latency and load benefits for free, with no correctness risk.
+
+Dynamic and personalized content — an API response that differs per user, a page rendered with a logged-in user's data — is harder, because naively caching it risks serving one user's private or stale data to another. CDNs can still help here (caching public, non-personalized fragments; caching at very short TTLs; edge compute that personalizes at the edge instead of the origin), but it takes deliberate design rather than "just turn caching on." This module's next lessons go deep on exactly that: how content actually gets onto edge nodes (push vs. pull), how caching and invalidation work in detail, and how to reason about consistency and security once a CDN is part of your architecture. This lesson is scoped to the concept and the "why," not those mechanics.
+
+## Worked example: estimating the win
+
+Suppose a media company serves a 2MB article-header image to 10 million page views a day, and its origin is in one US region. Average round-trip time to origin for a global user base is roughly 150ms; average round-trip time to a nearby CDN edge node is roughly 20ms. Ignoring transfer time itself (which is bandwidth-bound and roughly comparable either way for a well-peered CDN), that's a 130ms latency reduction per image load from edge caching alone — meaningful for a metric like "time to largest contentful paint" that directly affects bounce rate.
+
+Now the load side: assume a 90% cache hit ratio at the edge (a realistic number for a rarely-changing image with a long TTL). Of 10 million daily requests for that image, only 1 million actually reach the origin; 9 million are served entirely by edge nodes. If serving that image from origin costs, say, 50KB of egress-relevant compute and bandwidth overhead per request at some unit cost, a 90% hit ratio isn't just faster for users — it's a 10x reduction in the origin-side cost and load for that asset, which is capacity you don't have to provision, monitor, or pay for.
+
+<Callout type="warning">
+  A common mistake is treating a CDN as a fix for a slow application or slow database. A CDN only helps with the transfer of content it can cache and physically move closer to users — it does nothing for a request that has to hit your origin anyway (an uncached miss, a write, a truly personalized read) and still needs your backend to compute the response in 20ms instead of 2 seconds. Putting a CDN in front of a slow origin makes cache misses just as slow as before, and can even hide the problem during testing if your test traffic happens to keep hitting cached content. Fix backend latency and query performance on their own merits; use the CDN for what it's actually good at, which is proximity and offloading repeat traffic.
+</Callout>
+
+<Quiz
+  lessonId="cdn-what-a-cdn-is-and-why-it-matters"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A user in Singapore experiences 220ms of round-trip latency to an origin server in Virginia, even though the origin processes each request in 15ms. What is the most accurate explanation?',
+      options: [
+        { id: 'a', text: 'The origin server needs a faster CPU.', correct: false, explanation: 'The origin already processes the request in 15ms — the CPU is not the bottleneck here. The delay is in network transit, not computation.' },
+        { id: 'b', text: 'The physical distance between Singapore and Virginia imposes a network latency cost that no server-side optimization can remove.', correct: true, explanation: 'Correct — this is a distance/physics problem. The fix is placing content closer to the user (a CDN edge node), not speeding up the origin.' },
+        { id: 'c', text: 'The database is likely the bottleneck and needs an index.', correct: false, explanation: 'Nothing here points to the database; the 15ms origin processing time is already fast. The described delay is purely network round-trip time.' },
+        { id: 'd', text: 'HTTPS should be disabled to remove encryption overhead.', correct: false, explanation: 'TLS handshake overhead is real but small relative to 220ms of cross-continent latency, and disabling HTTPS trades away security for a negligible latency gain — it does not address the actual cause.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine benefits of putting a CDN in front of static assets? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Lower latency for users far from the origin.', correct: true, explanation: 'Correct — serving from a nearby edge node avoids the round-trip cost of reaching a distant origin.' },
+        { id: 'b', text: 'Reduced load on the origin server for cached content.', correct: true, explanation: 'Correct — every cache hit at the edge is a request the origin never has to handle, freeing up origin capacity.' },
+        { id: 'c', text: 'Guaranteed correctness of personalized, per-user API responses.', correct: false, explanation: 'CDNs are not automatically safe for personalized content — caching a per-user response naively risks serving one user\'s data to another. That requires deliberate design, not a default guarantee.' },
+        { id: 'd', text: 'It can absorb and rate-limit a portion of spike or attack traffic before it reaches the origin.', correct: true, explanation: 'Correct — edge nodes sit in front of the origin and can shed or throttle traffic, which is part of why CDNs are also used as a first line of defense against certain DDoS patterns.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Adding a CDN in front of an origin whose database queries take 2 seconds will make those slow responses fast for users who trigger a cache miss.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False is correct. A CDN only speeds up content it can cache and serve from the edge; a cache miss still has to go all the way to the origin, which still takes 2 seconds. The CDN does not fix backend or database latency.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — a cache miss falls through to the origin, and the origin is just as slow as it was without a CDN. CDNs solve proximity and repeat-load problems, not backend compute or query performance.' },
+      ],
+    },
+  ]}
+/>

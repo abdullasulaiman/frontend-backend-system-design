@@ -1,0 +1,128 @@
+---
+title: "Ranking and Feed Generation"
+module: "Design Quora"
+moduleOrder: 2
+order: 4
+track: "interview"
+summary: "Covers how to rank answers on a question page and how to generate a personalized home feed at scale, including vote-based scoring and push/pull fan-out trade-offs."
+tags: ["ranking-algorithms", "feed-generation", "fan-out", "personalization"]
+estMinutes: 13
+cheatsheet:
+  - "Never sort answers by raw net votes (upvotes minus downvotes) alone — it rewards whichever answer arrived first and accumulated votes early, not the answer with the best evidence of quality."
+  - "A Wilson-style lower-bound score compares the confidence interval of the upvote ratio, so an answer with 90 upvotes out of 100 outranks one with 3 upvotes out of 3, even though the second has a 'perfect' ratio."
+  - "Add a time-decay term to the answer score so a strong new answer can surface above an older one that's stopped accumulating votes, but tune the half-life so it doesn't just reward recency over substance."
+  - "Feed generation has two distinct problems: candidate generation (what could possibly show up) and ranking (what order to show it in) — never run an expensive ranking model over the full unfiltered corpus."
+  - "Pure push (fan-out-on-write) breaks down for high-follower authors — writing one answer would mean millions of feed inserts. Pure pull (fan-out-on-read) breaks down for normal users, since every home-feed load has to query every followed source live."
+  - "The standard fix is hybrid fan-out: push for authors under a follower threshold, pull-and-merge at read time for the rest — most systems that look like 'pure push' internally have this split."
+  - "A feed ranking model that only optimizes engagement will over-recommend inflammatory or duplicate-topic content; add an explicit diversity/re-ranking pass after scoring, not just a raw sort by score."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson gave you a schema for questions, answers, and votes, and an API to write and read them. None of that decides what order things appear in — and on a Q&A platform, order *is* the product. Open a popular question and the first answer you see should be the one that actually answers it best, not just the one posted first. Open your home feed and it should surface questions and answers you'll actually care about, out of a corpus that could be billions of items, without your servers falling over the moment someone with ten million followers posts.
+
+Those are genuinely two different problems with two different constraints, and interviewers will push on both. Ranking answers under a single question is a bounded, on-demand sort — you can afford to recompute it fairly often. Generating a personalized feed is an unbounded, per-user problem that has to work at write time and read time simultaneously. This lesson covers the ranking logic for each, and the fan-out architecture that makes feed generation feasible at scale.
+
+## Ranking answers on a question page
+
+### Why raw net votes fail
+
+The obvious first idea: sort answers by `upvotes - downvotes`, highest first. It's simple, but it has a structural bias toward *whichever answer showed up first*. The first answer to a fast-moving question gets seen by the most people (everyone who visits early), accumulates votes fastest, and locks in a lead that's very hard for a later, better answer to overcome — even if the later answer is more accurate or more complete. You end up ranking by "arrival time plus traffic," not by "quality."
+
+Net votes also treat an answer with 3 upvotes and 0 downvotes the same as one with 300 upvotes and 0 downvotes when both are compared against an answer with, say, 250 upvotes and 10 downvotes — a net score of `3` vs `240` correctly ranks the second higher, but a naive *ratio*-based score (upvotes / total votes) would rank the 3-vote answer's 100% approval above the 250-vote answer's 96% approval, which is clearly the wrong call. You need a scoring function that accounts for *how much evidence* you have, not just the ratio.
+
+### A confidence-based score
+
+The standard fix is to rank by the lower bound of a confidence interval on the true upvote ratio, given the votes observed so far — commonly called a Wilson score interval. The intuition, without the statistics: with only 3 votes, you genuinely don't know if the "true" quality is 100% or something much lower — you don't have enough samples to be confident. With 250 votes at 96%, you have enough evidence to be fairly confident the true quality really is around 96%. The lower bound of the confidence interval is low for the 3-vote answer (wide uncertainty) and only slightly below 96% for the 250-vote answer (narrow uncertainty), so the 250-vote answer correctly ranks first.
+
+You don't need to derive the formula from scratch in an interview — stating the idea ("rank by a confidence lower bound on the vote ratio, not the raw ratio or raw net count, so vote *volume* matters as much as vote *direction*") is the signal an interviewer is looking for.
+
+### Adding recency and quality signals
+
+Vote-based scoring alone still has a blind spot: it can't distinguish "this answer is now outdated" (a great answer about a product's pricing from three years ago) from "this answer is still correct." Layer in additional signals on top of the vote score:
+
+- **Time decay** — apply a decay factor to the vote-confidence score based on answer age, so an answer that stopped accumulating votes years ago gradually loses ground to a newer, actively-upvoted one.
+- **Edit recency** — an answer edited last month should get partial credit over one untouched since 2019, even with a similar vote history.
+- **Quality/trust classifiers** — length heuristics, spam/abuse classifiers, and author reputation (has this author been marked as a subject-matter expert on this topic?) all combine into a final composite score used for the sort.
+
+The composite is typically a weighted sum: `score = w1 * confidence_vote_score + w2 * recency_decay + w3 * author_reputation`, tuned by offline evaluation against what humans judge to be the better answer.
+
+## Generating the personalized home feed
+
+Ranking answers under one question is bounded — there might be a few hundred candidates. The home feed is a different scale problem entirely: the candidate pool is every question or answer posted by everyone you follow, every topic you're subscribed to, plus algorithmically recommended content — easily billions of items platform-wide. You cannot run an expensive ranking model over all of it for every feed load. The standard architecture splits the problem into stages.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Candidate generation] --> B[Feature scoring]
+  B --> C[Ranking model]
+  C --> D[Diversity re-rank]
+  D --> E[Serve paginated feed]
+  F[(Followed topics/people)] --> A
+  G[(Recommendation index)] --> A
+`} />
+
+**Candidate generation** narrows billions of possible items down to a few hundred plausible ones per user — items from followed topics, followed people, and a recommendation index — cheaply, using simple filters, not a heavy model. **Feature scoring** attaches signals to each candidate (topic match, author reputation, how similar it is to things you've engaged with before). The **ranking model** turns those features into a single relevance score per candidate. The **diversity re-rank** pass then adjusts the pure-score order so the top of your feed isn't ten answers about the same trending topic from the same three authors — without this step, a pure engagement-optimizing model over-indexes on whatever is currently viral. Only after all of that do you paginate and serve.
+
+### Push vs. pull: where the fan-out happens
+
+The remaining question is *when* candidate generation happens: at write time (someone posts) or at read time (you open your feed)?
+
+**Push (fan-out-on-write)**: when an author posts, immediately insert a reference to that item into the precomputed feed of every follower. Reading your feed is then just "read my precomputed list" — fast and cheap. This breaks down badly for high-follower authors: one post from someone with ten million followers means ten million feed-store writes fired from a single API call.
+
+**Pull (fan-out-on-read)**: don't precompute anything; when you open your feed, query every source you follow live and merge the results. This avoids the write storm, but it means every feed load for a normal user — who might follow hundreds of topics and people — issues hundreds of queries synchronously, which is too slow for a page that needs to render in a few hundred milliseconds.
+
+The practical answer almost every large feed system converges on is **hybrid fan-out**: push for authors under some follower-count threshold (the vast majority of users), and pull-at-read for authors above it, merging the pulled results into the same precomputed feed before ranking. This keeps write amplification bounded for the small set of very-high-follower accounts while keeping read latency low for everyone.
+
+## Worked example
+
+Say two answers on a question both currently show `net votes = +240`. Answer A has 250 upvotes and 10 downvotes; answer B has 245 upvotes and 5 downvotes. Net-vote sorting can't even distinguish them cleanly if the totals were closer, and it certainly can't distinguish either from a brand-new answer with 12 upvotes and 0 downvotes, which has a *perfect* ratio but far less evidence. A confidence-lower-bound score correctly ranks B slightly above A (higher ratio at similar volume) and ranks both well above the 12-vote answer, because 12 votes isn't enough evidence to be confident the true quality is actually 100%. As that new answer accumulates more upvotes with a sustained high ratio, its lower bound rises and it can legitimately overtake A and B — which is the behavior you want: consistent evidence over time beats an early lead.
+
+For the feed side: imagine an author with 8 million followers posts a new answer. Under pure push, that single write fans out to 8 million per-user feed-store entries — at even a modest cost per insert, that's a multi-second (or minute-scale) background job contending with every other fan-out job in the system. Under the hybrid model, that author is flagged "pull-tier," so the post triggers zero fan-out writes; each of their followers instead picks it up the next time their feed is generated, merged in alongside their normal push-tier candidates.
+
+<Callout type="warning">
+A common mistake in this lesson is designing pure push fan-out and only noticing the problem when asked "what if this author has 10 million followers?" If your design writes to every follower's feed synchronously (or even asynchronously but unconditionally) on every post, you've built a system where one popular author's write volume scales with their follower count, not with how often they post — that's the wrong axis to scale on. Call out the hybrid push/pull split before the interviewer has to ask for it; it's the detail that separates a design that merely works from one that survives a celebrity account.
+</Callout>
+
+<Quiz lessonId="quora-ranking-and-feed-generation" client:visible questions={[
+  {
+    id: 'q1',
+    kind: 'mcq',
+    prompt: 'Why is sorting answers purely by net votes (upvotes minus downvotes) a poor ranking strategy?',
+    options: [
+      { id: 'a', text: 'It biases toward whichever answer arrived first and had the most time to accumulate votes, not necessarily the best answer', correct: true, explanation: 'Correct. Early answers get seen by more visitors and lock in a vote lead, so net-vote sorting rewards arrival time and traffic exposure as much as actual quality.' },
+      { id: 'b', text: 'Databases cannot efficiently compute a subtraction between two integer columns', correct: false, explanation: 'Subtracting two integers is trivial for any database; the problem with net votes is a ranking-quality issue, not a computational one.' },
+      { id: 'c', text: 'Net votes always violate eventual consistency guarantees', correct: false, explanation: 'Net votes can be computed from eventually consistent vote counters just fine — the flaw is in what the metric measures, not in the consistency model used to store it.' },
+    ],
+  },
+  {
+    id: 'q2',
+    kind: 'boolean',
+    prompt: 'A confidence-lower-bound scoring approach can rank an answer with 250 upvotes and 10 downvotes above a brand-new answer with 12 upvotes and 0 downvotes, even though the new answer has a "perfect" 100% approval ratio.',
+    options: [
+      { id: 'true', text: 'True', correct: true, explanation: 'Correct — with only 12 votes there is not enough evidence to be confident the true quality is 100%, so its confidence lower bound is wide and low, while 250 votes at 96% gives a narrow, high lower bound.' },
+      { id: 'false', text: 'False', correct: false, explanation: 'This is exactly the scenario confidence-based scoring is designed to handle correctly — vote volume matters as much as vote ratio.' },
+    ],
+  },
+  {
+    id: 'q3',
+    kind: 'multi',
+    prompt: 'Which of these are genuine advantages of a hybrid push/pull fan-out model over a pure push model? (Select all that apply.)',
+    options: [
+      { id: 'a', text: 'It avoids a single post from a high-follower author triggering millions of synchronous feed-store writes', correct: true, explanation: 'Correct — authors above the follower threshold are excluded from fan-out-on-write, so their post volume no longer scales feed-store write load with follower count.' },
+      { id: 'b', text: 'It keeps read latency low for the majority of normal users, since their feeds are still precomputed via push', correct: true, explanation: 'Correct — only the small set of high-follower authors falls back to pull; everyone else still benefits from a fast precomputed feed read.' },
+      { id: 'c', text: 'It eliminates the need for a ranking model, since fan-out alone determines feed order', correct: false, explanation: 'Fan-out only determines which candidates land in a feed store — ranking (scoring and ordering those candidates) is still a separate, necessary step regardless of push or pull.' },
+    ],
+  },
+  {
+    id: 'q4',
+    kind: 'mcq',
+    prompt: 'In a typical feed generation pipeline, what is the purpose of the diversity re-rank step that runs after the ranking model produces scores?',
+    options: [
+      { id: 'a', text: 'To re-run candidate generation with a larger pool if too few candidates were found', correct: false, explanation: 'That describes a candidate-generation fallback, not diversity re-ranking, which operates on an already-scored set of candidates.' },
+      { id: 'b', text: 'To adjust the pure score-sorted order so the feed is not dominated by many similar items (same topic or same few authors)', correct: true, explanation: 'Correct — a pure engagement-optimized score order tends to cluster around whatever is currently most viral; the diversity pass deliberately spreads out topics/authors near the top of the feed.' },
+      { id: 'c', text: 'To remove all algorithmically recommended content and show only followed sources', correct: false, explanation: 'Diversity re-ranking adjusts ordering across all candidate types; it does not selectively exclude recommended content in favor of followed sources.' },
+    ],
+  },
+]} />

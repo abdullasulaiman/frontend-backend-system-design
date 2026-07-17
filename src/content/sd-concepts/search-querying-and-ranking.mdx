@@ -1,0 +1,133 @@
+---
+title: "Querying and Ranking"
+module: "Distributed Search"
+moduleOrder: 21
+order: 3
+track: "concept"
+summary: "Explains how a search query gets parsed into postings-list lookups and how relevance scoring (term frequency, inverse document frequency, and BM25) turns matching documents into a ranked top-k result list."
+tags: ["ranking", "relevance", "bm25", "query-processing", "search"]
+estMinutes: 13
+cheatsheet:
+  - "Query-time text must go through the same analyzer (lowercasing, stemming, stopword removal) as index-time text, or terms silently fail to match."
+  - "A query compiles into boolean operations over postings lists: AND intersects, OR unions, NOT subtracts; phrase queries additionally check term positions."
+  - "Term frequency (TF) rewards documents that repeat a query term; inverse document frequency (IDF) discounts terms that appear in most documents anyway (like \"the\")."
+  - "BM25 improves on plain TF-IDF by saturating the TF contribution (the 10th occurrence of a word barely counts more than the 5th) and normalizing for document length."
+  - "Ranking is usually two phases: cheap retrieval pulls a large candidate set by a simple score, then a more expensive re-ranker reorders just the top few hundred using richer signals."
+  - "Relevance signals beyond text match — recency, popularity, personalization, business rules — get blended in as a weighted combination or a learned re-ranking model, not bolted onto TF-IDF as an afterthought."
+  - "Score the top-k with a bounded heap during postings traversal; never compute a full score for every matching document if the corpus is large."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson built the inverted index: a map from term to the list of documents (and positions) containing it. That structure answers "which documents contain this word" in roughly constant time. It does not, on its own, answer the two questions a real search engine actually has to answer: which of the matching documents should show up at all, and in what order. Type "wireless mouse" into a product search and you'll get back thousands of documents that technically contain both words — a warehouse inventory system just returns matches, but a search engine has to decide that the `Logitech MX Master 3` listing belongs above a random forum post that happens to mention both words once each. That decision is query processing plus ranking, and it's where most of the perceived quality of a search product actually lives.
+
+## From query string to postings-list operation
+
+A raw query string first goes through the same analyzer pipeline used at index time — lowercasing, tokenization, stemming, stopword removal. This symmetry matters more than almost anything else in this lesson: if the indexer stems "running" down to "run" but the query analyzer doesn't, "running" in a search box will never match a document that only contains "run" in its inverted index, even though a human would call that an obvious match.
+
+Once tokenized, the query becomes a small boolean expression over postings lists:
+
+- **AND** (implicit in most search boxes for multi-word queries) intersects the postings lists of every term — a document must appear in all of them.
+- **OR** unions the lists — a document need appear in only one.
+- **NOT** subtracts a list — exclude documents containing a term.
+- **Phrase queries** ("wireless mouse" in quotes) go further than a plain AND: after intersecting, the engine also checks that the position of "mouse" in a document is exactly one more than the position of "wireless," using the position data stored per posting.
+
+Intersecting two postings lists efficiently is a merge-like walk: since postings lists are typically stored sorted by document ID, you can advance two pointers together and only pay linear time in the combined list length, rather than a nested-loop scan. For very long lists (a common word matched against millions of documents), engines add skip pointers inside the postings list so a merge can jump ahead instead of visiting every entry — useful when intersecting a huge list against a much smaller one.
+
+## Turning matches into a relevance score
+
+Boolean matching answers "does this document qualify," but every qualifying document needs a number so results can be sorted. The classical building blocks are:
+
+- **Term frequency (TF)** — how many times a query term appears in a document. A product description that says "wireless" three times is probably more about wireless than one that mentions it once, though the relationship isn't linear — see below.
+- **Inverse document frequency (IDF)** — how rare a term is across the whole corpus. "Mouse" appearing in a document says a lot; "the" appearing in a document says nothing, because "the" is in almost every document. IDF down-weights common terms and up-weights rare, distinguishing ones.
+- **TF-IDF** combines the two: a term contributes to a document's score in proportion to how often it appears there, scaled down by how unremarkable that term is across the corpus.
+
+TF-IDF alone has two well-known problems. First, raw term frequency keeps rewarding repetition without limit, so a page that stuffs a keyword fifty times can outscore a genuinely better one that uses it five times. Second, it doesn't account for document length — a term appearing three times in a 20-word snippet is a much stronger signal than the same term appearing three times in a 2,000-word article.
+
+**BM25** (Best Match 25) is the standard fix, and it's what most production text search relevance is still built on, directly or as a strong baseline underneath a learned model. It keeps the same TF and IDF ideas but adds two adjustments: it **saturates** term frequency (each additional occurrence of a term adds less to the score than the previous one, via a diminishing-returns curve), and it **normalizes for document length** (a term match in a short document counts for more than the same match in a long document, relative to that document's average length). Two tunable parameters control how aggressive each adjustment is, which is why BM25 is usually "tuned to the corpus" rather than used with universal defaults.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  Q[Query string] --> A[Analyzer:\ntokenize, stem, lowercase]
+  A --> P[Parse into\nAND / OR / phrase ops]
+  P --> R[Retrieve candidates:\nintersect postings lists]
+  R --> S[Score candidates:\nBM25 / TF-IDF]
+  S --> K[Top-k heap]
+  K --> RR[Re-rank top-k with\nricher signals]
+  RR --> O[Ranked results]
+`} />
+
+## Beyond text match: blending signals
+
+Text relevance is only one input. Real ranking usually blends in recency (a news search wants fresh articles weighted up), popularity or click-through data (documents users tend to click on for similar queries), personalization (a logged-in user's history or location), and business rules (sponsored placement, in-stock filtering). There are two common ways to combine these with the text score:
+
+1. **Weighted linear combination** — `final_score = w1 * bm25_score + w2 * recency_score + w3 * popularity_score`, with hand-tuned or A/B-tested weights. Simple, explainable, easy to debug, but the weights don't adapt per query.
+2. **Learning-to-rank (LTR)** — train a model (often gradient-boosted trees or a neural ranker) on historical click/relevance data, where BM25 score, recency, popularity, and dozens of other features are inputs and the model learns how to combine them. This is more accurate but far more expensive to run, which is exactly why it's applied only to a re-ranking stage.
+
+That two-stage split — cheap retrieval over the full postings lists, then expensive re-ranking over a much smaller candidate set — is the standard architecture at any real scale, and it's the reason "ranking" and "retrieval" are usually implemented as separate services with different latency budgets. Retrieval might pull the top 1,000 candidates by BM25 in a few milliseconds; re-ranking then spends a few more milliseconds running an LTR model over just those 1,000, not the full corpus.
+
+## Worked example: scoring by hand
+
+Say a query is "wireless mouse" against a small catalog of 10,000 product documents. The term "mouse" appears in 200 of them; "wireless" appears in 4,000 of them (lots of wireless products). Intuitively, "mouse" should carry more weight in the score, because matching it is rarer and more informative.
+
+Using a simplified IDF of `log(total_docs / docs_containing_term)`:
+
+- IDF("mouse") = `log(10000 / 200)` = `log(50)` ≈ 3.91
+- IDF("wireless") = `log(10000 / 4000)` = `log(2.5)` ≈ 0.92
+
+Now compare two candidate documents. Document A is a 40-word listing titled "Logitech Wireless Mouse" that says "wireless" once and "mouse" twice. Document B is a 900-word buying-guide article that happens to mention "wireless" six times and "mouse" once, padded across many unrelated paragraphs. Raw TF-IDF (ignoring length) might score B highly just because six mentions of "wireless" adds up. BM25's length normalization corrects this: relative to its own length, document A's term density is far higher, so after normalizing, A's score comes out ahead — matching what a human would expect: a focused product listing should outrank a long article that dilutes the same terms across ten times the text.
+
+<Callout type="warning">
+  A common production bug: reindexing changes the analyzer (say, adding stemming) but the query path keeps the old analyzer, or vice versa. Searches that used to return results suddenly return nothing, and it often isn't caught until a specific query is reported as broken — because most test queries happen to survive the mismatch by accident (exact-word matches still work; only stemmed/synonym matches silently break). Version your analyzer configuration alongside your index schema, and run integration tests that assert stemmed and synonym queries still match after any analyzer change.
+</Callout>
+
+Ranking design choices trade off directly against the scaling concerns in the next lesson — a heavier re-ranking model or a longer candidate list both cost latency and CPU, which matters once query volume and index size force you to shard and replicate the whole system.
+
+<Quiz
+  lessonId="search-querying-and-ranking"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does BM25 apply a saturating (diminishing-returns) curve to term frequency instead of using raw term counts?',
+      options: [
+        { id: 'a', text: 'To prevent a document from ranking higher just because it repeats a keyword many more times than a genuinely relevant document', correct: true, explanation: 'Raw TF grows without bound, so keyword-stuffed documents could outscore better matches; saturation caps how much extra repetition can add.' },
+        { id: 'b', text: 'To make the index smaller on disk', correct: false, explanation: 'Term frequency saturation is a scoring-time formula choice; it does not change what is stored in the postings list.' },
+        { id: 'c', text: 'To speed up postings-list intersection', correct: false, explanation: 'Intersection speed depends on list traversal (merge/skip pointers), not on the scoring formula applied afterward.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasons a two-stage retrieval-then-re-rank architecture is used at scale? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Running an expensive learned ranking model over every document in the corpus would be far too slow', correct: true, explanation: 'Correct — LTR-style models are only affordable over a small candidate set (e.g. top 1,000), not the full corpus.' },
+        { id: 'b', text: 'Cheap retrieval (e.g. BM25 over postings lists) can quickly narrow millions of documents to a manageable candidate set', correct: true, explanation: 'Correct — retrieval is the fast filter; re-ranking is the accurate but expensive refinement step applied only to the survivors.' },
+        { id: 'c', text: 'It removes the need for an inverted index entirely', correct: false, explanation: 'The inverted index is still what makes the first retrieval stage fast; two-stage ranking builds on top of it, not instead of it.' },
+        { id: 'd', text: 'It lets richer signals like personalization and click-through data influence final order without paying their cost on every document', correct: true, explanation: 'Correct — expensive signals only need to be computed for the small re-ranking candidate set.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'IDF (inverse document frequency) increases the score contribution of terms that appear in most documents in the corpus.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'IDF does the opposite: terms that appear in most documents (like "the" or "a") get a low IDF, which reduces their contribution to the score.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — IDF down-weights common terms and up-weights rare, distinguishing ones, since rare terms carry more information about relevance.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A phrase query for "wireless mouse" (in quotes) matches a document differently than a plain AND query for the same two words. What is the extra check a phrase query performs?',
+      options: [
+        { id: 'a', text: 'It checks that the term positions in the document place "mouse" immediately after "wireless"', correct: true, explanation: 'Phrase queries use the position data stored in the postings to confirm adjacency, not just that both terms are present anywhere in the document.' },
+        { id: 'b', text: 'It requires the document title to contain both words', correct: false, explanation: 'Phrase matching is about term adjacency within whatever field is being searched, not specifically the title field.' },
+        { id: 'c', text: 'It requires a higher IDF for both terms before considering a match', correct: false, explanation: 'IDF affects scoring, not whether a phrase match is structurally valid; adjacency is a positional check, independent of IDF.' },
+      ],
+    },
+  ]}
+/>

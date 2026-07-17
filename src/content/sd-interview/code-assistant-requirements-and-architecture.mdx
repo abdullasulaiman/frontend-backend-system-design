@@ -1,0 +1,222 @@
+---
+title: "Requirements and Architecture"
+module: "AI-Powered Code Assistant"
+moduleOrder: 19
+order: 1
+track: "interview"
+summary: "Frames the requirements for an AI coding assistant backend and lays out the high-level architecture, from IDE client through request routing to the inference fleet."
+tags: ["ai-code-assistant", "llm-serving", "developer-tools", "latency-budgets", "system-architecture"]
+estMinutes: 13
+cheatsheet:
+  - "An AI code assistant is really two products in one backend: inline completion (must feel instant, under ~150-200ms) and chat/agentic edits (tolerates seconds). Design them as separate paths with separate latency budgets, not one generic endpoint."
+  - "Cancellation is a first-class requirement, not an edge case — a developer who keeps typing invalidates the in-flight completion request on almost every keystroke, so the client and server both need cheap, fast abort."
+  - "Route every request through a classifier early: request type (completion vs. chat vs. edit) determines model size, context budget, and streaming behavior downstream."
+  - "Post-process every suggestion before it reaches the editor: syntax-validate it, scan for accidentally-echoed secrets or license-tainted snippets, and strip anything that would silently corrupt the buffer."
+  - "Proprietary source code is the sensitive asset here, not user PII — multi-tenant isolation of code and embeddings, plus a clear data-retention story, is a non-functional requirement you should say out loud."
+  - "Treat the repo index (embeddings, symbol graph) as a separate, asynchronously-updated system from the request path — indexing latency and completion latency have completely different budgets."
+  - "Cost is dominated by GPU-seconds on the completion path because of sheer request volume, even though each completion request is small — high frequency beats large size here, unlike chat."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Ask a room of engineers to design "an AI coding assistant" and most will
+start whiteboarding a chat backend — a text box, a model, a response. That
+undersells the problem. The feature developers actually live inside all day
+is inline completion: ghost text that appears mid-keystroke, disappears if
+you keep typing, and needs to feel instantaneous or it gets in the way more
+than it helps. Chat-style "ask about this codebase" is a second, much more
+forgiving workload bolted onto the same backend. An interviewer asking you
+to design this system wants to see whether you notice that these are two
+different problems with two different latency budgets, sharing one
+inference layer and one context pipeline underneath. This lesson frames the
+requirements and the top-level architecture; the next lesson in this module
+goes deep on context retrieval, the latency budget breakdown, and how the
+pieces fit together end to end.
+
+## Clarifying the requirements
+
+### Functional requirements
+
+- **Inline completion**: as a developer types, suggest the next few tokens
+  or lines (ghost text), triggered on keystroke or on an explicit shortcut.
+- **Multi-line / multi-file suggestions**: complete a whole function body,
+  or propose an edit that spans a few related files (e.g. update a caller
+  after a signature change).
+- **Chat over the codebase**: answer questions like "what does this function
+  do" or "where is this config read" using the current repo as grounding.
+- **Explain / refactor / generate tests**: given a selection, produce an
+  explanation, a refactor, or a test file — output the user reviews and
+  applies, not output that lands automatically.
+- **Accept/reject feedback loop**: the client reports whether a suggestion
+  was accepted, edited, or dismissed, feeding back into ranking and model
+  evaluation.
+
+Explicitly out of scope for this lesson (say so in an interview): training
+or fine-tuning the underlying model, and fully autonomous multi-step agents
+that execute shell commands unsupervised. Both are reasonable follow-up
+directions, but the core serving problem is completion + chat over a
+private codebase.
+
+### Non-functional requirements
+
+- **Latency, tiered by request type**: inline completion needs to render
+  before the developer's next keystroke — realistically under 150-200ms end
+  to end, or it visually fights with normal typing. Chat and multi-file
+  edits can tolerate 1-3 seconds, especially if streamed.
+- **Relevance over creativity**: a completion that's syntactically wrong or
+  ignores the file's imports is worse than no suggestion. Precision matters
+  more than for open-ended chat.
+- **Privacy and isolation**: the input is proprietary source code. Requests,
+  embeddings, and any cached context must stay isolated per tenant, and the
+  product needs a clear answer to "is our code used to train your model."
+- **Availability with graceful degradation**: if the inference fleet is
+  saturated, silently disabling ghost text (falling back to no suggestion)
+  is far better than a stalled editor or a crashed extension.
+- **Cost**: completion requests are small individually but enormous in
+  volume — every keystroke pause is a candidate trigger. Chat requests are
+  larger but far less frequent. The two paths have very different
+  cost-per-request and cost-per-active-user profiles.
+
+<Callout type="tip">
+  Say the split out loud early: "This is two workloads sharing one model
+  layer — a high-frequency, low-latency completion path, and a low-frequency,
+  higher-latency chat/edit path." That framing tells the interviewer you're
+  not going to design one generic request/response service and call it done.
+</Callout>
+
+## Why this isn't just "ChatGPT for code"
+
+A chat backend optimizes for one thing: stream a good response to an
+explicit question. A code assistant has to also handle *implicit* requests
+— the developer didn't ask anything, they just paused after typing `for` —
+and it has to handle them so often that most triggers should never reach
+the model at all. A production assistant debounces on the client (skip
+firing mid-keystroke), decides locally whether the cursor context is even
+completion-worthy (e.g. skip inside a comment or a string literal unless
+that's the intent), and only then calls the backend. Even after that
+filtering, a single active developer can generate dozens of real completion
+requests a minute, each of which must be assembled with the right context
+(open file, imports, nearby symbols) and answered before they've moved on —
+and the vast majority of in-flight requests get thrown away because the
+developer kept typing.
+
+## High-level architecture
+
+Break the system into a fast completion path, a slower chat/edit path, and
+a background indexing pipeline that both paths depend on:
+
+<Mermaid client:visible chart={`
+flowchart TB
+    IDE[IDE plugin] -->|debounced keystroke| GW[API gateway]
+    IDE -->|explicit question| GW
+    GW --> CLS[Request classifier]
+    CLS -->|completion| CTX1[Local context assembler]
+    CLS -->|chat / edit| CTX2[Repo-aware context assembler]
+    CTX1 --> INF[Inference fleet]
+    CTX2 --> INF
+    INF --> POST[Post-processor: syntax check, secret scan]
+    POST --> GW
+    GW --> IDE
+    IDX[Background indexer] -.builds/refreshes.-> STORE[(Repo index: embeddings, symbols)]
+    CTX2 -.queries.-> STORE
+`} />
+
+- **IDE plugin**: owns debouncing, cursor-context heuristics, and
+  cancellation — it must be able to abort an in-flight request the instant
+  the developer types past it.
+- **API gateway**: authenticates the request, enforces per-tenant rate
+  limits, and forwards it with a request-type hint.
+- **Request classifier**: routes completion requests down a lean path
+  (small model, tight context, no repo search) and chat/edit requests down
+  a richer path (larger model, retrieval over the repo index).
+- **Context assemblers**: the completion path pulls only what's cheap and
+  local — current file, cursor position, open tabs. The chat/edit path can
+  afford to query the repo index for relevant files. Lesson two in this
+  module covers this in depth.
+- **Inference fleet**: shared GPU capacity, but scheduled so completion
+  requests (small, latency-critical) aren't stuck behind long chat
+  generations — separate queues or priority scheduling, not one FIFO.
+- **Post-processor**: validates the suggestion parses, strips anything that
+  looks like a leaked secret or a verbatim large chunk from a
+  license-restricted source, and only then returns it.
+- **Background indexer**: incrementally re-embeds changed files and updates
+  a symbol graph as the repo changes, decoupled entirely from the request
+  path so a slow re-index never adds latency to a completion.
+
+<Callout type="warning">
+  A common mistake: designing one endpoint and one context-fetch step for
+  both completion and chat, because "it's all just calling an LLM." That
+  design either makes ghost text sluggish (waiting on a repo-wide search it
+  didn't need) or starves chat of the context it does need. Split the paths
+  at the classifier and give each its own context budget and model choice.
+</Callout>
+
+## Worked example: sizing the completion path
+
+Say the product has 50,000 active developers during peak hours, each
+actively coding (not idle) for about half the hour. A developer pauses long
+enough to trigger a completion roughly once every 4 seconds while actively
+typing — call it 15 real triggers/minute per active user, after client-side
+debouncing has already thrown away the keystrokes that don't warrant one.
+
+- Active users at peak: `50,000 x 0.5 = 25,000`
+- Trigger rate: `25,000 x 15 / 60 ≈ 6,250 requests/sec`
+- Each request needs a small-model forward pass returning ~20-40 tokens,
+  budgeted at under 150ms end to end including network.
+
+That request rate, at sub-200ms latency, is the number that sizes the
+completion inference fleet — and it dwarfs chat traffic, which might be 2-3
+orders of magnitude lower in requests/sec even though each chat request
+does more total work. This is why completion typically runs on a smaller,
+cheaper, heavily-batched model tier, while chat can afford a bigger model:
+optimizing the wrong tier for the wrong workload either blows the latency
+budget or blows the GPU budget.
+
+## Common pitfalls to avoid
+
+Beyond the single-endpoint mistake above, watch for two more: treating
+cancellation as an afterthought (an assistant that keeps generating and
+billing GPU time for completions the developer already typed past is
+burning cost for zero value), and forgetting that source code is the
+sensitive asset — a design that reuses a generic chat system's data
+handling without addressing per-tenant isolation of code and embeddings
+will get flagged immediately by an interviewer with security experience.
+
+<Quiz
+  lessonId="code-assistant-requirements-and-architecture"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should inline completion and chat/edit requests be routed down separate paths rather than one shared endpoint?',
+      options: [
+        { id: 'a', text: 'They need different latency budgets and context sizes — completion must be near-instant with minimal context, chat can afford seconds and a repo-wide search.', correct: true, explanation: 'Correct — completion is a high-frequency, low-latency workload; chat is low-frequency and latency-tolerant. Sharing one path means one of them is poorly served.' },
+        { id: 'b', text: 'Because completion requests use a different programming language than chat requests.', correct: false, explanation: 'The language of the code being edited has no bearing on why the paths are split — the split is about latency and context requirements, not language.' },
+        { id: 'c', text: 'Because IDE plugins cannot send more than one type of request to the same gateway.', correct: false, explanation: 'There is no such technical limitation — a gateway can happily accept multiple request types; the split is a design choice driven by differing requirements, not a protocol constraint.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are legitimate non-functional requirements specific to an AI code assistant (beyond a generic LLM chat backend)? (Select all that apply.)',
+        options: [
+        { id: 'a', text: 'Sub-200ms latency for inline completions so suggestions do not visually fight with typing.', correct: true, explanation: 'Correct — this tight latency budget is specific to the completion workload and much stricter than typical chat latency.' },
+        { id: 'b', text: 'Per-tenant isolation of proprietary source code and embeddings.', correct: true, explanation: 'Correct — the input here is often confidential source code, so isolation and a clear data-retention story matter more than in a generic chat product.' },
+        { id: 'c', text: 'Support for at least 50 spoken human languages in the chat interface.', correct: false, explanation: 'Multi-language UI support is a generic product concern, not something distinctive to designing a code assistant backend.' },
+        { id: 'd', text: 'Cheap, fast cancellation of in-flight completion requests as the developer keeps typing.', correct: true, explanation: 'Correct — because most completion triggers get invalidated within moments by further typing, cancellation is core to keeping cost and load sane.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In a well-designed code assistant backend, the background repo-indexing pipeline should sit directly in the request path so completions always use the freshest index.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Putting indexing in the request path would tie completion latency to re-indexing time, which varies wildly with repo size and change volume — exactly what a tight latency budget cannot tolerate.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — indexing should run asynchronously in the background, updating a store the context assembler reads from, fully decoupled from the request path\'s latency budget.' },
+      ],
+    },
+  ]}
+/>

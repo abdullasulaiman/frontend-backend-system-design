@@ -1,0 +1,281 @@
+---
+title: "Cascading Failures and Backpressure"
+module: "Lessons from System Failures"
+moduleOrder: 20
+order: 2
+track: "interview"
+summary: "Explains how a single slow or failing dependency can take down an entire system through retry storms and queue buildup, and how backpressure, timeouts, and circuit breakers stop the spread."
+tags: ["cascading-failures", "backpressure", "circuit-breaker", "resilience", "queueing"]
+estMinutes: 12
+cheatsheet:
+  - "A cascading failure is a chain reaction: one slow/failed dependency causes callers to pile up requests (threads, connections, memory), and that pileup takes the caller down too, spreading the failure upstream."
+  - "Retries without a cap or backoff are the single most common cascade accelerant — a retry storm can multiply load on an already-struggling service by 3-10x at exactly the wrong moment."
+  - "Backpressure means pushing 'I'm full' signals backward through the pipeline (reject, shed, or slow the producer) instead of silently queueing forever — an unbounded queue just delays the crash and hides the signal that would have prevented it."
+  - "Circuit breakers stop calling a failing dependency for a cooldown window, converting a slow failure (timeouts piling up) into a fast one (immediate rejection) that's cheaper for the caller to handle."
+  - "Timeouts must be set deliberately and tightly, with the tightest budget upstream and looser budgets deeper in the call chain never exceeding the caller's own deadline — a default 30s timeout on a service that must respond in 200ms just delays detection."
+  - "Load shedding (drop low-priority or excess work at the edge) and bulkheads (isolate resource pools per dependency) are the two structural defenses that keep one bad dependency from starving everything else."
+  - "Health-check and retry traffic itself can cause a 'thundering herd' on recovery — when a dependency comes back up, everyone who was queued or backed off tends to retry at once; jitter this."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson in this module catalogued the failure modes you'll
+meet in production: slow disks, GC pauses, network partitions, bad
+deploys. Most of those start as a **local** problem in one service. What
+turns a local problem into a full outage is almost never the original
+fault — it's what every other service does in response to it. A payment
+service that gets 30% slower doesn't cause a 30% dip in checkout success;
+it can cause a 100% outage twenty minutes later, in services that never
+had a bug of their own. That gap between "one thing got slow" and
+"everything is down" is what this lesson is about.
+
+This matters in interviews because "how does your design fail, and what
+stops that failure from spreading" is one of the highest-signal follow-up
+questions an interviewer can ask. Naming the mechanism (retry storms,
+unbounded queues, no timeouts) and the specific countermeasure
+(backpressure, circuit breakers, bulkheads) is what separates "I know this
+system works" from "I know this system fails safely."
+
+## How a cascade actually forms
+
+A cascade needs three ingredients, and removing any one of them stops it:
+
+1. **A trigger.** Some dependency gets slow or starts erroring — a
+   database running a bad query plan, a downstream service overloaded by
+   its own traffic spike, a network link dropping packets.
+2. **A pileup mechanism.** Callers of the slow dependency don't fail fast;
+   they wait. Threads block on a slow call, connections stay checked out
+   of a pool, requests queue up in memory. Each waiting caller is now
+   holding a resource (a thread, a socket, a chunk of heap) it would
+   otherwise have released quickly.
+3. **A propagation path.** The caller that's now resource-starved is
+   itself a dependency for something else. Its own callers start timing
+   out or queueing on *it*, and the same pileup mechanism repeats one
+   level up. Repeat this a few hops and services with no relationship to
+   the original trigger start failing.
+
+The insidious part is that step 2 is often made *worse* by good intentions.
+A service that retries failed calls "to be resilient" turns a slow
+dependency into 2-3x more load on that dependency. A thread pool sized
+generously "so we never reject work" just means more threads get stuck
+waiting instead of failing fast. Naive resilience mechanisms, applied
+without limits, are frequently the thing that turns a brief blip into a
+sustained outage.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Checkout service] -->|calls| B[Pricing service]
+  B -->|calls| C[Inventory DB]
+  C -->|slow query, 200ms to 8s| B
+  B -->|threads blocked waiting| A
+  A -->|thread pool exhausted| D[API gateway]
+  D -->|502s pile up, gateway retries| A
+  style C fill:#7a2e2e,color:#fff
+  style B fill:#7a4a2e,color:#fff
+  style A fill:#7a4a2e,color:#fff
+`} />
+
+Notice the DB is only "slow," not down. Nothing between the DB and the
+gateway is individually broken — every hop is doing something reasonable
+in isolation (call downstream, wait for a response, retry on failure).
+The system-level behavior is the failure.
+
+## Backpressure: the core defense
+
+Backpressure is the general principle that when a consumer can't keep up,
+it should signal that fact backward to whoever is producing work for it,
+rather than absorbing unlimited work and hoping it catches up later. It
+shows up at every layer:
+
+- **At the network layer**: TCP's own flow control is backpressure — a
+  receiver with a full buffer tells the sender to slow down.
+- **At the queue layer**: a bounded queue that rejects or blocks producers
+  once full is backpressure; an unbounded queue is the absence of it.
+- **At the API layer**: a `429 Too Many Requests` response, ideally with
+  a `Retry-After` header, is backpressure expressed as an HTTP contract.
+- **At the load-balancing layer**: shedding the least important 10% of
+  requests when the fleet is at capacity is backpressure applied with a
+  priority policy.
+
+The common thread: backpressure converts an overload condition into an
+explicit, fast, cheap signal ("no, not right now") instead of an implicit,
+slow, expensive one (a queue that grows until the process runs out of
+memory, or a client that hangs until its own timeout fires). Fast failure
+is recoverable. Slow, silent failure is what turns into a cascade,
+because every hop upstream is still waiting, still holding resources,
+still hoping the response is "just about to arrive."
+
+### Retries: helpful in isolation, dangerous in aggregate
+
+A single client retrying a single failed call is fine. The problem is
+what happens when thousands of clients retry simultaneously against a
+struggling service — the retries themselves become the load spike that
+prevents recovery. Three mitigations matter:
+
+- **Cap the retry count** (2-3 attempts, not unbounded).
+- **Use exponential backoff with jitter** — each retry waits longer than
+  the last, and the jitter (a random offset) prevents every client from
+  retrying at exactly the same moment.
+- **Retry budgets** — track the ratio of retries to original requests
+  service-wide, and stop retrying entirely once that ratio crosses a
+  threshold (e.g. retries are more than 10% of traffic), because at that
+  point retries are clearly not helping.
+
+### Circuit breakers: fail fast on purpose
+
+A circuit breaker wraps a call to a dependency and tracks its recent
+error/timeout rate. Once that rate crosses a threshold, the breaker
+"opens": it stops calling the dependency at all for a cooldown window and
+returns an immediate error (or a fallback) to the caller instead. After
+the cooldown, it lets a small number of trial requests through
+("half-open") to check whether the dependency has recovered, and only
+then closes fully.
+
+The value isn't avoiding failure — the call was going to fail either way.
+The value is *how fast* it fails. A timeout-based failure might take 5-10
+seconds per call to discover; a tripped circuit breaker fails in
+microseconds. That difference is what keeps the caller's own thread pool
+and connection pool from being consumed by calls that were never going to
+succeed.
+
+## Timeouts and bulkheads: containing the blast radius
+
+Two more structural tools limit how far a slow dependency's damage
+spreads, even before a circuit breaker trips:
+
+- **Deliberate timeouts.** Every network call needs an explicit timeout
+  set relative to the caller's own latency budget, not a framework
+  default. If the API gateway must respond in 300ms, a downstream call
+  with a 30-second default timeout can single-handedly blow that budget
+  by two orders of magnitude while "technically not failing yet."
+- **Bulkheads.** Named after ship compartments that keep one hull breach
+  from sinking the whole vessel: give each dependency its own resource
+  pool (its own thread pool, its own connection pool) instead of one
+  shared pool for all downstream calls. If the pricing service's calls
+  are all stuck waiting, they exhaust the pricing-specific pool — the
+  pool serving calls to inventory or shipping is untouched, and those
+  features keep working.
+
+<Callout type="warning">
+  The most common mistake teams make is treating retries, generous
+  timeouts, and large thread pools as resilience on their own. Each one,
+  applied without a cap, actually removes the fast-failure signal that
+  would have contained the problem — a retry with no limit multiplies
+  load on a struggling dependency, a 30-second timeout means a caller
+  discovers trouble ten times slower than a 300ms budget requires, and an
+  "unbounded so we never reject" thread pool just relocates the resource
+  exhaustion one hop upstream instead of preventing it. Resilience
+  patterns only work when they're bounded and fail fast.
+</Callout>
+
+## Worked example: a checkout service under a database hiccup
+
+Say a checkout API depends on a pricing service, which depends on a
+database. Normal latency: DB queries at 20ms, pricing responds in 40ms,
+checkout responds in 80ms. The checkout service runs 200 worker threads
+and normally uses about 30 of them at a time.
+
+Now the database's query planner picks a bad plan after a schema
+migration, and query latency jumps to 4 seconds. Walk the chain:
+
+- **Without any protection**: pricing's calls to the DB now take 4s
+  instead of 20ms. Pricing has no timeout configured, so its own worker
+  threads block for the full 4s per call. Within a few seconds, all of
+  pricing's threads are tied up waiting on the DB, and it stops accepting
+  new connections. Checkout's calls to pricing start timing out at
+  checkout's own default 30s timeout — but checkout's 200 threads are now
+  each blocked for up to 30 seconds per request, and incoming checkout
+  traffic (unrelated customers just trying to buy things) exhausts the
+  pool within roughly `200 threads / (normal request rate)` seconds.
+  Checkout goes down. So does everything that calls checkout.
+- **With the countermeasures in this lesson**: pricing sets a 200ms
+  timeout on its DB calls (tight, because pricing's own budget from
+  checkout is 300ms) and fails those calls fast once the DB is slow.
+  Checkout's circuit breaker on pricing trips within a few seconds of a
+  bad error rate and starts returning a fallback (e.g. last-known cached
+  price, or "pricing temporarily unavailable, try again") instead of
+  waiting. Checkout's thread pool for pricing calls is a separate
+  bulkhead from its thread pool for, say, the inventory check, so
+  inventory keeps working normally. The database problem is real and
+  still needs fixing, but it stays a pricing-degradation incident instead
+  of a full checkout outage.
+
+The difference between those two outcomes isn't the trigger — it's
+identical in both. It's entirely in whether the system was built to fail
+fast and contain damage, or to quietly absorb it until something breaks.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant U as Customer
+    participant CO as Checkout
+    participant PR as Pricing
+    participant DB as Database
+    U->>CO: place order
+    CO->>PR: get price (circuit closed)
+    PR->>DB: query (200ms timeout)
+    DB-->>PR: timeout, DB is slow
+    PR-->>CO: fast error (fallback price used)
+    Note over CO: after N failures, circuit opens
+    CO->>CO: skip calling pricing, use cache
+    CO-->>U: order placed with cached price
+`} />
+
+## Where this fits with the rest of the module
+
+This lesson focused on the mechanism of failure spread and the specific
+countermeasures (backpressure, retry limits, circuit breakers, timeouts,
+bulkheads). The next lesson, on postmortems and resilience patterns,
+covers the broader organizational and architectural practices — blameless
+postmortems, chaos engineering, graceful degradation strategies — that
+sit around these mechanisms. The final lesson walks through named,
+real-world outages so you can see these exact patterns (or their absence)
+play out at scale.
+
+<Quiz
+  lessonId="failures-cascading-failures-and-backpressure"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A service starts retrying every failed call up to 5 times with no delay between attempts, right as its main dependency becomes overloaded. What is the most likely effect?',
+      options: [
+        { id: 'a', text: 'The retries have no meaningful effect on load, since each individual request is small', correct: false, explanation: 'Retries multiply the request volume the struggling dependency sees — 5 uncapped, undelayed retries can turn one request into up to 6x the load at the worst possible time.' },
+        { id: 'b', text: 'The retry storm adds load to the already-overloaded dependency and can prevent it from recovering', correct: true, explanation: 'This is the classic retry-storm cascade accelerant: retries without backoff or a cap amplify load on a struggling dependency instead of giving it room to recover.' },
+        { id: 'c', text: 'The retries will automatically stop once the dependency returns a 200 response', correct: false, explanation: 'Retries stop once a given call succeeds, but new incoming requests keep triggering fresh retry sequences the whole time the dependency is degraded — the aggregate load does not drop until the dependency recovers or the retries are capped/backed off.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are structural defenses that limit how far a cascading failure spreads? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Bulkheads: separate resource pools (threads, connections) per downstream dependency', correct: true, explanation: 'Bulkheads isolate resource exhaustion to the pool serving the failing dependency, so calls to healthy dependencies keep working.' },
+        { id: 'b', text: 'Circuit breakers that stop calling a failing dependency for a cooldown window', correct: true, explanation: 'Circuit breakers convert slow failures (timeouts) into fast, cheap rejections, which stops the resources of the caller from being tied up waiting.' },
+        { id: 'c', text: 'Increasing the default timeout on all downstream calls to 60 seconds so calls have more time to succeed', correct: false, explanation: 'A longer timeout does the opposite — it means callers wait longer per request before discovering a problem, tying up more resources for longer and making cascades worse, not better.' },
+        { id: 'd', text: 'Shedding low-priority requests at the edge when the system is near capacity', correct: true, explanation: 'Load shedding is backpressure applied with a priority policy — it protects capacity for the requests that matter most instead of letting everything degrade together.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'An unbounded in-memory queue in front of a slow consumer is a safe way to handle a temporary traffic spike, since it just holds requests until the consumer catches up.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'An unbounded queue removes the backpressure signal that would let producers or callers react. It typically just delays the failure (as memory pressure or, once the consumer catches up, a burst of very stale responses) rather than preventing it.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — an unbounded queue hides the "overloaded" signal instead of surfacing it, letting memory grow until the process crashes, and any requests that do eventually get processed may already be past their useful deadline.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A circuit breaker in front of a dependency call has just tripped to "open" after a burst of timeouts. What should happen next, in a well-implemented breaker?',
+      options: [
+        { id: 'a', text: 'It permanently stops calling the dependency until a human manually resets it', correct: false, explanation: 'Requiring manual intervention for every trip defeats the purpose of automated resilience; a well-implemented breaker recovers on its own once the dependency is healthy again.' },
+        { id: 'b', text: 'It immediately returns errors or a fallback for all calls during a cooldown window, then lets a small number of trial requests through to check for recovery', correct: true, explanation: 'This is the standard open -> half-open -> closed cycle: fail fast during cooldown, then probe with limited traffic before fully re-enabling calls.' },
+        { id: 'c', text: 'It keeps calling the dependency at full volume but logs a warning for visibility', correct: false, explanation: 'That is what NOT tripping the breaker looks like — it provides visibility but does nothing to reduce load on the struggling dependency or protect the resources of the caller.' },
+      ],
+    },
+  ]}
+/>

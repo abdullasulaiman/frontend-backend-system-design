@@ -1,0 +1,229 @@
+---
+title: "Rider-Driver Matching and Dispatch"
+module: "Design Uber"
+moduleOrder: 5
+order: 3
+track: "interview"
+summary: "Covers how a ride-hailing system finds nearby candidate drivers, scores and assigns them to a ride request, and handles the races and failures that come with dispatch at scale."
+tags: ["uber", "matching", "dispatch", "geospatial", "queueing"]
+estMinutes: 12
+cheatsheet:
+  - "Matching is two separate steps: candidate generation (who's nearby, cheaply) and scoring/assignment (who's best, more expensively) — never run the expensive scoring pass over every driver in the city."
+  - "Index driver locations in a geospatial structure (geohash grid or quadtree) held in memory, updated on every location ping; querying a database table per match request will not scale."
+  - "Prefer a widening-radius search (start at a small radius, expand only if too few candidates) over a single fixed large radius — it keeps candidate sets small in dense areas and still finds someone in sparse ones."
+  - "Use short-lived reservations (a lock or a soft hold with a TTL) on a candidate driver while they're deciding, not a hard commit — offers get rejected or time out, and a stuck lock strands that driver from all other requests."
+  - "A ride request should live in a queue with retries and a max-attempt cutoff, not a single synchronous call — this is what lets the system say 'no drivers available' gracefully instead of hanging or crashing under load."
+  - "Idempotency matters here as much as in payments: a duplicate dispatch event assigning the same rider to two drivers is a real, embarrassing failure mode without dedup keys."
+  - "Scoring should weigh more than raw distance — driver rating, acceptance-rate history, and time-to-pickup (which isn't the same as straight-line distance) all belong in the score."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The high-level design gave dispatch a box on the diagram labeled "matching
+service" and moved on. This lesson opens that box. It's usually where an Uber
+interview earns or loses its "strong hire" — anyone can say "find the nearest
+driver," but the interesting part is what happens when three riders in the
+same neighborhood request a ride within two seconds of each other, the
+nearest driver just went offline mid-offer, and the system still has to
+respond in under a second without double-booking anyone.
+
+Matching and dispatch is fundamentally a real-time assignment problem under
+uncertainty: driver locations are seconds stale, drivers can reject or ignore
+offers, and the "best" match has to be computed fast enough that the rider
+isn't staring at a spinner. Get the structure right and it scales cleanly;
+get it wrong and you either starve riders of drivers who are technically
+available, or you double-assign the same driver to two rides.
+
+## Two-phase matching: find candidates, then rank them
+
+The core idea that makes matching tractable at scale is splitting it into
+two phases with very different cost profiles:
+
+1. **Candidate generation** — cheaply find a small set of drivers who are
+   plausibly close to the rider. This has to be fast and approximate.
+2. **Scoring and assignment** — take that small set (tens of drivers, not
+   thousands) and rank them by a more expensive, more accurate function,
+   then offer the ride to the top candidate.
+
+Skipping phase one and scoring every driver in the city against every
+incoming request doesn't scale: a city with 50,000 active drivers and 500
+requests per second can't afford 25 million distance calculations a second,
+let alone anything richer than distance. Phase one exists purely to shrink
+the problem before the expensive part runs.
+
+### Candidate generation: geospatial indexing
+
+Driver location updates (from the location-updates pipeline covered in the
+next lesson) get written into an in-memory geospatial index — a geohash
+grid or quadtree, keyed by driver ID, holding current lat/lng and an
+"available" flag. A match request queries this index, not a database table:
+a live radius query against a row-store scan is far too slow for a
+sub-second dispatch budget.
+
+The search itself should widen progressively rather than fix one radius for
+the whole city:
+
+- Start at a small radius (say `500m`) around the rider.
+- If fewer candidates than needed come back (fewer than roughly 5-10),
+  expand to the next ring and query again.
+- Stop once there are enough candidates, or a max radius is hit — at which
+  point the honest answer is "no drivers available nearby" rather than an
+  indefinitely expanding search.
+
+This matters because driver density varies enormously: a downtown request
+at rush hour might have 40 available drivers within 500m, while a suburban
+request at 2am might need a 5km radius before finding one. A single global
+radius either wastes work scoring too many drivers downtown or fails
+outright in the suburbs.
+
+### Scoring and assignment
+
+Once you have, say, 15-30 candidates, score each one and pick a winner. A
+naive design scores purely on straight-line distance, but that's a weak
+proxy for what riders actually experience — a driver 800m away separated by
+a highway with no nearby exit can take longer to arrive than a driver 1.5km
+away on a straight road. A more realistic score combines:
+
+- **Estimated time to pickup** — ideally from the routing/ETA service (a
+  road-network estimate, not straight-line distance).
+- **Driver acceptance-rate history** — a driver who ignores or rejects most
+  offers is a worse bet even if they're geographically closest, because
+  offering to them burns time before falling back to the next candidate.
+- **Driver rating** — a tie-breaker and a product-quality signal.
+- **Idle time** — some designs weight toward drivers who've been waiting
+  longest, for fairness and driver retention, at some cost to pure
+  efficiency.
+
+The system offers the ride to the top-scored candidate first, not to all
+candidates at once — broadcasting to many drivers simultaneously creates a
+race where multiple drivers might accept the same ride, which then requires
+an arbitration step to undo. Sequential offering with a short timeout (a
+few seconds) avoids that race entirely, at the cost of slightly higher
+worst-case latency when the top candidate doesn't respond.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    Req[Ride request: rider location] --> Gen[Candidate generation]
+    Gen --> Idx[(Geospatial index of driver locations)]
+    Idx --> Cands[15-30 nearby candidates]
+    Cands --> Score[Scoring: ETA, rating, acceptance rate]
+    Score --> Top[Top-ranked driver]
+    Top --> Offer[Offer with short TTL lock]
+    Offer -->|Accept| Assign[Assign trip, remove driver from pool]
+    Offer -->|Reject or timeout| Next[Offer to next-ranked candidate]
+    Next --> Offer
+`} />
+
+## Reservations, races, and idempotency
+
+Between "offer sent" and "driver accepts," that driver has to be held out
+of consideration for other requests, or two riders can both get assigned
+the same driver. The standard fix is a short-TTL soft lock (a Redis key
+with an expiry, or an equivalent) placed on the driver as soon as they're
+selected as the top candidate:
+
+- The lock has a TTL of a few seconds — long enough for the driver's app to
+  respond, short enough that a dropped connection or crashed client doesn't
+  strand the driver indefinitely.
+- If the driver accepts, the lock converts into a real assignment and the
+  driver is marked unavailable in the index.
+- If the driver rejects, ignores, or the lock expires, it's released and
+  the driver becomes eligible for the next request's candidate search.
+
+This is also where dedup and idempotency earn their keep. A retried
+dispatch message (from an at-least-once queue, a network retry, or a
+duplicate event) must not create two separate assignments for the same
+ride request — attach an idempotency key (ride request ID) to the
+assignment write, so a duplicate message is a no-op rather than a second
+booking. The same discipline you'd apply to a payment write applies here:
+assigning a driver is a side effect with real-world consequences (a driver
+physically drives somewhere), so "at least once delivery, exactly once
+effect" is the target.
+
+## Worked example: a request during a surge
+
+A rider requests a ride in a dense downtown grid cell during evening rush.
+The candidate generation step queries the geospatial index at a `500m`
+radius and gets back 22 available drivers immediately — no widening
+needed. The scoring step computes ETA for each (using cached road-network
+segments rather than a live routing call per candidate, to keep this step
+fast), factors in acceptance rate and rating, and ranks them. The top driver
+gets an offer with a 4-second TTL lock. They don't respond in time — maybe
+their phone lost signal in a tunnel — so the lock expires, that driver goes
+back into the pool, and the system immediately offers to the second-ranked
+driver, who accepts in 1.2 seconds. Total time from request to confirmed
+driver: under 6 seconds, most of it spent waiting out the first driver's
+timeout rather than doing computation. A well-tuned system keeps that
+timeout short (a few seconds, not tens) specifically because this fallback
+path is common at scale, not an edge case.
+
+<Callout type="warning">
+  A common interview mistake: describing matching as "query all drivers,
+  sort by distance, assign the closest one" and stopping there. That design
+  has no answer for what happens when the closest driver rejects the offer,
+  no protection against two ride requests racing for the same driver, and
+  no mechanism to prevent a driver from being offered a ride while another
+  offer to them is still pending. Naming the candidate-generation step, the
+  scoring step, and the reservation/lock mechanism separately — and being
+  able to say what happens on rejection and duplicate delivery — is what
+  separates a surface-level answer from a design that would actually work.
+</Callout>
+
+## Where this leaves you
+
+Dispatch now has a concrete shape: a geospatial index feeds fast candidate
+generation, a scoring function ranks a small candidate set on more than
+raw distance, and short-TTL locks plus idempotent assignment writes keep
+the system safe under retries and rejections. The next lesson goes one
+layer deeper on the input this all depends on — how driver location updates
+actually flow from phone GPS into that index in near real time, and the
+trade-offs in update frequency, batching, and staleness that make the index
+in this lesson trustworthy in the first place.
+
+<Quiz
+  lessonId="uber-rider-driver-matching-and-dispatch"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does matching split into a "candidate generation" phase and a separate "scoring" phase instead of scoring every driver in the city directly?',
+      options: [
+        { id: 'a', text: 'Scoring every driver against every request does not scale — candidate generation cheaply shrinks the problem to a small set before the more expensive ranking logic runs.', correct: true, explanation: 'Correct — this is exactly the point of the split: a cheap, approximate filter followed by an expensive, accurate rank, applied only to a small candidate set.' },
+        { id: 'b', text: 'Because scoring functions cannot be computed for more than one driver at a time.', correct: false, explanation: 'Nothing about scoring is inherently single-driver; the issue is pure computational cost at city scale, not a technical limit on batch scoring.' },
+        { id: 'c', text: 'Because geospatial indexes cannot store more than a few dozen drivers at once.', correct: false, explanation: 'Geospatial indexes comfortably hold every active driver in a region; the two-phase split is about compute cost, not index capacity.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasons to offer a ride sequentially (top candidate first, then next on rejection) rather than broadcasting the offer to all candidates simultaneously? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Broadcasting creates a race where multiple drivers could accept the same ride, requiring extra arbitration logic to resolve.', correct: true, explanation: 'Correct — sequential offering with a lock avoids this race by construction, instead of needing to detect and undo it after the fact.' },
+        { id: 'b', text: 'Sequential offering guarantees the fastest possible time-to-assignment in every case.', correct: false, explanation: 'The opposite can be true in the worst case — if the top candidate is slow to respond, sequential offering waits out that timeout before trying the next driver, so it can be slower, not faster, per single request.' },
+        { id: 'c', text: 'It lets a short-TTL lock cleanly hold one driver out of consideration for other requests while they decide.', correct: true, explanation: 'Correct — the lock only needs to protect one driver at a time per offer, which fits naturally with a sequential offer flow.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Once a driver is selected as the top candidate and sent an offer, they should be held with a permanent hard lock until they explicitly accept or reject, with no timeout.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A permanent lock with no expiry means a dropped connection or crashed app strands that driver from every other request indefinitely — the lock needs a short TTL specifically to bound that risk.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — a short-TTL soft lock is standard: long enough for a normal response, short enough that a stuck or unresponsive driver releases back into the pool quickly.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A widening-radius search for candidate drivers starts at a small radius and expands only if too few candidates are found. What problem does this solve compared to always searching a single large fixed radius?',
+      options: [
+        { id: 'a', text: 'It avoids scoring an unnecessarily large candidate set in dense areas while still reaching far enough to find someone in sparse areas.', correct: true, explanation: 'Correct — driver density varies a lot by area and time of day; a single fixed radius either wastes work downtown or fails to find anyone in low-density areas.' },
+        { id: 'b', text: 'It removes the need for a geospatial index entirely.', correct: false, explanation: 'The widening search still runs against the geospatial index at each radius step — it changes the query pattern, not whether an index is needed.' },
+        { id: 'c', text: 'It guarantees the closest possible driver is always found on the first query.', correct: false, explanation: 'Widening trades off some latency for adaptability; it does not by itself guarantee the very first query radius contains the objectively closest driver.' },
+      ],
+    },
+  ]}
+/>

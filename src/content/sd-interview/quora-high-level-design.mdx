@@ -1,0 +1,237 @@
+---
+title: "High-Level Design"
+module: "Design Quora"
+moduleOrder: 2
+order: 2
+track: "interview"
+summary: "Breaks a Quora-style Q&A platform into its core services and traces how the write path (posting) and read path (browsing a feed or a question) flow through them differently."
+tags: ["system-design", "architecture", "q-and-a", "feeds", "fan-out"]
+estMinutes: 12
+cheatsheet:
+  - "Separate the content service (questions/answers as durable records) from the scoring/vote service — votes are a much higher-write-rate, higher-contention workload than posting content."
+  - "A question/answer page is a fan-in read: one question, many answers, sorted by score — cache the assembled page, don't recompute the sort on every view."
+  - "A home feed is a fan-out problem: pick push (fan-out-on-write), pull (fan-out-on-read), or a hybrid based on a user's or topic's follower count — pure push breaks on high-follower accounts."
+  - "Keep search/topic indexing off the synchronous write path — index updates are eventually consistent and driven by an event, not part of the answer-submission transaction."
+  - "Vote counts should be buffered through a queue and aggregated, not incremented with a synchronous row-level update per click, or a viral question turns into a hot-row bottleneck."
+  - "Draw the boundary between the write path (content + votes, needs durability and eventual consistency) and the read path (feeds + question pages, needs low latency and heavy caching) before naming a single service."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+With requirements and scale pinned down in the last lesson, the next step is
+sketching a system that can plausibly hit those numbers. "Design Quora" sounds
+like it should be one big "questions and answers" service, but that framing
+hides the two problems that actually make this system hard: fanning a single
+piece of content out to many readers (a viral answer, a followed topic) and
+keeping a running score (votes) correct and fast under contention. Get the
+component boundaries right around those two problems, and the rest of the
+design falls into place quickly.
+
+## Start from the two access patterns
+
+Before drawing boxes, separate what a user *writes* from what a user *reads*,
+because they stress completely different parts of the system:
+
+- **Write path**: posting a question, posting an answer, casting a vote,
+  following a topic or a person. Lower volume than reads, but votes in
+  particular can spike hard on popular content and need to stay correct under
+  concurrent writes.
+- **Read path**: loading a home feed, opening a question page, searching for a
+  topic. Enormously higher volume than writes — every question view is a read,
+  every feed scroll is a read — and it's where latency actually gets judged by
+  the user.
+
+This mirrors the read/write asymmetry you'd sketch for any content platform,
+but Quora adds a wrinkle: a single write (one answer) can fan out to a huge
+number of reads (everyone following that question, that topic, or that
+author). How you handle that fan-out is the single biggest architectural
+decision in this lesson.
+
+## The major components
+
+- **Client** (web, mobile) — renders feeds, question pages, and the
+  ask/answer composer; calls a single API layer for everything else.
+- **API / edge layer** — stateless services behind a load balancer handling
+  auth, rate limiting, and request routing.
+- **Content service** — owns questions and answers as durable records: create,
+  edit, delete, fetch by ID. This is the source of truth for the actual text.
+- **Vote/scoring service** — owns upvotes, downvotes, and the derived score
+  per answer. Split out from the content service because its write rate and
+  contention profile are completely different — a popular answer can take
+  thousands of votes a minute while its text never changes again.
+- **Follow graph service** — who follows which users, topics, and questions.
+  Read constantly (to build feeds) and written rarely (a follow/unfollow
+  click) — a classic asymmetric read/write service.
+- **Feed service** — assembles the ranked list of items for a user's home
+  page. It consumes the follow graph and either precomputed ("push") or
+  on-demand ("pull") candidate items. The actual ranking formula is deferred
+  to the "Ranking and Feed Generation" lesson — here we only decide *how
+  candidates get to the feed service* in the first place.
+- **Search / topic index** — a separate index (inverted index) over question
+  titles, topics, and answer text, kept eventually consistent with the
+  content service via an event stream, never queried synchronously on write.
+- **Notification service** — tells a user "your followed question got a new
+  answer" or "someone answered your question" — driven off the same event
+  stream as the search index.
+- **Event bus / queue** — the backbone connecting the write path to every
+  downstream consumer (search indexing, notifications, feed fan-out, vote
+  aggregation) without making the writer wait for any of them.
+- **Primary datastore** — a relational or document store holding questions,
+  answers, users, and the follow graph, usually sharded by question/user ID
+  once volume demands it (that sharding strategy belongs in the "Scaling"
+  lesson).
+- **Cache layer** — in front of hot question pages, assembled feeds, and vote
+  counts, since the read volume dwarfs the write volume by orders of
+  magnitude.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    C[Client] --> API[API / Edge Layer]
+    API --> CONTENT[Content Service]
+    API --> VOTE[Vote Service]
+    API --> FEED[Feed Service]
+    API --> SEARCH[Search Index]
+    CONTENT --> DB[(Primary DB)]
+    VOTE --> DB
+    CONTENT --> BUS[[Event Bus]]
+    VOTE --> BUS
+    BUS --> SEARCH
+    BUS --> NOTIF[Notification Service]
+    BUS --> FANOUT[Feed Fan-out Worker]
+    FANOUT --> FEED
+    FEED --> CACHE[(Feed / Page Cache)]
+    C --> CACHE
+`} />
+
+## Walking the write path: posting an answer
+
+A user submits an answer to the content service, which validates it and
+writes it to the primary database as the durable record — that write returns
+success immediately once it's persisted. It does **not** wait for search
+indexing, notifications, or feed updates to finish; instead it publishes an
+"answer created" event onto the event bus. Three independent consumers react
+to that event asynchronously: the search index updates its entry for that
+question, the notification service messages everyone following the question,
+and a feed fan-out worker decides how this new answer should reach followers'
+home feeds.
+
+That last step is the interesting one. If the question's author (or the
+question itself) has a modest number of followers, pushing the new item
+directly into each follower's precomputed feed on write is cheap and keeps
+reads fast. If it has a huge follower count — a heavily-followed topic or a
+well-known writer — pushing to every follower on every single answer becomes
+its own write storm. The practical answer most real systems land on is
+hybrid: push for normal-sized follower counts, and fall back to pulling
+high-fan-out sources into the feed at read time, merging both at feed
+assembly. The exact ranking of that merged list is the next lesson's job —
+here we're only deciding which items become candidates at all.
+
+## Walking the read path: opening a question page
+
+A question page is a fan-*in* read rather than a fan-out one: one question,
+potentially thousands of answers, sorted by score. The content service
+fetches the question and a page of answers (already filtered/sorted by the
+vote service's stored score, not recomputed live), and the whole assembled
+page is cached, because the same question page gets viewed by many different
+users who all see essentially the same content. A user's own vote state on
+that page is small and specific to them, so it's fetched separately and
+overlaid on the cached page rather than busting the shared cache per viewer.
+
+## Worked example: a question goes viral
+
+Say a question about a breaking news event suddenly gets 50,000 new answers
+and 5 million upvotes across those answers within an hour. Trace it through
+the design above:
+
+1. Each answer submission is one write to the content service and one event
+   onto the bus — 50,000 writes is trivial for the primary database, so the
+   content path barely notices.
+2. Votes are the real stress test: 5 million vote clicks would be 5 million
+   row-level `UPDATE`s if handled naively, and a large fraction of them land
+   on the same handful of top answers — a hot-row problem. Instead, votes get
+   buffered through the vote service's own write path (in-memory counters or
+   a queue) and flushed as batched increments, so the database sees periodic
+   bulk updates instead of millions of point writes to the same rows.
+3. The question's page is read millions of times as the story spreads. Because
+   that page is cached and only invalidated/refreshed on a schedule (or when
+   the batched vote flush lands), those millions of reads hit the cache, not
+   the database or the vote service directly.
+4. Feed fan-out for this question follows the hybrid rule from above: it
+   likely has far more followers than a typical question, so it's pulled into
+   feeds at read/merge time rather than pushed to every follower's
+   precomputed feed the instant each of the 50,000 answers lands.
+
+Without steps 2–4, a single viral question would turn into millions of
+synchronous writes against a handful of hot rows and millions of uncached
+reads — exactly the kind of design that falls apart the moment an interviewer
+asks "what happens when this goes viral?"
+
+<Callout type="warning">
+  A common mistake is putting votes directly on the same row and the same
+  write path as the answer's text — for example, an `UPDATE answers SET
+  score = score + 1 WHERE id = ?` executed synchronously per click. That
+  couples a low-frequency operation (editing an answer) to an extremely
+  high-frequency, high-contention one (voting), and it means every vote is a
+  blocking write against a row that popular content will be hitting
+  constantly. Split scoring into its own service/table with a buffered,
+  batched write pattern, and let the content record itself stay
+  write-light.
+</Callout>
+
+## What this lesson set up
+
+This is deliberately a skeleton: component names and how traffic flows
+between them, not schemas (next lesson), not the ranking formula behind the
+feed (the lesson after that), and not sharding/replication numbers (the final
+lesson). The one idea worth keeping in your head walking into a follow-up
+question is the fan-out choice: almost every "what if this gets popular"
+question in this interview is really asking whether you picked push, pull, or
+a hybrid, and whether you know why.
+
+<Quiz
+  lessonId="quora-high-level-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why is the vote/scoring system usually split into its own service rather than living on the same answer row that stores the text?',
+      options: [
+        { id: 'a', text: 'Because votes need a different database engine than text content', correct: false, explanation: 'The engine choice isn\'t the driver here — the issue is write frequency and contention, not storage technology.' },
+        { id: 'b', text: 'Because votes are a much higher-frequency, higher-contention write than editing content, and coupling them slows down or blocks on both', correct: true, explanation: 'Correct. Popular answers can receive votes constantly while their text almost never changes; separating the two lets the vote path use buffering/batching without affecting the content record.' },
+        { id: 'c', text: 'Because answers cannot be edited once a vote is cast', correct: false, explanation: 'Editability is a product decision unrelated to why scoring is architecturally separated from content storage.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these should happen asynchronously, off the synchronous request that saves a new answer? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Updating the search index entry for the question', correct: true, explanation: 'Search indexing is event-driven and eventually consistent — it should never block the write that creates the answer.' },
+        { id: 'b', text: 'Notifying users who follow the question', correct: true, explanation: 'Notifications fan out to potentially many followers and are naturally handled off an event, not inline with the write.' },
+        { id: 'c', text: 'Persisting the answer text to the primary datastore', correct: false, explanation: 'This is the one thing that must happen synchronously — until the record is durably saved, there is nothing to index, notify about, or fan out.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A pure fan-out-on-write feed strategy, where every new answer is pushed into every follower\'s precomputed feed immediately, scales well regardless of how many followers a question or author has.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'It breaks down for high-follower-count sources: pushing one answer into millions of precomputed feeds at once is itself a massive write storm, which is why real systems use a hybrid push/pull approach.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Push works well for typical follower counts but needs a pull (or hybrid) fallback for high-fan-out sources like widely-followed topics or well-known authors.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A question page showing one question and its top answers is best described as which kind of access pattern?',
+      options: [
+        { id: 'a', text: 'A fan-in read: many pieces of content (answers) converging into one assembled view', correct: true, explanation: 'Correct. One question aggregates many answers sorted by score into a single page — the opposite direction of a feed\'s fan-out problem, and a good candidate for whole-page caching.' },
+        { id: 'b', text: 'A fan-out write: one answer being pushed to many destinations', correct: false, explanation: 'That describes how a new answer might propagate into feeds, not how an existing question page is assembled for a reader.' },
+        { id: 'c', text: 'A pure write operation with no caching opportunity', correct: false, explanation: 'It\'s a read-heavy, highly cacheable pattern — the same assembled page is shown to many different viewers.' },
+      ],
+    },
+  ]}
+/>

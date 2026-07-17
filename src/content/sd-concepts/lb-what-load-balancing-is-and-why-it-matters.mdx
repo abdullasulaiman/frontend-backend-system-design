@@ -1,0 +1,117 @@
+---
+title: "What Load Balancing Is and Why It Matters"
+module: "Load Balancers"
+moduleOrder: 8
+order: 1
+track: "concept"
+summary: "Introduces load balancers as the traffic cop that spreads requests across a fleet of servers, and explains the reliability and scalability problems they solve that a single server cannot."
+tags: ["load-balancing", "high-availability", "scalability", "networking"]
+estMinutes: 11
+cheatsheet:
+  - "A load balancer's two jobs are distributing traffic across healthy backends and hiding backend failures from clients — scalability and availability, in one component."
+  - "A single server has a hard capacity ceiling and is a single point of failure; a load balancer plus a fleet turns 'one big box' into 'many replaceable boxes,' which is what lets you scale horizontally at all."
+  - "Layer 4 (L4) load balancers route on IP/port and TCP/UDP connections — fast, protocol-agnostic, but blind to HTTP content like headers, cookies, or paths."
+  - "Layer 7 (L7) load balancers parse the application protocol (usually HTTP) and can route on path, header, or cookie — more flexible, more CPU cost per request."
+  - "The load balancer itself becomes a single point of failure the moment you introduce it — always deploy at least two (active-passive or active-active) behind something clients can fail over to, like DNS or a floating IP."
+  - "Sticky sessions (routing a client back to the same server) trade even load distribution for simplicity — prefer externalizing session state so any server can serve any request, and reserve stickiness for cases you can't avoid it."
+  - "Load balancers are a traffic-management layer, not a data layer — they don't solve database scaling, caching, or storage partitioning; those need their own techniques."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Picture a service running on one server. It handles 500 requests per second comfortably. Traffic grows to 5,000 requests per second — the server pegs its CPU, response times climb, and requests start timing out. Even setting capacity aside: that one server crashes, gets rebooted for a patch, or loses its network link, and the entire service goes down with it. Buying a bigger server buys you some headroom, but it doesn't fix the second problem at all, and it eventually runs out of runway on the first one too — there's always a bigger spike than the biggest box you bought.
+
+The fix in both cases is the same: stop routing all traffic to one server, and instead run several servers that can each handle a share of it, with something in front deciding which server gets each request. That something is a **load balancer**. It's one of the most load-bearing (pun intended) components in any backend system, which is why it's usually one of the first things you place in a system design interview's architecture diagram, right after "client" and "API."
+
+## What a load balancer actually does
+
+A load balancer sits between clients and a pool of backend servers (often called a "server farm," "fleet," or "backend pool"). Every incoming request or connection arrives at the load balancer first, which then forwards it to one server in the pool based on some selection rule. From the client's perspective, there's a single address to talk to; from the backend pool's perspective, the load balancer is the only thing that ever talks to them directly.
+
+That one repositioning solves two distinct problems, and it's worth naming both explicitly because interviewers will probe whether you understand that a load balancer isn't "just for scaling":
+
+- **Scalability.** Instead of one server absorbing all traffic, N servers each absorb roughly `1/N` of it. Need more capacity? Add another server to the pool — no rewrite, no re-architecture, just more of the same unit of compute. This is what makes horizontal scaling possible in the first place; without a load balancer (or something playing its role), clients would need to somehow know which of N servers to talk to, which doesn't scale.
+- **Availability.** If a server crashes, is being deployed to, or is overloaded, the load balancer can simply stop sending it traffic and route around it. Clients never see that server directly, so they never notice it's gone — they just keep getting served by the servers that are still healthy. A single-server system has no way to survive that server's failure; a load-balanced pool does, as long as at least one healthy server remains.
+
+Health checking (how the load balancer actually knows a server is unhealthy) and the specific algorithms used to pick a server are big enough topics that they get their own lessons later in this module — this lesson is about the concept and the shape of the problem, not the selection mechanics.
+
+## Where load balancing happens in the network stack
+
+Load balancers operate at different layers of the network stack, and which layer matters a lot for what the load balancer can and can't see.
+
+**Layer 4 (transport layer)** load balancers work at the TCP/UDP level. They look at IP addresses and ports, and forward whole connections to a backend without inspecting the data inside them. They're fast and protocol-agnostic — they'll balance any TCP traffic, not just HTTP — but they're blind to anything above the transport layer: they can't route based on a URL path, an HTTP header, or a cookie, because they never parse that far into the payload.
+
+**Layer 7 (application layer)** load balancers terminate the application protocol — almost always HTTP/HTTPS in a web backend — and can make routing decisions based on its content: send `/api/video/*` to the video-encoding pool, send requests carrying a specific `X-Beta-User` header to a canary deployment, or route based on a session cookie. That flexibility costs more CPU per request, since the load balancer has to actually parse and often terminate TLS for the request, rather than just shuffling packets.
+
+Most real systems use both: an L4 load balancer (or the cloud provider's managed equivalent) as the outermost edge, handling raw connection volume and DDoS-scale traffic cheaply, with L7 load balancers or API gateways behind it doing the content-aware routing.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  C1[Client A] --> LB{Load Balancer}
+  C2[Client B] --> LB
+  C3[Client C] --> LB
+  LB --> S1[Server 1]
+  LB --> S2[Server 2]
+  LB -.->|marked unhealthy| S3[Server 3]
+  S1 --> DB[(Shared Database)]
+  S2 --> DB
+`} />
+
+Notice server 3 in that diagram: it's still physically connected, but the load balancer has stopped routing to it because a health check failed. That's the availability half of the job in action — the pool shrank by one, but clients never saw an error, because there were still healthy servers to absorb the load.
+
+## Statelessness: the assumption load balancing quietly depends on
+
+A load balancer that spreads requests evenly only helps if any server in the pool can actually handle any request. That's easy when servers are stateless — no request-specific data lives only in one server's memory or local disk. It gets harder the moment a server holds something a later request needs: a shopping cart built up in local memory, a WebSocket connection, an in-progress file upload.
+
+The common workaround is **sticky sessions** (also called session affinity): the load balancer routes a given client back to the same server every time, usually via a cookie or the client's source IP. That fixes the correctness problem, but reintroduces the two problems load balancing was supposed to solve for that client — if their "sticky" server goes down, their session goes with it, and if that server happens to get more sticky clients than others, load stops being even. The more scalable fix is pushing state out of the server entirely — into a shared cache or database — so every server is interchangeable and the load balancer is free to route however it wants. We'll come back to this trade-off through the module, but it's worth internalizing now: statelessness isn't a nice-to-have, it's what makes load balancing actually work as advertised.
+
+## Worked example: sizing a fleet
+
+Say a service needs to sustain 12,000 requests per second at peak, and load testing shows a single server instance can sustain 1,500 requests per second before its p99 latency blows past the SLA. Naively, `12,000 / 1,500 = 8` servers.
+
+In practice you provision more than the bare minimum, for two reasons. First, you want headroom for a single server failing — with exactly 8 servers, losing one drops capacity to 7 × 1,500 = 10,500 req/s, below the 12,000 target, so the remaining servers get overloaded right as one fails, which is exactly the moment you can least afford it. Second, deployments typically take servers out of rotation one at a time (a rolling deploy), so you need slack for that too. A common rule of thumb is to size for `N+2` (tolerate two simultaneous losses — one failure plus one deploy) rather than the bare `N`: that's 10 servers at 1,500 req/s each, giving 15,000 req/s of total capacity against a 12,000 req/s target, a comfortable ~25% margin even with two servers out.
+
+<Callout type="warning">
+  A load balancer is not, by itself, highly available — it's a new single point of failure if you only run one instance of it. Teams sometimes solve every backend server's redundancy carefully and then put a single load balancer in front of all of them, which just relocates the outage risk rather than removing it. Run at least two load balancer instances (active-passive with a health-checked failover, or active-active behind a mechanism like DNS round-robin or a floating/virtual IP), and don't treat "we added a load balancer" as automatically meaning "we removed our single point of failure."
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="lb-what-load-balancing-is-and-why-it-matters"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A single server currently handles all traffic for a service. Which statement best describes the core problem a load balancer solves?',
+      options: [
+        { id: 'a', text: 'It makes each individual request process faster.', correct: false, explanation: 'A load balancer does not speed up how a server processes one request — it changes which server handles a given request. Per-request latency on a given server is unaffected by whether a load balancer exists.' },
+        { id: 'b', text: 'It lets traffic be spread across multiple servers and routes around ones that fail.', correct: true, explanation: 'Correct — this is the combined scalability (spread load across N servers) and availability (route around unhealthy ones) role a load balancer plays.' },
+        { id: 'c', text: 'It replaces the need for a database.', correct: false, explanation: 'Load balancers are a traffic-management layer, not a data layer. They have no bearing on database scaling or storage.' },
+        { id: 'd', text: 'It compresses responses to reduce bandwidth.', correct: false, explanation: 'Response compression is a separate, unrelated concern (often handled by the web server or a CDN), not what a load balancer fundamentally does.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are true of a Layer 7 (application-layer) load balancer compared to a Layer 4 (transport-layer) one? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It can route requests based on the URL path or an HTTP header.', correct: true, explanation: 'Correct — because it parses the application protocol (e.g. HTTP), it can see and route on path, header, or cookie content, which an L4 load balancer cannot.' },
+        { id: 'b', text: 'It generally costs more CPU per request than an L4 load balancer.', correct: true, explanation: 'Correct — parsing and often terminating the application protocol (including TLS) is more expensive per request than L4\'s simple connection forwarding.' },
+        { id: 'c', text: 'It is protocol-agnostic and can balance any TCP or UDP traffic.', correct: false, explanation: 'That describes L4 balancing. L7 balancers are tied to understanding a specific application protocol, typically HTTP/HTTPS.' },
+        { id: 'd', text: 'It operates without ever looking at IP addresses or ports.', correct: false, explanation: 'L7 balancers still use IP/port information as part of routing a connection — they add application-level visibility on top of, not instead of, transport-level information.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Once you place a load balancer in front of a server fleet, the load balancer itself can no longer be a single point of failure for the system.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False is correct: a single load balancer instance is itself a single point of failure. It needs its own redundancy (multiple instances with failover) to avoid just relocating the outage risk.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — a lone load balancer instance is a new single point of failure. You need at least two instances (active-passive or active-active) for the fleet\'s availability gains to actually hold.' },
+      ],
+    },
+  ]}
+/>

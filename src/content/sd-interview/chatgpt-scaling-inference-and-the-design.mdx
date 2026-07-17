@@ -1,0 +1,139 @@
+---
+title: "Scaling Inference and the Design"
+module: "Design a ChatGPT-Style System"
+moduleOrder: 16
+order: 2
+track: "interview"
+summary: "Covers how to turn a single-GPU chat completion into a system that serves millions of concurrent conversations — batching, KV-cache management, model/GPU placement, and the streaming path that ties it together."
+tags: ["llm-inference", "gpu-scaling", "streaming", "kv-cache", "capacity-planning"]
+estMinutes: 14
+cheatsheet:
+  - "The GPU, not the API layer, is almost always the bottleneck — capacity planning starts from tokens/sec per GPU, not requests/sec per server."
+  - "Continuous (in-flight) batching keeps GPU utilization high by admitting new requests into a running batch as soon as any sequence finishes, instead of waiting for a fixed batch to fully drain."
+  - "The KV cache, not model weights, is usually what limits how many concurrent sequences fit on a GPU — long contexts and many parallel users compete for the same fixed VRAM budget."
+  - "Prefill (processing the prompt) is compute-bound and cheap per token; decode (generating one token at a time) is memory-bandwidth-bound and dominates latency — treat them as different workloads when scaling."
+  - "Stream tokens to the client over SSE or WebSocket as they're generated; users judge latency by time-to-first-token, not total completion time."
+  - "Route by model + context-length bucket, not just round-robin, so a GPU pool sized for short chats doesn't get starved by a handful of long-context requests."
+  - "Autoscaling on GPU queue depth (not CPU or request count) is what actually protects tail latency for inference workloads."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson nailed down requirements and sketched the high-level pieces: a chat gateway, a conversation store, and an inference layer behind it. That sketch is honest about *what* the system does, but it glosses over the part that actually decides whether the design survives contact with real traffic — how one model, running on a fixed pool of expensive GPUs, serves thousands of simultaneous conversations without either wasting hardware or making users wait.
+
+This is where most candidates go quiet, because LLM inference has a cost and latency profile unlike a typical CRUD service: a single request can occupy a GPU for seconds, memory is the scarce resource rather than CPU, and "just add more app servers" doesn't apply when the bottleneck is a small number of very expensive accelerators. This lesson works through how inference actually gets scaled, then assembles the full request path end to end.
+
+## Why GPUs, not app servers, are the constraint
+
+A typical web service scales by adding stateless application instances behind a load balancer — cheap, horizontal, and largely interchangeable. LLM serving doesn't work that way for one reason: the model's weights (tens to hundreds of gigabytes) have to be resident on GPU memory, and a single GPU can only serve so many tokens per second before it saturates. You don't scale by adding more small machines; you scale by fitting more useful work onto a fixed, expensive pool of GPUs, and only then by adding more of that pool.
+
+That reframes the whole design problem. The API gateway, auth, rate limiting, and conversation storage are the parts you already know how to scale — they're conventional distributed-systems work. The GPU fleet is the part that needs LLM-specific techniques, and it's almost always where capacity actually runs out first.
+
+## Batching: the single biggest lever
+
+A GPU processing one request at a time is wasting most of its compute — matrix multiplications against model weights are far cheaper per additional sequence than the fixed cost of loading those weights into compute units. Batching multiple requests' tokens together and running them through the model in one pass amortizes that fixed cost across many users.
+
+The naive version — a fixed batch size, wait for a full batch to arrive, run it, wait again — has an obvious problem for chat: sequences finish generating at different times (some replies are one sentence, some are three paragraphs), so a static batch either stalls waiting to fill up or wastes GPU slots on already-finished sequences until the whole batch drains.
+
+**Continuous batching** (sometimes called in-flight batching) fixes this: the serving engine treats the batch as a rolling window. The moment any sequence in the batch finishes, a new request from the queue is admitted into that freed slot immediately, without waiting for the rest of the batch to complete. This keeps GPU utilization consistently high instead of oscillating between "packed" and "half-empty," and it's the difference between a GPU serving tens of requests/sec versus hundreds under the same hardware.
+
+## The KV cache is usually the real limit on concurrency
+
+Every token generated by a transformer attends back over all previous tokens in the sequence, and recomputing that attention from scratch for every new token would be wasteful — so serving engines cache the key/value projections for every token already processed, per sequence. That's the KV cache, and it lives in GPU memory alongside the model weights.
+
+Here's the part that surprises people: for realistic chat workloads, the KV cache — not the model weights — is usually what limits how many concurrent conversations a GPU can serve. Weights are a fixed cost, loaded once. The KV cache grows with both the number of concurrent sequences and each sequence's context length, and it competes with every other active conversation for the same fixed VRAM. A GPU with room for the model plus, say, 20GB of headroom might support 200 concurrent short chats — or 20 concurrent conversations with very long context windows, because each one's cache is that much bigger.
+
+This has direct design consequences:
+
+- **Long-context requests should be routed differently** than short chat turns, ideally to a pool sized with that in mind, so a few long conversations don't starve capacity meant for many short ones.
+- **Cache eviction and reuse matter.** Techniques like paged KV-cache allocation (allocating cache in fixed-size blocks rather than one contiguous region per sequence) reduce fragmentation and let more sequences share the same memory efficiently.
+- **Prompt caching** — reusing the KV cache for a shared system prompt or the earlier turns of an ongoing conversation instead of recomputing them — cuts both latency and GPU work for multi-turn chat, which is exactly this system's core use case.
+
+## Prefill vs. decode: two different workloads in one request
+
+Every chat completion actually runs two distinct phases on the GPU:
+
+- **Prefill** processes the entire input prompt (system prompt + conversation history + new user message) in one parallel pass, computing attention over all prompt tokens at once. This is compute-bound and highly parallel — a GPU chews through it fast.
+- **Decode** generates the reply one token at a time, and each step has to read the entire KV cache and model weights from memory before producing a single token. This is memory-bandwidth-bound, not compute-bound, which is why decode is comparatively slow and why adding more decode steps (longer replies) adds latency roughly linearly.
+
+Treating these as one undifferentiated "run the model" step is a common oversimplification. Some serving architectures separate prefill and decode onto different GPU pools entirely (since their resource profiles differ so much), letting each be scaled and batched independently. Even without that split, understanding the distinction explains why time-to-first-token (dominated by prefill) and total completion time (dominated by decode length) behave so differently and should be tracked as separate metrics.
+
+## Streaming the response back
+
+Users don't perceive "the whole reply arrived after 8 seconds" the same way they perceive "the first words appeared after 400ms and kept flowing." Once decode starts producing tokens, the serving layer streams each token (or small chunk) to the client immediately over a persistent connection — typically Server-Sent Events or a WebSocket — rather than buffering the full response and returning it in one payload. The gateway's job is to hold that connection open, relay tokens as the inference engine emits them, and handle a client disconnecting mid-stream by canceling the underlying generation so the GPU slot frees up rather than continuing to generate into the void.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  U[Client] --> GW[Chat gateway]
+  GW --> Route{Route by model + context length}
+  Route --> PoolA[GPU pool: short context]
+  Route --> PoolB[GPU pool: long context]
+  PoolA --> Batch[Continuous batching engine]
+  PoolB --> Batch2[Continuous batching engine]
+  Batch --> KV[(KV cache in GPU memory)]
+  Batch2 --> KV2[(KV cache in GPU memory)]
+  Batch --> Stream[Token stream]
+  Batch2 --> Stream
+  Stream --> GW
+  GW --> U
+`} />
+
+## Placement, autoscaling, and multi-model fleets
+
+A production chat system usually serves more than one model — a fast/cheap default and a slower/higher-quality option, say — so the routing layer needs to place a request on the right model's GPU pool, not just any free GPU. Model weights being resident in memory means you can't casually move a request between pools the way you'd move an HTTP request between stateless app servers; a GPU running model A can't serve a model-B request without reloading weights, which takes seconds and isn't something you do per-request.
+
+Autoscaling has to target the right signal. CPU utilization on the app tier tells you almost nothing about whether the GPU fleet is overloaded. The signal that actually predicts user-facing latency is **GPU queue depth** — how many requests are waiting for a batch slot — combined with per-GPU tokens/sec throughput. Scale the GPU pool (or shift traffic to overflow capacity) when queue depth or time-to-first-token starts climbing, not when a load balancer's CPU graph looks busy.
+
+## Worked example: sizing a GPU pool
+
+Say the product requirement is 10,000 concurrent active conversations, with a target time-to-first-token under 500ms and an average reply of 300 tokens. Assume one GPU, running continuous batching, sustains roughly 40 concurrent sequences at that context length before KV-cache pressure and decode latency start missing the 500ms target — a number you'd get from load-testing the actual model and hardware, not from a spec sheet.
+
+10,000 concurrent conversations divided by 40 per GPU is 250 GPUs just for steady-state decode capacity. Add headroom for uneven load (chat traffic isn't flat across the day — expect a 2-3x peak-to-average ratio) and you're provisioning closer to 600-700 GPUs, plus a separate, smaller pool carved out for long-context requests so they don't compete with the bulk of short conversations for the same KV-cache budget. This is the number that should drive the interview conversation about cost and scaling — not "we'll add a cache" or "we'll shard by user ID," because neither addresses the actual constraint.
+
+<Callout type="warning">
+A common mistake is designing the chat gateway, database, and caching layers in detail while treating "call the LLM" as a black-box step that magically returns a response. In a system where the model *is* the expensive, capacity-constrained resource, that's designing around the one part that will actually determine whether the system meets its latency and cost targets. Be ready to talk about batching strategy, KV-cache pressure, and GPU-based autoscaling explicitly — an interviewer asking about "designing ChatGPT" is testing whether you understand that the bottleneck moved from the database to the accelerator, not just whether you can draw a load balancer.
+</Callout>
+
+<Quiz lessonId="chatgpt-scaling-inference-and-the-design" client:visible questions={[
+  {
+    id: 'q1',
+    kind: 'mcq',
+    prompt: 'Why does continuous (in-flight) batching improve GPU utilization compared to fixed-size batching?',
+    options: [
+      { id: 'a', text: 'It admits new requests into freed slots as soon as any sequence finishes, instead of waiting for the whole batch to drain', correct: true, explanation: 'Correct — sequences finish at different times in chat workloads, so refilling slots immediately keeps the GPU consistently busy instead of oscillating between full and mostly-empty batches.' },
+      { id: 'b', text: 'It increases the model\'s context window so more tokens fit per request', correct: false, explanation: 'Batching strategy is about how many sequences run together per pass; it has no effect on a model\'s maximum context length.' },
+      { id: 'c', text: 'It moves the KV cache from GPU memory to CPU memory to free up VRAM', correct: false, explanation: 'That describes a cache-offloading technique, not batching. Continuous batching is about request admission timing within a batch.' },
+    ],
+  },
+  {
+    id: 'q2',
+    kind: 'multi',
+    prompt: 'Which of these are true about the KV cache in LLM serving? (Select all that apply.)',
+    options: [
+      { id: 'a', text: 'It grows with both the number of concurrent sequences and each sequence\'s context length', correct: true, explanation: 'Correct — every active sequence holds its own cache of key/value projections for all tokens processed so far, so more sequences or longer contexts both increase total cache memory.' },
+      { id: 'b', text: 'It usually limits concurrency on a GPU more than the model weights do', correct: true, explanation: 'Correct — weights are a fixed, one-time cost, while the KV cache scales with live traffic and often exhausts the remaining VRAM first.' },
+      { id: 'c', text: 'It only matters during the prefill phase, not during decode', correct: false, explanation: 'The KV cache is read on every decode step (to compute attention over prior tokens) and is exactly why decode is memory-bandwidth-bound — it matters throughout generation, not just prefill.' },
+    ],
+  },
+  {
+    id: 'q3',
+    kind: 'boolean',
+    prompt: 'Autoscaling an LLM inference fleet on app-tier CPU utilization is a reliable way to protect time-to-first-token under load.',
+    options: [
+      { id: 'true', text: 'True', correct: false, explanation: 'CPU utilization on the app/gateway tier says little about GPU load. The signal that actually predicts user-facing latency is GPU queue depth and per-GPU throughput.' },
+      { id: 'false', text: 'False', correct: true, explanation: 'Correct — GPU queue depth (and tokens/sec throughput) is the signal that reflects real inference load; CPU on the gateway tier can look idle while GPUs are saturated.' },
+    ],
+  },
+  {
+    id: 'q4',
+    kind: 'mcq',
+    prompt: 'A candidate proposes serving all conversations, regardless of context length, from one undifferentiated GPU pool with round-robin routing. What is the main risk with this approach?',
+    options: [
+      { id: 'a', text: 'A handful of long-context conversations can consume disproportionate KV-cache memory and starve capacity meant for many short conversations', correct: true, explanation: 'Correct — because KV-cache size scales with context length, a few long conversations landing on the same pool as short ones can crowd out far more short sessions than their request count suggests.' },
+      { id: 'b', text: 'Round-robin routing causes model weights to be duplicated across every GPU unnecessarily', correct: false, explanation: 'Weight residency depends on which model is loaded per GPU, not on the routing algorithm used to pick a GPU within a pool serving the same model.' },
+      { id: 'c', text: 'It prevents continuous batching from being used at all', correct: false, explanation: 'Continuous batching operates within a GPU\'s running batch regardless of how requests were routed to it; routing strategy and batching strategy are independent concerns.' },
+    ],
+  },
+]} />

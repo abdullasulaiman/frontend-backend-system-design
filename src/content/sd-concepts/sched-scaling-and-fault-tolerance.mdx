@@ -1,0 +1,118 @@
+---
+title: "Scaling and Fault Tolerance"
+module: "Distributed Task Scheduler"
+moduleOrder: 23
+order: 4
+track: "concept"
+summary: "Covers how a task scheduler scales past a single coordinator and keeps firing jobs correctly when schedulers and workers crash mid-job, using leader election, fencing tokens, heartbeats, and idempotent retries."
+tags: ["task-scheduler", "fault-tolerance", "leader-election", "scalability", "distributed-systems"]
+estMinutes: 12
+cheatsheet:
+  - "Split the scheduler tier in two: trigger evaluation (who decides a job is due) and execution (who runs it). Each scales independently and fails independently."
+  - "A lease-based leader (or a sharded set of leaders) decides trigger firing, backed by a consensus store like etcd or ZooKeeper — never let two nodes both believe they own the same shard at once."
+  - "Fencing tokens (a monotonically increasing number issued with each lease) stop a 'zombie' old leader from corrupting state after a slow GC pause or network blip makes it briefly outlive its lease."
+  - "Delivery is at-least-once in practice. Correctness comes from idempotent job handlers plus a dedup key (job_id + scheduled_time), not from trying to guarantee exactly-once delivery."
+  - "Worker liveness is judged by heartbeat/lease expiry, not by \"did the process crash\" — a hung worker and a dead worker look identical from the coordinator's side, so both get treated as failed and retried."
+  - "On scheduler restart, replay a bounded catch-up window (e.g. missed triggers in the last N minutes) from durable state instead of trusting in-memory timers, or a crash silently drops every job due during the outage."
+  - "Retries need backoff and a dead-letter path — a job that fails deterministically (bad payload, missing permission) will fail identically on every retry and just burns capacity until it's quarantined."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The design from the previous lesson works fine on a whiteboard and on a single machine. It falls apart the moment you ask two harder questions: what happens when the number of scheduled jobs grows past what one coordinator can track, and what happens when that coordinator — or the worker running a job — crashes at the worst possible moment? A scheduler that quietly drops a due job, or one that runs the same billing job twice because two nodes both thought they owned it, is worse than no scheduler at all: it fails silently, and nobody notices until a customer does. This lesson covers the two things every production task scheduler has to get right that a single-node prototype can skip: scaling the coordination layer horizontally, and staying correct through crashes, restarts, and network partitions.
+
+## Scaling: split "deciding" from "doing"
+
+A task scheduler actually has two distinct jobs, and they scale differently:
+
+- **Trigger evaluation** — deciding *when* a job is due, based on its cron expression or delay, and handing it off. This is low-volume, CPU-light work: scanning a sorted set of "next fire time" entries and comparing against the clock.
+- **Execution** — actually running the job's payload, which can be arbitrarily expensive (a report generation, an API call, a batch data job).
+
+Coupling these on one node is what caps a naive design. The fix is to scale them independently:
+
+- **Shard trigger evaluation** by job ID (consistent hashing works here the same way it does for a distributed cache — see the caching module) across a set of scheduler nodes, each owning a disjoint slice of the job table. A cluster with 10 million recurring jobs might split them across 50 scheduler shards, each responsible for roughly 200,000 jobs' worth of trigger checks.
+- **Scale execution as a separate worker pool** that pulls ready-to-run tasks off a queue (the queue design from lesson 2 of this module). Workers don't need to know anything about cron expressions or schedules — they just process tasks, so you scale that pool purely on job volume and duration, independent of how many distinct schedules exist.
+
+This separation also isolates failure: a burst of slow-running jobs saturating the worker pool doesn't stop new triggers from being evaluated on schedule, and a scheduler shard restarting doesn't stop workers from draining whatever's already queued.
+
+## Leader election: one owner per shard, not per cluster
+
+Sharding trigger evaluation solves the CPU-scaling problem, but introduces a correctness problem: for a given shard of jobs, exactly one node must be responsible for firing them at any moment. Two nodes both believing they own the same shard means a job can fire twice; zero nodes owning a shard means its jobs silently stop firing.
+
+The standard fix is a **lease-based ownership** model backed by a strongly consistent store (etcd, ZooKeeper, or a database with compare-and-swap): a node acquires a time-bounded lease on a shard, renews it periodically via heartbeat, and only evaluates triggers for shards it currently holds a valid lease on. If a node crashes or partitions away, its lease expires and another node acquires it after a bounded timeout.
+
+The subtle danger here is the **zombie leader**: a node that experiences a long GC pause or a slow network blip can believe it still holds a lease that has, in fact, already expired and been reassigned. If it resumes and fires a trigger without checking, you get a duplicate. The fix is a **fencing token** — a monotonically increasing number issued alongside each lease grant. Every write the "leader" makes (marking a job as fired, enqueuing a task) must include its fencing token, and the durable store rejects any write carrying a token older than the latest one it has seen. The old leader can keep believing it's in charge all it wants; its writes simply get rejected.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant S1 as Scheduler A (old leader)
+    participant Store as Lease store (etcd)
+    participant S2 as Scheduler B
+    S1->>Store: renew lease, shard 7 (token=41)
+    Note over S1: long GC pause...
+    Store-->>Store: lease expires (no renewal)
+    S2->>Store: acquire lease, shard 7 (token=42)
+    Store-->>S2: granted, token=42
+    S1->>Store: fire job, write (token=41)
+    Store-->>S1: rejected, stale token
+    S2->>Store: fire job, write (token=42)
+    Store-->>S2: accepted
+`} />
+
+## Worker fault tolerance: heartbeats, retries, idempotency
+
+Once a task is handed to a worker, the coordinator needs to know if that worker is still alive and making progress. It can't distinguish "still running a long job" from "hung" or "crashed" except by **heartbeat**: workers periodically report progress on their claimed task, and the coordinator treats a task as abandoned once its heartbeat deadline passes, regardless of whether the process actually died, deadlocked, or just lost network connectivity. The task then goes back on the queue for another worker to pick up.
+
+That re-delivery means the system is fundamentally **at-least-once**, not exactly-once — a task can be picked up twice if a worker's heartbeat is delayed right as it finishes, or if a crash happens after the job completed but before the completion was recorded. Rather than chasing exactly-once delivery (which requires distributed transactions spanning your queue and every side effect the job has — rarely worth it), design job handlers to be **idempotent**: keyed by `job_id` plus the specific scheduled run's timestamp, so running the same logical execution twice is a safe no-op the second time (an upsert instead of an insert, a dedup check before sending an email, checking a "already processed" marker before charging a card).
+
+Retries also need two more things to be production-safe: **exponential backoff with jitter**, so a downstream outage doesn't turn into a self-inflicted thundering-herd retry storm, and a **dead-letter path** after a retry budget (say, 5 attempts) is exhausted, so a job that fails deterministically — bad payload, revoked permissions — gets quarantined for manual inspection instead of endlessly consuming worker capacity.
+
+## Recovering from a scheduler restart
+
+A scheduler node that restarts (deploy, crash, OOM-kill) must not trust in-memory state about "what's already fired." On startup it re-derives its due list from durable storage: for its assigned shard, scan jobs whose next-fire time falls in a bounded catch-up window (e.g., the last 15 minutes), fire the ones genuinely missed, and skip ones already marked fired for that run. This is why the data model from lesson 2 — a durable, queryable record of each job's schedule and last-fired timestamp — matters: an in-memory timer wheel with no durable backing simply loses every job due during the outage.
+
+## Worked example: sizing a scheduler tier for failure
+
+Say you're running 2 million recurring jobs with a mean interval of 5 minutes, sharded across 50 scheduler nodes (40,000 jobs/shard). You configure a 10-second lease with a 3-second heartbeat and a 30-second acquisition timeout on failover. If a scheduler node dies, its shard's jobs pause for at most ~40 seconds (lease expiry plus acquisition) before another node picks up the shard and fires the catch-up window — an acceptable blip for 5-minute-interval jobs, but you'd tune the lease shorter for a shard holding 10-second-interval jobs, where a 40-second gap means eight missed runs instead of one. This is the concrete trade-off leader election forces: shorter leases mean faster failover but more heartbeat traffic and a higher chance of a healthy node losing its lease during a transient blip and triggering an unnecessary handoff.
+
+<Callout type="warning">
+  A common design mistake: building a scheduler that "detects" failed workers by having them log an error or call a `/report-failure` endpoint before dying. Crashes don't RSVP. If a worker is killed by an OOM reaper, loses power, or gets network-partitioned mid-task, it never gets to call anything. Failure detection has to be based on the *absence* of a heartbeat within a deadline, observed by the coordinator — never on the failing node self-reporting its own death.
+</Callout>
+
+<Quiz
+  lessonId="sched-scaling-and-fault-tolerance"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why is a fencing token needed in addition to a lease-based leader election scheme?',
+      options: [
+        { id: 'a', text: 'It replaces the need for heartbeats entirely', correct: false, explanation: 'Fencing tokens work alongside heartbeats/leases, not instead of them — heartbeats detect failure, fencing tokens prevent a stale node from corrupting state after it does.' },
+        { id: 'b', text: 'It stops a node that briefly outlives its expired lease (e.g. after a GC pause) from making writes that get accepted as if it were still the leader', correct: true, explanation: 'A zombie leader can wake up after its lease expired and try to act. The durable store rejects its writes because they carry an older fencing token than the newest lease holder\'s.' },
+        { id: 'c', text: 'It encrypts communication between scheduler nodes', correct: false, explanation: 'Fencing tokens are about ordering and rejecting stale writes, not encryption or transport security.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasons to separate trigger evaluation from job execution into two independently scaled tiers? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Trigger evaluation is lightweight and scales with job count, while execution scales with job volume and duration — different growth curves', correct: true, explanation: 'Coupling them means over-provisioning one to satisfy the other; splitting lets each scale on its own driver.' },
+        { id: 'b', text: 'A burst of slow-running jobs saturating the worker pool would otherwise stop new triggers from being evaluated on schedule', correct: true, explanation: 'Separation isolates failure: execution backpressure does not block the coordinator from continuing to decide what is due.' },
+        { id: 'c', text: 'It eliminates the need for idempotent job handlers', correct: false, explanation: 'Idempotency is still required regardless of this split — at-least-once delivery semantics come from failure handling and retries, not from how the tiers are organized.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A production task scheduler should aim to guarantee exactly-once execution of every scheduled job rather than designing job handlers to be idempotent.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Exactly-once delivery across a queue plus arbitrary side effects generally requires distributed transactions that are rarely practical. The standard, pragmatic approach is at-least-once delivery with idempotent handlers.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — real schedulers accept at-least-once delivery (duplicates can happen after crashes or heartbeat delays) and make duplicates safe via idempotent job handlers keyed on job ID plus scheduled run time.' },
+      ],
+    },
+  ]}
+/>

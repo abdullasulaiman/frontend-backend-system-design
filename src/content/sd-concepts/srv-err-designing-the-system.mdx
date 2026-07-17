@@ -1,0 +1,120 @@
+---
+title: "Designing the System"
+module: "Monitor Server-Side Errors"
+moduleOrder: 14
+order: 3
+track: "concept"
+summary: "Assembles the requirements and architecture from earlier lessons into one concrete, defensible design for a server-side error monitoring system, from the moment an exception is thrown to the moment an on-call engineer gets paged."
+tags: ["error-monitoring", "observability", "system-design", "distributed-systems", "alerting"]
+estMinutes: 13
+cheatsheet:
+  - "Capture must never block the request path — write the error to a local buffer or fire-and-forget queue and return control to the caller immediately; a monitoring outage should never cause a product outage."
+  - "Fingerprint by a normalized signature (exception type + top N stack frames with line numbers and dynamic values stripped), not by raw message text — raw messages fracture one real issue into thousands of near-duplicate groups."
+  - "Split the pipeline into an ingestion tier (durable, dumb, fast) and a processing tier (fingerprinting, grouping, enrichment) so a slow enrichment step never causes backpressure on ingestion."
+  - "Alert on grouped issues crossing a rate threshold, never on raw event counts — 10,000 occurrences of one known bug should page nobody twice; one new issue occurring 20 times in a minute should page immediately."
+  - "Size ingestion capacity from peak QPS times average payload size, not average QPS — error volume spikes hardest exactly when something is already broken, which is when you need the pipe to still be open."
+  - "Deduplicate and suppress at the alerting layer with a cool-down window per issue fingerprint, separate from deduplication at the storage layer — otherwise a single flapping issue can page on-call every few seconds."
+  - "Hot storage (recent, queryable, indexed by fingerprint/time/release) and cold storage (cheap, append-only, rarely touched) need different retention and different data stores — don't pay hot-storage cost for 90-day-old resolved errors."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous two lessons in this module covered *what* a server-side error monitoring system needs to do (capture, group, alert, retain, all without slowing down the service it watches) and *how* the pieces of its architecture connect (agents, ingestion, processing, storage, dashboards). That's necessary groundwork, but it isn't yet a system you could defend in an interview. An interviewer who's heard "we capture the error, send it to a queue, process it, and store it" will immediately ask the follow-ups that actually matter: what exactly gets hashed to decide two errors are "the same" one? What happens to the pipeline when error volume spikes 100x because a deploy just broke everything? Why doesn't the alerting layer page on-call once per exception? This lesson works through those questions and assembles one concrete, end-to-end design.
+
+## The write path: from a thrown exception to a stored, grouped issue
+
+Follow one unhandled exception through the system.
+
+1. **Capture, in-process.** A language-specific agent (installed as middleware or a global exception handler) intercepts the exception where it happens, and immediately serializes a payload: exception type, message, full stack trace, request context (route, user ID, headers minus secrets), service name, release/build version, and a timestamp. Capture must be synchronous only up to this serialization step — everything after it is off the request's critical path.
+2. **Local buffering and async send.** The agent pushes the serialized payload into a local, bounded in-memory (or on-disk) buffer and returns control to the application immediately. A background thread drains that buffer to the network. If the monitoring backend is slow or unreachable, the buffer fills, then drops oldest-first (with a dropped-event counter) rather than blocking the application thread — a monitoring dependency must degrade to "we missed some errors," never to "the app is now slow or down because of its error reporter."
+3. **Ingestion tier.** A thin, horizontally scaled fleet of ingestion nodes accepts the payload over HTTP/gRPC, does minimal validation, and appends it to a durable log (Kafka or an equivalent partitioned commit log), partitioned by service or by fingerprint-to-be. This tier does no grouping, no enrichment, no business logic — its only job is "accept fast, persist durably, don't lose data," which is exactly the profile that lets it survive a traffic spike without falling over.
+4. **Fingerprinting and grouping.** A separate stream-processing tier consumes the log and computes a **fingerprint**: a hash built from the exception type plus a normalized top-N stack frames, with file paths trimmed to a relative form and dynamic values (user IDs, request IDs, timestamps embedded in messages) stripped out. Two occurrences with the same fingerprint are the same underlying issue, however different their raw messages look. New fingerprint → create a new issue; existing fingerprint → increment its occurrence count and update its last-seen time.
+5. **Enrichment.** The processor attaches cheap-to-compute context to the issue: which release introduced it (first-seen release vs. current release), an approximate "who touched this line last" from source control metadata, and which environment/region it's occurring in.
+6. **Storage.** The grouped issue (one row per fingerprint, cheap to query, drives the dashboard) and the raw occurrences (one row per event, needed for drill-down into a specific request's stack trace) go to different stores tuned for their access patterns — more on this below.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    A[Exception thrown] --> B[Agent: capture + serialize]
+    B --> C[Local buffer, async drain]
+    C --> D[Ingestion tier: durable log]
+    D --> E[Processor: fingerprint + group]
+    E --> F[Enrichment: release, owner, env]
+    F --> G[(Issues store: grouped)]
+    F --> H[(Occurrences store: raw events)]
+    G --> I[Alert evaluator]
+    I --> J[On-call paging]
+`} />
+
+## Why fingerprinting is the hardest part
+
+Fingerprinting looks like a one-line hashing detail but it's the decision that determines whether the whole system is useful. Hash on the raw exception message and you'll fracture one real bug into thousands of "distinct" issues the moment the message embeds a user ID or a timestamp (`"user 48213 not found"` vs. `"user 91847 not found"` are the same bug, different strings). Hash too aggressively — say, exception type alone — and unrelated bugs that happen to throw the same exception type collapse into one noisy issue that never gets fixed because no single occurrence looks urgent.
+
+The practical middle ground: normalize the message (strip anything that looks like an ID, number, or UUID), and hash on exception type plus the top 5-8 stack frames' function names and line numbers, excluding frames from third-party library code where line numbers shift across dependency versions and would otherwise cause the same bug to get a new fingerprint on every dependency bump.
+
+## The alerting path: a separate concern from ingestion
+
+Alerting must never operate on the raw occurrence stream directly, or a single issue firing 50,000 times in a minute (a hot-path bug hit by every request) produces 50,000 evaluation attempts. Instead, the alert evaluator watches the **grouped issues** table:
+
+- **New issue rule**: a fingerprint never seen before, seen `N` times within `T` minutes (e.g. 10 times in 2 minutes) — pages immediately, since this usually means a bad deploy just shipped.
+- **Rate-spike rule**: a known issue's occurrence rate jumps well above its rolling baseline — pages, since a long-tolerated low-frequency error suddenly happening constantly is itself a signal something changed upstream.
+- **Suppression / cool-down**: once an issue has paged, suppress repeat pages for that same fingerprint for a cool-down window (e.g. 30 minutes) even if it keeps occurring, and instead roll new occurrences into the same open incident. Without this, a flapping issue re-pages on-call every evaluation cycle.
+
+## Worked example: sizing the pipeline for a mid-size fleet
+
+Say you're monitoring 4,000 backend service instances, each handling roughly 200 requests/sec at peak, with a baseline error rate of 0.1% of requests under normal conditions.
+
+- **Baseline volume**: 4,000 × 200 req/s × 0.001 = 800 error events/sec at steady state. At an average payload of ~2 KB (stack trace plus context), that's roughly 1.6 MB/s, or about 140 GB/day of raw ingestion — a workload any commodity partitioned log handles comfortably.
+- **Spike case, the one that actually matters**: a bad deploy causes 5% of requests on 10% of the fleet to start failing. That's 400 instances × 200 req/s × 0.05 ≈ 4,000 error events/sec just from the new bug, on top of baseline — a 5x jump. Size ingestion-tier throughput and partition count for this kind of spike, not for the calm-day average; the moment you most need the pipeline open is exactly when volume is highest.
+- **Storage split**: the grouped issues table might hold a few thousand active fingerprints at any time — trivially small, kept in a fast indexed store (a relational DB or a search index) so the dashboard's "top issues this week" query is sub-second. The raw occurrences table, at 140 GB/day, goes to cheaper columnar or log-oriented storage with a short hot-retention window (say 14 days queryable) and a much longer cold-archive window (90+ days, rarely touched, for compliance or historical drill-down).
+
+<Callout type="warning">
+  A common mistake is designing the alerting rule directly against the raw occurrence stream "for simplicity," reasoning that grouping can be added later. In practice this means every load test, every noisy known issue, and every retry storm generates a wave of individual alert evaluations, and the fix (adding grouping) turns into a rearchitecture of the alerting path rather than a config change. Design fingerprinting and grouping as the very first stage after ingestion, before you write a single alerting rule — alerting on ungrouped events isn't a simpler version of the system, it's a different, worse one.
+</Callout>
+
+<Quiz
+  lessonId="srv-err-designing-the-system"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should the ingestion tier avoid doing fingerprinting, grouping, or enrichment work itself?',
+      options: [
+        { id: 'a', text: 'Because it keeps the ingestion tier fast, simple, and durable, so it survives traffic spikes without becoming the bottleneck that drops events', correct: true, explanation: 'Ingestion\'s only job should be accept-and-persist; pushing slower CPU-bound work like fingerprinting into a separate tier means a burst in error volume does not stall or overload the component responsible for not losing data.' },
+        { id: 'b', text: 'Because fingerprinting requires data that is only available in the dashboard layer', correct: false, explanation: 'Fingerprinting only needs the exception type and stack trace, both already present in the raw payload at ingestion time — the reason to separate it is throughput and resilience, not data availability.' },
+        { id: 'c', text: 'Because ingestion tiers cannot run any custom code', correct: false, explanation: 'There is no such restriction — the separation is a deliberate design choice to isolate a fast, durable accept path from slower processing, not a technical limitation of ingestion services.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are real risks of fingerprinting errors by their raw, unnormalized message text? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'One real bug gets fractured into many distinct issues because the message embeds dynamic values like user IDs or timestamps', correct: true, explanation: 'Two occurrences of the same bug with different embedded IDs produce different raw strings, so a naive text hash treats them as unrelated issues, hiding the true occurrence count.' },
+        { id: 'b', text: 'The issue list becomes dominated by noise, making it hard to see which distinct problems actually need attention', correct: true, explanation: 'When one bug shows up as hundreds of "different" issues, the signal (a handful of real problems) gets buried under duplicate noise in the dashboard and in alert volume.' },
+        { id: 'c', text: 'It reduces ingestion throughput because message text is slower to transmit than a hash', correct: false, explanation: 'Fingerprinting strategy affects grouping quality, not network transmission cost — the raw message is sent either way as part of the payload.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A well-designed alert evaluator should page on-call once per new occurrence of an already-known, already-paged issue, so nothing slips through.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'This would cause alert fatigue — a known issue that keeps recurring should be suppressed for a cool-down window after its first page, with new occurrences rolled into the existing open incident instead of triggering repeat pages.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — suppression with a cool-down window per fingerprint is what keeps a single flapping or high-frequency issue from re-paging on-call on every evaluation cycle.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'When sizing the ingestion tier\'s throughput capacity, what should you design for?',
+      options: [
+        { id: 'a', text: 'The steady-state average error rate, since spikes are rare and can be handled by autoscaling after the fact', correct: false, explanation: 'Autoscaling reacts too slowly for the exact moment it matters most — a bad deploy or upstream outage causes error volume to spike right when the pipeline needs to already have headroom, not minutes later.' },
+        { id: 'b', text: 'The peak spike scenario, such as a bad deploy causing a multi-x jump in error rate on a fraction of the fleet', correct: true, explanation: 'The system\'s most important job is staying up exactly when something else is broken and error volume is highest — sizing for average load risks dropping the events that matter most, right when they matter most.' },
+        { id: 'c', text: 'The maximum theoretical error rate of 100% of all requests failing simultaneously across the entire fleet', correct: false, explanation: 'This over-provisions for a scenario so extreme it rarely reflects realistic failure modes, and ignores the more useful practice of modeling a specific, plausible partial-outage spike based on real deploy/incident patterns.' },
+      ],
+    },
+  ]}
+/>

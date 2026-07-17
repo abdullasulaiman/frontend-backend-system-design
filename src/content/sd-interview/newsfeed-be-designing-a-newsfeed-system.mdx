@@ -1,0 +1,162 @@
+---
+title: "Designing a Newsfeed System"
+module: "Design a Newsfeed System"
+moduleOrder: 7
+order: 1
+track: "interview"
+summary: "Walks through designing a generic social newsfeed backend end to end — requirements, data model, feed-generation strategy, ranking, and scaling trade-offs."
+tags: ["newsfeed", "fan-out", "feed-ranking", "system-design", "social-graph"]
+estMinutes: 14
+cheatsheet:
+  - "A newsfeed is a read-heavy fan-in problem: every user's feed is a merge of posts from everyone they follow, and reads massively outnumber writes."
+  - "Fan-out-on-write precomputes feeds at post time (cheap reads, expensive for high-follower authors); fan-out-on-read merges at request time (cheap writes, expensive reads); production systems use a hybrid split by follower count."
+  - "Store post references (post ID, author ID, timestamp) in the feed store, not full post bodies — resolve full content from a separate post store in one batched lookup at render time."
+  - "Ranking a feed needs a scoring function over signals like recency, affinity (how much this viewer engages with this author), and content weight (post type, engagement so far) — not just reverse-chronological order."
+  - "Feed generation and fan-out belong on an asynchronous queue behind the post-creation API, never inline in the write request path."
+  - "Design for eventual consistency: a followed user's new post reaching your feed a few seconds late is an acceptable trade-off for not blocking every write on synchronous fan-out."
+  - "Cache the top of each active user's feed (first page) separately from the full feed store — most feed reads only ever touch the first 1-2 pages."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design a newsfeed" is one of the most common system design prompts precisely because it's shallow to describe and deep to actually build. Everyone has used one — Instagram's home feed, LinkedIn's feed, a Facebook timeline — so the interviewer doesn't need to explain the product. What they're actually testing is whether you can turn "show me posts from people I follow, newest and most relevant first" into a system that survives a user with ten million followers, a viewer who follows five thousand accounts, and a read volume that dwarfs writes by orders of magnitude.
+
+This lesson builds a complete newsfeed backend from scratch: requirements and scale, data model, the feed-generation strategy that dominates the design conversation, a basic ranking layer, and where the system actually breaks under load. The companion mock-interview lesson in this module gives you a timed prompt to practice the same ground live.
+
+## Clarifying requirements
+
+Before drawing boxes, pin down what "newsfeed" means for this system, out loud, in the interview:
+
+**Functional requirements**
+- Users can create posts (text, optionally an image or video attachment).
+- Users can follow other users (one-directional follow, not mutual friendship — this changes the fan-out math, so ask which model the interviewer wants).
+- A user can request their feed: a paginated, ranked list of posts from people they follow.
+- Users can like and comment on posts, and those signals should influence ranking.
+
+**Non-functional requirements**
+- Read-heavy: feed reads happen far more often than posts are created — assume a read-to-write ratio of 100:1 or higher.
+- Low read latency: a feed load should return in well under a second.
+- High availability over strict consistency: a slightly stale feed is fine; a feed endpoint that's down is not.
+- Eventual consistency is acceptable for how quickly a new post propagates to followers' feeds.
+
+Nailing these down early matters because "read-heavy with tolerable staleness" is the single assumption that justifies almost every design decision that follows — precomputation, caching, and async fan-out all trade a little freshness for a lot of read performance.
+
+## Back-of-envelope estimation
+
+Say the platform has 200 million daily active users, each posting an average of 0.5 times/day and loading their feed 10 times/day.
+
+- **Writes**: 200M x 0.5 = 100M posts/day ≈ 1,150 posts/second average.
+- **Reads**: 200M x 10 = 2 billion feed requests/day ≈ 23,000 requests/second average (assume 3x that at peak, so ~70,000/second).
+- **Read:write ratio**: roughly 20:1 on request volume alone, and the gap widens further once you count that a single feed read implicitly touches dozens or hundreds of followed authors' posts.
+
+That ratio is the whole design argument in one number: it's worth spending write-side effort (precomputing, fanning out, caching) to make each of those 70,000 peak reads/second cheap, because the write side only has to absorb ~1,150 posts/second.
+
+## High-level architecture
+
+A newsfeed backend splits cleanly into a handful of services around two data stores: a durable post store and a fast feed store.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  U[User posts] --> API[Post Service]
+  API --> PS[(Post Store)]
+  API --> Q[[Fan-out Queue]]
+  Q --> FW[Fan-out Workers]
+  FW --> FS[(Feed Store: per-user post-ID lists)]
+  G[(Social Graph Store: follows)] --> FW
+  R[Feed Read Request] --> FSVC[Feed Service]
+  FSVC --> FS
+  FSVC --> Rank[Ranking Service]
+  Rank --> Content[Resolve full post content]
+  Content --> PS
+  Content --> Out[Return ranked, paginated feed]
+`} />
+
+- **Post service**: accepts a new post, writes it durably to the post store, and enqueues a fan-out job. Returns to the client as soon as the post is durably stored — fan-out is not on this critical path.
+- **Social graph store**: who follows whom. Needs fast "get all followers of user X" and "get all accounts user Y follows" lookups; typically a graph-friendly store or a well-indexed relational/key-value table, not something you query live against millions of rows per request.
+- **Fan-out workers**: pull jobs off the queue and write post references into each follower's feed-store entry.
+- **Feed store**: per-user, a capped-length, roughly time-ordered list of post references — not full post content.
+- **Feed service**: on a read request, pulls the requesting user's precomputed list, runs it (plus any real-time merges) through ranking, resolves full content, and returns a page.
+
+## The feed-generation trade-off
+
+This is the crux of the interview. There are exactly two moments you can assemble a feed: when a post is *created*, or when a feed is *read*.
+
+**Precompute at write time.** When a user posts, immediately look up their followers and push a reference to the new post into each follower's feed-store entry. Reads become a single lookup — fast and cheap. The cost shows up on the write side, and it's proportional to the poster's follower count: a post from an account with 50 million followers means 50 million feed-store writes from one API call.
+
+**Assemble at read time.** Do nothing at post time beyond storing the post. When a feed is requested, query every followed account's recent posts and merge them live. Posting is always cheap — O(1) regardless of follower count — but every read now does the work that precompute did once, over and over, for every viewer.
+
+Neither extreme survives a real follower-count distribution, which is heavily skewed: most accounts have a modest number of followers, and a small minority have counts in the millions. The standard answer is a hybrid, split by a follower-count threshold: precompute (fan out) for accounts under the threshold, and merge live for the handful of high-follower accounts any given viewer follows. Because a typical viewer only follows a few such accounts even if they follow hundreds of ordinary ones, the live-merge cost per read stays small and bounded, while the vast majority of accounts still get cheap, precomputed reads for their followers.
+
+Whichever side you land on, fan-out must be asynchronous — a background job on a queue, processed by an independently scalable worker pool — never something the post-creation request waits on synchronously.
+
+## A minimal data model
+
+- **`posts`**: `post_id`, `author_id`, `body`, `media_url`, `created_at`, `like_count`, `comment_count`.
+- **`follows`**: `follower_id`, `followee_id`, `created_at` — indexed both directions (by follower, to find who a user follows; by followee, to find their followers).
+- **`feed_entries`** (the feed store, keyed by viewer): a capped list of `(post_id, author_id, score_or_timestamp)` tuples, typically held in an in-memory store like Redis for low-latency access, with the post store as the durable source of truth.
+
+Keeping `feed_entries` as references rather than copies means an edited post or an updated like count is visible everywhere immediately, since every viewer's feed points at the same underlying post row instead of a stale, duplicated copy.
+
+## Ranking beyond "newest first"
+
+A pure reverse-chronological feed is the simplest baseline and a reasonable place to start the conversation, but real feeds score each candidate post with something closer to:
+
+`score = w1 * recency_decay + w2 * affinity(viewer, author) + w3 * content_weight(post)`
+
+- **Recency decay**: newer posts score higher, but decay smoothly rather than using a hard cutoff, so a great post from six hours ago can still outrank a mediocre one from six minutes ago.
+- **Affinity**: how much this specific viewer has historically engaged with this specific author — likes, comments, profile visits. This is what makes two users' feeds from the same follow-set look different.
+- **Content weight**: signals like early engagement velocity, post type (a video may be weighted differently than plain text), or whether the viewer's close connections have interacted with it.
+
+You don't need to design a machine-learning ranker to satisfy this part of the interview — naming these three signal categories and explaining how they combine into a single sortable score is usually enough. Where this actually gets computed matters too: for a small candidate set (a viewer's precomputed feed entries, typically capped at a few hundred), scoring at read time is cheap and lets you use the freshest engagement counts.
+
+<Callout type="warning">
+A common mistake is treating the fan-out threshold as a one-time classification made when an account is created. Follower counts change — a normal post goes viral, or a creator crosses into celebrity-tier territory — and a design that only checks the threshold once will keep precompute-fanning-out an account that has since become a write-storm risk, or worse, leave a newly-huge account's followers with stale feeds because nothing was flipped over to the read-time path. You need to periodically re-evaluate an account's tier and define what happens to already-generated feed entries during the transition, so followers neither lose posts nor get duplicates.
+</Callout>
+
+## Where this design breaks first
+
+At the estimation numbers above, the first thing to fall over is usually the feed-store hot path for very active viewers — someone who follows thousands of accounts still needs their feed assembled fast, so cap the precomputed list length (a few hundred entries) and paginate beyond that from a colder store. The second common bottleneck is the social graph store under fan-out load, since every post triggers a "get all followers" query — this store needs to be optimized for exactly that access pattern, separately from any query pattern used for the follow/unfollow write path.
+
+<Quiz lessonId="newsfeed-be-designing-a-newsfeed-system" client:visible questions={[
+  {
+    id: 'q1',
+    kind: 'mcq',
+    prompt: 'Why does a newsfeed system generally justify spending extra engineering effort on the write path (precomputation, fan-out) to make reads cheap?',
+    options: [
+      { id: 'a', text: 'Because posts contain more data than feed reads do', correct: false, explanation: 'Data size per item isn\'t the driver here — request volume and frequency are. A post is written once; a feed is read repeatedly by many viewers.' },
+      { id: 'b', text: 'Because feed reads vastly outnumber post writes, so making each read cheap has a much bigger aggregate payoff than optimizing writes', correct: true, explanation: 'Correct — with a read:write ratio of 20:1 or higher, shifting cost to the write side (which happens far less often) to make the dominant read path fast is the better trade.' },
+      { id: 'c', text: 'Because writes are inherently slower than reads in any database', correct: false, explanation: 'That\'s not a general truth, and it isn\'t the reason here. The reasoning is about relative volume (how often each happens), not intrinsic per-operation speed.' },
+    ],
+  },
+  {
+    id: 'q2',
+    kind: 'multi',
+    prompt: 'Which of these are true about the hybrid fan-out approach for feed generation? (Select all that apply.)',
+    options: [
+      { id: 'a', text: 'Accounts under a follower-count threshold get their posts precomputed into followers\' feed entries at post time', correct: true, explanation: 'Correct — this is the push side of the hybrid, applied to the majority of accounts with modest follower counts.' },
+      { id: 'b', text: 'Accounts above the threshold are excluded from precomputed fan-out, and their posts are merged into a viewer\'s feed live at read time', correct: true, explanation: 'Correct — this avoids the write-storm a single post from a huge-follower account would otherwise cause.' },
+      { id: 'c', text: 'The threshold, once assigned to an account, never needs to be re-evaluated', correct: false, explanation: 'This is the pitfall the lesson warns about directly. Follower counts change over time, so the tier assignment must be re-evaluated and transitions handled explicitly.' },
+    ],
+  },
+  {
+    id: 'q3',
+    kind: 'boolean',
+    prompt: 'The feed store should hold full copies of post content (body, media URLs, like counts) for every follower, rather than lightweight references to posts.',
+    options: [
+      { id: 'true', text: 'True', correct: false, explanation: 'Storing full copies means an edit or an updated like count would need to be rewritten across every follower\'s copy — expensive and hard to keep consistent.' },
+      { id: 'false', text: 'False', correct: true, explanation: 'Correct — the feed store should hold references (post ID, author ID, score or timestamp), resolved against a single post store at read time, so updates only ever need to happen in one place.' },
+    ],
+  },
+  {
+    id: 'q4',
+    kind: 'mcq',
+    prompt: 'What role does "affinity" play in feed ranking?',
+    options: [
+      { id: 'a', text: 'It measures how recently a post was created relative to now', correct: false, explanation: 'That is the recency-decay signal, a separate component of the scoring function.' },
+      { id: 'b', text: 'It captures how much a specific viewer has historically engaged with a specific author, making feeds personalized even for users who follow the same accounts', correct: true, explanation: 'Correct — affinity is what makes two viewers with overlapping follow-lists see differently ordered feeds, since it\'s scoped to the viewer-author pair.' },
+      { id: 'c', text: 'It determines which follower-count tier an author falls into for fan-out purposes', correct: false, explanation: 'Follower-count tiering is a fan-out/architecture concern, not a ranking-signal concern — they solve different problems in the design.' },
+    ],
+  },
+]} />

@@ -1,0 +1,217 @@
+---
+title: "Collaboration Models: OT vs. CRDT"
+module: "Design Google Docs"
+moduleOrder: 13
+order: 2
+track: "interview"
+summary: "Compares Operational Transformation and Conflict-free Replicated Data Types as the two dominant strategies for merging concurrent edits in a collaborative document editor."
+tags: ["collaborative-editing", "operational-transformation", "crdt", "distributed-systems", "consistency"]
+estMinutes: 13
+cheatsheet:
+  - "The core problem is concurrent edits at the same position: two users insert at index 5 at the same time, and every replica must converge to the same final text without a central lock."
+  - "OT keeps a linear, canonical operation history and transforms each incoming operation against operations it wasn't originally composed against (transform(opA, opB)); it needs a server as tie-breaker for ordering."
+  - "CRDTs give every character/element a globally unique, immutable ID (often `(counter, siteId)` or a fractional position) so merges are just set unions — no transform function, and peers can merge directly without a coordinating server."
+  - "OT is bandwidth-light (send small ops) but the transform logic is notoriously hard to get right for rich structures like tables or nested formatting; a single bug corrupts documents silently."
+  - "CRDTs are simpler to prove correct (mathematically guaranteed convergence) but carry per-character metadata overhead (tombstones, unique IDs) that bloats document size over a long edit history."
+  - "Real systems compact this cost: Google Docs' OT server keeps history bounded; CRDT editors like Yjs garbage-collect tombstones once all sites have acknowledged a deletion."
+  - "Pick OT when you control the server and want a lean wire format; pick CRDT when you need peer-to-peer or offline-first sync without a single source of truth."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson sized the problem: many users, one document, edits that
+have to show up everywhere in well under a second. But the hardest part of
+Google Docs isn't the networking — it's what happens when two people type at
+the *same position* at the *same time*. User A inserts "cat" at index 5. User
+B, half a second earlier on their own screen but before A's edit arrives,
+deletes the character at index 5. Both operations are valid on the document
+each user was looking at. Applied naively on the server, one of them lands on
+the wrong character, and the two users' screens silently diverge. This lesson
+covers the two families of algorithms that solve this — Operational
+Transformation (OT) and Conflict-free Replicated Data Types (CRDTs) — because
+which one you pick shapes almost every architectural decision in the rest of
+this module.
+
+## Why "last write wins" doesn't work
+
+The instinctive fix is to timestamp every edit and let the latest one win, or
+to lock the document while someone is typing. Both fail immediately at the
+scale a document editor needs:
+
+- **Locking** kills the "collaborative" part of collaborative editing — you
+  can't have ten people typing in different paragraphs if only one can hold
+  the lock at a time.
+- **Last-write-wins on the whole document** silently discards concurrent
+  edits — exactly the data-loss bug users notice first and trust you least
+  for.
+- **Last-write-wins per character** doesn't even solve the position problem:
+  if an insert and a delete both reference "index 5," you still need to
+  decide what index 5 *means* after the other operation has already been
+  applied elsewhere.
+
+What's actually needed is a way to describe an edit not just as "insert `cat`
+at 5" but in a way that stays meaningful even after other edits have shifted
+what "5" refers to. That's the job of both OT and CRDTs — they just solve it
+with opposite philosophies.
+
+## Operational Transformation: rewrite the operation
+
+OT treats every edit as an operation (`insert(pos, text)`, `delete(pos, len)`)
+and keeps a **single canonical order** of operations, usually arbitrated by a
+server. When two operations were generated concurrently — neither client had
+seen the other's edit — OT doesn't just replay them in arrival order. It
+**transforms** the later-arriving operation against the one it's being
+applied after, adjusting its position so the intent is preserved.
+
+Concretely: if operation `A = insert("cat", 5)` is already applied, and
+operation `B = delete(5, 1)` was generated concurrently (before the client saw
+`A`), applying `B` as-is would delete the wrong character — the first letter
+of "cat" instead of whatever was originally at index 5. Transforming `B`
+against `A` shifts `B`'s position by the length of `A`'s insertion, producing
+`delete(8, 1)`, which deletes the character the user actually intended.
+
+Every client keeps applying local edits optimistically, sends them to the
+server, and transforms any operations it receives against its own pending
+(not-yet-acknowledged) edits. The server is the arbiter of the canonical
+order — this is why classic OT (as used in Google Docs' original architecture
+and in Apache Wave) is inherently client-server, not peer-to-peer.
+
+The catch: writing a correct `transform` function for every pair of operation
+types, including edge cases like two inserts at the exact same position or a
+delete overlapping another delete, is genuinely hard. Extending it to rich
+formatting (bold spans, tables, comments anchored to text) multiplies the
+number of transform cases you need to prove correct.
+
+## CRDTs: make the data structure merge itself
+
+A CRDT sidesteps transform functions entirely by changing the data model.
+Instead of representing the document as a plain string with numeric indices,
+every inserted character (or block, depending on granularity) gets a
+**globally unique, immutable identifier** — commonly a `(site ID, logical
+clock)` pair, or a fractional position between its neighbors. Deletes don't
+remove data; they mark the ID as a **tombstone** (logically deleted, but kept
+around so ordering stays consistent).
+
+Because every element's identity and position are self-describing and never
+reused, merging two replicas' histories is just: union the sets of elements,
+sort by ID, skip tombstones when rendering. There's no transform step because
+there's nothing to transform — an operation created concurrently on another
+replica slots into the sequence at its own well-defined position, no matter
+what order operations arrive in. This is what "conflict-free" means: any
+merge order produces the same final state, which is a mathematical property
+(convergence), not something you have to test case-by-case.
+
+The trade-off is size and complexity of the data structure itself. A document
+edited for a year accumulates a lot of tombstones and per-character metadata
+— a naive character-by-character CRDT can bloat to many times the size of the
+visible text. Production CRDT libraries (Yjs, Automerge) mitigate this with
+run-length encoding of contiguous inserts and periodic garbage collection of
+tombstones once every connected peer has acknowledged the delete.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant A as Client A
+    participant S as Server / Merge
+    participant B as Client B
+    A->>S: insert("cat", 5)
+    B->>S: delete(5, 1)  (generated concurrently)
+    Note over S: OT: transform delete(5,1) against insert("cat",5)
+    Note over S: -> becomes delete(8,1)
+    S->>A: delete(8,1)
+    S->>B: insert("cat", 5) (already applied locally)
+    Note over A,B: Both replicas converge to the same text
+`} />
+
+## Where each one actually gets used
+
+Google Docs' production system is OT-based, with a server that owns the
+canonical operation log — this is also why Google Docs edits require a live
+connection to a specific backend and don't work as true peer-to-peer.
+CRDTs power editors built for offline-first or peer-to-peer sync: Figma's
+multiplayer engine and most modern local-first note apps use CRDT-style
+merge logic because a client can keep editing fully offline for hours and
+merge cleanly on reconnect, without a server in the loop to arbitrate order.
+
+In an interview, the honest framing is: OT front-loads complexity into a
+carefully tested transform function and keeps the wire format and stored
+document small; CRDTs front-load complexity into per-element metadata and
+garbage collection, but the merge logic itself is simple and provably
+correct, and it works without a central server. Neither is strictly "more
+scalable" — they trade different costs.
+
+## Worked example: two users, one word
+
+Say the document is `"The fox jumped"` and both Alice and Bob are looking at
+it with zero latency between them (an idealized case to keep the math
+simple). Alice inserts `"quick "` before `"fox"` (position 4). At the same
+instant, Bob deletes `"jumped"` (positions 8-14) to retype it.
+
+- **Under OT**: Alice's insert operation lengthens the string by 6
+  characters starting at position 4. Bob's delete operation, generated
+  against the *old* string, referenced positions 8-14. Before applying
+  Bob's op on top of Alice's, the server (or the receiving client) transforms
+  it: since Bob's delete range starts after Alice's insert point, it shifts
+  by +6, becoming delete(14, 6). Result: `"The quick fox "` after Alice's op,
+  then correctly deleting `"jumped"` from that new string.
+- **Under a CRDT**: `"jumped"`'s six characters each already have unique IDs
+  from when they were typed. Bob's delete just marks those six specific IDs
+  as tombstoned — it never referenced a numeric position at all, so Alice's
+  concurrent insert doesn't require any adjustment to Bob's operation. Both
+  replicas end up rendering the same visible characters, skipping tombstones.
+
+Same outcome, different mechanism: OT recalculates positions after the fact;
+CRDTs never depended on raw positions in the first place.
+
+<Callout type="warning">
+  A common interview mistake: presenting OT and CRDTs as "old vs. new" or
+  "worse vs. better." They're both used in production systems today for
+  good reasons tied to the product's needs (server-arbitrated real-time
+  editing vs. offline-first peer-to-peer sync) — treating one as strictly
+  obsolete signals you haven't actually understood the trade-off. Also
+  avoid hand-waving "we'll use a CRDT" without acknowledging the metadata
+  overhead question, or "we'll use OT" without acknowledging that a subtly
+  wrong transform function is one of the hardest classes of bugs to catch,
+  since it only manifests under specific concurrent-edit interleavings.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="docs-collaboration-models-ot-vs-crdt"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What does the "transform" step in Operational Transformation actually do?',
+      options: [
+        { id: 'a', text: 'Adjusts an operation\'s position/parameters so it still expresses the original intent after another concurrent operation has been applied', correct: true, explanation: 'That is exactly the role of transform(opA, opB): reconciling positions so concurrent edits do not corrupt each other when applied in a different order than they were authored.' },
+        { id: 'b', text: 'Converts the document into a CRDT for merging', correct: false, explanation: 'Transform is internal to OT; it does not involve CRDT data structures at all — the two are alternative approaches, not steps in a shared pipeline.' },
+        { id: 'c', text: 'Compresses operations before sending them over the network', correct: false, explanation: 'Transform is about correctness of concurrent edits, not about payload size or compression.' },
+        { id: 'd', text: 'Assigns a globally unique ID to each inserted character', correct: false, explanation: 'Unique IDs per element are the CRDT approach to avoiding position conflicts, not what OT\'s transform function does.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine costs of a character-level CRDT approach, compared to OT? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Per-character metadata (unique IDs, tombstones) can make stored/transmitted document size much larger than the visible text', correct: true, explanation: 'This is the well-known overhead of naive CRDT implementations; production libraries mitigate it with run-length encoding and tombstone garbage collection, but the cost is real.' },
+        { id: 'b', text: 'Deleted content must often be kept around logically (as tombstones) rather than immediately removed', correct: true, explanation: 'Tombstones preserve ordering guarantees for future merges; removing data immediately can break convergence for operations still in flight.' },
+        { id: 'c', text: 'CRDTs cannot guarantee that all replicas converge to the same final state', correct: false, explanation: 'The opposite is true — mathematically guaranteed convergence regardless of merge order is the defining property of a CRDT.' },
+        { id: 'd', text: 'CRDTs require a central server to arbitrate the order operations are applied in', correct: false, explanation: 'This describes OT, not CRDTs. A key advantage of CRDTs is that replicas can merge directly without a coordinating server.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Classic Operational Transformation, as used in systems like Google Docs, is inherently peer-to-peer and works the same whether or not a central server is involved.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Classic OT relies on a server (or some single arbiter) to establish a canonical order of operations that clients transform against; it is not naturally peer-to-peer.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — OT is inherently client-server in its classic form. Peer-to-peer, offline-first sync is the scenario CRDTs are specifically designed to handle well.' },
+      ],
+    },
+  ]}
+/>

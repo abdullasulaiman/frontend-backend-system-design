@@ -1,0 +1,126 @@
+---
+title: "Timeline Generation and Fan-Out"
+module: "Design Twitter"
+moduleOrder: 6
+order: 3
+track: "interview"
+summary: "Explains how a home timeline gets built at write time versus read time, and why nearly every large-scale feed system ends up with a hybrid of the two."
+tags: ["fan-out", "timeline-generation", "push-pull", "feed-architecture"]
+estMinutes: 12
+cheatsheet:
+  - "Fan-out-on-write (push) precomputes each follower's timeline when a tweet is posted — reads are cheap, but one tweet from a huge account means millions of writes."
+  - "Fan-out-on-read (pull) computes nothing at post time and merges every followed account's tweets live at read time — writes are cheap, but a normal user's read now means querying hundreds of sources synchronously."
+  - "Almost no real system picks one extreme: the standard design is hybrid fan-out — push for accounts under a follower threshold, pull-and-merge for accounts above it."
+  - "Fan out tweet IDs (or a small denormalized struct), not full tweet bodies — a follower's timeline is a list of pointers, resolved against a tweet-content store at render time."
+  - "Fan-out is asynchronous background work driven by a queue, not something done inline in the tweet-post request path — the post request should return as soon as the tweet is durably stored."
+  - "The follower-count threshold isn't free — it needs a place to live (a flag on the user record) and a plan for accounts that cross it, which is exactly the deep-dive in the next lesson on hot users."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson sketched a high-level architecture with a "timeline service" box and moved on. That box is where most of the actual engineering difficulty in a Twitter-like system lives, and it's the part interviewers dig into once the boxes-and-arrows sketch is on the whiteboard. The question is simple to state and surprisingly hard to answer well: when you open the app, where does the list of tweets in your home timeline actually come from, and when was it computed?
+
+Get this wrong and you build a system that works fine in a demo with a few hundred users and falls over the moment someone with ten million followers tweets, or one where every home-timeline load takes seconds because it's doing live fan-in work no page load can afford. This lesson covers the two fundamental strategies, why each one breaks under real-world follower graphs, and the hybrid design that makes the problem tractable.
+
+## Two ways to build a timeline
+
+A home timeline is, conceptually, the union of tweets from everyone you follow, sorted roughly by time (ranking is a separate concern, covered by the sibling lessons on data model and scaling). There are exactly two moments where you can do the work of assembling that union: when a tweet is *posted*, or when a timeline is *read*.
+
+### Fan-out-on-write (push)
+
+When a user posts a tweet, immediately look up their full follower list and insert a reference to the new tweet into each follower's precomputed timeline — typically a capped-length list stored in a fast key-value store like Redis, keyed by user ID. Reading your timeline later is then trivial: fetch your own precomputed list, done. This is why it's called "push" — the work happens once, at write time, and gets pushed out to every follower.
+
+The failure mode is entirely about fan-out size. A user with 500 followers triggers 500 small writes when they tweet — cheap. A user with 50 million followers triggers 50 million writes from a single API call. That single tweet now has to enqueue tens of millions of timeline-store insertions, and if your system tries to do that synchronously in the post request, the request either times out or takes the box down.
+
+### Fan-out-on-read (pull)
+
+The opposite approach: do nothing when a tweet is posted beyond storing it. When a user opens their timeline, query the tweet store for every account they follow, merge the results by recency, and return the top N. This is "pull" — the work happens at read time, pulled together on demand.
+
+This avoids the celebrity write-storm entirely — posting is always O(1) regardless of follower count. But it shifts the cost to reads, and reads happen far more often than posts. A user who follows 800 accounts triggers 800 queries (or 800 lookups into a fan-in structure) on every single timeline refresh. Do that synchronously against hundreds of millions of daily active users and your read path becomes the bottleneck instead.
+
+## The celebrity problem forces a hybrid
+
+Neither extreme survives contact with a real follower-count distribution, which is heavily skewed: the overwhelming majority of accounts have a modest follower count, and a tiny minority have counts in the millions or tens of millions. Pure push is fine for the majority and catastrophic for the tail. Pure pull is fine for the tail (posting is always cheap) but makes every single read expensive for everyone, including the majority who'd have been perfectly well served by push.
+
+The standard fix, and the one you should propose directly rather than waiting to be asked "what about a celebrity account?", is a follower-count threshold that splits accounts into two tiers:
+
+- **Below the threshold** (say, under 100k–1M followers, tuned to your infrastructure): fan out on write as normal. This covers the vast majority of accounts and keeps their followers' reads cheap.
+- **At or above the threshold**: skip fan-out entirely on write. Followers of these accounts pull directly from a small set of "high-follower accounts I follow" at read time and merge that pulled set into their otherwise-precomputed timeline.
+
+Because almost everyone follows only a handful of celebrity-tier accounts even if they follow hundreds of regular accounts, the read-time merge only has to touch a handful of live sources per request — nothing like the hundreds-of-queries problem pure pull has.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  T[New tweet posted] --> Q{Author follower count}
+  Q -- below threshold --> F[Enqueue fan-out job]
+  F --> W[Write worker pool]
+  W --> R1[(Follower A timeline)]
+  W --> R2[(Follower B timeline)]
+  W --> R3[(Follower N timeline)]
+  Q -- above threshold --> S[Skip fan-out, store tweet only]
+  V[Timeline read request] --> P[Read precomputed timeline]
+  V --> M[Pull tweets from any followed celebrity accounts]
+  P --> Merge[Merge and sort]
+  M --> Merge
+  Merge --> Out[Return timeline]
+`} />
+
+## What gets fanned out, and how
+
+A precomputed timeline should never store full tweet bodies. Store a small reference — the tweet ID, author ID, and a timestamp — and resolve those into full tweet content (text, media URLs, like counts) from a separate tweet-content store at read time, batched into one lookup. This keeps the timeline store small and fast, and means an edit to a tweet's engagement counts doesn't require rewriting it inside millions of followers' precomputed lists.
+
+Fan-out itself must be asynchronous. The tweet-post API call should durably persist the tweet and return quickly; the actual "write to N followers' timelines" work belongs on a queue, processed by a pool of workers that batch inserts and can be scaled independently of the request-serving fleet. This also gives you a natural place to apply backpressure — if fan-out workers fall behind during a traffic spike, followers simply see a tweet in their timeline a few seconds later, which is an acceptable degradation; a synchronous design has no such graceful failure mode.
+
+## Worked example: sizing the fan-out queue
+
+Say your platform has 500 million daily active users, and on average each user posts 2 tweets a day. That's 1 billion tweets/day, or roughly 11,600 tweets/second at average load (more at peak — assume 3x peak, so ~35,000 tweets/second).
+
+Now assume 99% of accounts have fewer than 100k followers (push tier) with an average of 300 followers each, and the remaining 1% are pull-tier. Push-tier fan-out work is roughly `11,600 * 0.99 * 300 ≈ 3.4 million` timeline-writes/second at average load, and about 3x that at peak — on the order of 10 million writes/second. That's a large number, but it's now a horizontally scalable queue-and-worker problem, not a single request blocking for the full duration of a fan-out. Compare that to what a single celebrity tweet would cost under pure push: one tweet from a 50-million-follower account is 50 million writes from one HTTP request — larger than the *entire platform's* average per-second fan-out volume, from one event. That comparison is usually the clearest way to make the celebrity problem concrete in an interview.
+
+<Callout type="warning">
+A common mistake is treating the follower-count threshold as a static, one-time classification. Accounts cross the threshold — a normal user goes viral, or a public figure's account grows past it — and a design that only checks the threshold once (e.g., at account creation) will silently keep push-fanning-out an account that has since become a write-storm risk. You need a mechanism to re-evaluate and flip an account's fan-out tier as its follower count changes, and to handle the transition (an account moving to pull-tier shouldn't lose tweets already sitting in followers' precomputed timelines). This tier-transition mechanics, plus other techniques for handling sudden spikes in a single account's activity, is exactly what the next lesson on scaling and hot users covers in depth.
+</Callout>
+
+<Quiz lessonId="twitter-timeline-generation-and-fan-out" client:visible questions={[
+  {
+    id: 'q1',
+    kind: 'mcq',
+    prompt: 'What is the core weakness of pure fan-out-on-write (push) as a timeline generation strategy?',
+    options: [
+      { id: 'a', text: 'It makes every timeline read slow, since reads have to merge results from every followed account', correct: false, explanation: 'That describes pull, not push. Push makes reads cheap by precomputing timelines at write time.' },
+      { id: 'b', text: 'A single tweet from a very high-follower account triggers a write to every one of their followers\' timelines at once', correct: true, explanation: 'Correct — write cost under push scales with the author\'s follower count, so a celebrity-scale account turns one post into millions of timeline writes.' },
+      { id: 'c', text: 'It cannot be combined with a queue-based worker architecture', correct: false, explanation: 'Push fan-out is commonly implemented with exactly that architecture — an async queue and worker pool doing the writes. The weakness is the sheer volume for high-follower accounts, not incompatibility with queues.' },
+    ],
+  },
+  {
+    id: 'q2',
+    kind: 'boolean',
+    prompt: 'In a hybrid fan-out design, followers of a high-follower ("celebrity-tier") account still need their timeline reads to merge in that account\'s tweets at read time.',
+    options: [
+      { id: 'true', text: 'True', correct: true, explanation: 'Correct — celebrity-tier accounts are excluded from push fan-out, so their tweets aren\'t in anyone\'s precomputed timeline; followers pull them in live and merge at read time.' },
+      { id: 'false', text: 'False', correct: false, explanation: 'If this were false, followers would simply never see tweets from celebrity-tier accounts, since those tweets were never pushed anywhere.' },
+    ],
+  },
+  {
+    id: 'q3',
+    kind: 'multi',
+    prompt: 'Which of these are good practices for implementing fan-out-on-write? (Select all that apply.)',
+    options: [
+      { id: 'a', text: 'Store tweet IDs and minimal metadata in each follower\'s precomputed timeline, resolving full content separately at read time', correct: true, explanation: 'Correct — this keeps the timeline store small and avoids having to rewrite full tweet bodies across millions of copies when a tweet\'s engagement counts change.' },
+      { id: 'b', text: 'Perform the fan-out writes synchronously inside the tweet-post API request before returning a response', correct: false, explanation: 'This is the opposite of good practice — it ties the post request\'s latency (and failure mode) to fan-out size, which is exactly what causes timeouts for high-follower accounts.' },
+      { id: 'c', text: 'Process fan-out as background jobs on a queue, consumed by an independently scalable worker pool', correct: true, explanation: 'Correct — this decouples fan-out throughput from request-serving capacity and gives you a natural way to apply backpressure under load.' },
+    ],
+  },
+  {
+    id: 'q4',
+    kind: 'mcq',
+    prompt: 'A platform has an account whose follower count crosses from below to above the push/pull threshold over time. What must the system account for?',
+    options: [
+      { id: 'a', text: 'Nothing — the threshold check only needs to happen once, at account creation', correct: false, explanation: 'This is the pitfall the lesson calls out directly — follower counts change, and a static one-time classification will keep push-fanning-out an account that has since become a write-storm risk.' },
+      { id: 'b', text: 'The account\'s fan-out tier needs to be re-evaluated over time, with a defined transition so followers don\'t lose tweets already sitting in their precomputed timelines', correct: true, explanation: 'Correct — tier assignment has to be dynamic, and the transition itself needs handling so the switch doesn\'t drop or duplicate content for existing followers.' },
+      { id: 'c', text: 'The account should be prevented from gaining more followers past the threshold', correct: false, explanation: 'Blocking follower growth isn\'t a real option for a social platform — the system has to adapt its fan-out strategy to the account, not the other way around.' },
+    ],
+  },
+]} />

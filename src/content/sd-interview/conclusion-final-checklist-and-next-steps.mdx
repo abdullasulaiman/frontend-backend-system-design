@@ -1,0 +1,133 @@
+---
+title: "Final Checklist and Next Steps"
+module: "Concluding Remarks"
+moduleOrder: 21
+order: 2
+track: "interview"
+summary: "A pre-interview readiness checklist across requirements, architecture, deep-dives, and delivery, plus a concrete plan for what to practice next."
+tags: ["checklist", "interview-prep", "study-plan", "system-design", "readiness"]
+estMinutes: 11
+cheatsheet:
+  - "Requirements checklist: 2-3 functional requirements you chose to focus on, explicit non-functional priorities (consistency vs availability, latency budget), and a back-of-envelope scale number you actually used later."
+  - "Architecture checklist: every box on your diagram has a one-sentence reason to exist, and you can point to where data enters, where it's stored, and where it's read from on the happy path."
+  - "Deep-dive checklist: at least one component pushed to a specific mechanism (e.g. consistent hashing, a specific index, a specific queue guarantee) rather than left as a labeled box."
+  - "Delivery checklist: you stated an assumption out loud when guessing, and you revisited an earlier decision on the whiteboard when new information made it wrong."
+  - "If you only have one week left: redo 2-3 case studies from a blank page under a 45-minute timer instead of re-reading more lessons — production under time pressure is the actual skill being tested."
+  - "If you have a month: rotate through the estimation math, one deep-dive mechanism per weak area (caching, queues, indexing, consensus), and one full mock interview per week."
+  - "Track failure patterns across your own mock interviews (rushing to draw boxes, skipping numbers, freezing on scale) — the same mistake repeating across sessions is a bigger signal than any single miss."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've now been through requirements gathering, capacity estimation, high-level architecture, and deep-dives across a dozen case studies — from URL shorteners to ride-hailing dispatch. The previous lesson, Interview-Day Strategy Recap, covered how to behave in the room: pacing, communication, and handling curveballs. This lesson is the opposite direction — a concrete checklist to run against your own preparation *before* you walk in, plus an honest answer to "what do I actually do with my remaining prep time."
+
+The reason a checklist matters here, specifically, is that system design prep has no automatic feedback loop. Unlike a coding problem, you can't run your design against test cases and get a red or green result. Without a structured self-check, it's easy to spend weeks re-reading case studies and feel more familiar with the material while your actual interview performance — the ability to *produce* a design live, under time pressure, from a blank page — barely improves. The checklist below is built to catch that gap.
+
+## The four-part readiness checklist
+
+Run this against your last 2-3 practice sessions (real or mock). If you can't check a box, that's your next study target, not a reason to feel behind.
+
+### 1. Requirements
+
+- Can you list the 2-3 functional requirements you chose to focus on, and explain *why* you cut the others? A design that tries to handle everything the prompt could plausibly mean usually handles nothing well in 45 minutes.
+- Did you state non-functional priorities explicitly — consistency vs. availability, read-heavy vs. write-heavy, a latency budget — rather than leaving them implicit in your diagram?
+- Did you produce at least one real number (QPS, storage per day, cache size) and actually *use* it later, e.g. to justify sharding, or to argue a single database is fine for now?
+
+### 2. Architecture
+
+- Does every box on your diagram have a one-sentence justification for existing? "We have a cache because reads outnumber writes 100:1 and most reads hit a small hot set" is a justification. A box labeled "Cache" with no reason is decoration.
+- Can you trace a single request end to end on your own diagram — where it enters, what validates it, where it's written, what serves the read path — without hand-waving over an arrow?
+- Did you separate concerns that behave differently under load? A common miss is dumping high-churn data (live location pings, view counts) into the same store as durable records (orders, accounts) — this bit you if you didn't at least mention it as a trade-off.
+
+### 3. Deep-dive depth
+
+- Did at least one component get pushed past a labeled box into an actual mechanism? "We use consistent hashing with virtual nodes to keep shard rebalancing to O(1/n) of the keyspace" is a deep-dive. "We shard the database" is not.
+- Can you name the specific failure mode your chosen mechanism handles, and what it costs you? Every real mechanism has a downside — if yours doesn't, you likely haven't gone deep enough to find it yet.
+- Did you connect the deep-dive back to a number from your requirements phase, instead of picking a trendy technology because it's the "expected" answer for that case study?
+
+### 4. Delivery
+
+- Did you say an assumption out loud when you were guessing, rather than presenting a guess as a fact? Interviewers weight "I'm assuming X because Y, correct me if that's off" far higher than silent guessing.
+- Did you revise an earlier decision when new information came up, and say so explicitly ("actually, given the write volume we just estimated, I'd rather queue this than write synchronously")? Static designs that never adapt read as memorized, not reasoned.
+- Did you manage the clock yourself, or did the interviewer have to redirect you more than once? Self-correction on pacing is itself a signal being evaluated.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    A[Requirements] --> B{All 3 boxes checked?}
+    B -- No --> A2[Redo this case study's<br/>requirements phase]
+    B -- Yes --> C[Architecture]
+    C --> D{All 3 boxes checked?}
+    D -- No --> C2[Redraw diagram,<br/>justify every box]
+    D -- Yes --> E[Deep-dive]
+    E --> F{Pushed past a labeled box?}
+    F -- No --> E2[Pick one component,<br/>name the real mechanism]
+    F -- Yes --> G[Delivery]
+    G --> H{Assumptions stated,<br/>pace self-managed?}
+    H -- No --> G2[Redo under a timer,<br/>narrate out loud]
+    H -- Yes --> I[Ready — move to next case study]
+`} />
+
+## Worked example: auditing one of your own mock interviews
+
+Say your last mock interview was designing a URL shortener, and it went "fine" — you finished the diagram, but the feedback was vague ("could be more detailed"). Run the checklist:
+
+- **Requirements**: you estimated 100 writes/sec and 10,000 reads/sec, and picked availability over strict consistency for redirects. Checked.
+- **Architecture**: your diagram has an API layer, a key-generation service, a database, and a cache. You can explain why the cache exists (read-heavy, small hot set of popular links). Checked.
+- **Deep-dive**: this is where it breaks down. You said "the key-generation service generates unique short codes" and moved on. You never specified *how* — random string, plus a collision check? A counter encoded in base62? Pre-generated key pool consumed by workers? That's the missing mechanism, and it's exactly the kind of gap that produces "could be more detailed" as feedback with no specifics.
+- **Delivery**: you paced well and finished on time, so no issue there.
+
+The fix isn't re-reading the whole case study again — it's spending 15 focused minutes on *one* thing: pick a concrete key-generation mechanism (say, a counter-based approach with base62 encoding, sharded by assigning counter ranges per worker to avoid a single point of contention), understand its trade-off (predictable codes are guessable/enumerable, so you'd add a permutation step or use them internally with a random-looking external mapping), and rehearse explaining it in under 90 seconds. That's a much higher-value 15 minutes than re-reading the whole lesson end to end.
+
+## Planning your remaining time
+
+How you use the time left before an interview depends heavily on how much of it you have:
+
+- **One week or less**: stop consuming new material. Redo 2-3 case studies from a blank page under a strict 45-minute timer, out loud (record yourself if you can bear it). The skill being tested is production under pressure, not recognition of concepts you've already read — rereading feels productive but doesn't train the thing that's actually being evaluated.
+- **Two to four weeks**: split time three ways — one weak deep-dive mechanism per session (pick from caching strategies, queueing/ordering guarantees, indexing structures, or consensus/replication, whichever you're shakiest on), estimation math drills until back-of-envelope numbers stop feeling effortful, and one full mock interview per week scored against the four-part checklist above.
+- **More than a month**: this is the time to build breadth — work through case studies you haven't touched, especially ones with an unfamiliar deep-dive concern (e.g. if you've never designed anything with strong consistency requirements, do one). Save the last week for the "one week or less" plan regardless of how much runway you started with.
+
+Across any timeline, keep a running list of your own failure patterns from mock interviews — not "I didn't know X fact," but behavioral patterns like "I always jump to boxes before finishing requirements" or "I freeze when asked to estimate storage." A repeated pattern across three separate mock interviews is a stronger signal than any single missed detail, and it's usually fixable with one or two deliberate reps once you've named it.
+
+<Callout type="warning">
+  The most common failure mode at this stage is treating "I've read all the lessons" as equivalent to "I'm ready." Reading builds recognition, not production — you can nod along to a design you're reading and still freeze on a blank whiteboard for the same prompt a week later. If your practice time is mostly re-reading rather than producing designs from scratch under a timer, you are optimizing the wrong metric. Swap at least half of remaining prep time to active recall: closed-book, timed, out loud.
+</Callout>
+
+<Quiz
+  lessonId="conclusion-final-checklist-and-next-steps"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A candidate finishes practice designs on time and can explain every box in the architecture, but every deep-dive stays at "we use a cache" or "we shard the database" without further detail. Which checklist category needs the most work?',
+      options: [
+        { id: 'a', text: 'Requirements', correct: false, explanation: 'Requirements is about scoping and using real numbers up front — the gap described here is specifically about mechanisms, not scoping.' },
+        { id: 'b', text: 'Deep-dive depth', correct: true, explanation: 'Labeling a box ("we use a cache") without naming the actual mechanism, its trade-off, and why it was chosen is exactly the deep-dive gap the checklist is meant to catch.' },
+        { id: 'c', text: 'Delivery', correct: false, explanation: 'Delivery covers pacing, stating assumptions, and adapting on the fly — timing was fine here, so delivery is not the bottleneck.' },
+        { id: 'd', text: 'Architecture', correct: false, explanation: 'The candidate can already explain why each box exists, which is what the architecture checklist is checking — the missing piece is going deeper on mechanism, which is the deep-dive category.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are recommended uses of a candidate\'s final week before an interview, per this lesson? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Redo 2-3 case studies from a blank page under a timer', correct: true, explanation: 'This is the specific recommendation for one week or less — active production under time pressure, not passive review.' },
+        { id: 'b', text: 'Re-read as many case-study lessons as possible one more time', correct: false, explanation: 'Rereading builds recognition, not production skill, and the lesson explicitly warns against treating this as equivalent to readiness this close to the interview.' },
+        { id: 'c', text: 'Narrate designs out loud, ideally recorded, rather than working silently', correct: true, explanation: 'Practicing out loud trains the actual interview skill of live verbal communication, which silent practice does not exercise.' },
+        { id: 'd', text: 'Start a brand-new case study with an unfamiliar deep-dive concern', correct: false, explanation: 'The lesson reserves building new breadth for candidates with a month or more of runway; in the final week the priority is production speed on material you already know, not new topics.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'According to this lesson, a single missed detail in one mock interview is a stronger signal to act on than a behavioral pattern (e.g. always skipping estimation) that repeats across three separate mock interviews.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'This reverses the lesson\'s guidance — a repeated behavioral pattern across multiple sessions is called out as the stronger signal, since a single miss could just be an off day.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the lesson states a repeated pattern across separate mock interviews is a stronger signal than any single missed detail, because it points to a systematic habit rather than one-off noise.' },
+      ],
+    },
+  ]}
+/>

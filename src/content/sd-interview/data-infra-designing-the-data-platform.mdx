@@ -1,0 +1,223 @@
+---
+title: "Designing the Data Platform"
+module: "Design a Data Infrastructure System"
+moduleOrder: 17
+order: 3
+track: "interview"
+summary: "Assembles ingestion, storage, processing, and serving into one coherent end-to-end data platform architecture, with a worked capacity estimate and the failure modes interviewers probe for."
+tags: ["data-infrastructure", "data-pipeline", "data-lake", "orchestration", "system-design"]
+estMinutes: 14
+cheatsheet:
+  - "A data platform is four layers wired together: ingestion (connectors + log), storage (raw/refined/curated), processing (batch + stream), and serving (query engine, feature store, dashboards) — know all four before you draw a single box."
+  - "Land data raw and immutable first (bronze), then produce cleaned/deduped (silver), then aggregated/business-ready (gold) — never let downstream consumers read directly from raw source dumps."
+  - "Use a durable log (Kafka-style) as the single ingestion backbone that both the batch and streaming paths read from — this is what makes Lambda/Kappa architectures actually buildable instead of two disconnected pipelines."
+  - "A schema registry with compatibility rules (backward/forward) is not optional at scale — one unannounced upstream field rename should not be able to silently corrupt every downstream job."
+  - "Orchestration (DAG scheduler) owns dependencies, retries, and backfills — treat 'rerun the last 3 days after a bug fix' as a first-class requirement, not an afterthought."
+  - "Data quality checks (freshness, volume, schema, null-rate) belong between every layer, not just at the end — catching a bad batch at the bronze-to-silver boundary is far cheaper than catching it in a dashboard."
+  - "Serving layer choice should match the read pattern: OLAP warehouse for ad-hoc/BI queries, a low-latency store or feature store for online lookups — don't force one system to do both well."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+By the time you've picked Lambda vs. Kappa and reasoned about batch vs.
+stream processing, an interviewer will ask the question that actually
+matters: "okay, now draw the whole thing." This is where candidates who
+understood the individual pieces but never assembled them into a working
+system start to struggle. A data platform isn't a stream processor plus a
+batch job plus a database — it's a set of layers with specific contracts
+between them, and the quality of those contracts is what determines whether
+the system survives a bad deploy, a schema change, or three years of nobody
+remembering why a table exists.
+
+This lesson puts the pieces from the previous two lessons together into one
+architecture: ingestion, storage, processing, and serving, plus the
+orchestration and metadata glue that keeps them honest.
+
+## The four layers, at a glance
+
+Every data platform, no matter the company, decomposes into the same four
+layers:
+
+- **Ingestion** — gets data from sources (application databases, event
+  producers, third-party APIs) into the platform reliably.
+- **Storage** — holds data at different stages of refinement, cheaply and
+  durably.
+- **Processing** — transforms raw data into clean, aggregated, query-ready
+  data, on both a scheduled (batch) and continuous (stream) basis.
+- **Serving** — exposes processed data to the people and systems that
+  actually consume it: analysts running SQL, dashboards, ML models, other
+  services.
+
+Wrapping all four is **orchestration** (who runs what, when, and in what
+order) and **metadata/governance** (schemas, lineage, access control, data
+quality). Skipping either of those in your design is the single most common
+way to lose points in this kind of interview — they're not "extra credit,"
+they're what makes the other four layers operable by a team of humans.
+
+## Ingestion: one backbone, many sources
+
+Sources are heterogeneous — OLTP databases via change-data-capture (CDC),
+application event producers, third-party webhooks, file drops from
+partners. The mistake to avoid is building a bespoke pipe from each source
+straight to each consumer; that's an N×M problem that becomes unmaintainable
+past a handful of sources.
+
+Instead, funnel everything through a durable, replayable log (a
+Kafka-style commit log) as the single ingestion backbone. Every source
+writes to a topic; every downstream consumer — batch jobs, stream
+processors, even other teams' services — reads from that same topic
+independently, at its own pace, without the producer knowing or caring who's
+consuming. This is precisely the property that makes the Lambda/Kappa
+choice from lesson 1 buildable in practice: both the batch and speed layers
+read the same underlying event stream instead of maintaining separate,
+potentially-inconsistent ingestion paths.
+
+## Storage: raw, refined, curated
+
+Land data in layered storage rather than one flat data lake:
+
+- **Raw/bronze** — the untouched, immutable copy of what arrived, in
+  whatever format the source sent it, partitioned by ingestion time. This is
+  your source of truth for replay and debugging — never let anyone mutate
+  it.
+- **Refined/silver** — deduplicated, schema-validated, type-corrected data,
+  still at roughly the source's granularity (one row per event, one row per
+  record).
+- **Curated/gold** — business-level aggregates and joins, shaped for how
+  they'll actually be queried (e.g., daily active users by country, revenue
+  by product line).
+
+This staged structure matters because it isolates blast radius: a bug in an
+aggregation job corrupts gold tables, which you can drop and recompute from
+silver; a bug in parsing corrupts silver, recomputable from bronze; only
+data loss at the source itself is unrecoverable. Object storage (cheap,
+durable, decoupled from compute) is the natural home for bronze and silver;
+a columnar warehouse or OLAP engine is the natural home for gold, where
+query latency matters.
+
+## Processing and orchestration
+
+Processing is where the batch/stream techniques from lesson 2 actually run:
+scheduled Spark/Flink batch jobs turning silver into gold, and streaming
+jobs maintaining low-latency aggregates or triggering alerts directly off
+the ingestion log. An orchestrator (DAG scheduler — think Airflow-style)
+owns the dependency graph between them: "don't start the daily revenue
+rollup until the hourly currency-conversion job for all 24 hours has
+succeeded." Two orchestration properties are easy to skip and expensive to
+skip:
+
+- **Backfills** — the ability to rerun a job over an arbitrary historical
+  window (e.g., after fixing a bug in a transform) without hand-crafting a
+  one-off script.
+- **Idempotent writes** — a rerun of the same job over the same input
+  window must produce the same output, not append duplicates. Partition
+  overwrite semantics (replace the whole day's partition, don't append rows
+  to it) is the simplest way to get this.
+
+## Serving: match the store to the read pattern
+
+Don't make one system serve every read pattern. A columnar warehouse
+(BigQuery/Snowflake/Redshift-style) is right for ad-hoc analyst SQL and BI
+dashboards scanning large ranges. A key-value or document store, or a
+purpose-built feature store, is right for online lookups an application
+needs in milliseconds (e.g., "this user's last-7-day purchase count" fed
+into a recommendation model at request time). Trying to serve both from the
+warehouse gets you either a slow application path or an analyst team
+fighting for warehouse capacity with production traffic.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  S1[App DB - CDC] --> L[Durable log]
+  S2[Event producers] --> L
+  S3[Partner files] --> L
+  L --> B[Bronze - raw, immutable]
+  B --> P1[Batch: clean + dedup]
+  L --> P2[Stream: continuous agg]
+  P1 --> SI[Silver]
+  SI --> P3[Batch: aggregate]
+  P3 --> G[Gold - warehouse]
+  P2 --> FS[Feature store / low-latency store]
+  G --> BI[Dashboards / analyst SQL]
+  FS --> APP[Online app lookups]
+  O[Orchestrator] -.schedules & retries.-> P1
+  O -.-> P3
+  R[Schema registry + quality checks] -.validates.-> B
+  R -.validates.-> SI
+`} />
+
+## Worked example: a ride-sharing trip-events platform
+
+Say you're designing this for a ride-sharing company: 5 million trips/day,
+each trip emitting roughly 20 events (request, match, pickup, waypoints,
+drop-off, payment) — 100 million events/day, around 1,150 events/second
+average, with a 5x peak multiplier at rush hour (~5,800 events/second).
+
+- **Ingestion**: trip-service instances publish events to a `trip-events`
+  log topic, partitioned by trip ID so all events for one trip land on the
+  same partition (preserves per-trip ordering).
+- **Storage**: bronze holds the raw event JSON, partitioned by event date,
+  retained 90 days for replay. Silver holds deduplicated, schema-validated
+  events (dedup by event ID, since at-least-once delivery means retries
+  happen). Gold holds daily aggregates: trips per city, average pickup
+  time, driver utilization.
+- **Processing**: a streaming job maintains a real-time "trips in progress
+  per city" counter for the ops dashboard (seconds-level freshness); a
+  nightly batch job computes gold aggregates and driver payout summaries
+  (correctness over latency).
+- **Serving**: gold tables sit in a warehouse for the finance and analytics
+  teams; the real-time counters sit in a low-latency store (e.g., an
+  in-memory KV store) that the ops dashboard polls every few seconds.
+- **Orchestration**: the nightly batch DAG depends on all 24 hourly
+  partitions of silver being complete and quality-checked before the
+  aggregation step runs; a failed check halts the DAG and pages on-call
+  rather than silently computing payouts on incomplete data.
+
+<Callout type="warning">
+  The most common design-review failure here is presenting ingestion,
+  storage, processing, and serving as four independent boxes with arrows
+  between them and stopping there. Interviewers will immediately ask "what
+  happens when the schema of an upstream event changes without warning?" or
+  "how do you rerun last Tuesday after finding a bug?" If your design has no
+  answer — no schema registry, no backfill story, no idempotent write path —
+  you've described a demo, not a platform. Budget real design time for the
+  orchestration and governance glue, not just the data flow.
+</Callout>
+
+<Quiz
+  lessonId="data-infra-designing-the-data-platform"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why funnel all ingestion sources through a single durable log rather than building a direct pipe from each source to each consumer?',
+      options: [
+        { id: 'a', text: 'A direct N-source-to-M-consumer wiring becomes unmaintainable, while a shared log lets each consumer read independently at its own pace', correct: true, explanation: 'This is exactly the N×M problem the log backbone avoids, and it is also what makes both a batch path and a stream path able to read the same underlying data.' },
+        { id: 'b', text: 'A log is required because batch processing cannot read from a database directly', correct: false, explanation: 'Batch jobs can and often do read from databases or files; the log is about avoiding duplicated bespoke pipes, not a hard technical requirement of batch processing.' },
+        { id: 'c', text: 'A log guarantees zero data loss even without replication', correct: false, explanation: 'A log still needs replication and durable storage to avoid data loss; using a log by itself does not guarantee that.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasons to stage storage as raw/bronze -> refined/silver -> curated/gold rather than writing consumer-ready tables straight from ingestion?',
+      options: [
+        { id: 'a', text: 'It isolates blast radius: a bug in an aggregation job only corrupts gold, which can be recomputed from silver', correct: true, explanation: 'Correct — each layer can be rebuilt from the layer below it, so a bug in a later stage does not require re-ingesting from source systems.' },
+        { id: 'b', text: 'It preserves an immutable copy of exactly what arrived, useful for replay and debugging', correct: true, explanation: 'Bronze retains the untouched data, so you can always replay processing from a known-good starting point.' },
+        { id: 'c', text: 'It removes the need for any schema validation, since raw data is stored as-is', correct: false, explanation: 'The opposite is true — schema validation typically happens on the way into silver; storing raw data as-is in bronze does not remove the need for validation downstream.' },
+        { id: 'd', text: 'It lets each layer use a storage format suited to its access pattern (e.g., cheap object storage for bronze/silver, a columnar warehouse for gold)', correct: true, explanation: 'Correct — bronze/silver favor cheap, durable storage decoupled from compute, while gold favors low-latency query engines for BI and dashboards.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A well-designed data platform should serve both ad-hoc analyst SQL and millisecond-latency online application lookups from the same warehouse table.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'This is a common design mistake. A warehouse tuned for large analytical scans is a poor fit for millisecond lookups, and mixing the workloads causes analysts and production traffic to contend for the same capacity.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — match the store to the read pattern: a columnar warehouse for ad-hoc/BI queries, and a separate low-latency store or feature store for online application lookups.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,112 @@
+---
+title: "SQL vs. NoSQL: Choosing a Data Store"
+module: "Databases"
+moduleOrder: 9
+order: 1
+track: "concept"
+summary: "Frames the SQL vs. NoSQL decision as a set of concrete trade-offs — schema rigidity, transactional guarantees, and scaling model — rather than a brand-name choice, and walks through a framework for picking (or combining) data stores."
+tags: ["databases", "sql", "nosql", "data-modeling", "trade-offs"]
+estMinutes: 11
+cheatsheet:
+  - "\"SQL vs. NoSQL\" is really three separate decisions bundled together: schema rigidity, transactional/consistency guarantees, and scaling model. Don't let one label decide all three."
+  - "Relational databases give you multi-row/multi-table ACID transactions and enforced schema; most NoSQL stores trade some or all of that for horizontal scalability and flexible, evolvable records."
+  - "\"NoSQL doesn't scale\" and \"SQL always needs a rigid schema\" are both outdated as absolutes — modern relational databases shard and replicate, and plenty of NoSQL stores support strong consistency for a single document/row."
+  - "Pick based on the access pattern and the invariant you can't violate (e.g. \"a payment must never be double-charged\"), not on team familiarity or what's trending."
+  - "Polyglot persistence — SQL for the ledger, document/key-value for the flexible or high-volume parts — is normal at scale, not a sign of an unfinished design."
+  - "State your reasoning out loud in an interview: name the access pattern and the consistency requirement before naming a product."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Should this be SQL or NoSQL?" is one of the first questions an interviewer expects you to answer out loud, and it's also one of the easiest places to sound like you're picking a database by brand recognition instead of by reasoning. The honest answer is almost always "it depends on what I can't afford to get wrong" — and that's exactly the kind of answer that distinguishes a strong response from a name-drop.
+
+This lesson gives you a framework for that decision. The previous lesson, "Storage Fundamentals and Data Models," covered the underlying data models (relational, key-value, document, wide-column, object) and storage engines (B-tree vs. LSM-tree) — read that first if you haven't, because this lesson builds directly on it rather than re-deriving it. Here, the focus is narrower: given those options, how do you actually decide, and how do you talk through that decision in an interview?
+
+## What the SQL/NoSQL split is really bundling together
+
+"SQL vs. NoSQL" sounds like one decision. It's actually three, and treating them as one is where most weak answers go wrong.
+
+1. **Schema rigidity.** A relational database enforces a schema at write time — every row in a table has the same columns, with types and constraints checked before the write succeeds. Most NoSQL stores are schema-on-read: the database doesn't enforce structure, so a "users" collection can happily hold documents with different fields, and it's up to your application code to handle that variance when reading.
+2. **Transactional guarantees.** Relational databases are built around ACID transactions that can span multiple rows and multiple tables: "debit this account and credit that one, both or neither." Many NoSQL stores guarantee atomicity only at the level of a single row or document, and trade cross-record transactions for availability and partition tolerance (the next module's lesson on Transactions and Consistency goes deep on this trade-off).
+3. **Scaling model.** Relational databases historically scaled up (a bigger machine) more easily than out (more machines), because joins and cross-row transactions don't shard cleanly. NoSQL stores were largely designed scale-out first — partition by key, replicate, and accept weaker cross-partition guarantees in exchange.
+
+None of these three axes strictly determines the other two anymore — modern Postgres and MySQL shard and replicate reasonably well, and stores like MongoDB and DynamoDB now offer stronger consistency options than their early reputations suggest. But as a starting mental model for "what am I actually trading away," these three axes are the right ones to reason from.
+
+## The decision framework
+
+Ask these questions, roughly in this order, before naming a product:
+
+- **Is there an invariant that must never be violated across multiple records?** ("An order's inventory reservation and its payment charge must succeed or fail together.") If yes, you want multi-row ACID transactions — lean relational, or a NoSQL store that explicitly offers multi-document transactions for that specific case.
+- **Does the shape of a record vary a lot, or evolve fast?** A product catalog where a "shoe" and a "laptop" have almost nothing in common, or a schema that changes every sprint, is painful to force into rigid columns. A document store lets each record carry its own shape.
+- **What's the dominant access pattern, and at what volume?** Point lookup by key at huge write volume (session state, activity feed writes, IoT sensor data) favors key-value or wide-column stores built for exactly that. Ad-hoc queries and joins across many entities favor relational.
+- **How much read-your-own-writes / cross-record consistency does the product actually need?** "The user must see their own comment immediately" is a real requirement; "every follower's feed reflects a new post within one second" is usually not — the second can tolerate eventual consistency, which opens up more scale-friendly options.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Start: describe the access pattern] --> B{"Multi-record invariant<br/>that can never break?"}
+  B -->|yes| REL[Relational / ACID store]
+  B -->|no| C{"Record shape varies<br/>or evolves often?"}
+  C -->|yes| DOC[Document store]
+  C -->|no| D{"Point lookup by key,<br/>very high write volume?"}
+  D -->|yes| KV[Key-value or wide-column store]
+  D -->|no| REL
+`} />
+
+## Polyglot persistence: it's fine to use more than one
+
+Real systems rarely make one global SQL-or-NoSQL choice. A single product commonly runs several data stores side by side, each matched to the sub-problem it's actually solving — this is called polyglot persistence, and it's the normal, mature outcome, not a sign the design is unfinished.
+
+The trap to avoid is the opposite of indecision: picking one store because it's "good enough for everything" and forcing every access pattern through it, which is how you end up doing joins in application code against a key-value store, or running a payment ledger on a store with no cross-record transactions.
+
+## Worked example: an e-commerce checkout system
+
+Say you're designing the backend for an online store. Four sub-problems, four different answers:
+
+- **Orders and payments**: "charge the card and decrement inventory, both or neither" is a hard invariant — a double-charge or an oversold item is a real business incident. This needs a relational database with ACID transactions across the order, inventory, and payment tables.
+- **Product catalog**: a jacket has size and color; a laptop has RAM and screen size. Forcing every product type into the same fixed columns means either a table with fifty mostly-null columns or a maze of type-specific tables. A document store, where each product record carries its own attribute set, fits this variance naturally.
+- **Shopping cart / session state**: read and written on almost every page view, keyed by session ID, and disposable if lost. A key-value store (Redis-style) gives fast point lookups and doesn't need durability guarantees as strong as the order ledger.
+- **"Customers who bought this also bought" recommendations**: this is fundamentally a graph query — traverse relationships between customers and products. A graph database (or a relational schema with heavy join support, at smaller scale) fits the access pattern better than forcing it through key-value lookups.
+
+One system, four stores, each chosen for its access pattern — not because "NoSQL is more scalable" or "SQL is safer," both said as absolutes.
+
+<Callout type="warning">
+  A common interview mistake: reaching for NoSQL the moment "scale" is mentioned, as if SQL databases can't handle load. Sharded, replicated relational databases run some of the highest-throughput systems in the world. The real question was never "SQL or NoSQL at scale" — it's "does this workload need cross-record transactions and ad-hoc joins, or is it a high-volume access pattern that a store built around one specific lookup shape can serve more cheaply?" Answer that, and the product choice follows; skip it, and you're just naming a trend.
+</Callout>
+
+<Quiz
+  lessonId="db-sql-vs-nosql-choosing-a-data-store"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A payments service must guarantee that a card charge and the corresponding inventory decrement either both succeed or both fail. Which factor most strongly points toward a relational database here?',
+      options: [
+        { id: 'a', text: 'The need for a multi-record ACID transaction spanning the order, inventory, and payment records.', correct: true, explanation: 'This is exactly the invariant relational databases are built to guarantee: a transaction across multiple rows/tables either fully commits or fully rolls back.' },
+        { id: 'b', text: 'Relational databases are always faster than NoSQL stores for any workload.', correct: false, explanation: 'This is not a general truth — different stores are optimized for different access patterns, and NoSQL stores can outperform relational databases on high-volume key-based workloads.' },
+        { id: 'c', text: 'NoSQL databases cannot store numeric values like prices and quantities.', correct: false, explanation: 'NoSQL databases store numeric fields fine. The deciding factor here is transactional atomicity across records, not data type support.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine, current trade-offs to weigh when choosing between SQL and NoSQL (as opposed to outdated absolutes)? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'How much cross-record transactional atomicity the workload actually requires.', correct: true, explanation: 'This remains a real, central trade-off — how many records need to change together as an atomic unit shapes the whole decision.' },
+        { id: 'b', text: 'How much the shape of a record varies or is expected to evolve.', correct: true, explanation: 'Schema rigidity vs. schema-on-read flexibility is a genuine, current trade-off — not every record type fits neatly into fixed columns.' },
+        { id: 'c', text: 'Whether the database is SQL or NoSQL, which alone determines whether the system can scale horizontally.', correct: false, explanation: 'This is the outdated absolute the lesson calls out: modern relational databases can shard and replicate, and plenty of NoSQL stores have their own scaling limits. The label alone does not determine scalability.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A well-designed system should generally settle on a single database technology (either SQL or NoSQL) and use it for every part of the system, to keep the architecture simple.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False — polyglot persistence (using multiple stores, each matched to its own sub-problem) is normal and often the stronger design. Forcing every access pattern through one store is a common source of awkward workarounds, like doing joins in application code or running a ledger on a store without cross-record transactions.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Mature systems commonly use several data stores side by side, each chosen for the access pattern and consistency needs of the sub-problem it serves.' },
+      ],
+    },
+  ]}
+/>

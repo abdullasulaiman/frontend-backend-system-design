@@ -1,0 +1,237 @@
+---
+title: "Geospatial Indexing (Geohash and Quadtrees)"
+module: "Design a Proximity Service (Yelp)"
+moduleOrder: 4
+order: 3
+track: "interview"
+summary: "Explains how geohashing and quadtrees turn a two-dimensional 'find nearby points' query into a fast index lookup, and how to choose between them."
+tags: ["geospatial", "geohash", "quadtree", "indexing", "proximity"]
+estMinutes: 12
+cheatsheet:
+  - "Never scan-and-filter on raw lat/lon in a relational table for 'nearby' queries — a b-tree on either column alone can't prune a 2D radius search, so it degrades to a full scan under load."
+  - "Geohash turns 2D coordinates into a 1D string by interleaving latitude and longitude bits, then base32-encoding the result — shared prefixes mean 'roughly the same area.'"
+  - "Longer geohash prefixes mean smaller cells: 5 characters is roughly a small town (~5km), 7 characters is roughly a city block (~150m)."
+  - "Geohash cells are a grid with hard boundaries, so two points a meter apart can land in different cells (and share a very short common prefix) if a grid line runs between them — always query a point's own cell plus its 8 neighbors."
+  - "Quadtrees recursively split only the regions that actually contain points, so they adapt to uneven density (dense in cities, sparse in rural areas) where a fixed geohash grid wastes cells everywhere or is too coarse in dense areas."
+  - "Geohash strings slot directly into existing key-value stores and sorted sets (e.g. Redis `ZRANGEBYSCORE`, or a plain b-tree index) with no custom tree to build or rebalance; a quadtree needs its own service or library to build, rebalance, and keep in memory."
+  - "Both are ways to build the index that lesson 4's proximity service queries — indexing structure is a separate concern from how you shard and serve that index at scale (covered in the scaling lesson)."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson sketched a proximity service's high-level shape: clients
+send a location and a radius, and some "location index" answers with nearby
+businesses. That box labeled "location index" is doing all the real work, and
+it's the part interviewers dig into next. Latitude and longitude are just two
+floating-point numbers, so it's tempting to store them as two columns and
+query `WHERE lat BETWEEN x AND y AND lon BETWEEN a AND b`. That query cannot
+use a standard single-column index efficiently on both dimensions at once —
+the database ends up scanning far more rows than it needs to, and it gets
+worse as the table grows. Geospatial indexing exists to fix exactly this: turn
+a two-dimensional "what's nearby" question into something a normal index can
+answer quickly. Geohashing and quadtrees are the two techniques you're
+expected to know, and a strong candidate can explain not just how each works
+but when to reach for one over the other.
+
+## The core idea: collapse 2D into something indexable
+
+Both techniques solve the same problem the same general way: divide the
+world into a hierarchy of regions, and give every region an identifier such
+that "nearby in space" tends to mean "similar identifier." Once that's true,
+a "find nearby points" query becomes "find rows whose identifier matches
+this prefix" or "walk this small part of a tree" — both are things ordinary
+indexes and data structures are good at.
+
+## Geohashing
+
+A geohash encodes a lat/lon pair into a single string by repeatedly bisecting
+latitude and longitude ranges and interleaving the resulting bits. Each step
+asks "is the point in the top or bottom half of the current latitude range?"
+and "left or right half of the current longitude range?", appending a `0` or
+`1` for each answer, alternating between the two dimensions. The resulting
+bitstream is then grouped into 5-bit chunks and base32-encoded into a short,
+readable string like `9q8yy`.
+
+The property that makes this useful: every additional character narrows the
+bounding box further, and two points that share a long common prefix are
+guaranteed to be close together (though, as you'll see below, the reverse
+isn't quite true). This gives you a natural precision/area trade-off:
+
+| Geohash length | Approx. cell size |
+|---|---|
+| 3 chars | ~150km x 150km |
+| 5 chars | ~5km x 5km |
+| 6 chars | ~1.2km x 0.6km |
+| 7 chars | ~150m x 150m |
+| 9 chars | ~5m x 5m |
+
+To find "everyone within roughly 5km," compute the geohash of the query
+point at 5-character precision and look up rows whose geohash column starts
+with that prefix — a plain indexed range query (`geohash >= 'dr5ru'` AND
+`geohash < 'dr5rv'`), no spatial data structure required. This is exactly why
+geohash is popular: it turns a 2D problem into an ordinary string-prefix
+lookup that any key-value store, relational index, or Redis sorted set
+already knows how to do fast.
+
+### The boundary problem
+
+Prefix matching has one sharp edge: it only finds points that fall in the
+*same* grid cell as the query point. Two points a meter apart, one just
+east and one just west of a cell boundary, can end up with almost no common
+prefix at all, even though they're neighbors in real life. If you only query
+the query point's own cell, you'll silently miss real nearby matches sitting
+just across a grid line.
+
+The standard fix is to always query the point's own cell **plus its 8
+surrounding neighbor cells** at the same precision (a 3x3 block), then filter
+the combined candidate set by actual distance. This is a well-known, expected
+part of any geohash-based design — leaving it out is one of the most common
+gaps in candidate answers.
+
+## Quadtrees
+
+A quadtree takes a different approach: instead of a fixed grid, it builds a
+tree by recursively splitting a region into four quadrants, but **only where
+there's enough data to justify it**. A quadrant holding fewer than some
+threshold of points (say, 100) stays a leaf; a quadrant with more points
+splits into four children, and each of those is checked again, recursively.
+
+This makes quadtrees adaptive to density in a way a fixed geohash grid isn't:
+a leaf covering dense midtown Manhattan might be a tiny few-hundred-meter
+square holding 100 businesses, while a leaf covering rural land might span
+tens of kilometers holding the same 100. A fixed-precision geohash grid, by
+contrast, uses the same cell size everywhere — too coarse to be useful in a
+dense downtown, or needlessly fine (and needlessly many empty cells) out in
+the countryside.
+
+The cost of that adaptivity: a quadtree is an actual tree structure you build,
+keep in memory (or in a store that supports it), and rebalance as points are
+added or removed — it doesn't reduce to "one indexed string column" the way
+geohash does.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    Root["Whole map region"] --> NW["NW quadrant (12 points) - leaf"]
+    Root --> NE["NE quadrant (400 points) - splits again"]
+    Root --> SW["SW quadrant (3 points) - leaf"]
+    Root --> SE["SE quadrant (80 points) - leaf"]
+    NE --> NE1["NE-NW (90 pts) - leaf"]
+    NE --> NE2["NE-NE (95 pts) - leaf"]
+    NE --> NE3["NE-SW (110 pts) - leaf"]
+    NE --> NE4["NE-SE (105 pts) - leaf"]
+`} />
+
+To query a quadtree for "nearby points," you descend from the root, entering
+only the quadrants that overlap the search radius, and collect points from
+the leaves you reach — pruning away entire subtrees that don't intersect the
+query area at all.
+
+## Geohash vs. quadtree: which one, and when
+
+Both solve the same problem; the decision comes down to what you're
+optimizing for:
+
+- **Reach for geohash** when you want to reuse existing infrastructure —
+  a relational index, a plain key-value store, or Redis (which has geohash
+  support with `GEOADD`/`GEORADIUS` built in) — and don't want to own a
+  custom tree structure. It's the simpler answer to defend in an interview
+  and the more common real-world default for exactly that reason.
+- **Reach for a quadtree** when density is highly uneven and you want cells
+  that shrink automatically in busy areas without needing needlessly tiny
+  cells everywhere else, or when you're comfortable owning and operating a
+  purpose-built in-memory spatial index (some systems keep the whole
+  quadtree in memory on a fleet of index servers, rebuilt periodically from
+  a source of truth).
+
+In an interview, naming both, explaining the trade-off in one or two
+sentences, and picking one to run with is worth far more than reciting every
+implementation detail of either.
+
+## Worked example: indexing 2 million businesses
+
+Say the proximity service holds 2 million businesses and needs to answer
+"what's within 2km of this point" queries. With geohashing, every business
+row stores a geohash computed at, say, 6-character precision (~1.2km x
+0.6km cells — close enough to a 2km query radius that a handful of
+neighboring cells cover it). A query computes the 6-character geohash of the
+user's location, looks up its cell plus its 8 neighbors (9 cells total) via
+an indexed prefix range scan, and then does an exact distance calculation on
+that (typically small) candidate set to filter out anything actually outside
+2km and to rank the rest by distance.
+
+With a quadtree instead, the same query walks down from the root, discarding
+any quadrant whose bounding box doesn't intersect a 2km circle around the
+point, and collects candidates only from the leaves that do intersect —
+naturally landing on tiny leaves in a dense downtown and much larger ones
+in a sparse suburb, without any precision parameter to tune up front.
+
+Either index answers the query in roughly the same shape: narrow millions of
+rows down to a small candidate set using the spatial structure, then do exact
+math only on that small set. That's the pattern the next lesson builds the
+actual service around.
+
+<Callout type="warning">
+  Don't stop at "compute a geohash prefix" and call the query done. A prefix
+  match alone misses real nearby points that fall just across a cell
+  boundary — always search the neighboring cells too, and always follow up
+  with an exact distance check (e.g. haversine distance) on the candidate set
+  before returning or ranking results, since a geohash cell's corners can be
+  meaningfully farther from the query point than its center.
+</Callout>
+
+## Where this leaves you
+
+You now have two concrete ways to build the "location index" from the
+previous lesson's high-level design, plus the vocabulary to justify a choice
+between them out loud. The next lesson takes one of these (or a managed
+geospatial index built on the same ideas) and wires it into the full read
+and write paths of a working proximity service — including how updates to a
+business's location or a user's live position flow into the index.
+
+<Quiz
+  lessonId="proximity-geospatial-indexing-geohash-and-quadtrees"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: "Why can't a proximity service just index a `latitude` column and a `longitude` column separately and query both with a WHERE clause?",
+      options: [
+        { id: 'a', text: 'A standard single-column index on each dimension can\'t jointly prune a 2D range efficiently, so the database ends up scanning far more rows than the query actually needs.', correct: true, explanation: 'Correct — an index on latitude alone (or longitude alone) can narrow one dimension, but combining two separate single-column filters does not give the database an efficient way to prune on both dimensions together.' },
+        { id: 'b', text: 'Floating-point numbers cannot be indexed at all.', correct: false, explanation: 'Floating-point columns can absolutely be indexed on their own — the problem is specifically that two independent 1D indexes don\'t combine into an efficient 2D range query.' },
+        { id: 'c', text: 'Latitude and longitude must always be stored as strings, not numbers.', correct: false, explanation: 'There\'s no such requirement; the issue is about query efficiency across two dimensions, not the storage type of the numbers.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'boolean',
+      prompt: 'If two points share a very long common geohash prefix, they are guaranteed to be close together in real-world distance.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — a long shared prefix means both points fall within the same small bounding box, which does guarantee they are close together.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This direction actually does hold: a long shared prefix implies a small shared bounding box. The tricky direction is the reverse — two close points can fail to share a long prefix if a grid boundary runs between them.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'multi',
+      prompt: 'Which of these are genuine advantages of a quadtree over a fixed-precision geohash grid? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It adapts cell size to local point density, avoiding needlessly tiny cells in sparse areas and needlessly coarse cells in dense ones.', correct: true, explanation: 'Correct — a quadtree only splits regions that hold enough points, so cell size naturally shrinks in dense areas and stays large where data is sparse.' },
+        { id: 'b', text: 'It requires no custom data structure to build or maintain, unlike geohash.', correct: false, explanation: 'This is backwards — geohash is the one that reduces to a plain indexed string column with no custom structure; a quadtree is the one you have to build, store, and rebalance yourself.' },
+        { id: 'c', text: 'It eliminates the need for an exact distance check after narrowing candidates.', correct: false, explanation: 'Both geohash and quadtree only narrow down a candidate set based on region overlap; an exact distance calculation on that candidate set is still needed for either approach to return correct, precisely ranked results.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A proximity query for a 2km radius only checks the geohash cell containing the query point and skips its 8 neighboring cells. What is the most likely consequence?',
+      options: [
+        { id: 'a', text: 'The query runs correctly but slightly slower than necessary.', correct: false, explanation: 'The problem here is correctness, not extra latency — skipping neighbor cells does not slow the query down, it changes which results come back.' },
+        { id: 'b', text: 'Real nearby businesses that happen to sit just across a cell boundary from the query point get silently missed from the results.', correct: true, explanation: 'Correct — this is the geohash boundary problem: prefix matching only finds points in the same grid cell, so points just across a boundary line are missed unless neighboring cells are also queried.' },
+        { id: 'c', text: 'The query returns businesses that are far outside the 2km radius.', correct: false, explanation: 'Skipping neighbor cells causes false negatives (missed nearby results), not false positives — it does not cause distant businesses to appear in the results.' },
+      ],
+    },
+  ]}
+/>

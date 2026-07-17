@@ -1,0 +1,240 @@
+---
+title: "Idempotency, Ledgers, and Reconciliation"
+module: "Design a Payment System"
+moduleOrder: 15
+order: 2
+track: "interview"
+summary: "Covers the three techniques that keep a payment system correct under retries and partial failures: idempotency keys, an append-only double-entry ledger, and reconciliation against the payment processor."
+tags: ["payments", "idempotency", "ledger", "reconciliation", "distributed-transactions"]
+estMinutes: 13
+cheatsheet:
+  - "Every write endpoint that moves money must accept a client-generated idempotency key and store the first response keyed by it — retries return the cached result instead of re-executing."
+  - "Scope idempotency keys to the caller (e.g. merchant + key), not globally, so two different merchants can't collide on the same key value."
+  - "The ledger is append-only, double-entry, and immutable — you never UPDATE a balance, you INSERT a new balancing pair of entries; balances are derived, not stored as mutable state."
+  - "A payment's state machine (created -> authorized -> captured -> settled, plus failed/reversed) belongs in the ledger and the payment record, not just in application memory — a crashed worker must be able to resume from persisted state."
+  - "Reconciliation is not a nice-to-have: run a scheduled job that diffs your ledger against the processor's settlement report and alerts on any mismatch, because network timeouts mean your system and the processor's will disagree at least occasionally."
+  - "Idempotency prevents double-charging on retry; it does not prevent double-charging when a user double-clicks 'Pay' and your client generates two different keys — dedupe that at the request layer too."
+  - "Design for three failure states explicitly: you sent the charge and got a confirmed response, you sent it and got no response (timeout), or you never sent it — only the middle case requires reconciliation to resolve, and idempotency keys make retrying it safe."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Picture this: your service calls the payment processor to charge a
+customer's card, the request is sent, and then... the connection drops
+before you get a response. Did the charge go through? You genuinely don't
+know. If your instinct is "just retry," you've now got a real chance of
+charging the customer twice. If your instinct is "don't retry, ask the
+user to try again," you've got a real chance of never charging them at
+all and shipping the order anyway. Neither answer is acceptable at scale,
+and this exact ambiguous state — "sent, no confirmed response" — is the
+single hardest problem in payment systems. Everything in this lesson
+exists to resolve it safely.
+
+The previous lesson laid out the requirements and the request flow. Here
+we cover the three mechanisms that make that flow trustworthy under
+retries, crashes, and network partitions: idempotency keys, a ledger that
+records money movement as immutable facts, and reconciliation that catches
+whatever the first two miss.
+
+## Idempotency: making retries safe
+
+An idempotent operation produces the same result no matter how many times
+you run it. `SET balance = 100` is idempotent; `balance += 10` is not.
+Payment APIs are full of the second kind of operation by nature — "charge
+this card," "transfer these funds" — so you have to bolt idempotency on
+deliberately.
+
+The standard mechanism is an **idempotency key**: the client generates a
+unique token (a UUID is fine) for each logical payment attempt and sends
+it with the request, typically as a header. The server's contract is:
+
+- On first sight of a key, execute the operation and store the key
+  together with the resulting response (success or failure) and the
+  request's parameters.
+- On any later request with the same key, skip execution and return the
+  stored response verbatim.
+- If a request arrives with a key that's mid-flight (another request with
+  that key is still processing), reject or block rather than double-run —
+  otherwise two near-simultaneous retries race past each other.
+
+Two details trip people up in interviews. First, scope the key to the
+caller: store it as `(merchant_id, idempotency_key)`, not just
+`idempotency_key`, or two different merchants can accidentally collide.
+Second, also store a hash of the request body alongside the key — if the
+same key arrives with genuinely different parameters (a bug, or someone
+reusing a key by mistake), that's an error condition, not a retry, and you
+should reject it loudly rather than silently returning a stale response
+for a different payment.
+
+Idempotency keys solve retries from the *same* logical attempt. They do
+not solve a user clicking "Pay" twice in two tabs and generating two
+different keys for what is, to the user, one purchase — that needs a
+separate check, like a short-lived lock on "customer X, checkout Y."
+
+## The ledger: money movement as immutable facts
+
+A payments system should never store a mutable "balance" column that gets
+updated in place. Instead it keeps an **append-only, double-entry
+ledger** — every event that moves money writes a new pair of rows, one
+debit and one balancing credit, and existing rows are never changed. A
+balance is a *query* (sum the entries for an account), not a stored field.
+
+Why bother with this instead of just updating a balance column?
+
+- **Auditability.** "What was the balance on March 3rd?" is trivial to
+  answer — sum entries up to that date. With a mutable balance you'd need
+  a separate audit log anyway, so you may as well make the audit log the
+  source of truth.
+- **Concurrency safety.** Two concurrent `balance += x` updates on the
+  same row are a classic race condition without careful locking. Two
+  concurrent *inserts* of new ledger rows don't conflict with each other
+  at all.
+- **Recoverability.** If a worker crashes mid-transaction, you can tell
+  exactly what was and wasn't recorded by inspecting the ledger, and
+  replay safely (especially combined with idempotency keys on the ledger
+  write itself).
+
+A minimal ledger entry needs: an account ID, an amount, a direction
+(debit/credit), a reference to the payment/transaction it belongs to, a
+timestamp, and the idempotency key that produced it. Double-entry means
+every transaction writes at least two rows whose amounts sum to zero
+across the accounts involved — e.g. a `$50` charge debits the customer's
+"payable" account and credits the merchant's "receivable" account by `$50`
+each, so the books always balance by construction.
+
+Alongside the ledger, each payment has an explicit **state machine**:
+`created -> authorized -> captured -> settled`, with `failed` and
+`reversed` as branches. Persist the current state on the payment record
+itself (not just as an implication of which ledger rows exist) so a
+recovering worker can ask "what state was this payment in?" with a single
+row read instead of reconstructing it from ledger history.
+
+<Mermaid client:visible chart={`
+stateDiagram-v2
+    [*] --> created
+    created --> authorized: processor approves hold
+    authorized --> captured: funds captured
+    captured --> settled: processor settlement batch
+    created --> failed: processor declines
+    authorized --> failed: capture fails
+    captured --> reversed: refund/chargeback
+    settled --> [*]
+    failed --> [*]
+`} />
+
+## Reconciliation: trusting, but verifying
+
+Idempotency and the ledger handle correctness *inside* your system. But
+your system and the payment processor are two separate systems connected
+by an unreliable network, and they will occasionally disagree — a
+timeout on your side might be a success on the processor's side, or vice
+versa. **Reconciliation** is the scheduled process that catches this drift
+before it becomes a customer complaint or an accounting problem.
+
+The mechanics: the processor (Stripe, Adyen, a card network) publishes a
+settlement report — typically a batch file or API feed — listing every
+transaction it actually settled, usually once a day. A reconciliation job
+pulls that report and diffs it against your own ledger:
+
+- **In your ledger but not in the processor's report**: you think you
+  charged someone but the processor doesn't agree. Likely a timed-out
+  request that never actually completed on their end — mark the payment
+  failed and, if goods/services were already granted, flag for
+  collection or write-off.
+- **In the processor's report but not in your ledger**: the processor
+  charged the customer but your system never recorded it — likely a
+  timeout where the request actually *did* succeed upstream. Record it
+  after the fact and make sure downstream systems (order fulfillment)
+  get the delayed confirmation.
+- **Amount mismatches**: same transaction ID, different amount — almost
+  always a bug, and worth paging someone rather than auto-resolving.
+
+Run reconciliation on a schedule (hourly for high-value flows, daily is
+common for typical e-commerce), and alert on any unmatched transaction
+older than a defined threshold (say, 2 hours) rather than waiting for the
+daily batch to quietly note it. Reconciliation is also your safety net
+for bugs in the idempotency logic itself — if a race condition ever did
+let a double-charge slip through, reconciliation against the processor's
+authoritative record is what catches it.
+
+## Worked example: the timeout case end to end
+
+A customer buys a `$120` item. Your checkout service generates
+idempotency key `pay_8f2c...` and calls the processor's charge API. The
+TCP connection stalls for 15 seconds and your HTTP client times out —
+you never see a response.
+
+Without idempotency: your retry logic (or the user hitting refresh)
+resends the charge with a *new* key, and if the original request actually
+succeeded upstream, the customer is now charged `$240`.
+
+With the mechanisms in this lesson: your retry resends the request with
+the *same* key, `pay_8f2c...`. Two outcomes:
+
+1. The processor never received the original request — it executes the
+   charge for real now, returns success, and your service writes one
+   ledger entry pair and moves the payment to `authorized`. Correct
+   outcome, one charge.
+2. The processor *did* receive and process the original request — it
+   recognizes the retry (many processors support idempotency keys on
+   their own API too) and returns the original success response without
+   charging again. Your service, seeing a success response for a payment
+   it had marked `created`, writes the ledger entry and moves to
+   `authorized`. Correct outcome, one charge.
+
+If both your retries are exhausted and you genuinely can't get a
+confirmed answer, you leave the payment in `created` state and let the
+next reconciliation cycle resolve it against the processor's settlement
+report — a `$120` entry either appears there (you missed a success) or it
+doesn't (the charge truly never happened), and you update your ledger to
+match reality.
+
+<Callout type="warning">
+  A common mistake is implementing idempotency only on your own API's
+  front door and assuming that's sufficient. If your service then calls
+  the payment processor's API *without* forwarding an idempotency key on
+  that outbound call, a retry inside your own service (e.g. after your
+  worker crashes and resumes) can still double-charge upstream — your
+  front-door idempotency only dedupes requests reaching *you*, it does
+  nothing for calls *you* make onward. Idempotency has to be threaded
+  through every hop that can retry, including outbound calls to the
+  processor.
+</Callout>
+
+<Quiz
+  lessonId="payments-idempotency-ledgers-and-reconciliation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A client sends a charge request, times out waiting for a response, and retries with the same idempotency key. What should the server do if the original request actually completed successfully?',
+      options: [
+        { id: 'a', text: 'Execute the charge again and return the new result', correct: false, explanation: 'This is exactly what idempotency keys are meant to prevent — it would double-charge the customer.' },
+        { id: 'b', text: 'Return the stored response from the original request without re-executing the charge', correct: true, explanation: 'The key\'s purpose is to let the server recognize this as a retry of a completed operation and return the cached result instead of running it again.' },
+        { id: 'c', text: 'Reject the retry with an error since the key was already used', correct: false, explanation: 'Rejecting outright defeats the purpose of retries — the client needs to learn the outcome of its original request, and returning the cached response is exactly how it does that safely.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'boolean',
+      prompt: 'A payment ledger should store a mutable running "balance" column per account that gets updated with each transaction, for fast reads.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A mutable balance column is prone to race conditions under concurrent updates and loses point-in-time auditability. The standard approach is append-only double-entry rows, with balance computed by summing entries.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. The ledger should be append-only and immutable; balances are derived by querying/summing entries, not stored as a field that gets overwritten.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'multi',
+      prompt: 'Which of these are legitimate purposes of a reconciliation process? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Detecting transactions your system recorded that the processor never actually settled', correct: true, explanation: 'This catches cases where a timed-out request actually failed upstream despite your system assuming success.' },
+        { id: 'b', text: 'Detecting transactions the processor settled that your ledger never recorded', correct: true, explanation: 'This catches the opposite timeout case — the processor completed the charge but your system never got the confirmation and needs to backfill it.' },
+        { id: 'c', text: 'Replacing the need for idempotency keys on the charge API', correct: false, explanation: 'Reconciliation is a periodic after-the-fact check, typically running hourly or daily — it cannot substitute for idempotency keys, which prevent double-charges from happening in real time during retries.' },
+      ],
+    },
+  ]}
+/>

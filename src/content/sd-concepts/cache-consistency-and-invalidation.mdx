@@ -1,0 +1,161 @@
+---
+title: "Consistency and Invalidation"
+module: "Distributed Cache"
+moduleOrder: 16
+order: 3
+track: "concept"
+summary: "Explains why a distributed cache and its source-of-truth database drift out of sync, and the invalidation strategies — TTLs, cache-aside deletes, double-delete, event-driven invalidation, and stampede protection — that keep staleness bounded and safe."
+tags: ["distributed-cache", "cache-invalidation", "consistency", "cache-stampede", "ttl"]
+estMinutes: 12
+cheatsheet:
+  - "A cache is a copy, not a source of truth — every invalidation strategy is really a bet on how long you'll tolerate that copy being wrong."
+  - "Prefer deleting a cache key on write over updating it: a delete is idempotent and self-healing (the next read just repopulates it), while a stale update can silently overwrite a newer value if writes race."
+  - "The classic cache-aside race — write commits, but a concurrent stale read repopulates the cache right after — is closed by deleting the key again a short delay after the write (double-delete), not by trying to make the update atomic with the DB write."
+  - "TTLs bound staleness even when every other invalidation path fails; never rely purely on explicit invalidation for correctness-sensitive data."
+  - "A cache stampede happens when a hot key's expiry (or invalidation) lets a burst of concurrent requests all miss at once and hammer the database — fix it with per-key locking/request coalescing and TTL jitter, not a bigger cache."
+  - "In a multi-node cache cluster, a write from one app instance doesn't automatically invalidate copies on other nodes or in other regions — that needs an explicit invalidation channel (pub/sub, CDC) unless every write already routes to the one owning node."
+  - "Choose the staleness bound per data type: a product price tolerates a few seconds of lag; an inventory count at checkout usually can't."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson picked a writing policy — write-through, write-around, or write-back — and an eviction policy for when the cache fills up. Neither one answers the question that actually breaks production systems: once a value sits in the cache, how do you know when it's *wrong*? The database changed underneath it, and the cache doesn't find out on its own. This lesson is about that gap — why it opens up, and the concrete mechanisms (TTLs, invalidation, and stampede protection) that keep it from becoming a correctness bug.
+
+Get this wrong in an interview and it's the first thing a good interviewer probes: "so what happens to the cached copy when someone updates that row?" A vague "the cache updates too" isn't an answer — it's a race condition waiting for a demo.
+
+## Why a cache drifts out of sync
+
+A cache exists specifically so reads don't have to hit the database every time. That means, by construction, there are two copies of the data: the authoritative one in the database and a shadow copy in the cache. Any write path that has to update both is an opportunity for them to disagree, if only for a moment:
+
+- The write to the database can succeed while the write (or invalidation) to the cache fails or gets delayed.
+- Two concurrent writes to the same key can be applied to the database and the cache in different orders, if nothing coordinates them.
+- A cache entry can simply be older than the last write, because nothing ever told it to refresh.
+
+None of these are bugs in the cache itself — they're the structural cost of having a second copy of the data at all. The question isn't "how do I make this never happen," it's "how do I bound how wrong the cache can be, and for how long."
+
+## TTL: the default staleness bound
+
+The simplest invalidation mechanism needs no coordination at all: give every cached entry a **time-to-live** and let it expire. After `n` seconds, the entry is either evicted or treated as stale on the next read, forcing a refetch from the database.
+
+TTLs are attractive because they're the only invalidation mechanism that keeps working even when every other signal fails — a missed pub/sub message, a crashed worker, a bug in your invalidation code. Worst case, staleness is bounded by the TTL. That's why even systems with sophisticated event-driven invalidation still set a TTL as a backstop.
+
+The trade-off is that TTL alone means every entry is stale for *up to* the full TTL window, even right after an update. For a homepage banner, a few seconds of lag is invisible. For "did my payment go through," it isn't — which is why TTL is rarely the *only* mechanism for data that changes and matters.
+
+## Cache-aside invalidation: delete, don't update
+
+The more common pattern for read-heavy services is **cache-aside**: reads check the cache first and populate it on a miss; writes go to the database and then tell the cache to drop the now-stale key.
+
+The key design choice is *delete* the key rather than *write* the new value into the cache directly. It looks equivalent, but it isn't:
+
+- **Update-on-write** means the app has to compute or already have the new value in hand at write time, and if two writes to the same key race, the cache can end up holding the result of the *older* write even though the database holds the newer one — whichever update-to-cache call happens to land last wins, regardless of which database write actually landed last.
+- **Delete-on-write** just removes the entry. The next reader repopulates it straight from the database, which is authoritative by definition. There's no "which value is newer" question to get wrong, because nothing stale is ever written back — only fresh reads refill the cache.
+
+This is why "invalidate" in cache-aside almost always means "delete the key," not "push the new value."
+
+### The race that delete alone doesn't close
+
+Deleting isn't fully airtight either. Consider this interleaving on a single key:
+
+1. Request A reads the cache, misses, and starts reading the old value from the database.
+2. Request B writes a new value to the database, then deletes the (currently empty) cache key.
+3. Request A finishes its database read — of the *old* value — and writes it into the cache.
+
+The cache now holds the stale value indefinitely, because nothing else will touch that key until its TTL expires. This is a narrow window, but on a hot key with high write and read concurrency it happens often enough to matter.
+
+The standard fix is the **double-delete pattern**: after the write completes, delete the key immediately (as usual), then delete it *again* after a short delay (hundreds of milliseconds, long enough for any read that was mid-flight during the write to finish and land its stale write into the cache). The second delete clears out exactly that race window, at the cost of one extra reference key deletion per write.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant R as Reader (Request A)
+    participant C as Cache
+    participant W as Writer (Request B)
+    participant D as Database
+    R->>C: GET key (miss)
+    R->>D: read old value (in flight)
+    W->>D: write new value
+    W->>C: DELETE key (1st delete)
+    R-->>C: SET key = old value (race!)
+    Note over C: cache now holds stale data
+    W->>C: DELETE key (2nd delete, after short delay)
+    Note over C: stale entry cleared; next read repopulates fresh
+`} />
+
+## Event-driven invalidation across a cluster
+
+Everything above assumes one app instance talking to one cache. A real distributed cache has many nodes, and often multiple app services writing the same underlying data. A delete issued by one instance only clears the copy on the node(s) it talks to — if another region or another service has its own cache layer (e.g., a local in-process cache in front of the shared distributed one), that copy doesn't know anything changed.
+
+The fix is an explicit **invalidation channel**: publish an "this key changed" event (via pub/sub, a message queue, or database change-data-capture) whenever a write happens, and have every cache layer subscribe and drop the key on receipt. This decouples "who wrote the data" from "who needs to know it's stale," and it's the same idea CDNs use for purge-by-tag, just applied one layer down the stack.
+
+## Cache stampede: when invalidation itself causes an outage
+
+Bounding staleness is only half the problem — invalidating (or expiring) a **hot** key can create a thundering-herd effect. The instant a popular key is evicted or invalidated, every one of the thousands of requests that would have hit it in the next few milliseconds all miss simultaneously and hammer the database at once, often hard enough to take it down.
+
+Two standard mitigations:
+
+- **Request coalescing / per-key locking**: on a miss, the first request acquires a short-lived lock for that key and fetches from the database; every other concurrent request for the same key waits on that fetch instead of issuing its own, then all read the result the first request just cached.
+- **TTL jitter**: instead of a fixed TTL, add random variance (e.g., 300s plus or minus 30s) so a batch of keys written at the same time doesn't all expire in the same instant, spreading the reload load out instead of concentrating it.
+
+## Worked example: invalidating a product price cache
+
+Say a product-catalog service caches `product:42:price` with a 60-second TTL, and a pricing admin updates the price at 2:00:00pm. Three things need to be true:
+
+1. **The write path invalidates immediately.** The admin update writes the new price to the database, then deletes `product:42:price` from the cache (not an update — a delete), followed by a second delayed delete ~500ms later to close the read/write race above.
+2. **The TTL is a backstop, not the plan.** If the delete never fires (a network blip to the cache cluster, a crashed pod before the delete call), the 60-second TTL still bounds the damage to at most one minute of stale pricing — bad, but recoverable, and nobody paged at 3am over it.
+3. **A stampede-safe reload.** This is a genuinely hot key (product page views spike after a promo), so the reload after invalidation goes through a per-key lock: the first miss fetches from the database and repopulates the cache; the next several thousand near-simultaneous misses wait on that one fetch instead of each issuing their own database query.
+
+Put together: the price is correct within roughly half a second of the write in the common case, wrong for at most 60 seconds in the worst case, and a single database read handles the reload regardless of how many concurrent requests show up right after invalidation.
+
+<Callout type="warning">
+  A common mistake is treating cache invalidation as "call an update-cache function after the database write" and calling it done. That handles the happy path but misses the concurrent-write race (fixed by deleting, and double-deleting, instead of updating) and the multi-node case (a delete on one instance's connection doesn't reach every cache node or region without an explicit invalidation channel). If a design only has one invalidation mechanism and no TTL backstop, ask what happens when that one mechanism fails to fire — the answer should never be "the cache is wrong forever."
+</Callout>
+
+The next lesson builds on this: once you're invalidating correctly on a single logical cache, sharding and replication cover how the cache itself is spread across many physical nodes, and what that does to the consistency guarantees discussed here.
+
+<Quiz
+  lessonId="cache-consistency-and-invalidation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'In a cache-aside pattern, why do most designs delete a cache key on write instead of writing the new value directly into the cache?',
+      options: [
+        { id: 'a', text: 'Deletes are faster than writes on most cache servers', correct: false, explanation: 'Raw delete and set operations are comparably cheap on a cache like Redis or Memcached — speed is not the reason for this choice.' },
+        { id: 'b', text: 'Deleting avoids a race where a slower concurrent write could overwrite the cache with an older value than what the database now holds', correct: true, explanation: 'If two writes race and both push their value into the cache, the one that happens to write to the cache last wins, even if it was not the last one committed to the database. Deleting sidesteps this: the next read always repopulates from the (authoritative) database, so there is no "which cached value is newer" question to get wrong.' },
+        { id: 'c', text: 'Cache servers do not support overwriting an existing key', correct: false, explanation: 'Overwriting an existing key is a normal, supported operation on virtually every cache technology; this is not a technical limitation.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine causes or mitigations of a cache stampede? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A hot key expiring or being invalidated right as a large burst of requests for it arrives', correct: true, explanation: 'This is exactly the stampede trigger: many concurrent requests all miss at the same moment and all fall through to the database simultaneously.' },
+        { id: 'b', text: 'Per-key locking so only the first miss fetches from the database while others wait on that result', correct: true, explanation: 'Request coalescing is a standard stampede mitigation — it collapses many concurrent database hits for the same key into one.' },
+        { id: 'c', text: 'Adding random jitter to TTLs so a batch of keys does not all expire at the same instant', correct: true, explanation: 'Jitter spreads expirations out over time instead of letting many keys lapse simultaneously, reducing the odds of a synchronized mass reload.' },
+        { id: 'd', text: 'Increasing the cache eviction threshold so fewer keys are ever removed', correct: false, explanation: 'Eviction pressure (the previous lesson\'s topic) is a different concern from stampedes, which are driven by expiration/invalidation timing on hot keys, not by how aggressively the cache evicts under memory pressure.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A TTL on a cached entry is unnecessary as long as the application always explicitly invalidates the key on every write.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Explicit invalidation can still fail to fire — a crashed process before the delete call, a dropped message on an invalidation channel, a bug in the write path. A TTL is the backstop that bounds staleness even when explicit invalidation breaks.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — relying solely on explicit invalidation means any single failure in that path leaves the cache wrong indefinitely. A TTL guarantees an upper bound on staleness regardless of whether invalidation logic runs successfully.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A service writes to a database, then deletes the corresponding cache key. A concurrent, slightly slower read that started before the write finishes reads the old value from the database and writes it into the (now-empty) cache right after the delete. What closes this specific race?',
+      options: [
+        { id: 'a', text: 'Switching from cache-aside to write-through', correct: false, explanation: 'Write-through changes who writes to the cache on the write path, but does not by itself prevent a concurrent, slower read from repopulating a stale value after the writer\'s delete has already run.' },
+        { id: 'b', text: 'A second, delayed delete of the same key shortly after the first delete', correct: true, explanation: 'The double-delete pattern issues a follow-up delete after a short delay long enough for any in-flight read from before the write to finish and land its stale value, clearing exactly that race window.' },
+        { id: 'c', text: 'Increasing the cache\'s TTL for that key', correct: false, explanation: 'A longer TTL makes the stale value persist for longer, not shorter — it does not address the race that let the stale value get written in the first place.' },
+      ],
+    },
+  ]}
+/>

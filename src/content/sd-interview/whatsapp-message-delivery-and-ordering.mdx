@@ -1,0 +1,240 @@
+---
+title: "Message Delivery and Ordering"
+module: "Design WhatsApp"
+moduleOrder: 11
+order: 3
+track: "interview"
+summary: "Explains how a chat system turns an unreliable network into reliable-feeling message delivery, using per-conversation sequencing, store-and-forward for offline recipients, and client-generated IDs for deduplication."
+tags: ["messaging", "delivery-guarantees", "ordering", "queues", "idempotency"]
+estMinutes: 12
+cheatsheet:
+  - "Chat systems build 'exactly-once behavior' out of at-least-once delivery plus idempotent dedup on a client-generated message ID — true exactly-once delivery isn't achievable over an unreliable network, so don't claim it in an interview."
+  - "Order messages per conversation, not globally — a single writer (or single partition) per conversation assigns a monotonically increasing sequence number that is the actual source of truth for order, not any client's wall-clock timestamp."
+  - "Client clocks skew and drift; never sort messages for display by client-supplied timestamp alone. Use it only as a tiebreaker or for optimistic local rendering before the server sequence number arrives."
+  - "Offline recipients aren't a failure case — they're the normal case. Store the message durably keyed by recipient, wake the client with a push notification, and let it sync everything after its last-known sequence number on reconnect."
+  - "Sent, delivered, and read are three separate acks (server accepted -> recipient device received -> recipient opened the thread), each producing its own event the sender's UI reacts to independently."
+  - "Every outgoing message needs a client-generated unique ID attached before it's sent — that's what lets a retried request (timeout, but the first attempt actually succeeded) get deduplicated instead of showing up twice."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The high-level design gave you boxes: chat servers, a message store, a
+pub-sub layer for fan-out. This lesson is about what happens to one message
+inside those boxes, because that's where interviewers push hardest on a chat
+system. Mobile networks drop connections mid-send. Phones go to sleep with a
+message half-delivered. Two devices on the same account can both be typing.
+None of that is exotic — it's every message, every day — and the difference
+between a chat app that feels reliable and one that silently drops or
+duplicates messages comes down to a small number of concrete decisions:
+what delivery guarantee you actually provide, who decides message order, and
+how you handle a recipient who isn't listening right now.
+
+## What "reliable delivery" actually means
+
+Three delivery semantics get discussed in distributed systems, and only one
+of them is realistic here:
+
+- **At-most-once** — send it, don't retry. Simple, but any dropped packet or
+  server hiccup silently loses a message. Not acceptable for chat.
+- **Exactly-once** — the message arrives precisely once, no drops, no
+  duplicates. This is not achievable over a network that can fail mid-request
+  (the sender can never be sure whether a timeout meant "never arrived" or
+  "arrived, but the ack was lost"). Be wary of claiming this in an interview
+  without qualifying it.
+- **At-least-once** — retry until acknowledged. Messages might arrive more
+  than once, but never zero times.
+
+What chat systems actually build is at-least-once delivery plus **idempotent
+deduplication** on the receiving end, which behaves like exactly-once from
+the user's point of view without requiring the impossible guarantee. The
+trick is entirely in how duplicates get recognized and dropped, covered
+below.
+
+## The three acks: sent, delivered, read
+
+A message moves through three distinct states, each driven by a separate
+acknowledgment, which is exactly what those familiar check-mark icons are
+tracking:
+
+1. **Sent** — the chat server accepted the message from the sender's client
+   and durably persisted it. This is the sender's own client-server ack; it
+   says nothing about the recipient yet.
+2. **Delivered** — a recipient's device received the message over its own
+   connection and sent back its own ack. The server relays this back to the
+   sender.
+3. **Read** — the recipient opened the conversation and the client fired a
+   read receipt, again relayed back to the sender.
+
+Each transition is a distinct event flowing in the opposite direction from
+the original message: recipient to server to sender. In a group, this gets
+tracked per recipient — "delivered" and "read" aren't single booleans on the
+message, they're a small map of recipient-to-state, which the next lesson
+covers in more depth when it deals with group fan-out.
+
+## Store-and-forward: offline is the default case, not an exception
+
+A recipient's device is frequently not connected when a message arrives —
+backgrounded, asleep, or on a dead network. Treat this as the expected path,
+not an edge case:
+
+1. The chat server persists the message to a durable per-recipient inbox
+   (or appends it to the conversation's message log, indexed for that
+   recipient) regardless of whether the recipient's connection is currently
+   live.
+2. If the recipient has an open connection, push immediately over it.
+3. If not, trigger a platform push notification (APNs/FCM) — not to carry
+   the message content reliably, but purely to wake the app so it
+   reconnects and pulls what it missed.
+4. On reconnect, the client doesn't wait passively for pushes — it asks the
+   server for everything after the last sequence number it has locally per
+   conversation ("sync me from cursor `N`"). This single mechanism handles a
+   dropped connection, a cold app launch, and a lost push notification with
+   one code path, since the push is just a wake-up hint, not the source of
+   truth.
+
+## Ordering: per-conversation, not global
+
+You don't need a single global order across every message every user on the
+platform ever sends — nobody reads across conversations. What you need is a
+consistent order **within** each conversation, agreed on by every
+participant and every one of their devices.
+
+The clean way to get this: make one component the single point that assigns
+order for a given conversation, and have it hand out a monotonically
+increasing sequence number as each message is durably accepted. This can be
+a per-conversation counter in a database with a unique, ordered key, or a
+single partition per conversation in a log like Kafka (the partition's
+offset is the sequence number for free). Either way, the sequence number the
+server assigns — not any client's timestamp — is the source of truth for
+order.
+
+Client timestamps are still useful for optimistic UI: show the message in
+the thread immediately, ordered by local clock, the instant the user hits
+send, before any round trip completes. Once the server's ack arrives with
+the real sequence number, reconcile silently. What you must not do is use
+client timestamps as the final ordering signal once multiple devices or
+users are involved — phone clocks drift by seconds to minutes, and a
+message sent a beat later by clock time can easily have an earlier
+timestamp than one sent just before it on a different device.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant S as Sender client
+    participant Srv as Chat server
+    participant Store as Message store
+    participant R as Recipient client
+    S->>Srv: send(msg, clientMsgId, localTs)
+    Srv->>Store: persist + assign seq number
+    Store-->>Srv: seq = 4821
+    Srv-->>S: ack sent (seq 4821)
+    Srv->>R: push message (if connected)
+    R-->>Srv: ack delivered
+    Srv-->>S: delivered
+    Note over R: user opens thread
+    R-->>Srv: ack read
+    Srv-->>S: read
+`} />
+
+## Deduplication: the other half of at-least-once
+
+At-least-once delivery means retries happen, and retries can produce
+duplicates: the sender's request times out, retries, but the first attempt
+had actually already succeeded server-side. To make this invisible to the
+user, the client attaches a unique ID to every outgoing message **before**
+it's ever sent (a UUID generated client-side, not a server-assigned one, since
+the whole point is surviving the case where the client doesn't know if the
+server saw the first attempt).
+
+The server treats this client message ID as an idempotency key: if a message
+with that ID was already persisted, it returns the existing sequence number
+instead of creating a second entry. The same ID travels with the message to
+recipients, so a recipient's client that somehow receives the same message
+twice (say, once via push-triggered sync and once via a live connection that
+reconnected moments later) can drop the second copy on sight rather than
+rendering it twice.
+
+## Worked example: a retried send during a network blip
+
+A sender's phone sends a message, the request reaches the server and gets
+durably persisted with sequence number 4821, but the reply gets lost as the
+phone briefly loses signal. From the client's perspective, this looks
+identical to "the request never arrived" — it has no ack. After a short
+timeout, the client retries the same message, with the **same client
+message ID** attached.
+
+The server sees a message with a client ID it's already persisted, does not
+create a second entry, and simply returns the existing sequence number 4821
+again. The sender's client reconciles its locally-shown message with that
+sequence number and moves on — the user never sees a duplicate, and the
+message's position in the conversation (4821) was decided once, not twice.
+Without the shared client message ID, this retry would have created a
+second message at, say, sequence 4830, and the recipient would see the same
+text twice.
+
+<Callout type="warning">
+  A common mistake is ordering messages by the timestamp each client
+  attaches locally, especially once multiple devices or a group chat are
+  involved. Client clocks aren't synchronized, so two messages sent a second
+  apart by two different phones can arrive with timestamps in the wrong
+  order, and everyone's client would render a different order depending on
+  which timestamps it trusts. Use client timestamps only for immediate,
+  optimistic local display before the round trip completes; the
+  server-assigned per-conversation sequence number is what every
+  participant's client should actually sort by once it's known.
+</Callout>
+
+Delivery and ordering are the mechanics that make a chat thread trustworthy:
+messages don't vanish when a phone drops signal, don't duplicate when a
+request is retried, and appear in the same order for everyone reading the
+same conversation. The next lesson builds on this same message pipeline to
+cover presence, typing indicators, and how these per-recipient delivery
+states scale once a "recipient" is a group of hundreds of people.
+
+<Quiz
+  lessonId="whatsapp-message-delivery-and-ordering"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Which delivery guarantee do production chat systems actually implement for message sending?',
+      options: [
+        { id: 'a', text: 'At-most-once, accepting occasional silent message loss for simplicity.', correct: false, explanation: 'Silently losing messages is not acceptable for chat; this is not the approach used.' },
+        { id: 'b', text: 'True exactly-once delivery, guaranteed by the network layer.', correct: false, explanation: 'Exactly-once delivery is not achievable over a network where requests and acks can both be lost — a sender can never be certain which happened.' },
+        { id: 'c', text: 'At-least-once delivery combined with idempotent deduplication on a client-generated message ID.', correct: true, explanation: 'Correct — retries guarantee the message eventually arrives at least once, and dedup on a shared client message ID makes retried duplicates invisible to the user, which behaves like exactly-once without requiring the impossible guarantee.' },
+        { id: 'd', text: 'Best-effort UDP broadcast to all of a recipient\'s known devices.', correct: false, explanation: 'This describes neither the transport nor the guarantee model used for reliable message delivery.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are accurate reasons to order messages by a server-assigned per-conversation sequence number rather than by client-supplied timestamps? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Client clocks can drift or skew, so timestamps from two different devices are not reliably comparable.', correct: true, explanation: 'Correct — clock drift means a message sent slightly later by wall-clock time on one device can carry an earlier timestamp than one sent moments before on another device.' },
+        { id: 'b', text: 'A single sequencing point per conversation gives every participant\'s client the same, unambiguous order to sort by.', correct: true, explanation: 'Correct — this is exactly why the server (or a single partition/counter per conversation) assigning the sequence number works: there is one agreed source of truth for order.' },
+        { id: 'c', text: 'Client timestamps are never useful anywhere in the message pipeline.', correct: false, explanation: 'They are useful for optimistic local display immediately after send, before the server ack with the real sequence number arrives — they just should not be the final ordering signal once multiple devices are involved.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A recipient being offline when a message is sent should be treated as an unusual failure case requiring special-case handling, rather than the normal, expected path.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Offline recipients are extremely common (backgrounded apps, dead networks, sleeping phones) and should be the default design assumption, not an exception.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — store-and-forward (durably persist the message, then push-notify to wake the client, which syncs from its last known sequence number) is designed around offline being the normal case.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A sender\'s message reaches the server and is persisted, but the network drops before the sender receives an ack. The client times out and retries the same message with the same client-generated message ID. What should the server do?',
+      options: [
+        { id: 'a', text: 'Persist a new message with a new sequence number, since the client made a new request.', correct: false, explanation: 'This would create a visible duplicate in the conversation, which is exactly what the shared client message ID is meant to prevent.' },
+        { id: 'b', text: 'Recognize the client message ID as already persisted, and return the existing sequence number without creating a second entry.', correct: true, explanation: 'Correct — treating the client-generated message ID as an idempotency key lets the server detect this is a retry of an already-accepted message and avoid duplicating it.' },
+        { id: 'c', text: 'Reject the retried request outright and require the client to manually resolve the conflict.', correct: false, explanation: 'Rejecting the retry would leave the sender\'s client stuck with no ack at all; the correct behavior is to transparently return the already-assigned sequence number.' },
+      ],
+    },
+  ]}
+/>

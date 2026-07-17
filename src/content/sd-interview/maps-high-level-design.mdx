@@ -1,0 +1,249 @@
+---
+title: "High-Level Design"
+module: "Design Google Maps"
+moduleOrder: 3
+order: 2
+track: "interview"
+summary: "Breaks a mapping and routing service into its major components — map data pipeline, tile serving, search, and routing — and shows how they fit together on a request path."
+tags: ["maps", "system-design", "architecture", "geospatial", "routing"]
+estMinutes: 13
+cheatsheet:
+  - "Split map data into an offline pipeline (ingest raw geo data, build tiles and a routing graph, push to storage) and an online serving path (read-only, latency-critical) — never let the heavy build process touch the request path."
+  - "Tiles are static, cacheable, and content-addressed (z/x/y coordinates) — serve them through object storage plus a CDN, exactly like static assets, not through your application database."
+  - "The routing graph (roads as edges, intersections as nodes) is a completely different data structure from the map-display tiles — don't conflate 'draw the map' with 'compute a route' as one component."
+  - "Live traffic is a thin, fast-changing overlay on a mostly-static base graph — keep it in a separate, frequently-refreshed store (in-memory / streaming) rather than rewriting the base graph."
+  - "Location search (geocoding: text to coordinates) is its own service backed by a search/geo index, not a side effect of the routing or tile services — it has different query patterns and different freshness needs."
+  - "Client-side interpolation between periodic location updates keeps a moving marker smooth without needing the server to push updates every 100ms."
+  - "Draw the boundary between the 'map data plane' (tiles, graph, traffic — huge, mostly read-only) and the 'user plane' (search, routing requests, live position) early; they scale and fail independently."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've pinned down the requirements and rough scale in the previous lesson —
+hundreds of millions of daily users, tile requests in the billions, route
+queries that need a p99 well under a second. Now the interviewer wants to see
+a system that could plausibly hit those numbers. "Design Google Maps" sounds
+like it needs a hundred boxes on the whiteboard, but almost every strong
+answer collapses into the same handful of components once you notice that
+the system is really three loosely-coupled products sharing one dataset:
+**look at a map, search for a place, and get a route**. Treating those as
+one monolithic "maps service" is the single biggest mistake candidates make
+here — keeping them separate is what makes the rest of the design tractable.
+
+## The three request types, and why they don't share a path
+
+Before drawing boxes, separate the traffic by what it actually needs:
+
+- **Map viewing** — a client pans/zooms and asks for the images/vectors
+  covering a viewport. Enormous volume, read-only, latency budget in the tens
+  of milliseconds, and the answer for a given tile barely changes minute to
+  minute.
+- **Location search** — a user types "coffee near me" or an address. Lower
+  volume than tile requests, needs fuzzy text matching plus geospatial
+  ranking, and freshness matters (a business that closed last month shouldn't
+  rank first).
+- **Routing / ETA** — given a start, end, and current traffic, compute a path
+  and a time estimate. Much lower volume than tile views, but computationally
+  heavy per request and the one place where "live" data (current traffic)
+  has to blend with mostly-static data (the road network).
+
+These three have wildly different read/write ratios, different latency
+budgets, and different consistency needs, so they become three separate
+services with their own scaling knobs — even though they all read from the
+same underlying map data.
+
+## Major components
+
+### Offline map-building pipeline
+
+Raw geographic data — road centerlines, building footprints, points of
+interest, administrative boundaries — comes from map data providers and
+internal edits, and it's large and slow-changing. An offline batch pipeline
+processes this into two very different outputs:
+
+- **Map tiles**: pre-rendered raster images or pre-packaged vector tiles, one
+  per `(zoom, x, y)` coordinate, ready to be served byte-for-byte.
+- **Routing graph**: roads reduced to a graph of nodes (intersections) and
+  weighted edges (road segments), annotated with speed limits, one-way
+  restrictions, and turn costs — the input to the routing service.
+
+This pipeline runs on a schedule (hours to days), not per request. That's
+the point: all the expensive geometry and graph-building work happens once,
+off the request path, and the results are published as immutable, versioned
+artifacts.
+
+### Tile service
+
+A thin, stateless read path in front of object storage and a CDN. A client
+asks for tiles by coordinate; the CDN edge serves a cache hit almost
+every time, because tiles for popular areas (city centers) are requested by
+millions of different users but are identical bytes. Cache misses fall back
+to origin storage, never to a live rendering step.
+
+### Geocoding / search service
+
+Takes free-text or partial addresses and returns ranked coordinates plus
+metadata (name, category, hours). Backed by a geospatial search index (an
+inverted text index combined with a spatial index like a quadtree or
+geohash) so it can answer both "match this text" and "rank by distance from
+here" in one query. Runs independently of tiles and routing — it's read from
+by the client's search box and, internally, by the routing service to
+resolve an address into a graph node before pathfinding starts.
+
+### Routing and ETA service
+
+Takes a resolved origin/destination pair (already geocoded) and current
+traffic conditions, and computes a path over the routing graph plus a time
+estimate. This is the most compute-heavy request type despite being the
+lowest volume, and it's covered in depth in the next lesson — for now, the
+key architectural point is that it reads two things that change at very
+different rates: the mostly-static graph (rebuilt offline, hours-old is
+fine) and live traffic (seconds-old, held in a fast in-memory or streaming
+store, layered on top as edge-weight adjustments rather than rewriting the
+graph itself).
+
+### Live location and traffic ingestion
+
+Millions of devices running the app periodically report their GPS position.
+This stream serves two purposes: showing other users' aggregated speed as
+"traffic" on the roads they're driving, and, for a specific active
+navigation session, tracking that one user's progress against their route.
+It's a high-write, loosely-consistent pipeline — a dropped or late location
+ping is fine to lose, unlike a route computation or a search result.
+
+### API / edge layer and client
+
+A stateless layer handling auth, rate limiting, and routing requests to the
+right backend service, sitting in front of all of the above. The client
+itself does real work too: caching recently-viewed tiles, interpolating a
+moving marker smoothly between two periodic position updates instead of
+waiting on the network for every frame, and re-requesting only the tiles
+that entered the viewport after a pan rather than the whole visible area.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph Offline["Offline pipeline (hours/days)"]
+      RD[Raw geo data] --> Build[Tile + graph builder]
+      Build --> Tiles[(Tile store)]
+      Build --> Graph[(Routing graph store)]
+    end
+    subgraph Online["Online serving path"]
+      Client[Client app] --> Edge[API / edge layer]
+      Edge --> TileSvc[Tile service]
+      Edge --> SearchSvc[Geocoding / search service]
+      Edge --> RouteSvc[Routing and ETA service]
+      TileSvc --> CDN[CDN cache] --> Tiles
+      SearchSvc --> Index[(Geo search index)]
+      RouteSvc --> Graph
+      RouteSvc --> Traffic[(Live traffic store)]
+      Devices[User devices: GPS pings] --> Traffic
+    end
+`} />
+
+## Where consistency matters and where it doesn't
+
+A useful lens for this design: for each store, ask "what's the cost of
+serving slightly stale data, versus the cost of making every request wait
+for the freshest possible answer?"
+
+- **Tiles**: staleness of hours or days is completely fine — roads don't
+  move. Optimize purely for cache hit rate and latency.
+- **Search index**: staleness of hours is usually fine (a new restaurant
+  doesn't need to appear in results within seconds), but returning a
+  permanently-closed business is a real user-visible failure, so there's a
+  freshness floor, not a freshness ceiling.
+- **Routing graph**: same as tiles — an occasional missed lane closure isn't
+  a correctness bug, it's a UX rough edge.
+- **Live traffic**: the opposite end of the spectrum. Data older than a
+  couple of minutes is actively misleading — you'd rather have no traffic
+  data for a road than traffic data from twenty minutes ago during rush
+  hour. This is why traffic lives in a separate, fast-refresh store instead
+  of being folded into the graph.
+
+## Worked example: a user navigates across town
+
+Trace one navigation session through the components above. A user types
+"Union Station" into the search box: that hits the **geocoding service**,
+which returns a coordinate and a graph node ID. The client then requests
+**tiles** for the current viewport to draw the map — served from CDN, cache
+hit. The user taps "Directions," which sends origin and destination node IDs
+to the **routing service**; it reads the static graph plus the current
+**live-traffic** overlay for the roads along candidate paths, and returns a
+route plus an ETA. As the user drives, their device sends **GPS pings**
+every few seconds, which do two things: update their session's progress
+against the chosen route (client-side interpolation smooths the marker
+between pings) and feed anonymized speed data back into the traffic store
+that benefits other users' ETAs on the same roads. Notice that four
+different services handled this one user flow, and none of them needed to
+know the internals of the others — that separation is exactly what lets
+tile-serving scale independently from the far lower-volume, far
+heavier-per-request routing computation.
+
+<Callout type="warning">
+  A common mistake is drawing "the map backend" as a single service with one
+  database, then trying to explain how it serves billions of tile requests
+  and computes shortest paths out of the same store. In an interview this
+  reads as not having thought about the read/write and latency profiles at
+  all. Say explicitly, early, that tiles are static cacheable assets, the
+  routing graph is a purpose-built graph structure, and traffic is a
+  fast-changing overlay — three different storage and scaling strategies,
+  not one.
+</Callout>
+
+## Where this leaves you
+
+This lesson's job was to get the boxes on the board and justify why they're
+separate services. The next two lessons go deep on the two hardest pieces
+this design glosses over: how you actually structure map data into tiles and
+keep a routing graph efficient to query (next lesson), and how routing
+algorithms compute a path and ETA at the latency this system demands (the
+lesson after). Location search and the scaling story for the whole system
+close out the module.
+
+<Quiz
+  lessonId="maps-high-level-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does a Google-Maps-style design split map data into an offline pipeline and a separate online serving path, rather than building tiles on demand per request?',
+      options: [
+        { id: 'a', text: 'Because building tiles/graphs from raw geo data is expensive and roads change slowly, so doing it once on a schedule and serving the static result is far cheaper than redoing it per request.', correct: true, explanation: 'Correct — the source data barely changes minute to minute, so precomputing once and serving cached, immutable artifacts is the whole point of separating the two paths.' },
+        { id: 'b', text: 'Because the online path cannot access a database.', correct: false, explanation: 'The online path absolutely reads from stores (tile storage, the graph store, the search index) — the split is about when expensive computation happens, not about database access.' },
+        { id: 'c', text: 'Because tile requests are rare compared to routing requests.', correct: false, explanation: 'The opposite is true — tile-view traffic is by far the highest-volume request type, which is exactly why it needs to be served from cheap, cacheable, precomputed artifacts.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these should live in a separate, fast-refresh store rather than being baked into the offline-built routing graph? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Current traffic speeds on road segments', correct: true, explanation: 'Traffic changes on the order of minutes and needs to stay fresh; rebuilding the whole graph to reflect it would be far too slow.' },
+        { id: 'b', text: 'A user’s live GPS ping during an active navigation session', correct: true, explanation: 'Live position updates are per-session, high-frequency, and loosely-consistent — they belong in the same class of fast-changing, low-durability data as traffic, not the static graph.' },
+        { id: 'c', text: 'The one-way restriction on a residential street', correct: false, explanation: 'One-way restrictions almost never change and are exactly the kind of structural road-network fact that belongs in the offline-built graph.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'The geocoding/search service and the tile service should share one query path, since both are ultimately answering "what is here on the map?"',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'They look related but have very different query patterns and scaling needs — tiles are coordinate-keyed static asset lookups served from a CDN, while search does fuzzy text matching plus spatial ranking against an index. Combining them couples two components with unrelated failure modes and load profiles.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — tile serving and geocoding/search solve different problems with different data structures (static cacheable tiles vs. a text+spatial search index) and should scale independently.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A client is actively navigating and receives a GPS position update from the server only once every 3 seconds, yet the marker on screen moves smoothly instead of jumping. What technique explains this?',
+      options: [
+        { id: 'a', text: 'The server is secretly sending updates every frame.', correct: false, explanation: 'That would defeat the point of batching updates and would not match the stated 3-second interval.' },
+        { id: 'b', text: 'Client-side interpolation animates the marker smoothly between the last two known positions instead of waiting on the network for every frame.', correct: true, explanation: 'Correct — the client extrapolates/interpolates motion between periodic updates, which is standard practice for smooth-looking live location tracking without needing high-frequency server pushes.' },
+        { id: 'c', text: 'The routing graph recomputes the path every second.', correct: false, explanation: 'Recomputing the route has nothing to do with smoothing a marker’s on-screen motion between position updates.' },
+      ],
+    },
+  ]}
+/>

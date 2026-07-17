@@ -1,0 +1,142 @@
+---
+title: "Requirements of a Key-Value Store"
+module: "Key-Value Store"
+moduleOrder: 10
+order: 1
+track: "concept"
+summary: "Frames the functional and non-functional requirements you must nail down before designing a distributed key-value store, and shows how each requirement drives a specific downstream design decision."
+tags: ["key-value-store", "requirements", "distributed-systems", "scalability", "consistency"]
+estMinutes: 11
+cheatsheet:
+  - "Lock down the API surface first: get(key), put(key, value), and (usually) delete(key) — no range queries, no joins, no secondary indexes. That's the whole contract."
+  - "Decide the value size ceiling early (KB vs MB) — it drives whether you can keep everything in memory, need chunking, or need a separate blob store behind the KV layer."
+  - "Every scale requirement (nodes, keys, QPS) is really asking 'how will you partition this?' — write the number down now, you'll use it in the partitioning lesson."
+  - "High availability for writes almost always means giving up strong consistency during a partition (CAP) — decide which one this specific store needs before you pick a replication scheme."
+  - "'Eventual consistency is fine' is a requirement, not a cop-out — it has to come from the actual use case (session cache vs. financial ledger), not from wanting an easier design."
+  - "Write a rough capacity estimate (keys x average value size x replication factor) before your first diagram — it catches 'in-memory only' assumptions that don't survive contact with real numbers."
+  - "The requirements you write here constrain every later lesson: hashing scheme, replica count, quorum sizes, and conflict resolution all trace back to a decision made in this step."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design a distributed key-value store" is one of the most common prompts in a system design interview, and it's also one of the easiest to fumble in the first five minutes — not because the mechanics are hard, but because candidates jump straight to consistent hashing or Dynamo-style replication before anyone has agreed on what the system actually needs to do. A key-value store that backs a session cache and one that backs a payments ledger share almost no design decisions in common, even though both expose `get`/`put`. This lesson is the one you do before any of that: pin down the requirements so every later choice — partitioning, replication, conflict resolution — has something concrete to be judged against.
+
+This is the first lesson in the Key-Value Store module. The lessons that follow (consistent hashing, replication and quorum, conflict resolution, and putting it all together) each solve a problem that a requirement stated here creates. Get this lesson right and the rest of the module reads as "here's how we satisfy the requirement we already wrote down," instead of a grab-bag of distributed-systems trivia.
+
+## Start with the API, not the architecture
+
+A key-value store's functional surface is deliberately narrow, and stating it explicitly is worth doing out loud in an interview:
+
+- `put(key, value)` — store or overwrite a value under a key.
+- `get(key)` — retrieve the value for a key, or a "not found" signal.
+- `delete(key)` — remove a key (sometimes via a tombstone rather than a physical delete, which matters later for replication).
+
+Notice what's missing: no range scans, no secondary indexes, no joins, no transactions across keys. That absence is the entire point of a KV store — by refusing to support arbitrary queries, it can partition data across many machines with no cross-node coordination on reads or writes. If an interviewer's prompt later asks for "find all keys with prefix X" or "query by a non-key attribute," that's a sign the system needs a secondary index or a different data model layered on top — flag it as a scope decision rather than silently designing it in.
+
+## Functional requirements to pin down
+
+Beyond the basic API, clarify these before moving on:
+
+- **Value size and shape.** Are values small (a few hundred bytes — session tokens, counters) or large (multi-MB blobs — serialized objects, small files)? This single answer decides whether the store can be a pure in-memory hash table or needs on-disk storage, compression, and possibly chunking large values across nodes.
+- **Key structure.** Are keys opaque strings/UUIDs, or do they have implicit structure (e.g. `userId:sessionId`) that a partitioning scheme could exploit or accidentally break by co-locating hot keys?
+- **TTL / expiry.** Does data expire (cache-like) or persist indefinitely (ledger-like)? This changes whether you need a background eviction/compaction process at all.
+- **Read/write ratio.** A cache in front of a database is read-heavy; a write-heavy workload (e.g. ingesting sensor events) needs a design that optimizes the write path — different tuning for the same API.
+
+## Non-functional requirements: where the real design decisions live
+
+The functional requirements above are usually quick to agree on. The non-functional ones are where a distributed KV store gets interesting, because most of them are in direct tension with each other.
+
+### Scale
+
+State concrete numbers, not adjectives. "Web-scale" tells you nothing; "500 million keys, average value 1 KB, 200K reads/sec and 20K writes/sec, 3x replication" tells you exactly how much data one node can hold in memory, how many partitions you need, and how much network bandwidth replication will consume. Every later lesson in this module — how keys map to nodes, how many replicas per key, how conflicts get resolved — is downstream of this number.
+
+### Availability vs. consistency
+
+This is the crux. During a network partition, do you want every replica to keep accepting reads and writes even if that means two replicas can briefly disagree (an "AP" choice, in CAP terms), or do you want to refuse requests on a minority partition to guarantee every client sees the same value (a "CP" choice)? A shopping-cart-style KV store (Amazon's original Dynamo motivation) picks availability — a stale cart is annoying, an unavailable one loses a sale. A KV store backing distributed locks or leader election picks consistency — a stale value there causes a correctness bug, not an inconvenience. Say which one your system needs and why, before you touch replication design.
+
+### Durability
+
+Can an acknowledged write ever be lost? If yes (pure cache), you can skip write-ahead logs and multi-node fsync entirely. If no, every write needs to survive on at least N nodes' disks before you return success to the client — which directly shapes the replication and quorum lesson that follows this one.
+
+### Latency
+
+Single-digit-millisecond `get`/`put` latency is a common requirement, and it constrains you toward keeping hot data in memory, keeping the number of network hops per request low (avoid multi-hop routing through a coordinator on every request), and picking a partitioning scheme that lets a client (or a thin routing layer) go directly to the right node.
+
+<Mermaid client:visible chart={`
+flowchart TD
+  A[Client request] --> B{Read or write?}
+  B -->|put/delete| C[Durability requirement]
+  B -->|get| D[Latency requirement]
+  C --> E[How many replicas must ack?]
+  D --> F[How many hops to the right node?]
+  E --> G[Replication and Quorum lesson]
+  F --> H[Consistent Hashing lesson]
+`} />
+
+<Callout type="warning">
+  The most common mistake in this stage of the interview is skipping straight to "I'll use consistent hashing and quorum reads/writes" without ever stating what the availability/consistency/durability trade-offs actually need to be for *this* system. An interviewer will (rightly) ask "why quorum reads specifically, and what quorum size?" — if the answer traces back to a requirement you stated, you look deliberate. If it doesn't, it looks memorized. Spend two minutes here before drawing anything.
+</Callout>
+
+## Worked example: sizing a session-store KV cluster
+
+Say the prompt is "design a KV store to hold web session data for a service with 50 million daily active users." A reasonable set of requirements, stated out loud:
+
+- Each session is small: ~2 KB (user ID, permissions, a few flags).
+- Sessions expire after 24 hours of inactivity — durability doesn't need to survive a full data-center loss, but losing a live session mid-request is a bad user experience, so we want it to survive a single node failure.
+- Read-heavy: sessions are checked on almost every request, refreshed occasionally. Say 100K reads/sec average, 10K writes/sec.
+- Availability over strict consistency: if a user's session is briefly stale on one replica after a failover, that's acceptable; refusing to serve requests during a partition is not.
+
+From here the capacity math is quick: 50 million sessions x 2 KB ~ 100 GB of raw data. With 3x replication for durability against single-node failure, that's ~300 GB to place across the cluster. If each node comfortably holds 50 GB in memory (leaving headroom), that's 6 nodes minimum for replicated storage — round up for growth and you're proposing an 8-10 node cluster before you've drawn a single arrow. That number, and the availability-over-consistency decision, are exactly what the next lesson (consistent hashing) needs as inputs to decide how keys get distributed across those nodes.
+
+## Putting the requirements list together
+
+A tight requirements pass for a KV store interview question should leave you able to state, in a few sentences: the API (get/put/delete, value size ceiling), the scale (keys, QPS, replication factor), the consistency/availability choice and why, the durability guarantee, and the latency target. Everything from here forward in this module — how keys map to nodes, how many copies of each key exist and how they're kept in sync, and how conflicting writes get resolved — is just engineering in service of the numbers and trade-offs you write down at this stage.
+
+<Quiz
+  lessonId="kv-requirements-of-a-key-value-store"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A key-value store deliberately does not support range queries, joins, or secondary indexes. Why does this restriction matter for a distributed design?',
+      options: [
+        { id: 'a', text: 'It lets each node handle reads and writes for its keys with no cross-node coordination, which is what makes partitioning across many machines practical.', correct: true, explanation: 'Exactly — a narrow API with no cross-key operations is precisely what allows the data to be split across nodes without needing distributed joins or scatter-gather queries.' },
+        { id: 'b', text: 'It reduces the amount of code needed to implement the client library.', correct: false, explanation: 'Client simplicity is a side effect, not the reason. The real motivation is what the restriction enables for distribution.' },
+        { id: 'c', text: 'It is required so that values can be compressed before storage.', correct: false, explanation: 'Compression is unrelated to whether the store supports range queries or joins.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are non-functional requirements that should be pinned down before designing the partitioning and replication scheme? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Whether the system favors availability or consistency during a network partition', correct: true, explanation: 'This is the central trade-off (CAP) that determines how replication and reads/writes are designed.' },
+        { id: 'b', text: 'Whether an acknowledged write can ever be lost (durability)', correct: true, explanation: 'Durability requirements determine whether you need write-ahead logs, multi-node acknowledgment, and disk persistence at all.' },
+        { id: 'c', text: 'The exact name of the hash function used for consistent hashing', correct: false, explanation: 'That is an implementation detail decided in the partitioning lesson, not a requirement gathered up front.' },
+        { id: 'd', text: 'Target read/write latency', correct: true, explanation: 'Latency targets push the design toward in-memory storage, fewer network hops, and specific partitioning/routing choices.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Choosing "eventual consistency is acceptable" for a key-value store should be justified by the actual use case, not adopted by default because it is easier to build.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct. Eventual consistency is a legitimate choice for many workloads (e.g. a shopping cart or session cache), but it must come from what the data actually tolerates, not from convenience — a ledger or lock service typically cannot accept it.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'Defaulting to eventual consistency because it is simpler to implement, without checking whether the use case tolerates staleness, is exactly the mistake this lesson warns against.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A KV store needs to hold 50 million items, each averaging 2 KB, with 3x replication for durability. Roughly how much total storage should the cluster provision?',
+      options: [
+        { id: 'a', text: '~100 GB', correct: false, explanation: 'That is the raw (unreplicated) data size — 50 million x 2 KB ~ 100 GB — but it omits the replication factor.' },
+        { id: 'b', text: '~300 GB', correct: true, explanation: 'Correct: 50 million x 2 KB ~ 100 GB of raw data, and 3x replication means the cluster must provision roughly 300 GB total across nodes.' },
+        { id: 'c', text: '~1 TB', correct: false, explanation: 'That overshoots the estimate — it is not supported by the given numbers (100 GB raw x 3 replicas = 300 GB, not 1 TB).' },
+      ],
+    },
+  ]}
+/>

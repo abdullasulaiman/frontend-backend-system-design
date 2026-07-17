@@ -1,0 +1,273 @@
+---
+title: "Requirements and Estimation"
+module: "Design WhatsApp"
+moduleOrder: 11
+order: 1
+track: "interview"
+summary: "Scopes a real-time chat system into messaging, presence, and media sub-problems, then derives connection, QPS, and storage estimates from daily active users and group fan-out."
+tags: ["requirements", "capacity-estimation", "messaging", "real-time", "interview-framework"]
+estMinutes: 11
+cheatsheet:
+  - "Scope around messages, not 'chat features' — 1:1 messaging, group messaging, delivery/read receipts, presence, and media are the core; calls, stories, and a business API are almost always out of scope for a 45-minute session."
+  - "A sent message and a delivered message are different numbers — group fan-out multiplies deliveries by (group size minus one), and that amplified number, not the send rate, is what the fan-out path has to handle."
+  - "The dominant infrastructure cost isn't request throughput, it's concurrency: hundreds of millions of simultaneous long-lived connections need a horizontally sharded gateway tier with per-user sticky routing, not a stateless request/response fleet."
+  - "End-to-end encryption is a non-functional requirement that shapes the architecture, not a bolt-on feature — it rules out server-side content search, spam scanning on plaintext, and any design that assumes the server can inspect message bodies."
+  - "At-least-once delivery is the only honest guarantee over an unreliable mobile network — durability and correctness come from client-generated message IDs and idempotent dedup on the receiving side, not from pretending exactly-once delivery is achievable."
+  - "Text storage is a rounding error; media storage is the real capacity number — size them separately, because a single photo or voice note can outweigh thousands of text messages in bytes."
+  - "State your DAU, messages-per-user, and average group size out loud before deriving QPS — every downstream number in this module traces back to those three assumptions."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Most system design prompts ask you to serve reads fast or rank content well.
+"Design WhatsApp" asks something different: don't lose anyone's message,
+ever, even though the recipient's phone might be off, out of signal, or
+sitting in airplane mode for a day. A dropped social media post is a bug
+users shrug off. A dropped or duplicated chat message is a bug users notice
+immediately and stop trusting the product over. That single constraint —
+guaranteed, ordered, at-least-once delivery over an unreliable network,
+at global scale — is what should drive every decision in this module, and
+it starts with scoping the problem honestly before drawing any boxes.
+
+This lesson does that scoping. The high-level design, the delivery and
+ordering guarantees, presence/groups, and media/encryption lessons that
+follow all build on the numbers and constraints you establish here.
+
+## Step 1: Scope the functional requirements
+
+Say the scope out loud and let the interviewer redirect rather than
+silently guessing:
+
+- **Send and receive 1:1 messages.** Text messages between two users,
+  delivered as close to real time as the network allows.
+- **Group messaging.** A message sent to a group reaches every member,
+  typically tens of members, occasionally into the hundreds.
+- **Delivery and read receipts.** Sender sees when a message reached the
+  recipient's device (delivered) and when it was opened (read).
+- **Presence.** Online/offline status and a "last seen" timestamp.
+- **Media sharing.** Photos, short videos, and voice notes attached to a
+  message, not just text.
+- **Offline delivery via push.** If a recipient's app isn't running, a
+  push notification wakes it and the message is waiting once it opens.
+
+Explicitly defer: voice/video calling, status/stories, a business
+messaging API, and multi-device backup/restore mechanics. Each is a real
+feature of a real chat app, but pulling all of them into one session
+leaves no time to go deep on any single one. (Multi-device *sync* — the
+same account logged in on a phone and a laptop at once — does come up
+later in this module, but it's a delivery-fan-out concern, not something
+to design from scratch in this lesson.)
+
+### Non-functional requirements
+
+- **Low latency when both parties are online.** A message should land on
+  the recipient's screen within a second or two, not tens of seconds.
+- **Durability over immediacy.** If the recipient is offline, the message
+  must be held and delivered later — it must never simply vanish because
+  a device wasn't reachable at send time.
+- **Per-conversation ordering.** Messages within a single 1:1 or group
+  chat must appear in the order they were sent, even if they take
+  different network paths or hit different servers.
+- **At-least-once delivery with client-side dedup.** Over a lossy mobile
+  network, retries are unavoidable — the honest guarantee is "delivered
+  one or more times," with a client-generated message ID used to drop
+  duplicates on arrival, not a false promise of exactly-once delivery.
+- **End-to-end encryption constrains the architecture, not just the
+  wire.** If message content is encrypted so only the endpoints can read
+  it, the server can route and store ciphertext but cannot search
+  content, scan for spam, or generate a preview server-side. That
+  assumption has to be baked in from this lesson forward, not patched in
+  later.
+- **Massive connection concurrency, not just request throughput.** Every
+  online user holds a persistent connection waiting for messages. The
+  gateway tier has to hold hundreds of millions of simultaneous
+  connections, which is a fundamentally different scaling problem than a
+  stateless web tier handling short-lived HTTP requests.
+
+## Step 2: Establish the scale
+
+State assumptions and invite correction:
+
+- 1 billion monthly active users (MAU); 600 million daily active users
+  (DAU) — chat apps have unusually high daily stickiness compared to
+  browsing apps.
+- Each DAU sends an average of 40 messages a day (a mix of 1:1 and group
+  chats, text and media combined).
+- 25% of sent messages go to a group; the remaining 75% are 1:1. Average
+  group size is 8 members (so a group message fans out to 7 other
+  recipients).
+- 15% of sent messages carry media (photo, short video, or voice note)
+  averaging 150 KB; the rest are plain text averaging 100 bytes.
+- At global peak, roughly 25% of DAU are connected simultaneously (peak
+  overlap across time zones), rather than everyone online at once.
+
+<Callout type="tip">
+  Say it plainly: "I'll assume 600 million daily active users sending 40
+  messages a day each, a quarter of those to groups averaging 8 members,
+  and roughly 150 million simultaneous connections at peak — does that
+  match the scale you have in mind?" Anchoring on DAU and messages-per-user,
+  not MAU, keeps every later number defensible.
+</Callout>
+
+## Step 3: Derive the numbers
+
+### Messages sent vs. messages delivered
+
+- Total messages sent per day: 600,000,000 users times 40 messages is
+  24,000,000,000 (24 billion) sent per day.
+- Average sent QPS: 24,000,000,000 divided by 86,400 seconds is about
+  278,000 sends/sec. Apply a 3x peak multiplier (chat traffic clusters
+  around evenings and regional peaks, though less spiky than, say,
+  live-event traffic): roughly 833,000 sends/sec at peak.
+- Deliveries are a different, larger number because of group fan-out:
+  75% of the 24 billion (18 billion) are 1:1, each producing exactly one
+  delivery. The remaining 25% (6 billion) are group messages, each
+  producing 7 deliveries (one per other member): 6 billion times 7 is
+  42 billion. Total deliveries: 18 billion plus 42 billion is 60 billion
+  deliveries/day — 2.5x the send count, purely from group fan-out.
+- Average delivery QPS: 60,000,000,000 divided by 86,400 is about
+  694,000 deliveries/sec, roughly 2.08 million/sec at the same 3x peak.
+
+### Connection concurrency
+
+- 25% of 600 million DAU online at once is about 150 million concurrent
+  persistent connections at peak. This is the number that sizes the
+  gateway/connection tier — it has nothing to do with message QPS and
+  everything to do with how many idle sockets a fleet must hold open and
+  route to simultaneously.
+
+### Storage: text is trivial, media is not
+
+- Text: 24 billion messages/day at roughly 100 bytes is about 2.4 TB/day
+  of raw text — under a petabyte a year even before compression, easily
+  handled by an ordinary distributed store.
+- Media: 15% of 24 billion is 3.6 billion media messages/day, averaging
+  150 KB each, which is 3,600,000,000 times 150,000 bytes, or about
+  540 TB/day. That's over 200x the text volume from a fifth as many
+  messages — media capacity, not text, is the real storage number to
+  size for, and it's why media is typically stored once in object storage
+  and referenced by a link rather than duplicated per recipient.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    C["Sender client"] --> GW["Connection gateway\n(~150M persistent conns at peak)"]
+    GW --> MS["Message service"]
+    MS --> Q["Per-conversation store/queue\n(ordered, at-least-once)"]
+    Q --> FO["Fan-out\n(1:1 = 1 target, group = N-1 targets)"]
+    FO --> GW2["Recipient's gateway conn"]
+    FO --> Push["Push notification service\n(recipient offline)"]
+    MS --> Media["Object storage\n(~540 TB/day media)"]
+    style Q fill:#9c4221,color:#fff
+    style FO fill:#9c4221,color:#fff
+    style GW fill:#2b6cb0,color:#fff
+    style GW2 fill:#2b6cb0,color:#fff
+    style Media fill:#4a5568,color:#fff
+`} />
+
+## Step 4: State the resulting design constraints
+
+1. **The connection tier is its own scaling problem.** 150 million
+   concurrent persistent connections at peak requires a horizontally
+   sharded gateway fleet with per-user sticky routing, distinct from the
+   stateless services handling message processing.
+2. **Fan-out multiplies group traffic, and the design must account for
+   it explicitly.** 2.5x delivery amplification from a modest 25%
+   group-message share means group chats deserve deliberate fan-out
+   handling (the next lesson covers this), not an assumption that a
+   group message is "one write."
+3. **Media needs a separate storage and delivery path from text.** At
+   roughly 200x the byte volume of text despite being a fifth of message
+   count, media belongs in object storage with a CDN in front of it, not
+   inline in the same store as message records.
+4. **Encryption is a day-one architectural constraint.** Because message
+   bodies are unreadable to the server, every server-side feature —
+   ordering, storage, delivery confirmation, even push notification
+   payloads — has to work off metadata and ciphertext, never plaintext
+   content.
+
+## Worked example: sanity-checking a follow-up
+
+Suppose the interviewer asks: "What if average group size grows from 8 to
+20?" Re-derive rather than guess. Group fan-out per message goes from 7
+recipients to 19. Group messages are still 25% of the 24 billion sent
+(6 billion), so group deliveries go from 6 billion times 7 (42 billion) to
+6 billion times 19 (114 billion) — a jump of 72 billion deliveries/day.
+Total deliveries rise from 60 billion to 18 billion (unchanged 1:1) plus
+114 billion (new group figure), or 132 billion/day — more than double.
+Meanwhile sent QPS, connection concurrency, and text/media storage per
+message are completely untouched by this change, since none of them
+depend on group size. Naming exactly which number moves — and which don't
+— is what separates a candidate reasoning about the system from one just
+re-running a formula.
+
+<Callout type="warning">
+  A common mistake is quoting the *sent* message rate as if it were the
+  system's real load. It isn't — group fan-out means the delivery rate
+  (what the fan-out and push paths actually have to handle) can be several
+  times the send rate, and that gap grows further if average group size is
+  larger than assumed. A related mistake: sizing storage off text alone
+  and forgetting media, which in this estimate outweighs text by two
+  orders of magnitude despite being a small fraction of message count.
+</Callout>
+
+## Where this leads
+
+The three constraints established here — a connection tier sized for
+concurrency rather than throughput, a delivery pipeline that has to
+tolerate a multi-times fan-out multiplier from groups, and an encrypted
+message body that the server can route but never read — are exactly the
+shape of the architecture in the next lesson. They're also why ordering
+and delivery guarantees, presence and group fan-out, and media/encryption
+each get their own dedicated lesson: each is a distinct hard problem
+hiding behind the same chat bubble UI.
+
+<Quiz
+  lessonId="whatsapp-requirements-and-estimation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'With 24 billion messages sent per day, 25% of them to groups averaging 8 members, roughly how many total message deliveries occur per day?',
+      options: [
+        { id: 'a', text: 'About 60 billion', correct: true, explanation: '75% (18 billion) are 1:1 messages producing 1 delivery each; 25% (6 billion) are group messages producing 7 deliveries each (42 billion). 18 billion plus 42 billion is 60 billion.' },
+        { id: 'b', text: 'About 24 billion', correct: false, explanation: 'That is the sent count, not the delivered count — it ignores that every group message fans out to multiple recipients.' },
+        { id: 'c', text: 'About 192 billion', correct: false, explanation: 'That would result from treating all 24 billion messages as group messages fanning out to 8 recipients each, but only 25% of messages are group messages.' },
+        { id: 'd', text: 'About 42 billion', correct: false, explanation: 'That is only the group-message delivery portion; it omits the 18 billion 1:1 deliveries that also occur.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasonable non-functional priorities for a real-time chat system? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A message must eventually be delivered even if the recipient is offline when it is sent', correct: true, explanation: 'Durability over immediacy is a core guarantee — an offline recipient should still receive the message once back online, not lose it.' },
+        { id: 'b', text: 'The system should guarantee exactly-once delivery over the network with no possibility of duplicates reaching the client', correct: false, explanation: 'Over a lossy mobile network, retries are unavoidable, so the honest guarantee is at-least-once delivery with client-side dedup via message IDs, not a true exactly-once promise.' },
+        { id: 'c', text: 'Messages within a single conversation should preserve their sent order when displayed', correct: true, explanation: 'Per-conversation ordering is a hard requirement — a chat where replies appear before the messages they respond to breaks the core experience.' },
+        { id: 'd', text: 'The server should be able to scan message content for spam even when end-to-end encryption is enabled', correct: false, explanation: 'End-to-end encryption means the server holds ciphertext it cannot read; content-based scanning has to happen client-side or not at all, not on the server.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In this lesson\'s estimation, media storage volume is smaller than text storage volume because far fewer messages contain media.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False — despite media being only 15% of messages, its far larger average size (150 KB vs. 100 bytes) makes media storage roughly 540 TB/day versus about 2.4 TB/day for text, over 200x larger.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — media dominates storage volume by a wide margin precisely because per-message size outweighs the lower message count.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why does 150 million concurrent connections at peak matter as a distinct number from the ~833,000 sends/sec peak QPS?',
+      options: [
+        { id: 'a', text: 'Because it sizes a different tier of the system — a gateway fleet holding open, idle, long-lived connections per user — which is a concurrency problem, not a request-throughput problem', correct: true, explanation: 'Most online users are idle most of the time, simply holding a connection open waiting for a message; that requires a horizontally sharded connection tier with sticky per-user routing, an entirely different scaling axis from processing sends per second.' },
+        { id: 'b', text: 'Because it is actually the same number as peak QPS once you account for retries', correct: false, explanation: 'These are unrelated numbers measuring different things — one counts simultaneous open connections, the other counts messages processed per second — and neither derives from the other.' },
+        { id: 'c', text: 'Because every connected user sends exactly one message per second, so connection count directly determines QPS', correct: false, explanation: 'Most connected users are idle at any given second; connection count reflects how many sockets are open, not how frequently each one sends.' },
+        { id: 'd', text: 'It doesn\'t matter — only message QPS affects system design', correct: false, explanation: 'Connection concurrency directly determines gateway tier sizing, memory footprint per server, and load-balancing strategy, independent of message throughput.' },
+      ],
+    },
+  ]}
+/>

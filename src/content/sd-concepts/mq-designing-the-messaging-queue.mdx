@@ -1,0 +1,150 @@
+---
+title: "Designing the Messaging Queue"
+module: "Distributed Messaging Queue"
+moduleOrder: 17
+order: 5
+track: "concept"
+summary: "Assembles brokers, partitioned logs, and offset tracking into one end-to-end produce/consume path, showing exactly where delivery semantics, ordering, and retention are enforced."
+tags: ["messaging-queue", "architecture", "distributed-systems", "kafka", "system-design"]
+estMinutes: 13
+cheatsheet:
+  - "A message's journey has four stops: producer to broker (partition assignment), broker append-to-log (durability point), consumer fetch (offset read), and offset commit (progress checkpoint) — know which stop enforces which guarantee."
+  - "Partition count is your parallelism ceiling: one partition can only ever be consumed by one consumer in a group at a time, so partitions-per-topic caps how many consumers can work in parallel."
+  - "Durability is decided at the broker: an ack is only meaningful once acks reach the number of in-sync replicas you require — acking before replication is a silent data-loss risk on broker failure."
+  - "Offset commit timing is the delivery-semantics lever: commit before processing risks message loss, commit after risks reprocessing (at-least-once) — there's no free lunch without transactional/idempotent writes."
+  - "Ordering is only guaranteed within a partition, never across partitions — a system that needs global order for one key must always route that key to the same partition."
+  - "Retention (time- or size-based log truncation) is a storage decision independent of delivery — a slow consumer can fall behind and be truncated out of its own data if retention is shorter than its processing lag."
+  - "When asked to design this end to end in an interview, narrate the full path (producer, partition key, broker append, replication, consumer fetch, offset commit) instead of listing components — that's what shows you understand how the guarantees are actually implemented."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've now covered the requirements a messaging queue has to satisfy, the delivery-semantics options, how ordering and deduplication work, and how storage and retention are managed. Each of those is a clean, self-contained idea — but in an interview, being asked to "design a messaging queue" means showing how they bolt together into one system that a producer and a consumer can actually talk through. This lesson walks the full path a message takes, end to end, and points at exactly which component is responsible for which guarantee from the earlier lessons.
+
+The core insight: none of "at-least-once delivery," "ordered per key," or "seven days of retention" is a feature you add on top of a queue. They're properties that fall directly out of *where* you put durability, *how* you assign partitions, and *when* you commit an offset. Get the architecture right and the guarantees follow; bolt guarantees on after the fact and you'll fight the design constantly.
+
+## The four building blocks
+
+A production message queue (think Kafka, Pulsar, or a managed equivalent like Kinesis/SQS-with-FIFO) is built from four pieces:
+
+- **Producers** — clients that publish messages to a **topic**, optionally with a partition key.
+- **Brokers** — servers that own partitions, append incoming messages to a durable, append-only log, and replicate that log to followers.
+- **Partitions** — each topic is split into ordered, independent logs. A partition is the unit of both ordering and parallelism.
+- **Consumers** (organized into **consumer groups**) — read from partitions starting at a tracked **offset**, process the message, and commit progress.
+
+The topic itself is just a name; the partitions are where the actual data and ordering guarantees live. This is the single most important structural fact to internalize: "the topic is ordered" is never true — only "the partition is ordered" is true.
+
+## The produce path
+
+Follow one `publish(topic, key, value)` call through the system:
+
+1. **Partition assignment.** The producer (or a client-side partitioner) hashes `key` to pick a partition — same key always lands on the same partition, which is what makes per-key ordering possible later.
+2. **Append to leader.** The message is sent to the broker that leads that partition. The leader appends it to its local log — this append is the durability point: before this, the message exists only in the producer's memory or network buffer.
+3. **Replication.** Follower brokers for that partition fetch the new log entries. The leader tracks which followers are "in-sync" (caught up within a configured lag).
+4. **Ack.** The leader acknowledges the write to the producer once it's satisfied its durability policy — acknowledge immediately after the local append (fast, risk of loss if the leader dies before replicating), or wait for all in-sync replicas to confirm (slower, safe against single-broker failure).
+
+That ack policy is exactly the lever the delivery-semantics lesson described: a producer that doesn't wait for any ack and doesn't retry gives you at-most-once; a producer that retries on ambiguous failures gives you at-least-once (with possible duplicates, which is why the ordering/dedup lesson's idempotency keys matter); combining idempotent producer IDs with transactional writes is what gets you exactly-once on the produce side.
+
+## The consume path
+
+1. **Assignment.** Each consumer in a group is assigned a disjoint subset of the topic's partitions — this is why partition count caps parallelism: five partitions means at most five consumers in a group can be actively reading at once, the rest sit idle for that topic.
+2. **Fetch.** A consumer polls its assigned partitions starting from its last known offset, in strict log order.
+3. **Process.** The consumer runs its business logic against the message (write to a database, send an email, update a cache).
+4. **Commit.** The consumer records the offset it has processed up to, either automatically on a timer or manually after processing succeeds.
+
+Offset commit timing is where the delivery-semantics lesson's trade-off physically lives: committing the offset *before* processing means a crash mid-processing loses that message forever (closer to at-most-once); committing *after* processing means a crash after processing but before commit causes reprocessing on restart (at-least-once — the normal default). Getting exactly-once end to end means making the processing side effect and the offset commit atomic, typically via a transactional write that includes both, or by making the downstream write idempotent so reprocessing is harmless.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant P as Producer
+    participant L as Partition Leader
+    participant F as Follower Replica
+    participant C as Consumer
+    P->>L: publish(key, value)
+    L->>L: append to log (offset N)
+    L->>F: replicate entry
+    F-->>L: ack (in-sync)
+    L-->>P: ack (durability policy met)
+    C->>L: fetch from last committed offset
+    L-->>C: messages up to offset N
+    C->>C: process message
+    C->>L: commit offset N
+`} />
+
+## Where retention and storage fit in
+
+The storage/retention lesson's log-segment design is what makes this whole path replayable: because the broker keeps the log (not just a single in-flight queue), a consumer can restart from any offset within the retention window, a new consumer group can start from the beginning to backfill, and a slow consumer can safely lag behind for a while. The failure mode to watch for is a consumer whose processing lag exceeds the retention window — the log truncates entries the consumer hasn't read yet, and those messages are gone regardless of how well the delivery-semantics or offset-commit logic is designed. Retention and consumer speed are a race, not independent settings.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    A[Producer] -->|hash key| B[Partition leader log]
+    B --> C[Replicate to followers]
+    C --> D{Durability policy met?}
+    D -->|Yes| E[Ack producer]
+    B --> F[Consumer fetch from offset]
+    F --> G[Process message]
+    G --> H[Commit offset]
+    B -.retention window.-> I[Old segments truncated]
+`} />
+
+## Worked example: an order-processing queue
+
+Say you're designing the queue behind an e-commerce order pipeline: 5,000 orders/sec at peak, each order must be processed in the order it was placed *for that customer* (not globally), and losing an order is unacceptable but a duplicate charge is not (downstream payment writes are idempotent on order ID).
+
+- **Partitioning key: `customer_id`.** This gives per-customer ordering for free — every order from the same customer lands on the same partition and is read in order — without paying for a single global-order queue that couldn't scale past one partition.
+- **Partition count: 50.** At 5,000 orders/sec, 50 partitions means ~100 orders/sec per partition, comfortably within a single broker's throughput, and gives headroom for up to 50 parallel consumers in a group.
+- **Replication factor: 3, ack policy "all in-sync replicas."** Losing an order is unacceptable, so the extra latency of waiting for replication is the right trade against a rare burst of processing duplicates (which the idempotent payment write already absorbs).
+- **Retention: 3 days.** Long enough to survive a consumer outage over a bad weekend deploy and replay from scratch, short enough to keep storage cost bounded — this is a direct application of the storage/retention lesson's time-based trade-off.
+- **Delivery semantics: at-least-once with idempotent consumers.** Given the payment write is already idempotent on order ID, chasing true exactly-once semantics in the queue itself would add complexity (distributed transactions across produce and commit) for no additional correctness — the cheaper at-least-once plus idempotent downstream write gets the same observable outcome.
+
+<Callout type="warning">
+  A common mistake: treating "design the queue" as listing four boxes — producer, broker, consumer, topic — with arrows between them, and stopping there. That diagram is true of nearly any messaging system and demonstrates nothing. The signal an interviewer is looking for is whether you can trace a single message through partition assignment, the append-then-replicate durability point, and the offset-commit timing — because that's where every guarantee (ordering, at-least-once vs. exactly-once, replay-ability) is actually decided. If you can't say *which specific step* enforces a guarantee you just claimed, you haven't designed the system, you've named its parts.
+</Callout>
+
+<Quiz
+  lessonId="mq-designing-the-messaging-queue"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A topic has 4 partitions and a consumer group has 6 consumers. What happens to the extra 2 consumers?',
+      options: [
+        { id: 'a', text: 'They sit idle for this topic — a partition can only be actively read by one consumer per group at a time', correct: true, explanation: 'Partition count caps in-group parallelism. With 4 partitions and 6 consumers, at most 4 consumers get an assignment; the remaining 2 are idle unless partitions are added or they join a different group.' },
+        { id: 'b', text: 'They each get a partial slice of a partition to read concurrently', correct: false, explanation: 'A partition is not subdivided further within a single consumer group — it is always read by exactly one consumer in that group at a time to preserve ordering.' },
+        { id: 'c', text: 'The broker automatically creates 2 more partitions to match the consumer count', correct: false, explanation: 'Partition count is a topic configuration set by the operator/designer, not something the broker auto-scales in response to consumer count.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which design choices in the order-processing example directly implement a guarantee from an earlier lesson in this module? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Partitioning by customer_id enforces per-customer ordering', correct: true, explanation: 'Same key always maps to the same partition, and partitions are strictly ordered logs — this is exactly how the ordering lesson\'s per-key guarantee is implemented.' },
+        { id: 'b', text: 'Replication factor 3 with an all-in-sync-replica ack policy enforces durability against broker failure', correct: true, explanation: 'Waiting for all in-sync replicas before acking means the message survives the leader broker crashing immediately after the ack — a direct application of the durability trade-off from the produce path.' },
+        { id: 'c', text: 'A 3-day retention window guarantees exactly-once delivery', correct: false, explanation: 'Retention controls how long messages are replayable, not delivery semantics — exactly-once (or at-least-once with idempotent consumers, as chosen here) is enforced by offset-commit timing and downstream idempotency, not retention.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'If a consumer commits its offset immediately after fetching a batch of messages, but before finishing processing them, a crash during processing can cause those messages to be silently skipped on restart.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Committing before processing completes means the broker believes those messages are done. A crash mid-processing loses that work permanently on restart — this is the at-most-once-leaning failure mode described in the consume path.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This is exactly the risk of committing early: the consumer resumes from the committed offset, which is now past the messages that never finished processing.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A partition\'s retention window is 2 days, but a consumer group has been down for 5 days due to an incident. What is the most accurate outcome when it comes back online?',
+      options: [
+        { id: 'a', text: 'Messages older than the 2-day retention window have been truncated from the log and are permanently unavailable to that consumer', correct: true, explanation: 'Retention is enforced independently of any consumer\'s progress — once a segment ages out, it is deleted whether or not every consumer group has read it.' },
+        { id: 'b', text: 'The broker automatically extends retention because a consumer group is behind', correct: false, explanation: 'Brokers do not track "is any consumer group behind" as a signal for retention — retention is a fixed policy applied uniformly to the log.' },
+        { id: 'c', text: 'The consumer resumes from its last committed offset with no data loss, since offsets are never invalidated', correct: false, explanation: 'The offset itself still exists, but it now points at data that has already been deleted by retention — the consumer will jump forward to the oldest available offset and has lost the messages in between.' },
+      ],
+    },
+  ]}
+/>

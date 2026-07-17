@@ -1,0 +1,222 @@
+---
+title: "Indexing"
+module: "Databases"
+moduleOrder: 9
+order: 4
+track: "concept"
+summary: "Explains how database indexes trade write cost and storage for fast reads, and how to reason about which columns to index and which structure to use."
+tags: ["indexing", "databases", "b-trees", "query-performance", "sql"]
+estMinutes: 12
+cheatsheet:
+  - "An index is a separate, sorted (or hashed) structure that maps column values to row locations, so the engine avoids a full table scan."
+  - "B-tree indexes support range queries, sorting, and prefix matches; hash indexes only support exact-match lookups but are faster for those."
+  - "Every index speeds up reads but slows down writes (insert/update/delete must also update the index) and costs extra storage — don't index everything."
+  - "Composite index column order matters: an index on `(a, b)` serves queries filtering on `a` alone or `a` and `b`, but not `b` alone."
+  - "A covering index (includes all columns a query needs) lets the engine answer from the index alone, skipping the row lookup entirely."
+  - "In a sharded system, a query that doesn't filter on the shard key still has to fan out to every shard even with a perfect local index."
+  - "Check `EXPLAIN` output before assuming an index is used — a query can silently fall back to a full scan if a function wraps the indexed column or types don't match."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A table with ten million rows and no index on `user_id` means every
+`WHERE user_id = 42` query scans all ten million rows to find the handful
+that match. At low traffic that's survivable — a few hundred milliseconds,
+nobody notices. At production traffic, that same scan run a thousand times
+a second turns into the thing that pages you at 2am: CPU pinned, disk I/O
+saturated, every other query on the table waiting behind it.
+
+Indexing is how you avoid that. It's one of the highest-leverage,
+lowest-effort tools in the database toolbox, and in interviews it's often
+the first concrete "how do we make this fast" answer after you've already
+picked SQL vs. NoSQL and decided how to replicate and shard. This lesson
+covers how indexes actually work, the trade-offs they impose, and how to
+choose what to index.
+
+## What an index actually is
+
+A table without an index is a pile of rows in whatever order they were
+written (or clustered by primary key, depending on the engine). Finding a
+row by anything other than that order means reading every row — an `O(n)`
+full table scan.
+
+An index is a second data structure, stored alongside the table, that maps
+values of one or more columns to the location of the matching rows. Instead
+of scanning the whole table, the engine looks the value up in the index
+(fast, often `O(log n)`) and jumps straight to the matching rows.
+
+The most common structure is a **B-tree** (or a variant like a B+tree): a
+balanced, sorted tree where each lookup, insert, or delete takes
+`O(log n)` operations. Because the tree is sorted, B-trees also serve
+range queries (`WHERE created_at > '2026-01-01'`), ordering (`ORDER BY`),
+and prefix matches (`WHERE name LIKE 'san%'`) efficiently — not just exact
+matches.
+
+The other common structure is a **hash index**: it maps a value to a
+location via a hash function, giving `O(1)` average-case exact-match
+lookups. It's faster than a B-tree for `WHERE id = 42`, but it can't do
+range queries or sorting at all, because a hash destroys ordering. Most
+general-purpose databases default to B-tree indexes for this reason — you
+rarely know in advance that a column will *only* ever be queried by exact
+match.
+
+## The cost side: why you don't index everything
+
+An index isn't free. Every index you add:
+
+- **Slows down writes.** Every `INSERT`, `UPDATE`, or `DELETE` on the table
+  has to also update every index on that table. Five indexes means five
+  extra structures to keep in sync on every write.
+- **Costs storage.** An index on a large text column can itself be a
+  meaningful fraction of the table's size.
+- **Adds planning overhead.** More indexes give the query planner more
+  options to consider, which is usually good, but on write-heavy tables
+  the accumulated write cost of unused indexes is pure waste.
+
+This is the core trade-off: indexes buy read speed by spending write
+speed and storage. A read-heavy analytics table can afford many indexes.
+A write-heavy event-ingestion table should have as few as the query
+patterns strictly require.
+
+## Choosing what to index
+
+Index the columns that actually appear in your `WHERE`, `JOIN`, and
+`ORDER BY` clauses — not every column that "seems important."
+
+**Composite (multi-column) indexes** cover more than one column, and
+**column order matters**. An index on `(country, city)` is sorted first by
+`country`, then by `city` within each country. That index serves:
+
+- `WHERE country = 'US'` (uses the leading column)
+- `WHERE country = 'US' AND city = 'Austin'` (uses both, in order)
+
+But it does **not** efficiently serve `WHERE city = 'Austin'` alone,
+because without knowing the country first, the engine can't jump to the
+right part of the tree — `city` values for Austin are scattered across
+every country's section of the index. This is the single most common
+indexing mistake: assuming an index on `(a, b)` helps a query that only
+filters on `b`.
+
+A **covering index** includes every column a query needs — filter columns
+and selected columns — so the engine can answer entirely from the index
+without a second lookup into the table's row data. If a query only ever
+runs `SELECT user_id, plan FROM subscriptions WHERE user_id = ?`, an
+index on `(user_id, plan)` covers it completely.
+
+## Indexing in a distributed, sharded system
+
+Indexing decisions don't stop mattering once a table is sharded across
+multiple nodes (see the Partitioning and Sharding lesson in this module).
+A local index on each shard still speeds up queries that hit that shard —
+but if a query doesn't filter on the shard key, it has to fan out to
+every shard and merge results, no matter how good each shard's local
+index is. This is why the shard key choice and the indexing strategy
+aren't independent decisions: a query pattern that can't be served by the
+shard key alone will pay a scatter-gather tax regardless of indexing.
+
+Some systems also build **global secondary indexes** — an index structure
+maintained across all shards for a non-shard-key column — so a query on
+that column can go straight to the right shard instead of fanning out.
+These cost more to maintain (every write may need to update an index
+structure living on a different node) but avoid scatter-gather reads for
+hot secondary-lookup patterns.
+
+<Mermaid client:visible chart={`
+flowchart TD
+    Q[Query: WHERE user_id = 42] --> D{Index exists on user_id?}
+    D -->|No index| S[Full table scan: read every row]
+    D -->|Index exists| I[B-tree lookup: O log n]
+    I --> R[Jump directly to matching row locations]
+    S --> M[Compare user_id on every row]
+    R --> Done[Return matching rows]
+    M --> Done
+`} />
+
+## Worked example: adding an index under load
+
+Say `orders` has 50 million rows, and the checkout page runs:
+
+```sql
+SELECT * FROM orders
+WHERE customer_id = ? AND status = 'pending'
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+Without an index, this is a full scan of 50 million rows per request. At
+200 requests/second, that's the database doing 10 billion row comparisons
+a second just for this one query — nothing else gets a turn.
+
+Add a composite index on `(customer_id, status, created_at)`. Now the
+engine: jumps straight to the `customer_id` value in the B-tree
+(`O(log n)`, roughly 26 comparisons for 50 million rows), narrows to rows
+with `status = 'pending'` within that customer's slice, and reads them
+already sorted by `created_at` — the `ORDER BY` and `LIMIT` become nearly
+free instead of requiring a separate sort step. A request that touched
+50 million rows now touches dozens.
+
+The cost: every new order insert or status update on this table now also
+writes to this index. For a checkout system, writes are far less
+frequent than reads of order history, so this trade is an easy call. For
+a table that's 90% writes and rarely queried by `customer_id`, the same
+index could be a net loss.
+
+<Callout type="warning">
+  A query can silently skip an index you were sure existed. Common causes:
+  wrapping the indexed column in a function (`WHERE YEAR(created_at) = 2026`
+  instead of a range on `created_at`), comparing mismatched types (a string
+  column compared against a number, forcing an implicit cast per row), or a
+  leading wildcard in `LIKE '%term'` (no prefix means the B-tree can't help).
+  Always check the query planner's output (`EXPLAIN` / `EXPLAIN ANALYZE`)
+  rather than assuming — an index that isn't being used is pure write-cost
+  overhead with zero benefit.
+</Callout>
+
+<Quiz
+  lessonId="db-indexing"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'You have a composite index on (country, city). Which query does this index serve efficiently?',
+      options: [
+        { id: 'a', text: "WHERE city = 'Austin'", correct: false, explanation: 'Without filtering on the leading column (country) first, the engine cannot narrow down within the index — city values are scattered across every country.' },
+        { id: 'b', text: "WHERE country = 'US' AND city = 'Austin'", correct: true, explanation: 'This uses the index in column order — country narrows the tree first, then city narrows further within that slice.' },
+        { id: 'c', text: 'Any query filtering on either column alone', correct: false, explanation: 'Column order matters in composite indexes: a query filtering only on the trailing column (city) cannot use the index efficiently.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of the following are real costs of adding an index to a table? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Slower writes, since every insert/update/delete must also update the index', correct: true, explanation: 'Correct — the index is a separate structure kept in sync with every write to the table.' },
+        { id: 'b', text: 'Additional storage for the index structure itself', correct: true, explanation: 'Correct — an index, especially on large or multiple columns, takes its own disk space.' },
+        { id: 'c', text: 'Slower reads on queries that use the index', correct: false, explanation: 'The opposite is true: reads that use the index get faster, going from a full scan to a near-logarithmic lookup.' },
+        { id: 'd', text: 'Potential query-planner overhead from having more index options to consider', correct: true, explanation: 'More indexes give the planner more choices to weigh, which is a real (if usually small) cost.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In a sharded database, a good local index on each shard guarantees a query will avoid scatter-gather across shards.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A local index only speeds up work within a shard. If the query does not filter on the shard key, it still has to fan out to every shard regardless of local indexing.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — avoiding scatter-gather depends on the shard key matching the query pattern (or using a global secondary index), not just on local indexing.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A hash index generally outperforms a B-tree index for which access pattern?',
+      options: [
+        { id: 'a', text: 'Exact-match lookups only, with no range queries or sorting needed', correct: true, explanation: 'Hash indexes give O(1) average-case exact-match lookups but destroy ordering, so they cannot serve range queries or ORDER BY.' },
+        { id: 'b', text: 'Range queries like created_at > X', correct: false, explanation: 'Hashing destroys the ordering a range query needs; a B-tree is required for this pattern.' },
+        { id: 'c', text: 'Prefix matches like LIKE "san%"', correct: false, explanation: 'Prefix matching relies on sorted order, which a hash index does not preserve.' },
+      ],
+    },
+  ]}
+/>

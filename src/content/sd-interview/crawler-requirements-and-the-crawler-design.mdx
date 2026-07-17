@@ -1,0 +1,250 @@
+---
+title: "Requirements and the Crawler Design"
+module: "Design a Web Crawler"
+moduleOrder: 10
+order: 1
+track: "interview"
+summary: "Scopes a web crawler's functional and non-functional requirements, derives crawl-rate and storage estimates, and lays out the core components — frontier, fetchers, parser, and dedup/filter stage — that the rest of the module builds on."
+tags: ["web-crawler", "requirements", "capacity-estimation", "distributed-systems", "interview-framework"]
+estMinutes: 12
+cheatsheet:
+  - "A crawler is a graph-traversal problem at web scale: pages are nodes, links are edges, and the graph is unbounded, dynamic, and adversarial (traps, duplicates, cycles)."
+  - "State scope explicitly: broad web crawl vs. focused/vertical crawl, HTML-only vs. also handling JS-rendered pages, and how often pages get re-crawled — each choice changes the design."
+  - "Split 'discover URLs' from 'fetch a page' from 'extract links and content' into distinct components — the URL frontier, fetcher pool, and parser scale independently and fail independently."
+  - "Estimate throughput as pages-per-second, not pages-per-month — that number tells you how many concurrent fetcher connections you need, since each fetch is dominated by network latency, not CPU."
+  - "The frontier is the crawler's central nervous system: it decides not just what to fetch next but in what order, which is the hook the next lesson's politeness and priority logic hangs on."
+  - "Storage for a large crawl splits into two very different systems: a URL/metadata store (small records, huge count, needs fast existence checks) and a content store (large blobs, sequential writes, rarely read synchronously)."
+  - "Crawler traps (infinite calendar pages, auto-generated session URLs) aren't an edge case to patch later — assume they exist from the first design and bound crawl depth/count per host."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design a web crawler" looks deceptively contained: fetch a page, find the
+links on it, fetch those too. Most candidates can sketch that loop in thirty
+seconds. What separates a strong answer from a weak one is everything that
+loop doesn't show — the web has no known size, a huge share of it is
+duplicate or near-duplicate content, some pages regenerate infinite new URLs
+on purpose or by accident, and a naive crawler will either get stuck forever
+on one site or get its IP banned by every site it touches on day one.
+
+This lesson scopes the problem the way you should in the first ten minutes
+of the interview: what the crawler actually needs to do, how big "big" is,
+and the shape of a design that can hold that scale. The next lesson,
+Politeness, Deduplication, and Scaling, goes deep on the three hardest
+sub-problems this design surfaces. Here, the goal is a defensible skeleton.
+
+## Step 1: Scope the functional requirements
+
+Get these on the table before designing anything:
+
+- **Seed and discover.** Start from a set of seed URLs, fetch each page,
+  extract outbound links, and add newly discovered URLs back into the work
+  queue. This is the core loop.
+- **Store crawled content.** Downstream systems (a search index, a data
+  pipeline, an archive) need the fetched HTML and extracted metadata, not
+  just a list of visited URLs.
+- **Avoid re-fetching the same page repeatedly.** A URL, and ideally a
+  piece of content, should not be fetched over and over with no benefit.
+- **Re-crawl over time.** Pages change. A one-shot crawl is rarely the
+  actual requirement — most real systems need pages refreshed on some
+  cadence, faster for pages that change often (news homepages) and slower
+  for pages that rarely do (a company's "About" page).
+
+Just as important is naming what's out of scope, out loud: rendering
+JavaScript-heavy single-page apps, crawling behind logins, and full
+duplicate-content clustering across the entire corpus are all real problems
+a production crawler eventually faces, but each is its own design
+discussion. For this module, assume a broad crawl of public, mostly-static
+HTML pages, refreshed periodically.
+
+### Non-functional requirements
+
+- **Scalability.** The design must handle billions of pages and keep
+  growing without a redesign — this pushes toward a distributed,
+  horizontally scalable architecture from the start, not a single machine
+  with a queue.
+- **Politeness.** The crawler must not overwhelm any single web server. This
+  is a hard constraint, not a nice-to-have — violate it and your crawler
+  gets IP-blocked, which ends the crawl for that host entirely. (Full
+  treatment in the next lesson.)
+- **Robustness.** The open web is adversarial by default: malformed HTML,
+  redirect loops, multi-gigabyte files, servers that hang instead of
+  responding, and deliberately generated infinite URL spaces (crawler
+  traps). The design must bound resource use per host and per URL rather
+  than trusting the web to behave.
+- **Freshness over completeness.** It's usually better to have slightly
+  stale coverage of the whole web than perfectly fresh coverage of a
+  fraction of it — freshness budget should be spent where content actually
+  changes.
+- **Extensibility.** New content types, new extraction rules, or new
+  priority signals should be pluggable without rewriting the fetch loop.
+
+<Callout type="tip">
+  Say the scope out loud early: "I'll assume a broad crawl of public HTML
+  pages at web scale, with periodic re-crawling for freshness — not
+  JS-rendered pages or authenticated content. Does that match what you had
+  in mind?" This single sentence usually saves you from designing the wrong
+  system for fifteen minutes.
+</Callout>
+
+## Step 2: Establish the scale
+
+Concrete numbers turn "a big crawler" into a design you can defend:
+
+- Target: crawl 1 billion pages per month.
+- Average fetched page size (HTML only): 500 KB.
+- Average number of outbound links extracted per page: 20.
+- Re-crawl policy: most pages re-crawled roughly every 30 days, with a
+  smaller high-priority set (news, frequently updated pages) re-crawled
+  daily.
+
+From the monthly target, derive throughput:
+
+- 1,000,000,000 pages per month divided by roughly 2,600,000 seconds in a
+  30-day month gives about 385 pages/sec average sustained fetch rate.
+- Peak provisioning at a 2-3x multiplier for headroom and re-crawl bursts:
+  roughly 1,000 pages/sec at peak.
+- Content storage: 1,000,000,000 pages multiplied by 500 KB is about
+  500 TB per crawl cycle. Retaining a few months of history for
+  freshness comparison pushes this into low-petabyte territory over time.
+- URL/metadata volume: 1 billion crawled pages multiplied by 20 links each
+  is 20 billion discovered URL references per month — most pointing at
+  URLs already known, which is exactly why a fast "have we seen this
+  before" check matters more than raw fetch speed.
+
+<Callout type="tip">
+  State the re-fetch assumption explicitly — it's the number an
+  interviewer is most likely to push on. "Most pages re-crawled every 30
+  days, hot pages daily" is a specific, defensible policy; "we crawl
+  everything as often as possible" isn't a policy at all.
+</Callout>
+
+## Step 3: The high-level shape of the design
+
+Break the single "fetch, extract, repeat" loop into components that scale
+and fail independently:
+
+1. **URL frontier** — the queue of URLs waiting to be fetched. Not a plain
+   FIFO: it needs to decide ordering (priority, freshness) and pacing per
+   host, which is the subject of the next lesson.
+2. **Fetcher pool** — a horizontally scaled set of workers that pull a URL
+   from the frontier, resolve DNS, open a connection, and download the
+   page. Since each fetch is dominated by network round-trip time, not CPU,
+   a single machine can run many fetches concurrently.
+3. **URL filter** — before a URL ever reaches the frontier, check it against
+   robots.txt rules, URL-scheme/extension allowlists (skip `.zip`, `.mp4`,
+   etc. if out of scope), and a "seen before" store, so obviously
+   unwanted or duplicate work never enters the queue.
+4. **Parser and link extractor** — takes downloaded HTML, extracts the
+   text/metadata for storage and the outbound links for re-queueing.
+5. **Content store** — durable storage (object storage, not a relational
+   database) for the fetched page bodies, keyed by URL or content hash.
+6. **URL/metadata store** — a separate, smaller-record store tracking each
+   URL's crawl state (queued, fetched, last-crawled time, content hash) —
+   this is what the "seen before" check in the filter queries.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    Seeds[Seed URLs] --> Frontier[URL frontier]
+    Frontier --> Fetchers[Fetcher pool]
+    Fetchers --> Parser[Parser / link extractor]
+    Parser --> ContentStore[(Content store)]
+    Parser --> NewURLs[Extracted URLs]
+    NewURLs --> Filter[URL filter: robots.txt, seen-before, scope]
+    Filter --> Frontier
+    Fetchers --> MetaStore[(URL / metadata store)]
+`} />
+
+Notice the loop: extracted links flow back through the filter before
+re-entering the frontier, so a page that's already fully crawled, or a URL
+that robots.txt disallows, never gets re-queued. That filter step is doing
+most of the work that keeps this from turning into an infinite, wasteful
+crawl.
+
+## Worked example: sizing the fetcher pool
+
+Take the 1,000 pages/sec peak target from Step 2. If a single fetch (DNS
+lookup, connection, download, TLS where needed) takes an average of 2
+seconds end-to-end, and each fetcher worker can hold, say, 200 connections
+open concurrently using asynchronous I/O, one worker sustains roughly
+200 connections divided by 2 seconds per fetch, or 100 pages/sec.
+
+To hit 1,000 pages/sec peak, you need roughly 1,000 divided by 100, or
+about 10 fetcher workers running concurrently — a small, horizontally
+scalable pool, not hundreds of machines. The bottleneck this reveals isn't
+raw fetch capacity; it's making sure the frontier can hand out 1,000
+politeness-compliant URLs per second without starving any single host or
+handing out URLs faster than the filter and metadata store can validate
+them. That hand-off — frontier throughput under politeness constraints — is
+exactly where the next lesson picks up.
+
+<Callout type="warning">
+  A common mistake is designing the frontier as a single shared FIFO queue.
+  Under real crawl conditions, a handful of large, highly-linked sites (a
+  major news outlet, a popular forum) dominate the queue with thousands of
+  their own URLs, so fetchers end up hammering those few hosts back-to-back
+  while the rest of the crawl starves. Any workable frontier design needs
+  per-host queuing or throttling built in from the start, not bolted on
+  after the first IP ban.
+</Callout>
+
+## Where this leads
+
+The skeleton here — frontier, filter, fetcher pool, parser, and two
+separate stores — is what makes the harder problems tractable. The next
+lesson takes each weak point in this design and hardens it: how the
+frontier enforces per-host politeness without starving the rest of the
+crawl, how to detect duplicate and near-duplicate content cheaply at
+billions-of-pages scale, and how to shard and scale each component as the
+crawl grows past a single data center's worth of fetchers.
+
+<Quiz
+  lessonId="crawler-requirements-and-the-crawler-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A crawler targets 1 billion pages per month. Roughly what average sustained fetch rate does that imply?',
+      options: [
+        { id: 'a', text: 'About 385 pages/sec', correct: true, explanation: '1,000,000,000 pages divided by roughly 2,600,000 seconds in a 30-day month is about 385 pages/sec average.' },
+        { id: 'b', text: 'About 1,000 pages/sec', correct: false, explanation: 'That figure is closer to the peak-provisioned rate after applying a headroom multiplier, not the average sustained rate.' },
+        { id: 'c', text: 'About 11,600 pages/sec', correct: false, explanation: 'This overstates the rate by roughly 30x; it does not match dividing 1 billion pages by the seconds in a month.' },
+        { id: 'd', text: 'About 20 pages/sec', correct: false, explanation: 'This understates required throughput well below what 1 billion pages/month demands.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are good reasons to split "URL frontier," "fetcher pool," and "parser/link extractor" into separate components rather than one monolithic fetch loop? (Select all that apply.)',
+        options: [
+        { id: 'a', text: 'Each component has a different bottleneck (queue ordering vs. network I/O vs. CPU-bound parsing) and scales differently', correct: true, explanation: 'The frontier is about ordering and coordination, fetchers are I/O-bound and benefit from high concurrency, and parsing is CPU-bound — conflating them means you cannot scale the actual bottleneck independently.' },
+        { id: 'b', text: 'It lets one component fail or be redeployed without stopping the whole crawl', correct: true, explanation: 'A parser bug or a fetcher pool restart does not need to halt URL discovery if the frontier is a separate, durable component.' },
+        { id: 'c', text: 'It guarantees the crawler never revisits the same URL twice', correct: false, explanation: 'Splitting components does not by itself prevent re-visits — that requires the URL filter and metadata store to run a "seen before" check, a separate design decision.' },
+        { id: 'd', text: 'It eliminates the need for a politeness policy per host', correct: false, explanation: 'Component separation does not remove the need for per-host pacing; politeness has to be designed into the frontier explicitly, as the next lesson covers.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In this design, a single shared FIFO queue is a safe choice for the URL frontier as long as the fetcher pool is large enough.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A large fetcher pool does not fix a FIFO frontier — a handful of high-link-count hosts can still dominate the queue, and more fetchers just means those same hosts get hammered harder and faster.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. A plain FIFO frontier lets a few large sites flood the queue with their own URLs, starving the rest of the crawl and risking IP bans regardless of fetcher pool size — per-host queuing or throttling is required.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why does this design use two separate stores — a URL/metadata store and a content store — instead of one combined database?',
+      options: [
+        { id: 'a', text: 'Because the two stores have very different record sizes and access patterns: small, high-volume metadata needing fast existence checks versus large, sequentially-written page bodies', correct: true, explanation: 'Metadata records (URL, crawl state, timestamp, content hash) are small and queried constantly for "have we seen this" checks; content blobs are large, written once per fetch, and rarely read synchronously — different storage systems suit each.' },
+        { id: 'b', text: 'Because regulations require crawled content and URL metadata to be stored in physically separate data centers', correct: false, explanation: 'No such regulatory requirement is part of this design; the split is driven by access-pattern and data-shape differences, not compliance.' },
+        { id: 'c', text: 'Because a single store cannot durably persist more than a few million records', correct: false, explanation: 'Modern databases and object stores can hold far more than a few million records; the split here is about workload shape, not a hard capacity ceiling.' },
+        { id: 'd', text: 'Because the fetcher pool needs two stores to run more concurrent connections', correct: false, explanation: 'Fetcher concurrency is about connection handling and async I/O, unrelated to how many storage systems back the crawl.' },
+      ],
+    },
+  ]}
+/>

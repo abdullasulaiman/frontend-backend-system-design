@@ -1,0 +1,242 @@
+---
+title: "High-Level Design"
+module: "Design a Proximity Service (Yelp)"
+moduleOrder: 4
+order: 2
+track: "interview"
+summary: "Lays out the major components of a nearby-places service — ingestion, a geospatial index, a read-heavy query path, and caching — and explains why each one is shaped the way it is."
+tags: ["proximity-service", "system-design", "architecture", "geospatial", "caching"]
+estMinutes: 12
+cheatsheet:
+  - "Split the system into a write path (business owners add/update places, low volume) and a read path (users search nearby, extremely high volume) — they need completely different scaling strategies."
+  - "A naive query — scan every row, compute distance, filter — doesn't work past a few thousand rows; you need a geospatial index (grid, geohash, or quadtree) to prune the search space before computing exact distances."
+  - "The index answers 'which cells overlap this radius,' not 'give me the final sorted list' — you still fetch candidate place IDs from the index, hydrate full records from a data store, compute exact distance, then sort and trim."
+  - "This workload is read-dominated and latency-sensitive but tolerant of staleness — a place that moved 5 minutes ago showing at the old spot for a bit is a non-issue, which is exactly the profile a cache thrives on."
+  - "Cache by (rounded location, radius, category) key, not per-user — many users in the same few city blocks ask nearly the same question, so a coarse cache key gets a much higher hit rate than one keyed on exact lat/lng."
+  - "Keep the geospatial index in memory (or a purpose-built in-memory service) — recomputing which grid cells a radius touches on every request, from disk, is the single biggest latency risk in this design."
+  - "Don't let a single 'places' database try to serve both the geo-lookup and the full-text/filter query — separate the spatial index from the metadata store, similar to how a search index is separate from a metadata store elsewhere."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson pinned down the shape of the problem: tens of millions of
+places, a read QPS that dwarfs the write QPS by orders of magnitude, and a p99
+latency budget in the tens of milliseconds for "what's near me." None of that
+matters yet, though, until you turn it into boxes on a whiteboard. The trap
+most candidates fall into here is treating this as "a database with a
+`WHERE distance < 5km` clause" — that works in a demo with 500 rows and falls
+over completely once you're past a few thousand, because there's no index
+that makes "distance from an arbitrary point" cheap to filter on directly.
+The real design hinges on one decision: introduce a purpose-built geospatial
+index that sits in front of the place data, and let it do the heavy lifting
+of narrowing millions of places down to a few hundred candidates before you
+ever touch exact distance math.
+
+## Separate the write path from the read path
+
+Start by noticing these are two almost unrelated workloads sharing one
+dataset:
+
+- **Write path**: business owners add a new place, update hours, or a
+  location gets corrected. Volume is tiny — thousands of writes a day across
+  the whole system — and a few seconds of propagation delay is completely
+  fine.
+- **Read path**: a user opens the app and asks "what's near me right now."
+  Volume is enormous, bursty (lunchtime, weekend evenings), and latency
+  sensitive — nobody tolerates a two-second spinner for a list of nearby
+  coffee shops.
+
+Because the read path so drastically outweighs the write path, and because
+staleness is cheap here (a place that moved 10 minutes ago still showing at
+its old coordinates for a little while is not a correctness bug), the design
+should optimize almost entirely for fast, cheap reads and treat writes as a
+background concern that eventually catches up.
+
+## Major components
+
+### Place data store
+
+The system of record for place details — name, category, address, hours,
+attributes — keyed by place ID. This is a fairly ordinary database (relational
+or document store both work); nothing about it needs to be geospatially
+aware. It's written to rarely and read from only to hydrate full records for
+a small set of candidate IDs, never scanned to answer "what's nearby."
+
+### Geospatial index
+
+The component that actually answers "which places are near this point."
+Conceptually it maps geographic space into buckets (a grid, a geohash string,
+or a quadtree cell — the next lesson covers these in depth) and stores, per
+bucket, the list of place IDs whose location falls inside it. A query for
+"places within 3km of (lat, lng)" becomes: figure out which buckets overlap
+that radius, fetch the place IDs in those buckets, then compute exact
+distance only for that much smaller candidate set. This index is rebuilt (or
+incrementally updated) whenever a place is added or its location changes, and
+it's read on essentially every user search — which is why it belongs in
+memory or in a service purpose-built for fast spatial lookups, not as an
+afterthought bolted onto the relational place store.
+
+### Query / ranking service
+
+The service a client actually talks to. Given a user's location, a radius,
+and optional filters (category, open-now, rating), it: asks the geospatial
+index for candidate place IDs, hydrates those IDs against the place data
+store (or a denormalized read replica of it), computes exact distance for
+each candidate, applies any remaining filters, sorts by distance (or a
+blended relevance score), and returns a page of results. This is where a
+cache sits, because the same rough query — "restaurants near downtown right
+now" — repeats across thousands of different users within the same few
+minutes.
+
+### Ingestion / indexing pipeline
+
+Handles the write path: a new or updated place gets validated, written to the
+place data store, and then the geospatial index is updated to reflect its
+current bucket. This can run asynchronously — a new restaurant appearing in
+search results 30 seconds after being added is a non-event, so there's no
+need to make index updates synchronous with the write, and doing them async
+keeps the write path simple and keeps load off the latency-critical index.
+
+### Cache layer
+
+Sits in front of the query service, keyed on a rounded location plus radius
+plus filters (more on the key design below). Because the read traffic is so
+skewed toward popular areas — city centers, business districts at lunchtime —
+a cache absorbs a large fraction of read traffic before it ever reaches the
+geospatial index, which is what makes the tight latency budget achievable at
+the estimated scale.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    Owner[Business owner: add/update place] --> Ingest[Ingestion pipeline]
+    Ingest --> PlaceDB[(Place data store)]
+    Ingest --> GeoIndex[(Geospatial index)]
+
+    User[User: search nearby] --> Cache{Cache hit?}
+    Cache -->|hit| User
+    Cache -->|miss| QuerySvc[Query / ranking service]
+    QuerySvc --> GeoIndex
+    QuerySvc --> PlaceDB
+    QuerySvc --> Cache
+    QuerySvc --> User
+`} />
+
+## Why the index has to sit between the query and the data store
+
+It's worth being explicit about why you can't just add a spatial column and
+an index to the place database and call it done. A B-tree style index sorts
+on one dimension; distance from an arbitrary point is a two-dimensional,
+query-time-dependent quantity — there's no way to pre-sort rows so that "the
+next N closest to this specific point" falls out of a simple range scan the
+way "the next N alphabetically" does. Specialized geospatial structures exist
+precisely to solve this: they trade a small amount of precision (you get
+candidates from whole buckets, not an exact ranked list) for the ability to
+prune millions of rows down to hundreds before doing any real distance math.
+That pruning step is the entire reason this system can hit a sub-100ms
+budget — computing exact Haversine distance for 20 million places per query
+is not viable at any read volume worth caring about; computing it for 200
+candidates is trivial.
+
+## Cache key design
+
+A tempting-but-wrong cache key is the user's exact GPS coordinates. That gets
+almost no reuse — two users standing 30 meters apart produce different keys
+and both miss the cache, even though they'd get near-identical results.
+Instead:
+
+- Round the location to a coarse grid (for example, the same geohash-style
+  cells the index itself uses, at a resolution of a few hundred meters).
+- Combine that with radius and any filters into the key.
+- Serve a query from any user landing in the same cell with the same filters
+  from one cached result.
+
+This turns "millions of unique GPS coordinates" into a much smaller set of
+popular (cell, radius, filter) combinations, and it's why the cache hit rate
+in a real system like this is high — most searches cluster around a
+relatively small number of dense areas.
+
+## Worked example: lunchtime rush near an office tower
+
+Picture midday on a weekday: thousands of people within a few office towers
+downtown all search "lunch near me" within a 10-minute window. Without
+caching, that's thousands of independent geospatial-index lookups against
+nearly the same physical area — wasted work, since the answer barely changes
+person to person. With a coarse cache key, the first handful of requests miss
+the cache, hit the query service, which asks the geospatial index for
+candidate places in the surrounding cells, hydrates and ranks them, and
+writes the result into the cache. Every other user in roughly that same area
+over the next several minutes gets a cache hit and never touches the index or
+the place store at all. The design absorbs a traffic spike that would
+otherwise scale linearly with the number of nearby users, and turns it into a
+handful of index lookups plus a flood of cheap cache reads — exactly the
+profile you want for a workload this skewed toward popular locations at
+popular times.
+
+<Callout type="warning">
+  A common mistake is designing the geospatial index and the ranking/filtering
+  logic as one inseparable step — for example, having the index itself try to
+  apply "open now" or "rating above 4 stars" filters. Keep the index doing
+  exactly one job (narrow candidates by location), and apply business filters
+  afterward against the hydrated records. Baking filters into the spatial
+  index makes it harder to update independently and couples two concerns
+  (spatial pruning vs. business rules) that change for completely different
+  reasons and at completely different rates.
+</Callout>
+
+## Where this leaves you
+
+This lesson's job was to justify the shape of the system: a small, slow write
+path feeding an index that a much larger, fast read path depends on, with a
+cache absorbing the skew in real-world query patterns. The next lesson digs
+into how that geospatial index actually works — geohashing and quadtrees, and
+the trade-offs between them — followed by a lesson that puts the full request
+flow together with concrete APIs, and a final lesson on scaling this design
+past a single region.
+
+<Quiz
+  lessonId="proximity-high-level-design"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why can\'t a proximity service just add a spatial column with a standard database index and rely on that alone to answer "places within 5km of this point" quickly at scale?',
+      options: [
+        { id: 'a', text: 'A standard index sorts on one dimension and can\'t pre-sort rows by distance from an arbitrary, query-time-supplied point, so it can\'t prune the search space the way a purpose-built geospatial index can.', correct: true, explanation: 'Correct — distance from an arbitrary point is computed at query time, not something you can pre-sort a single column by, which is exactly why dedicated geospatial structures exist.' },
+        { id: 'b', text: 'Databases cannot store latitude and longitude values.', correct: false, explanation: 'Databases store numeric coordinates fine — the problem isn\'t storage, it\'s that no simple index lets you cheaply filter by distance from an arbitrary point.' },
+        { id: 'c', text: 'Because writes are too frequent for an index to keep up with.', correct: false, explanation: 'Writes (new/updated places) are relatively rare in this system — the challenge is the read path\'s query pattern, not write volume.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which design choices help this system meet a tight read-latency budget at high read volume? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Keeping the geospatial index in memory rather than recomputing candidate cells from disk on every request', correct: true, explanation: 'The index is read on nearly every query, so keeping it fast (in-memory) is central to hitting a tight latency budget.' },
+        { id: 'b', text: 'Caching results keyed on a coarse, rounded location plus radius and filters', correct: true, explanation: 'Rounding the key lets many nearby users share one cached answer, which is what gives the cache a meaningful hit rate under real-world query clustering.' },
+        { id: 'c', text: 'Making index updates from new place writes synchronous with the write request', correct: false, explanation: 'The opposite is preferable — since staleness of a new place for tens of seconds is a non-issue, updating the index asynchronously keeps the write path simple and avoids adding latency-critical work to a low-volume path.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'The geospatial index should also apply business filters like "open now" or "rating above 4 stars" directly, so the query service can skip a separate filtering step.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Baking business rules into the spatial index couples two concerns that change independently and at different rates — the index should only narrow candidates by location; filters apply afterward against hydrated records.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — keep the geospatial index focused on one job (spatial pruning) and apply business filters as a separate step after hydrating candidate records.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why does keying the cache on a user\'s exact GPS coordinates perform poorly compared to keying on a rounded location cell?',
+      options: [
+        { id: 'a', text: 'Exact coordinates take more storage space than rounded ones.', correct: false, explanation: 'Storage size difference is negligible and not the reason this matters — the issue is hit rate, not storage.' },
+        { id: 'b', text: 'Two users standing meters apart produce different exact-coordinate keys and both miss the cache, even though they\'d get nearly identical results — rounding lets them share one cached answer.', correct: true, explanation: 'Correct — coarse keys let nearby users converge on the same cache entry, which is what produces a useful hit rate given real-world query clustering around popular areas.' },
+        { id: 'c', text: 'Exact coordinates cannot be hashed into a cache key.', correct: false, explanation: 'Exact coordinates can absolutely be hashed — the problem is that doing so produces keys too unique to be reused across nearby users, not a technical inability to hash them.' },
+      ],
+    },
+  ]}
+/>

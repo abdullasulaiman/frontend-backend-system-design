@@ -1,0 +1,124 @@
+---
+title: "Designing the Scheduler"
+module: "Distributed Task Scheduler"
+moduleOrder: 23
+order: 3
+track: "concept"
+summary: "Assembles the scheduling loop, leader election, and lease-based dispatch into one end-to-end design that fires jobs exactly when due without double-executing them."
+tags: ["task-scheduler", "distributed-systems", "leader-election", "architecture", "system-design"]
+estMinutes: 13
+cheatsheet:
+  - "Split the system into three roles: the scheduler decides *what's due*, the queue *buffers* the work, and workers *execute* it — never let one role do another's job."
+  - "Only one scheduler instance may be active at a time for a given job partition; use a distributed lock or lease (etcd, ZooKeeper, a DB row with TTL) to enforce this, since two active schedulers means duplicate fires."
+  - "A min-heap or time-bucketed index keyed on next-fire-time turns 'which jobs are due' from a full table scan into a cheap peek-and-pop, which is what makes sub-second scheduling ticks viable at scale."
+  - "Dispatch to a worker is a lease, not a handoff: the worker must heartbeat during execution, and a missed heartbeat lets the scheduler requeue the job to another worker after the lease expires."
+  - "Leases plus at-least-once delivery mean a job can run more than once — the scheduler cannot prevent this alone, so execution must be idempotent (dedup by job-run ID) or the design is incomplete."
+  - "Track task state explicitly (pending, queued, running, succeeded, failed, retrying) and persist transitions — this is what lets a crashed scheduler resume without losing or duplicating in-flight work."
+  - "Clock skew between the scheduler and workers is a real failure mode: base lease expiry on a monotonic timer measured by the same node that owns the lease, not on comparing wall-clock timestamps across machines."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lessons in this module nailed down what the scheduler needs to support (retries, priorities, dependencies) and how jobs and their run history are stored and queued. This lesson is where those pieces become an actual running system: something that wakes up, decides which of a million stored jobs are due right now, hands each one to exactly one worker, and survives that worker — or the scheduler itself — crashing mid-execution.
+
+The hard part isn't storing "run this job at 3am daily." It's the *loop*: efficiently finding what's due without scanning every job on every tick, guaranteeing only one scheduler instance acts on a given job even when you run several for availability, and handing work to workers in a way that survives failure without silently dropping or duplicating a run. Get the loop wrong and every guarantee from the requirements lesson — "runs once," "retries on failure," "meets its deadline" — falls apart in practice even if the data model is perfect.
+
+## The three roles
+
+A distributed scheduler cleanly separates into three responsibilities, and conflating them is where most designs go wrong:
+
+- **Scheduler (the brain)** — periodically figures out which jobs are due, and enqueues a *run* for each one. It never executes application code itself.
+- **Queue (the buffer)** — decouples "job became due" from "a worker is free to run it." This is the queue you designed in the data-model lesson; here we care about how the scheduler writes to it and how workers read from it.
+- **Workers (the muscle)** — pull runs off the queue, execute the job's actual work, report success or failure, and heartbeat while running so the system knows they're still alive.
+
+Keeping these separate means each one scales independently: you can run more workers under load without touching the scheduling logic, and you can add a second scheduler for availability without it needing to know anything about how jobs are actually executed.
+
+## The scheduling loop
+
+At its core, the scheduler runs a tick: wake up on an interval (say, every second), ask "which jobs have a next-fire-time less than or equal to now," enqueue a run for each, and compute each one's *next* fire time before going back to sleep.
+
+The naive version of "which jobs are due" is `SELECT * FROM jobs WHERE next_fire_time <= NOW()` — fine at a thousand jobs, ruinous at ten million, because it's a full index range scan every single tick even when almost nothing is due. The fix is to keep an in-memory **min-heap keyed on next-fire-time**, sharded across scheduler instances by job ID. Each tick, you peek the heap's minimum: if it's due, pop it, enqueue the run, recompute its next occurrence (parsing the cron expression or adding the fixed interval), and push it back in. If the minimum isn't due yet, there's nothing to do this tick. This turns "find due jobs" from an O(n) scan into an O(log n) peek-and-pop, and it's the same trick a timer wheel or a priority-queue-based OS scheduler uses for the identical problem at a different layer.
+
+The heap is a cache of the durable job table, rebuilt on scheduler startup (or on ownership handoff) by loading each owned job's next-fire-time — the source of truth stays on disk; the heap just makes the hot path fast.
+
+## Leader election: exactly one active scheduler per shard
+
+Run only one scheduler instance and it's a single point of failure. Run several active at once with no coordination and they'll all see the same due job and enqueue it multiple times — a duplicate fire, not a retry, and one your retry-count logic will misclassify.
+
+The standard fix is a **distributed lock with a lease**: scheduler instances race to acquire ownership of a shard of the job space (by hash range, by job ID modulo N, or by a partition assignment from a coordination service like etcd or ZooKeeper). Whoever holds the lock for a shard is the only instance allowed to tick jobs in it. The lock has a TTL and must be renewed periodically; if the holder crashes or is partitioned away, the lease expires and another instance takes over that shard, rebuilding its heap from the durable store before resuming ticks.
+
+This is the same lease pattern you'll use again for worker dispatch below — it's worth internalizing once: **ownership is time-bounded and must be actively renewed, not assumed to hold forever.**
+
+## Dispatch: lease, don't handoff
+
+Once a run is enqueued, a worker pulls it. The naive model — worker pulls the message, the message is gone from the queue, worker executes — has no way to recover if the worker dies mid-execution: the job silently never finishes and nothing notices.
+
+Instead, dispatch should be a **lease**: the worker pulls the run, the queue marks it invisible/reserved for a bounded lease duration, and the worker must heartbeat (or explicitly extend the lease) while it's still working. If the lease expires with no heartbeat, the scheduler assumes the worker is dead or hung and makes the run visible again for another worker to pick up. This is exactly the visibility-timeout pattern most managed queues (SQS, and similar systems) provide natively, and it's what lets the system recover from a worker crash without any scheduler-side polling of worker health.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant S as Scheduler (leader)
+    participant H as Fire-time heap
+    participant Q as Queue
+    participant W as Worker
+    S->>H: peek min next-fire-time
+    H-->>S: job J is due
+    S->>Q: enqueue run(J), mark J's next fire time
+    S->>H: push J back with new fire time
+    W->>Q: pull run(J), lease starts
+    loop while running
+        W->>Q: heartbeat (extend lease)
+    end
+    W->>Q: report success/failure
+    Q-->>S: update run state, done
+`} />
+
+## Task state machine
+
+Persist every run's state so the system can resume correctly after any crash: `pending` (enqueued, not yet leased) to `running` (leased to a worker) to either `succeeded`, `failed` (retries exhausted), or `retrying` (failed, will re-enqueue per the backoff policy from the requirements lesson). A run that's `running` with an expired lease and no heartbeat transitions back to `pending` automatically — that's the recovery path, and it must be a state transition your storage layer actually records, not just an in-memory assumption.
+
+## Worked example: sizing the tick for 5 million jobs
+
+Say you have 5 million scheduled jobs, averaging one fire every 10 minutes each — about 8,300 fires/second system-wide. A single scheduler shard holding, say, 500,000 of those jobs in its heap needs to support roughly 830 pops/second at peak. A binary heap pop/push is `O(log n)` — with `n` = 500,000, that's about 19 comparisons per operation, comfortably under a millisecond even on modest hardware, so a 1-second tick interval leaves enormous headroom; the bottleneck in practice is almost always the durable write to persist the new fire time and the queue enqueue, not the heap math itself. This is why production designs batch those writes and shard the job space across roughly 8-16 scheduler instances well before heap CPU becomes the constraint — durability I/O, not scheduling logic, is what you scale for.
+
+<Callout type="warning">
+  A common mistake: treating the lease/heartbeat mechanism as making execution "exactly once." It doesn't — a worker can finish the job, crash before reporting success, and have its lease expire, causing the scheduler to legitimately reschedule a run that already completed. Leases only bound *how long* you wait before assuming a worker is dead; they can't distinguish "dead before finishing" from "finished but died before reporting." The only real fix is making job execution idempotent — dedup by a unique run ID so a second execution of the same run is a safe no-op — and treating "at least once" as the actual delivery guarantee you're designing for, not a bug to eliminate.
+</Callout>
+
+<Quiz
+  lessonId="sched-designing-the-scheduler"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does a scheduler use a min-heap keyed on next-fire-time instead of repeatedly querying "WHERE next_fire_time <= NOW()" against the full job table?',
+      options: [
+        { id: 'a', text: 'It turns finding due jobs into an O(log n) peek/pop instead of an O(n) scan on every tick', correct: true, explanation: 'A full-table range query re-scans every job each tick even when almost nothing is due; a heap lets the scheduler check only the single soonest job in logarithmic time.' },
+        { id: 'b', text: 'It removes the need to persist job schedules durably', correct: false, explanation: 'The heap is a fast in-memory cache of the durable store, not a replacement for it — the source of truth still lives on disk and the heap is rebuilt from it on failover.' },
+        { id: 'c', text: 'It guarantees a job never fires twice, even across scheduler restarts', correct: false, explanation: 'The heap only speeds up finding due jobs. Preventing duplicate fires is the job of leader election and leases, not the heap data structure.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which mechanisms in this lesson are examples of a time-bounded lease that must be actively renewed? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A scheduler instance holding ownership of a shard of the job space', correct: true, explanation: 'Shard ownership is acquired via a distributed lock with a TTL and must be renewed, or another instance takes over — a lease.' },
+        { id: 'b', text: 'A worker holding a leased run while executing a job', correct: true, explanation: 'The worker must heartbeat to extend its lease on the run; if it stops heartbeating, the lease expires and the run becomes visible to another worker.' },
+        { id: 'c', text: 'A job\'s cron expression defining how often it repeats', correct: false, explanation: 'A cron expression is a static schedule definition, not a claim of ownership that needs renewal — it doesn\'t expire or get contended for.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Using leases with heartbeats for worker dispatch is sufficient by itself to guarantee a job executes exactly once.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A worker can complete the job and then crash before reporting success, causing a legitimate but duplicate re-execution once its lease expires. Leases bound wait time, not delivery count.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Leases only give at-least-once delivery; true exactly-once outcomes require idempotent execution (deduping by run ID) on top of the lease mechanism.' },
+      ],
+    },
+  ]}
+/>

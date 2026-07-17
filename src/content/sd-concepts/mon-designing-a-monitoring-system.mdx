@@ -1,0 +1,148 @@
+---
+title: "Designing a Monitoring System"
+module: "Distributed Monitoring"
+moduleOrder: 13
+order: 3
+track: "concept"
+summary: "Walks through designing a monitoring system end to end — agents, ingestion, storage, alerting, and dashboards — and the capacity math and trade-offs behind each piece."
+tags: ["monitoring", "observability", "alerting", "time-series", "system-design"]
+estMinutes: 13
+cheatsheet:
+  - "Split the pipeline into five stages: collection (agents), ingestion (buffering/batching), storage (time-series DB), alerting (rule evaluation), and visualization (dashboards) — each scales and fails independently."
+  - "Push agents that batch-and-forward beat 'call home on every metric' — a 10-second flush interval cuts network calls by roughly 10x for negligible added alerting delay."
+  - "Aggregate before you write: pre-aggregating counters/histograms at the agent (or a local collector) avoids shipping raw high-cardinality samples across the network."
+  - "Alerting must read from replicated/queryable storage, not the live ingestion buffer directly — otherwise an ingestion outage silently blinds your alerts exactly when you need them most."
+  - "Downsample old data (1s -> 1min -> 1hr resolution) on a retention schedule; nobody needs second-level precision on metrics from 8 months ago, and it's most of your storage cost."
+  - "Design the monitoring system to survive the failure of the thing it monitors — separate infrastructure, separate deploy pipeline, separate on-call path. A monitoring system that dies with the host it's watching is worse than none."
+  - "Cardinality (unique label/tag combinations) is the metric that actually breaks time-series databases, not raw metric count — watch for tags like user_id or request_id leaking into metric labels."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've now seen why monitoring matters and how metrics get from a process to storage — push vs. pull, and the shape of a time-series database. This lesson puts the whole system together: the interview question "design a monitoring system for a few thousand hosts" isn't really about picking push or pull, it's about tracing data from a running process all the way to an on-call engineer's phone, and defending every hop under load and under failure.
+
+That end-to-end view is what interviewers actually probe. It's easy to say "collect metrics, store them, alert on them." It's harder to say what happens when the collector falls behind, when a single bad deploy makes a metric's cardinality explode, or when the monitoring system itself needs monitoring.
+
+## Requirements first
+
+Before drawing boxes, pin down scale and behavior:
+
+- **Scale**: how many hosts/services report metrics, how many distinct metrics per host, and how often (typical: 10-60 second intervals).
+- **Latency**: how fresh does a metric need to be before an alert fires? Seconds for a paging alert on error rate, minutes are fine for a capacity-planning dashboard.
+- **Durability vs. cost**: losing a few seconds of metrics during a blip is usually acceptable; losing an alert that should have fired is not. Storage cost matters because retention windows are long (weeks to years) while raw data volume is enormous.
+- **Query patterns**: dashboards do wide time-range scans over few series; alert rules do narrow, frequent scans over many series. These have different performance profiles and often end up served differently.
+
+## The five-stage pipeline
+
+Break the system into stages that can each be reasoned about, scaled, and failed independently.
+
+### 1. Collection (agents)
+
+A lightweight agent runs alongside each monitored process (as a sidecar, a host-level daemon, or an in-process library). It reads counters, gauges, and histograms — request counts, latencies, queue depth, CPU — and holds them in memory between flushes.
+
+The agent should do local pre-aggregation: instead of shipping every individual request latency sample, it maintains a histogram bucket count and ships the buckets. This is the single biggest lever for controlling downstream volume, because it turns "N samples per second" into "a fixed number of bucket counters per flush interval," independent of traffic.
+
+### 2. Ingestion
+
+Agents forward batches (push) — or a collector scrapes them (pull) — into an ingestion tier. This tier's job is narrow: validate, briefly buffer, and hand data to storage as fast as storage can absorb it. Put a message queue or write-ahead buffer here so a storage hiccup doesn't lose data or block agents; it just adds a few seconds of lag.
+
+Ingestion is also where you should reject or drop pathological input — a client sending a metric with a `user_id` label attached, for instance, before it multiplies your series count by your user count.
+
+### 3. Storage (time-series database)
+
+Data lands in a time-series database, sharded by metric/series and partitioned by time. Two design choices dominate: how long full-resolution data lives before being downsampled, and how writes are batched into the underlying storage engine (almost always append-only, compacted files rather than random-write B-trees, because writes are overwhelmingly sequential-in-time).
+
+### 4. Alerting
+
+An alerting service periodically evaluates rules ("error rate over 5xx > 2% for 5 minutes") against storage — never against the raw ingestion stream directly. Rules need their own retry and dedup logic: if the query backend is slow for one evaluation cycle, you want the next cycle to catch up, not silently skip a firing condition.
+
+### 5. Visualization
+
+Dashboards run ad-hoc and saved queries against storage, usually through a caching layer since many people load the same dashboard querying the same recent time range repeatedly.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Host / Service + Agent] -->|batched metrics| B[Ingestion buffer]
+  B --> C[(Time-series storage)]
+  C --> D[Alerting: rule evaluation]
+  C --> E[Dashboards / ad-hoc queries]
+  D --> F[On-call: page / notify]
+  C --> G[Downsampler: 1s to 1min to 1hr]
+`} />
+
+## Availability of the monitoring system itself
+
+The uncomfortable truth about monitoring systems: they need to keep working precisely when the rest of the infrastructure is on fire. That drives a few concrete decisions:
+
+- **Isolate the failure domain.** Don't run the monitoring stack on the same cluster, network segment, or deploy pipeline as the systems it watches. If a bad rollout takes down the primary data center, the monitoring stack in that same data center goes down with it, and you find out about the outage from customers instead of alerts.
+- **Fail open on alerting, not silent.** If the alerting service can't evaluate a rule (storage is unreachable), it should raise a meta-alert ("alerting degraded") rather than just skip the cycle quietly.
+- **Keep the collection path simple and dependency-light.** The agent itself should have minimal dependencies and degrade gracefully (buffer locally, drop oldest data first) rather than crash the process it's attached to.
+
+<Callout type="warning">
+  A common design mistake: routing alert evaluation through the same ingestion buffer or cache that serves live writes, to "save a hop." This couples alerting availability to ingestion availability — exactly the dependency you don't want, because ingestion is usually the first thing to degrade under a traffic spike, which is often exactly when you need alerts to keep firing. Alerting should read from durable, replicated storage (or a dedicated read replica), not the write-path buffer.
+</Callout>
+
+## Worked example: sizing the pipeline
+
+Suppose you're monitoring 5,000 hosts, each emitting 200 metrics on a 10-second interval.
+
+- **Ingest rate**: `5,000 hosts x 200 metrics / 10s = 100,000 data points/sec`. At roughly 16 bytes per raw point (timestamp + value + a series ID), that's about 1.6 MB/s of raw ingest, or ~140 GB/day before any aggregation.
+- **Series count (cardinality)**: if each metric only varies by host, that's `5,000 x 200 = 1,000,000` distinct series — manageable. If someone adds a `customer_id` label with 50,000 distinct values to even one of those metrics, cardinality jumps by 50,000x for that metric alone, and most time-series databases will choke on the index size long before storage runs out.
+- **Retention cost**: keeping 140 GB/day at full resolution for a year is ~51 TB. Downsampling anything older than 7 days from 10-second to 1-minute resolution cuts that by roughly 6x; downsampling anything older than 90 days to 1-hour resolution cuts it another 60x. A tiered retention policy (7 days full-res, 90 days at 1-min, 1+ year at 1-hour) turns an unsustainable 51 TB/year into a few TB.
+- **Alert evaluation load**: if you have 2,000 alert rules each querying a 5-minute window every 30 seconds, that's `2,000 / 30s ≈ 67 queries/sec` against storage — small compared to dashboard traffic, but each query must complete well under the 30-second cycle or evaluation starts falling behind.
+
+This is the kind of arithmetic an interviewer wants to see you do out loud: it justifies pre-aggregation at the agent, tiered retention, and cardinality limits as load-bearing design decisions, not just nice-to-haves.
+
+## Putting it together in an interview
+
+When asked to design a monitoring system, a strong structure is: state the scale/latency/retention requirements, draw the five-stage pipeline, then spend most of your remaining time on two things interviewers actually care about — how cardinality and storage volume are kept bounded, and how the system stays up when the thing it's watching doesn't. Naming specific numbers (like the worked example above) shows you're reasoning about capacity, not just naming components.
+
+<Quiz
+  lessonId="mon-designing-a-monitoring-system"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should alert rule evaluation read from durable storage instead of the live ingestion buffer?',
+      options: [
+        { id: 'a', text: 'Reading from the ingestion buffer is technically impossible', correct: false, explanation: 'It is usually possible, just architecturally risky — the buffer is a transient write-path structure, not a query interface.' },
+        { id: 'b', text: 'It decouples alerting availability from ingestion availability, so alerts keep working even if ingestion is degraded', correct: true, explanation: 'Ingestion is often the first stage to degrade under load, which is exactly when alerting needs to still function — coupling them removes the safety margin.' },
+        { id: 'c', text: 'Durable storage is always faster to query than an in-memory buffer', correct: false, explanation: 'Durable storage is usually slower per-query than an in-memory buffer; the reason to use it is independence from ingestion health, not raw speed.' },
+        { id: 'd', text: 'It reduces the total number of metrics collected', correct: false, explanation: 'This choice is about where alerting reads from, not about reducing collection volume.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these would blow up cardinality in a time-series storage backend? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Adding a per-request user_id as a metric label', correct: true, explanation: 'Each distinct label value combination creates a new series; a user_id label can create as many series as there are users.' },
+        { id: 'b', text: 'Increasing the reporting interval from 10s to 60s', correct: false, explanation: 'This reduces data point volume (fewer points per series over time) but does not change the number of distinct series — cardinality is unaffected.' },
+        { id: 'c', text: 'Tagging a metric with a request_id that is unique per call', correct: true, explanation: 'A unique-per-request tag creates a practically unbounded number of series, one of the classic cardinality-explosion mistakes.' },
+        { id: 'd', text: 'Adding one more host to the fleet', correct: false, explanation: 'This adds a bounded, linear increase in series count (proportional to metrics-per-host), not the combinatorial explosion that a high-cardinality label causes.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'The monitoring stack should run on the same infrastructure and deploy pipeline as the services it monitors, so metrics stay close to their source.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Co-locating them creates a shared failure domain: an outage or bad deploy that takes down the monitored infrastructure takes the monitoring stack down with it, exactly when it is needed most.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the monitoring system should be isolated from the failure domain of what it observes, so it keeps functioning (and can alert) even when the monitored systems are failing.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'What is the main reason agents pre-aggregate metrics (e.g. into histogram buckets) before sending them, rather than shipping every raw sample?',
+      options: [
+        { id: 'a', text: 'Raw samples cannot be stored in a time-series database at all', correct: false, explanation: 'Raw samples can be stored; the issue is the volume, not feasibility.' },
+        { id: 'b', text: 'It bounds the data volume sent per interval regardless of request traffic, instead of scaling linearly with every request', correct: true, explanation: 'A fixed number of bucket counters per flush interval decouples network/storage load from raw request volume, which is the core scaling win.' },
+        { id: 'c', text: 'It removes the need for a storage tier entirely', correct: false, explanation: 'Aggregated data still needs to be stored and queried; pre-aggregation reduces volume, it does not eliminate storage.' },
+      ],
+    },
+  ]}
+/>

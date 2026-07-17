@@ -1,0 +1,212 @@
+---
+title: "Putting the Uber Design Together"
+module: "Design Uber"
+moduleOrder: 5
+order: 6
+track: "interview"
+summary: "Stitches requirements, architecture, matching, location, and pricing into one interview-paced Uber design, showing how the pieces feed each other and fail together under load."
+tags: ["uber", "system-design", "interview-strategy", "trade-offs", "ride-hailing"]
+estMinutes: 12
+cheatsheet:
+  - "Budget your 45 minutes before the interview starts: roughly 5 clarify, 5 estimate, 12 high-level design, 15 on one deep dive the interviewer steers you toward, 8 on trade-offs/failure modes — you cannot re-derive all five prior lessons at full depth in one session."
+  - "The location service and matching service are coupled by a staleness budget, not a hard boundary: matching must discard or down-rank candidates whose last ping is older than your freshness threshold, or you'll dispatch a driver who has already moved on."
+  - "Pricing and matching form a feedback loop under surge: falling match success rate raises the price signal, which changes who requests rides, which changes match success rate again — say this out loud, it's a system-design-interview-favorite follow-up."
+  - "A cancelled or failed match must release its claim back to the location service's available-driver pool immediately, or you'll silently shrink driver supply during exactly the load spike you can least afford to."
+  - "Model 'no drivers found' and 'payment failed' as first-class states, not exceptions bolted on later — an interviewer will ask about both, and 'the trip just fails' is not an answer that survives a follow-up question."
+  - "When asked to synthesize, don't re-present each service in isolation — narrate one request end to end and call out the two or three seams between services explicitly; that's what shows you understand the system, not just five separate diagrams."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You've now spent four lessons going deep on requirements, the high-level
+architecture, matching and dispatch, real-time location, and pricing and
+ETA. Each of those lessons deliberately isolated one concern so it could be
+taught cleanly. A real interview never asks you to present five separate
+concerns — it gives you 45 minutes and expects one coherent design, and the
+questions that actually separate a strong answer from a mediocre one live
+in the seams *between* those pieces: what happens when location data is a
+few seconds stale and matching uses it anyway, what happens when a match
+fails and a driver needs to become available again, what happens when
+surge pricing and dispatch success start influencing each other. This
+lesson is about assembling the pieces and being ready to defend the seams,
+not about re-teaching any of them from scratch.
+
+## Budgeting a 45-minute answer
+
+You cannot re-derive five lessons' worth of depth in one session, and
+trying to is the most common way candidates run out of time before
+reaching trade-offs. A workable budget:
+
+- **5 minutes — clarify scope.** Rider and driver apps, or just one side?
+  One ride type or multiple (pool, premium)? Real-time tracking precision
+  required? These answers change what you estimate and design next.
+- **5 minutes — capacity estimate.** Trip volume, concurrent drivers,
+  location-ping rate, peak-to-average multiplier. Keep this tight — it's
+  there to justify design choices later, not to be a standalone exercise.
+- **10-12 minutes — high-level architecture.** Name the services (location,
+  matching, trip, pricing, notification, payment) and the two-plane split
+  between churn-heavy location data and durable trip state.
+- **12-15 minutes — one deep dive.** Interviewers usually steer this; the
+  most common ask is matching (the driver-claim race) or location (update
+  frequency and staleness). Go deep on whichever they pick rather than
+  trying to touch all three lightly.
+- **remaining time — trade-offs and failure modes.** This is where the
+  seams below come in, and it's often skipped when time runs short — don't
+  let it be the part you cut.
+
+## Where the seams actually connect
+
+Each earlier lesson treated its service as a clean box with a clean
+interface. In reality, three connections between services carry real
+design weight, and an interviewer who's paying attention will probe
+exactly these.
+
+### Location freshness is matching's problem too
+
+The location service answers "who's nearby" from whatever it last heard.
+If a driver's last ping is 12 seconds old and they're moving at city
+traffic speed, "nearby" might already be wrong by 100-150 meters. Matching
+has to apply a freshness cutoff — discard or down-rank any candidate whose
+last ping exceeds some threshold (say 15-20 seconds) — rather than trusting
+the location index blindly. Push this threshold too low and you shrink
+your candidate pool during exactly the load spikes when drivers' pings are
+most likely to queue up; push it too high and you dispatch drivers who've
+already turned a corner.
+
+### Pricing and matching feed each other
+
+Pricing reads live supply/demand signals — often derived from the same
+data matching uses (how many available drivers near a hot area, how many
+open ride requests). But it runs the other way too: when match success
+rate for a region drops (too many riders, too few available drivers),
+that's itself a demand signal that should push price up, which changes who
+actually requests a ride, which changes the match rate again. This is a
+closed feedback loop, not two independent read paths, and naming it
+explicitly is one of the highest-value things you can say in this part of
+the interview.
+
+### A failed or cancelled match must release its claim
+
+Matching's driver-claim step (covered in the matching lesson) takes a
+driver out of the "available" pool the instant a candidate is selected. If
+the rider cancels during `driver_en_route`, or the driver's app times out
+mid-claim, that driver has to go back into the available pool immediately
+— not after some idle-timeout garbage-collection sweep. Miss this and
+you silently bleed driver supply during the busiest, most contested
+minutes of a surge, which is the worst possible time to lose capacity you
+already had.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant R as Rider app
+    participant T as Trip service
+    participant M as Matching service
+    participant L as Location service
+    participant P as Pricing service
+    participant D as Driver app
+    R->>T: Request ride
+    T->>P: Get fare/ETA estimate
+    P->>L: Read live supply/demand
+    P-->>T: Estimate + surge factor
+    T->>M: Find and claim a driver
+    M->>L: Query nearby, filter stale pings
+    M->>M: Claim top candidate
+    alt claim succeeds
+        M-->>T: Matched
+        T-->>D: New trip assigned
+    else claim fails or times out
+        M-->>T: No driver available
+        T-->>R: Retry / widen radius / surge notice
+    end
+`} />
+
+## Worked example: a seam breaking under Friday-night surge
+
+Say a downtown zone has 400 available drivers and a normal request rate of
+80 requests/minute at 8pm on a Friday, but a concert lets out and requests
+spike to 600/minute for ten minutes. Matching's claim success rate drops
+from its usual ~95% to maybe 60%, because many candidate drivers returned
+by the location query get claimed by a competing request microseconds
+earlier. Two things need to happen at this exact seam: pricing needs to see
+the falling match-success signal and raise the surge multiplier within
+seconds (not the next batch cycle) so demand cools and some drivers who
+were idle nearby get pulled in by the higher fare; and every failed claim
+needs to release its driver back to the pool in well under a second, or
+the 400-driver pool effectively shrinks to something smaller purely from
+claim contention, making the surge worse than the raw supply/demand numbers
+would suggest. If you can narrate that dynamic instead of just saying "we
+raise prices during surge," you've demonstrated you understand the system
+as a system, not five stapled-together diagrams.
+
+<Callout type="warning">
+  The most common failure in a synthesis-style answer is presenting each
+  service correctly in isolation and never connecting them — describing
+  matching, then pricing, then location as three unrelated slides. An
+  interviewer will notice the silence at the seams and ask directly: "how
+  does pricing know demand is high?" or "what happens to the driver if the
+  match attempt fails?" Have the feedback loops and failure-state answers
+  ready before you're asked, and mention at least one of them proactively
+  during your high-level walkthrough.
+</Callout>
+
+## Closing the design
+
+Two states deserve explicit handling because they're easy to gloss over
+when you're moving fast: **no drivers found** (trip service needs a
+distinct terminal-ish state here — retry with a wider radius, surface a
+wait estimate, or suggest a different ride type, rather than silently
+failing) and **payment failure at trip completion** (the trip should sit in
+a `completed_pending_payment` state with retries, not be marked fully
+closed until payment actually confirms). Both are one sentence to mention
+and both are exactly the kind of edge case interviewers ask about once the
+happy path is drawn. With the architecture, the two feedback loops, and
+these two failure states in hand, you have a design that holds together
+end to end rather than five good answers to five separate questions.
+
+<Quiz
+  lessonId="uber-putting-the-uber-design-together"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should the matching service apply a freshness cutoff to location data instead of trusting every result from the location service as-is?',
+      options: [
+        { id: 'a', text: 'A driver’s true position can drift meaningfully from a stale ping, so matching may otherwise dispatch a driver who has already moved well away from the reported point.', correct: true, explanation: 'Correct — location data is a churn-heavy, best-effort stream, and matching has to account for how stale a given ping is before treating a driver as a valid nearby candidate.' },
+        { id: 'b', text: 'The location service never returns results for drivers who are actually available.', correct: false, explanation: 'Availability filtering is a separate concern from staleness; the issue here is specifically about how old a returned ping might be, not whether available drivers are returned at all.' },
+        { id: 'c', text: 'Trip state transitions require the location service to be perfectly synchronous with matching.', correct: false, explanation: 'The location plane is intentionally loss-tolerant and eventually consistent; the fix is a staleness cutoff in matching, not forcing synchronous consistency between the two services.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these describe genuine feedback loops or seam-level interactions between services in this design? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A falling match success rate can itself act as a demand signal that pushes the surge multiplier up, which changes who requests rides and affects match success rate again.', correct: true, explanation: 'Correct — this is a closed loop between pricing and matching, not two independent read paths, and it is exactly the kind of connection worth naming explicitly in an interview.' },
+        { id: 'b', text: 'A driver released by a failed or cancelled match claim needs to return to the available pool immediately so driver supply isn’t silently reduced during a surge.', correct: true, explanation: 'Correct — failing to release the claim promptly bleeds capacity precisely when the system can least afford it, during high-contention periods.' },
+        { id: 'c', text: 'The payment service must approve a fare before the trip service is allowed to transition a trip out of the requested state.', correct: false, explanation: 'Payment capture happens at trip completion, well after matching and the requested-to-matched transition; it has no bearing on the initial match.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In a 45-minute interview covering this full design, a strong strategy is to spend roughly equal time going deep on matching, location, and pricing so all three get full coverage.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Trying to go deep on all three within a single 45-minute session usually means running out of time before trade-offs and failure modes, which are just as important to demonstrate.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — a workable budget spends most time on clarify/estimate/high-level design, then goes deep on whichever one area the interviewer steers toward, leaving real time for trade-offs and failure modes at the end.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A trip fails to find any available driver after a reasonable search radius and wait. What does this lesson recommend the trip service do?',
+      options: [
+        { id: 'a', text: 'Silently drop the request so the rider’s app simply stops responding.', correct: false, explanation: 'Silently failing is exactly the pitfall this lesson calls out — "no drivers found" should be an explicit, handled state, not an unhandled dead end.' },
+        { id: 'b', text: 'Move the trip into an explicit no-driver-found state and respond with an option such as a wider radius, a wait estimate, or a different ride type.', correct: true, explanation: 'Correct — treating this as a first-class state with a clear rider-facing response is what a strong design does instead of letting the request fail invisibly.' },
+        { id: 'c', text: 'Mark the trip completed and route it directly to the payment service.', correct: false, explanation: 'There is no trip to bill if no driver was ever matched — completion and payment only make sense after a trip actually happened.' },
+      ],
+    },
+  ]}
+/>

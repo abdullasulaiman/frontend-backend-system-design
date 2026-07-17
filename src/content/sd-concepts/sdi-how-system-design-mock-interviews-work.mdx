@@ -1,0 +1,129 @@
+---
+title: "How System Design Mock Interviews Work"
+module: "System Design Interviews"
+moduleOrder: 2
+order: 5
+track: "concept"
+summary: "Explains what a system design mock interview actually simulates, how to structure practice sessions solo or with a partner, and how to turn feedback into measurable improvement."
+tags: ["mock-interviews", "interview-prep", "practice", "feedback"]
+estMinutes: 11
+cheatsheet:
+  - "A mock interview has three separate jobs: rehearsing the clock, rehearsing the dialogue, and generating feedback you can act on. Practicing alone only covers the first."
+  - "45 minutes is the real budget: ~5 min requirements, ~5 min capacity estimate, ~15 min high-level design, ~15 min deep dive, ~5 min wrap-up/trade-offs."
+  - "Record yourself (audio is enough) at least once — most candidates are startled by how much they talk without saying anything, or how quiet they go while thinking."
+  - "A good mock partner interrupts you the way a real interviewer would: asking 'why' on a component, injecting a scale bump, or pushing back on an assumption."
+  - "Score against a rubric, not a vibe. 'Did I state my assumptions out loud?' is answerable yes/no; 'did that go well?' is not."
+  - "The most common mock-interview mistake is running it like a study session — pausing to look things up, restarting when you get stuck. Real interviews don't pause; your practice shouldn't either."
+  - "Three to five mocks against a rubric, spaced out with time to fix the same recurring gap, beats twenty unstructured ones."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You can read every system design article ever written and still freeze the first time an interviewer asks you to design a URL shortener out loud, on a whiteboard, with someone watching. That's not a knowledge problem — it's a performance problem. System design mock interviews are the tool that closes the gap between "I understand consistent hashing" and "I can explain consistent hashing coherently while someone is judging me and the clock is running." This lesson covers what a mock interview is actually simulating, how to run one well whether you have a partner or not, and how to turn the experience into a feedback loop instead of a one-off exercise.
+
+## What a mock interview is actually testing
+
+A real system design interview evaluates three things at once, and most candidates only prepare for one of them:
+
+1. **Content** — do you know the relevant concepts (load balancing, caching, partitioning, replication, queues) and can you apply them to this problem?
+2. **Process** — do you have a repeatable way to move from a vague prompt to a defensible architecture, or do you wander?
+3. **Communication** — can you narrate your thinking clearly enough that someone else can follow and steer it?
+
+Reading and note-taking builds content. A mock interview is the only cheap way to practice process and communication under the same conditions you'll face for real: a ticking clock, an unfamiliar-feeling prompt, and a person reacting to what you say in real time. Skipping mocks and going straight from study to the real interview is like training for a presentation by only reading the slides — you've never rehearsed the part that actually gets evaluated.
+
+## The three modes of practice
+
+Mock interviews aren't one format. Pick the mode that matches what you're weak on.
+
+### Solo, timed, out loud
+
+You take a prompt, set a 35-45 minute timer, and talk through the design out loud (or write while narrating) with no interruptions and no reference material. This is the cheapest mode and the one people skip most, because talking to an empty room feels silly. It isn't — it's the only way to notice that you don't actually have a smooth opening move, or that you go silent for 90 seconds every time you have to think about a trade-off. Record the audio. Listening back is uncomfortable and extremely informative.
+
+### Peer-to-peer with a partner
+
+You and another candidate take turns interviewing each other. This is the closest free simulation to the real thing because a partner does what a static prompt can't: asks "why did you pick that?", pushes back when your assumption is shaky, and drops in a scale change mid-design ("what if this needs to handle 50x that traffic?"). The partner doesn't need system design expertise to be useful — they mainly need to ask the standard follow-up questions and take notes on where you got stuck or vague.
+
+### Structured, rubric-scored practice
+
+Whether solo or with a partner, the highest-value version adds a rubric you score yourself (or get scored) against after the session — a checklist like "stated explicit assumptions before designing," "gave a capacity estimate," "identified the primary bottleneck and addressed it," "discussed at least one failure mode." A rubric turns a fuzzy "that felt okay" into a specific list of gaps to close before the next attempt. See the module's next lesson for a repeatable method whose steps double nicely as rubric items.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Pick a prompt] --> B["Run it live\n(timed, no pausing)"]
+  B --> C["Score against\na rubric"]
+  C --> D{Gaps found?}
+  D -->|Yes| E["Study that\nspecific gap"]
+  E --> F[Next mock, same weak spot]
+  D -->|No major gaps| G["Increase difficulty\nor add a partner"]
+  F --> B
+  G --> B
+`} />
+
+## Running a session so it actually resembles the interview
+
+The value of a mock interview comes entirely from how faithfully it reproduces the real constraints. A few rules keep it honest:
+
+- **Don't pause the clock.** If you get stuck, that's data — real interviews don't stop either. Push through with your best guess and note the stuck point for review afterward.
+- **Don't look anything up mid-session.** If you can't recall how a message queue handles backpressure, say what you'd try and move on. Looking it up mid-mock teaches you to reach for a browser, which you can't do in the real room.
+- **Say assumptions and numbers out loud, don't just think them.** An interviewer only sees what you externalize. If you silently decide "let's assume 10 million daily active users" and never say it, your partner (or your recording) will show you went straight to architecture with no stated basis — which reads as guessing, even if your internal reasoning was fine.
+- **Use a whiteboard or shared doc, not just talking.** Most real interviews are conducted with some kind of drawing surface (physical whiteboard, Excalidraw, a shared doc). Practicing purely verbally hides how much slower and messier you are once you also have to sketch boxes and arrows while talking.
+- **Time-box each phase.** A common failure is spending 20 minutes on requirements gathering and having 10 minutes left for the actual architecture. Give yourself rough checkpoints (see the worked timeline below) and notice when you blow through one.
+
+<Callout type="warning">
+  The most common way people sabotage their own mock interviews is running them like study sessions: pausing when stuck, restarting when the design goes sideways, or "cheating" by glancing at notes. This feels productive because you leave with a cleaner design on paper, but it doesn't train the skill you're actually being tested on — recovering out loud, in real time, from an assumption that turns out to be wrong. If you wouldn't be allowed to do it in the real interview, don't do it in the mock.
+</Callout>
+
+## A worked timeline for a 45-minute mock
+
+Here's a concrete budget to run a mock against, using "design a URL shortener" as the prompt:
+
+- **0-5 min — requirements.** Read/write vs. read-heavy? Custom aliases? Expiration? Analytics on clicks? You state these out loud and pick reasonable defaults where the prompt is silent.
+- **5-10 min — capacity estimate.** Say you land on 100 million new URLs/month and a 100:1 read:write ratio. That's roughly 40 writes/sec and 4,000 reads/sec average — numbers that immediately tell you this is a caching and read-scaling problem, not a write-scaling one.
+- **10-25 min — high-level design.** Sketch the API, the encoding scheme for short codes, the datastore choice, and where a cache sits. This is the "boxes and arrows" phase.
+- **25-40 min — deep dive.** The interviewer (or you, self-directed) picks one area to push on — say, how you avoid short-code collisions at 40 writes/sec across multiple app servers, or how the cache stays consistent when a URL is deleted.
+- **40-45 min — wrap-up.** Name the trade-offs you made and what you'd reconsider given different numbers (e.g., "if writes were 100x higher, I'd shard the ID-generation step instead of using a single counter").
+
+Run that same timeline three times over two weeks against different prompts, scoring yourself against a fixed rubric each time, and you'll typically see the biggest gains not in "knowing more" but in "using the clock better" — less time stuck on requirements, more time left for the deep dive where most of the signal actually lives.
+
+## Turning feedback into progress
+
+A single mock interview tells you about one session. A useful practice plan compares mocks over time to find your *recurring* failure mode — the thing that shows up whether the prompt is a URL shortener or a chat system. Common recurring patterns worth watching for: consistently skipping capacity estimation, always defaulting to the same one or two components regardless of the problem, or going quiet under pushback instead of reasoning out loud. Once you know your pattern, the next few mocks should target it directly rather than sampling a new random prompt each time — three to five focused mocks that fix one real gap beat twenty scattered ones that each feel different but teach you the same lesson.
+
+<Quiz
+  lessonId="sdi-how-system-design-mock-interviews-work"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the main reason mock interviews add value beyond reading and studying system design concepts?',
+      options: [
+        { id: 'a', text: 'They teach new architectural patterns faster than reading does', correct: false, explanation: 'Mocks are not primarily a content source — reading and study cover concepts more efficiently. Mocks train process and communication under real conditions.' },
+        { id: 'b', text: 'They rehearse process and communication under timed, real-time conditions that reading alone never exercises', correct: true, explanation: 'A real interview evaluates content, process, and communication together under a clock. Reading only builds content; mocks are the practical way to rehearse the other two.' },
+        { id: 'c', text: 'They guarantee you will be asked the exact same prompt in the real interview', correct: false, explanation: 'Mock prompts are practice vehicles, not predictions of the real question — the goal is transferable process, not memorizing one prompt.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which practices make a mock interview session a faithful simulation of the real thing? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Keeping the clock running even if you get stuck, instead of pausing', correct: true, explanation: 'Real interviews do not pause when you are stuck — practicing recovery under time pressure is a core part of what mocks should train.' },
+        { id: 'b', text: 'Stating assumptions and numbers out loud rather than only thinking them', correct: true, explanation: 'An interviewer (or a recording) only captures what you externalize. Silent assumptions look like unexplained leaps to whoever is listening.' },
+        { id: 'c', text: 'Looking up a concept you forgot mid-session so the design stays technically correct', correct: false, explanation: 'You cannot look things up in the real interview. Practicing that habit trains a behavior you will not have access to when it counts — better to state your best guess and move on.' },
+        { id: 'd', text: 'Time-boxing each phase (requirements, estimation, high-level design, deep dive)', correct: true, explanation: 'A common real failure is spending too long on one phase and running out of time for the deep dive, which usually carries the most signal. Time-boxing practice makes that visible.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Running many unstructured mock interviews with a different random prompt each time is generally more effective than running a smaller number scored against a fixed rubric.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Without a rubric, each mock produces a vague impression rather than a specific, actionable gap, and prompt variety alone does not reveal your recurring failure mode.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'A smaller number of mocks scored against a consistent rubric surfaces a recurring weakness you can deliberately fix, which tends to produce faster improvement than sampling many unstructured sessions.' },
+      ],
+    },
+  ]}
+/>

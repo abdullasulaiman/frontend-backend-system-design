@@ -1,0 +1,134 @@
+---
+title: "Video Upload, Transcoding, and Storage"
+module: "Design YouTube"
+moduleOrder: 1
+order: 4
+track: "interview"
+summary: "Walks through the write path of a video platform — chunked resumable upload, async transcoding into an ABR ladder, and a tiered storage layout — and the trade-offs behind each stage."
+tags: ["video-processing", "transcoding", "object-storage", "media-pipeline", "distributed-systems"]
+estMinutes: 13
+cheatsheet:
+  - "Never transcode inline on the upload request — accept the raw file fast, ack the user, and do the heavy work asynchronously off a queue."
+  - "Chunk uploads (5-10MB pieces) with per-chunk checksums so a flaky connection only costs a retry of one chunk, not the whole file."
+  - "Fan out one raw video into many transcode jobs (per resolution x codec) so a 4K job doesn't block the 360p job the mobile viewer needs first."
+  - "Encode an ABR ladder (e.g. 240p/480p/720p/1080p/4K in H.264 and a AV1/VP9 variant) plus fixed-length segments (2-10s) so players can switch quality without a full re-download."
+  - "Use a state machine (uploaded -> queued -> transcoding -> ready -> failed) per video and per rendition, and make every step idempotent so retries after a worker crash don't corrupt output."
+  - "Tier storage: hot object storage + CDN for popular/recent videos, cheaper cold storage for the long tail, and keep the original raw upload only as long as your reprocessing policy needs it."
+  - "Perceptual hashing / fingerprinting for copyright and dedup work best run during transcoding, on the decoded frames you already have in memory — not as a bolted-on separate pass."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The high-level design gave you boxes and arrows for "upload service," "transcoding," and "storage." This lesson is where an interviewer presses on those boxes: what actually happens between the moment a creator hits "publish" and the moment a viewer on a slow phone connection can watch smooth video without buffering? This is one of the most content-heavy parts of a video-platform interview, because it touches async processing, state machines, storage economics, and codec trade-offs all at once — and it's where candidates who've only memorized "we use a CDN" usually run out of things to say.
+
+Get this stage right and you've covered roughly a third of the interview's depth requirement. Get it wrong (e.g. transcoding synchronously in the upload request) and you've introduced a bottleneck that caps your entire platform's throughput at your slowest encoding job.
+
+## Step 1: getting the raw bytes in reliably
+
+A video upload is a large, slow, failure-prone HTTP transfer — a 2GB 4K file over a home upload connection can take many minutes, and mobile networks drop mid-transfer constantly. Two decisions matter here:
+
+- **Chunked, resumable upload.** Split the file client-side into fixed-size chunks (5-10MB is a common range), upload each with its own checksum, and track which chunks have landed. If the connection drops, the client resumes from the last acknowledged chunk instead of restarting the whole file. This is the same idea behind the [resumable upload protocol](https://en.wikipedia.org/wiki/Tus_(protocol))-style tools many platforms build on.
+- **Direct-to-storage upload.** Don't proxy every byte through your application servers — have the client request a short-lived signed URL from an upload service, then `PUT` chunks straight to object storage (S3-style). Your app servers stay free to handle metadata and orchestration instead of soaking up gigabytes of transfer bandwidth per upload.
+
+Once all chunks land and checksums match, the upload service assembles them into a single raw object, writes a video row in `status = uploaded`, and publishes a message onto a queue. The creator's client gets an immediate "processing" response — nothing downstream is synchronous from their point of view.
+
+## Step 2: transcoding — turning one file into many
+
+Raw uploads arrive in wildly different codecs, resolutions, frame rates, and container formats. Nobody watches the raw file. The transcoding stage produces the actual set of files viewers will stream, and it has to solve two problems at once: *format normalization* and *adaptive bitrate streaming (ABR)*.
+
+### The ABR ladder
+
+A player needs to switch quality mid-playback as available bandwidth changes, without stalling. That means encoding the same video at multiple resolution/bitrate pairs — a "ladder" — for example 240p, 480p, 720p, 1080p, and 4K, each further encoded in more than one codec (H.264 for broad compatibility, plus a more efficient codec like VP9 or AV1 for supporting clients, since better compression directly cuts your CDN egress bill). Each rendition is then chopped into short fixed-length segments (2-10 seconds), which is what actually enables mid-stream quality switching — the player just requests the next segment from a different rendition folder.
+
+### Fan-out, not one giant job
+
+A single raw upload becomes N independent transcode jobs — one per resolution x codec combination. Fanning these out to a worker pool means:
+
+- The cheap, fast renditions (say 360p H.264, needed for the "first watchable version") can finish and go live in minutes, while 4K finishes later — you don't force every viewer to wait for the slowest rendition.
+- One worker crashing on the 4K job doesn't block or corrupt the 480p job.
+- You can prioritize queues — a job for a channel with a fanbase mid-livestream-VOD gets picked up before a low-traffic backlog re-encode.
+
+Each job should be idempotent: if a worker dies mid-encode, requeue the same job safely, and don't leave a half-written output file that a player might fetch. Track state per rendition (`queued -> encoding -> ready -> failed`) as well as an overall video status, so the API layer can answer "is 720p ready yet?" without querying the encoder directly.
+
+### Extra passes you get almost for free
+
+While frames are already decoded in memory for transcoding, it's efficient to also generate thumbnails at several timestamps, extract audio for caption/transcription pipelines, and compute a perceptual fingerprint for copyright-matching and duplicate detection. Bolting these on as a separate pass later means decoding the video a second time — wasteful at this scale.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  U[Client] -->|chunked upload| S[Object storage: raw]
+  U --> API[Upload service]
+  API -->|status: uploaded| DB[(Video metadata DB)]
+  API -->|enqueue job| Q[Transcode queue]
+  Q --> W1[Worker: 360p H.264]
+  Q --> W2[Worker: 1080p H.264]
+  Q --> W3[Worker: 1080p AV1]
+  Q --> W4[Worker: thumbnails + fingerprint]
+  W1 --> OS[Object storage: renditions]
+  W2 --> OS
+  W3 --> OS
+  W4 --> OS
+  OS --> CDN[CDN origin pull]
+  W1 -->|status: ready| DB
+`} />
+
+## Step 3: storage — tiering by access pattern
+
+Storage cost and access pattern are the two axes that drive the design here:
+
+- **Raw uploads** are large and only needed for reprocessing (e.g. re-encoding into a new codec later, or handling a copyright dispute). Once transcoding succeeds, move the raw file to cheap cold/archival storage — or delete it after a retention window, depending on product policy — rather than keeping it in hot storage indefinitely.
+- **Renditions** (the actual streamable segments) go into object storage fronted by a CDN. Popularity is extremely skewed — a small fraction of videos account for most views — so most rendition reads never touch origin storage at all; they're served from CDN edge caches (the streaming/CDN lesson covers this path in depth).
+- **Long-tail cold videos** (uploaded years ago, rarely watched) can live in cheaper storage classes with higher retrieval latency, since a cache miss on a video nobody's watched in a year is an acceptable trade for the storage savings at petabyte scale.
+
+<Callout type="warning">
+  A common mistake in interviews: describing transcoding as if it were a single synchronous step ("the server converts the video and then it's uploaded"). This creates two problems. First, it makes upload latency proportional to encode time — a multi-minute wait before a creator even gets confirmation the upload succeeded. Second, it means one slow or failing encode job (say, a corrupt frame in the 4K pass) blocks every other rendition, when in reality they should fail and retry independently. Always describe this as: fast synchronous upload acknowledgment, then async fan-out to independent, retryable, per-rendition transcode jobs tracked in a state machine.
+</Callout>
+
+## Worked example: sizing the transcode fleet
+
+Say the platform ingests 500 hours of raw video per minute at peak (a number you'd derive in the estimation lesson). Assume each hour of raw footage requires, on average, 4x realtime encode time per rendition (a reasonable ballpark for software encoding across a mixed ladder of five resolutions in two codecs — roughly 10 rendition-jobs per video), and that a single encoding worker can dedicate its throughput to one rendition-job at a time.
+
+- Rendition-jobs per minute of ingestion: 500 hours × 10 renditions = 5,000 rendition-jobs, each needing on average 4 hours of encode time per hour of source (so a job for a 10-minute video takes roughly 40 minutes of compute).
+- If the average uploaded video is 10 minutes long, 500 hours/min of ingestion is roughly 3,000 videos/min, or 30,000 rendition-jobs/min needing ~40 encode-minutes each.
+- Total compute demand: 30,000 × 40 = 1,200,000 worker-minutes of work generated every minute of ingestion.
+- To keep the queue from growing unboundedly, you need roughly 1,200,000 concurrent encode workers at this scale — which is exactly why real platforms invest heavily in hardware transcoding (dedicated encode ASICs/GPUs get 10-50x the throughput of software encoding per unit of hardware) and in prioritizing which renditions get produced first (lowest resolution first, so the video is watchable minutes after upload, with 4K/AV1 trailing behind).
+
+The exact numbers matter less than showing the interviewer you can reason from ingestion rate to required processing capacity, and that you understand *why* fan-out and prioritized rendition ordering are what make that fleet size tractable instead of a single bottlenecked pipeline.
+
+<Quiz
+  lessonId="youtube-video-upload-transcoding-and-storage"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should video transcoding happen asynchronously off a queue rather than inline during the upload HTTP request?',
+      options: [
+        { id: 'a', text: 'Because encode time can be minutes to hours, so blocking the upload response on it would make uploads appear to hang or time out', correct: true, explanation: 'Correct — the upload only needs to confirm the raw bytes landed safely; encoding is a separate, independently retryable background workflow.' },
+        { id: 'b', text: 'Because object storage cannot accept files larger than a few hundred MB', correct: false, explanation: 'Object storage (e.g. S3-style systems) comfortably handles multi-gigabyte files via multipart upload; that is not the reason for async transcoding.' },
+        { id: 'c', text: 'Because CDNs refuse to cache files that were transcoded synchronously', correct: false, explanation: 'CDN caching behavior is unrelated to whether transcoding happened synchronously or asynchronously.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasons to fan a single raw upload out into many independent transcode jobs (one per resolution/codec) rather than one big job? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A lower-resolution rendition can finish and go live before the highest-resolution one does', correct: true, explanation: 'Correct — prioritizing cheap, fast renditions gets a watchable version live minutes sooner instead of waiting on the slowest one.' },
+        { id: 'b', text: 'A crash or corruption in one rendition job does not block or corrupt the others', correct: true, explanation: 'Correct — independent, idempotent jobs mean a failure is isolated and retryable on its own.' },
+        { id: 'c', text: 'It eliminates the need to store more than one rendition per video', correct: false, explanation: 'The opposite is true — ABR streaming requires storing multiple renditions per video; fan-out is about how they get produced, not about reducing how many are stored.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Once a video finishes transcoding successfully, the original raw uploaded file should be kept in the same hot object storage tier indefinitely, alongside the renditions.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The raw file is rarely accessed after successful transcoding (only for reprocessing or disputes), so keeping it in expensive hot storage indefinitely wastes cost — move it to cold storage or delete it per retention policy.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — raw uploads should move to cheaper cold/archival storage (or be deleted per policy) once transcoding succeeds, since renditions in the CDN-fronted tier serve almost all viewer traffic.' },
+      ],
+    },
+  ]}
+/>

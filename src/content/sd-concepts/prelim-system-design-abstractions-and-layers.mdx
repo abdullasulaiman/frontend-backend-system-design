@@ -1,0 +1,140 @@
+---
+title: "System Design Abstractions and Layers"
+module: "Preliminary Concepts"
+moduleOrder: 3
+order: 1
+track: "concept"
+summary: "Explains how backend systems are organized into layered abstractions, why interviewers expect you to name and move between them, and how to reason about a design at the right altitude."
+tags: ["fundamentals", "architecture", "abstraction", "interview-technique"]
+estMinutes: 11
+cheatsheet:
+  - "A layer hides implementation details behind an interface — callers depend on the interface's contract, not on how the layer does its job internally."
+  - "Standard backend layers: client, edge/CDN, load balancer, application/service tier, cache, database/storage, and the network connecting them — name these explicitly when you draw a design."
+  - "Leaky abstractions are normal, not a design flaw — a cache miss, a slow query, and a network partition all leak the layer below into the layer above, and good designs plan for that leakage instead of pretending it can't happen."
+  - "Match your altitude to the question: 'walk me through the request path' wants layer-by-layer detail; 'how would this scale to 10x traffic' wants you zoomed out to which layer bends first."
+  - "Every abstraction boundary is also a place work can be duplicated, retried, cached, or rate-limited — that's often more interesting in an interview than the boundary itself."
+  - "Don't design bottom-up (starting from the database schema) or top-up (starting from a single monolithic service) by default — sketch layers first, then fill in each one at the depth the question demands."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every backend system you'll ever design — a URL shortener, a ride-hailing dispatch service, a chat app — is built out of the same handful of layers stacked on top of each other: something the client talks to, something that routes and balances load, something that runs your business logic, something that remembers state. The specific technology at each layer changes constantly; the layering itself barely does. That's why "system design interview" questions rarely ask you to memorize a product's internals — they ask whether you can decompose an unfamiliar problem into the right layers, reason about what each one is responsible for, and predict where it will bend under load.
+
+This lesson isn't about any one layer in depth — the other lessons in this module cover networking, storage, and consistency in detail. It's about the mental model that ties them together: what an abstraction actually buys you, how the standard backend stack is organized, and how to move your reasoning up and down that stack deliberately instead of getting stuck at one altitude for the whole interview.
+
+## What an abstraction actually is
+
+An abstraction is a boundary that lets one part of a system depend on *what* another part does without depending on *how* it does it. A database gives you a query interface — `SELECT`, `INSERT`, transactions — and hides B-trees, write-ahead logs, and disk I/O behind it. A load balancer gives upstream services one virtual address and hides the fact that there are 40 machines behind it, any of which might be unhealthy right now.
+
+The payoff is that you can change the "how" without breaking anyone depending on the "what." You can swap a single Postgres instance for a sharded cluster, or replace round-robin balancing with least-connections, without touching the code that calls the interface. That's the whole point of layering a system instead of writing one undifferentiated blob of code that reads a socket, parses HTTP, runs business logic, and writes to disk all in one function.
+
+The cost is that abstractions hide *behavior*, not just *implementation* — and behavior differences leak through when conditions change. A function call in-process is (almost) always going to return. A function call across a network layer might time out, might succeed on the server but lose its response on the way back, might get retried and executed twice. The interface looks the same (`response = call(request)`), but the failure modes underneath are completely different. Treating a remote call like a local one is one of the most common system design mistakes there is — the sibling lesson "Network Protocols and RPC" goes deeper on exactly this leak.
+
+## The standard backend stack
+
+Most request-driven backend systems decompose into the same layers, even when the box-and-line diagram looks different per company:
+
+- **Client** — browser, mobile app, or another service. Cares about latency and a stable contract, not about anything below.
+- **Edge / CDN** — terminates the connection close to the user, caches static or semi-static responses, absorbs the first layer of traffic before it reaches your infrastructure.
+- **Load balancer / gateway** — distributes requests across a fleet, often also handling TLS termination, routing by path or header, and basic rate limiting.
+- **Application / service tier** — where your business logic lives. This is frequently split further into multiple services, each owning a bounded piece of functionality (see "microservices" trade-offs, covered elsewhere in this course).
+- **Cache** — an optional but extremely common layer sitting in front of storage to absorb read load and cut latency for hot data.
+- **Storage / database** — the durable source of truth: relational, key-value, document, or object storage depending on the access pattern (covered in depth in "Storage Fundamentals and Data Models").
+- **Network** — not a single box, but the connective tissue between every layer above; it's the thing every layer boundary actually crosses.
+
+Not every system needs every layer — a small internal tool might skip the CDN and edge tier entirely — but the interviewer wants to see that you know which layers exist and can justify omitting one, not that you're unaware it exists.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  C[Client] --> E[Edge / CDN]
+  E --> LB[Load Balancer]
+  LB --> S1[App Service A]
+  LB --> S2[App Service B]
+  S1 --> CACHE[(Cache)]
+  S2 --> CACHE
+  CACHE --> DB[(Database)]
+  S1 --> DB
+  S2 --> DB
+`} />
+
+## Moving between altitudes deliberately
+
+A design review or interview constantly shifts between two modes, and the biggest tell of a junior answer is staying stuck in one:
+
+- **Zoomed out** — "which layer is the bottleneck at 10x scale?", "where would we add a queue?", "what fails over if this region goes down?" This is reasoning about the boxes in the diagram above and the arrows between them.
+- **Zoomed in** — "walk me through exactly what happens when this specific request hits the app tier," "what does the cache key look like," "what index does that query use?" This is reasoning inside one box.
+
+A strong answer explicitly signals which altitude it's operating at: "Zooming out for a second — before we pick a database, let's confirm the read/write ratio, because that decides whether caching or sharding is the bigger lever." That sentence alone tells the interviewer you have a map of the whole stack and are choosing where to spend depth, rather than free-associating into whichever layer you thought of first.
+
+A useful habit: when asked to "design X," resist the urge to open with a schema or a specific database product. Sketch the layer diagram first — even four boxes and a network line — and only then decide, out loud, which layer the interesting problem actually lives in. Half of interview time-pressure mistakes come from going deep on a layer that turns out not to matter for the question (e.g., debating index types for 30 seconds before establishing whether the system is read-heavy or write-heavy at all).
+
+## Worked example: sizing where the bottleneck lives
+
+Say you're asked to design a service that serves a celebrity's profile page, viewed 50,000 times per second at peak, updated by the celebrity maybe twice a day.
+
+Walk the stack layer by layer with that read/write ratio in mind:
+
+- **Edge/CDN**: 50k reads/sec of nearly-static content is exactly what a CDN is for — cache the rendered page or API response with a short TTL (say, 30 seconds) and invalidate on update. That alone can absorb the overwhelming majority of the load before it reaches your infrastructure.
+- **Load balancer**: after the CDN absorbs cache hits, the origin only sees cache-miss traffic — a tiny fraction of 50k/sec — so the balancer and app tier don't need to be sized for the full peak.
+- **App tier**: barely does any work per request — read from cache, format a response.
+- **Cache (application-level, e.g. Redis)**: a second line of defense behind the CDN for any request the CDN can't serve (cache-cold regions, personalization).
+- **Database**: sees, at most, two writes a day plus occasional cache-refill reads. It is nowhere near the bottleneck, and spending interview time on sharding it would be a mistake.
+
+The point of the exercise isn't "know that CDNs exist" — it's that naming the layers explicitly and reasoning about traffic at each one tells you, quickly, that the interesting engineering here is caching and invalidation, not database scaling. A candidate who jumps straight to "let's shard the database" without asking about read/write ratio has skipped the step that would have told them the database was never the problem.
+
+<Callout type="warning">
+  A common interview mistake: presenting a system as one flat list of technology choices ("we'll use React, a Node.js API, Postgres, and Redis") instead of a layered diagram with responsibilities per layer. That format hides whether you understand *why* each piece is there — it reads as a shopping list, not a design. Draw boxes and arrows, label what each layer is responsible for, and only then attach a specific technology to a box if the question calls for it.
+</Callout>
+
+## Layers you'll drill into next
+
+This lesson deliberately stayed at the level of "what layers exist and how to reason across them." The next three lessons in this module each zoom into one part of the stack: how services actually talk to each other over the network, how storage layers differ in their data models and access patterns, and how the guarantees a system makes (or doesn't) about consistency and availability ripple through every layer above the database. Treat this lesson as the map; those are the terrain.
+
+<Quiz
+  lessonId="prelim-system-design-abstractions-and-layers"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the main benefit an abstraction layer (like a database\'s query interface) provides to the code that depends on it?',
+      options: [
+        { id: 'a', text: 'It guarantees the layer below can never fail.', correct: false, explanation: 'No abstraction eliminates failure modes in the layer below — it hides implementation details, not failure behavior. A remote call can still time out or fail even though the interface looks like a simple function call.' },
+        { id: 'b', text: 'It lets the implementation underneath change without breaking code that depends on the interface.', correct: true, explanation: 'That is the core value of an abstraction boundary: callers depend on the contract (e.g., query semantics), not on the internal implementation, so the implementation can be swapped or scaled independently.' },
+        { id: 'c', text: 'It removes the need to reason about performance at that layer.', correct: false, explanation: 'Abstractions hide implementation, not performance characteristics — you still need to reason about latency, throughput, and failure modes of whatever sits behind the interface.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are typical layers in a request-driven backend stack, as discussed in this lesson? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Edge / CDN', correct: true, explanation: 'The edge/CDN layer terminates connections close to the user and caches responses before they reach your core infrastructure.' },
+        { id: 'b', text: 'Load balancer / gateway', correct: true, explanation: 'The load balancer distributes requests across a fleet of application instances and often handles TLS termination and basic routing.' },
+        { id: 'c', text: 'Application / service tier', correct: true, explanation: 'This is where business logic runs, often split into multiple bounded services.' },
+        { id: 'd', text: 'A single global lock shared by every service', correct: false, explanation: 'A single global lock is an anti-pattern for scaling a distributed system, not a standard layer — it would serialize all requests through one contended resource.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In the celebrity profile page example, the right first move is to size the database for the full 50,000 reads/sec peak before considering caching.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Given the extreme read/write skew (near-static content, 50k reads/sec vs. two writes/day), a CDN and/or cache should absorb almost all read traffic, so the database rarely sees peak load at all. Sizing the database for full peak first skips the layer that actually matters.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. The read/write ratio points to caching (edge and application-level) as the layer doing the real work here — the database sees only a tiny fraction of traffic once caching is in place.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'An interviewer asks, "Which layer would bend first if traffic grew 10x?" What kind of reasoning does this question require?',
+      options: [
+        { id: 'a', text: 'Zoomed-in reasoning about a specific query\'s index usage.', correct: false, explanation: 'Index-level detail is zoomed-in reasoning inside one layer (storage) — it does not answer a question about which layer, among several, is the bottleneck at scale.' },
+        { id: 'b', text: 'Zoomed-out reasoning across the whole layer stack to identify the bottleneck.', correct: true, explanation: 'Questions about scaling behavior across the system require stepping back to compare layers against each other, not diving into the internals of just one.' },
+        { id: 'c', text: 'No reasoning is needed — always assume the database is the bottleneck.', correct: false, explanation: 'Assuming the database is always the bottleneck skips the actual analysis; depending on the read/write ratio and caching strategy, the bottleneck could just as easily be the app tier, a downstream dependency, or the network.' },
+      ],
+    },
+  ]}
+/>

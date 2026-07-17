@@ -1,0 +1,235 @@
+---
+title: "Pricing and ETA"
+module: "Design Uber"
+moduleOrder: 5
+order: 5
+track: "interview"
+summary: "Covers how ride-hailing fare quotes and ETAs are computed - a deterministic base fare plus a demand-driven surge multiplier, and a route-aware time estimate - and why both need caching and a locked quote to stay fast and trustworthy."
+tags: ["uber", "pricing", "eta", "surge-pricing", "ride-hailing"]
+estMinutes: 12
+cheatsheet:
+  - "Fare = base components (base fee + per-km + per-minute + booking fee) times a surge multiplier read from a cache, not recomputed live against the driver pool on every request."
+  - "Compute surge as a background aggregation job (open requests / available drivers per geo-cell, refreshed every few seconds), so quoting stays a cheap cache read under load."
+  - "ETA has two distinct meanings - pickup ETA (driver to rider) and trip ETA (rider to destination) - and both should come from a routing graph, not straight-line distance divided by an average speed."
+  - "Lock the quoted fare (and its surge multiplier) into the trip record at request time; don't silently re-price mid-flow just because the live surge value moved a minute later."
+  - "Recompute pickup ETA on a timer (every 10-15s) or on meaningful driver movement, not on every single GPS ping - ETA doesn't need pipeline-level freshness the way the map marker does."
+  - "Reconcile the final fare against actual GPS-traced distance/time at trip completion; the quote is an estimate, the ledger charge is derived from what actually happened."
+  - "Smooth surge changes (small steps, short hysteresis) - a multiplier that jumps 1.0 to 2.5 to 1.0 within a minute reads as broken pricing, even if each snapshot was technically correct."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Two numbers get shown to a rider within a second of tapping "request ride":
+a price and a time. Get either one visibly wrong and the rider closes the
+app before a driver ever gets assigned. Yet both numbers have to be produced
+under the same tight latency budget as everything else in this design, at
+a scale where the naive version of either calculation — walk every nearby
+driver's exact route, or read live demand straight off the request table —
+falls over immediately. This lesson covers how both get computed cheaply
+and consistently: a fare built from deterministic components times a
+demand-driven multiplier, and an ETA that comes from a road graph rather
+than a ruler.
+
+## Two different problems wearing one name
+
+"Pricing and ETA" is really two related but separable calculations:
+
+- **Price**: what will this ride cost? Made of a predictable part (distance,
+  time, a flat fee) and a volatile part (surge — how tight is supply right
+  now).
+- **Time**: how long until pickup, and how long is the trip itself? Made of
+  the same distance the pricing calculation needs, run through a routing
+  model instead of a cost model.
+
+They share an input (route distance/duration) but answer different
+questions, and — as you'll see below — they have different freshness
+requirements. It's worth stating this split explicitly in an interview:
+it stops you from accidentally designing one service that does both badly.
+
+## Computing ETA
+
+### Pickup ETA vs. trip ETA
+
+A rider sees two ETAs at different points in the flow: **pickup ETA** (how
+long until the matched driver arrives) drives the "driver arriving in 4
+min" banner right after matching, and **trip ETA** (how long the ride
+itself will take) is part of the upfront quote and then the in-trip
+progress bar. Both need the same underlying capability — turn two points
+into a route and a duration — just applied to different point pairs
+(driver-to-rider vs. rider-to-destination).
+
+### From distance to time: routing vs. approximation
+
+The tempting shortcut is straight-line (haversine) distance divided by an
+assumed average speed. It's cheap, but it's wrong in exactly the cases
+that matter most: a driver on the other side of a river, a one-way grid
+downtown, a highway that adds distance but saves time. A real design needs
+a **routing engine** — a road-graph service (think a specialized shortest-
+path service over an OSM-style road network) that returns an actual route
+polyline plus a duration, informed by road class and, ideally, historical
+or live traffic conditions for that time of day.
+
+That said, "call the full routing engine on every request" is itself a
+scaling concern — routing a graph with tens of millions of edges is not
+free. The practical mitigation, and a reasonable thing to say out loud in
+an interview: cache route/duration lookups for common origin-destination
+cell pairs (most short urban rides start and end in a small set of dense
+geo-cells), and fall back to the full graph search only on a cache miss.
+
+### Keeping ETA fresh during the trip
+
+Pickup ETA isn't a one-shot number computed at match time — the driver
+keeps moving, so the estimate has to update. It's tempting to recompute it
+on every location ping, but that's overkill: location pings arrive every
+few seconds purely to keep the map marker smooth (see the previous
+lesson), while an ETA that changes by a few seconds isn't worth a
+recompute. Recompute pickup ETA on its own, coarser cadence — every 10–15
+seconds, or when the driver's position has moved enough to plausibly
+change the route — and treat it as a separate concern from raw location
+streaming, even though it reads from the same position data.
+
+## Computing price
+
+### The deterministic base fare
+
+Most of a fare is arithmetic, not a service call: a flat **base fee**, a
+**per-kilometer rate**, a **per-minute rate** (covers time stuck in
+traffic, not just distance), and sometimes a flat **booking fee**. This
+part is cheap, predictable, and the same for every ride of a given type in
+a given city — it's a lookup of rate-card constants plus the route
+distance/duration you already computed for the ETA.
+
+### Surge: pricing for scarcity
+
+The volatile part is a **surge multiplier** applied on top of the base
+fare, meant to do two things at once: ration a scarce resource (available
+drivers) toward the riders willing to pay for it, and pull more drivers
+into an under-served area by making it temporarily more profitable to
+drive there.
+
+The naive implementation — for every incoming request, count open ride
+requests and available drivers in the surrounding area, right then — is a
+hot, contended read against the same driver pool the matching service is
+also hammering, and it recomputes the same number thousands of times a
+minute for requests in the same neighborhood. The better shape: a
+**background aggregation job** partitions the city into geo-cells (the
+same grid the location service already uses), continuously tracks open
+requests and available drivers per cell, and writes a multiplier per cell
+into a fast cache (something like Redis) every few seconds. The pricing
+service, at request time, does a single cheap cache read by cell — no
+live counting on the request path.
+
+### Locking the quote
+
+A rider confirms a quoted fare, but matching, driver acceptance, and the
+actual trip can take a couple of minutes — long enough for the surge
+multiplier in that cell to have moved by the time a driver is assigned.
+The trip service should snapshot the fare (base components and the surge
+multiplier read at quote time) into the trip record the moment the rider
+confirms, and honor that snapshot rather than re-reading a live multiplier
+later. The final charge is then reconciled against the *actual* GPS-traced
+distance and time once the trip completes (routes deviate from the
+estimate — traffic, a driver taking a different turn), but the surge
+component of the price stays what was quoted.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    RiderApp[Rider app: request ride] --> Gateway[API gateway]
+    Gateway --> PriceSvc[Pricing / ETA service]
+    PriceSvc --> RouteEngine[Routing engine: distance + duration]
+    PriceSvc --> SurgeCache[(Surge multiplier cache, per geo-cell)]
+    Aggregator[Surge aggregator job] -->|every few sec: open requests vs available drivers| SurgeCache
+    PriceSvc --> Quote[Fare + ETA quote]
+    Quote --> TripSvc[Trip service: snapshot fare + surge into trip record]
+`} />
+
+## Worked example: quoting a downtown ride after a concert lets out
+
+A concert venue lets out 8,000 people at 11pm into a 1 km² downtown cell
+that normally has 40 available drivers and maybe 15 open requests at any
+moment — comfortable supply. Within two minutes, open requests in that
+cell jump to 300 while available drivers stay near 40, since drivers
+already dropped off elsewhere haven't rerouted in yet.
+
+The aggregator job, running every 5 seconds, recalculates that cell's
+ratio: roughly 300 requests to 40 drivers, well past the threshold the
+platform maps to (say) a 2.2x multiplier, and writes `2.2` into the surge
+cache for that cell. A rider requesting a ride from just outside the venue
+gets a quote of `base fare x 2.2`, computed as a cache read plus the
+routing engine's distance/duration for their trip — no live scan of the
+driver table on their request. They confirm; the trip service snapshots
+`2.2` into the trip record. Even if the ratio drifts to `1.8` by the time
+a driver is actually matched 90 seconds later (more drivers converge on
+the area, chasing the surge), this rider's confirmed price doesn't change
+— it was locked at quote time. The next rider requesting a ride now reads
+the fresh `1.8` from the cache.
+
+<Callout type="warning">
+  A common mistake is treating the quoted fare as "advisory" and silently
+  re-pricing the trip if the live surge multiplier changes before a driver
+  is assigned. It feels more "accurate," but it's the fastest way to erode
+  rider trust — people remember the number they confirmed, and a fare that
+  moves after confirmation reads as a bait-and-switch, even when the
+  underlying market genuinely shifted. Snapshot the multiplier into the
+  trip record at confirmation and hold it there; let only the
+  distance/time components reconcile against what actually happened during
+  the trip.
+</Callout>
+
+## Where this leaves you
+
+Pricing and ETA both boil down to the same shape: a cheap deterministic
+calculation (rate card, or route distance/duration) combined with a value
+read from a cache that a background process keeps warm, rather than
+anything computed live and synchronously against a hot data store on the
+request path. The next lesson pulls this together with matching, location,
+and the trip state machine into one interview-paced answer for the whole
+system.
+
+<Quiz
+  lessonId="uber-pricing-and-eta"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why compute the surge multiplier with a background aggregation job writing to a cache, instead of counting open requests and available drivers live on every pricing request?',
+      options: [
+        { id: 'a', text: 'Live counting on every request would create a hot, contended read against the same driver data the matching service depends on, and recomputes the same number redundantly for many nearby requests.', correct: true, explanation: 'Correct - a background job amortizes the counting cost across many requests in the same cell, turning the request-path work into a cheap cache read.' },
+        { id: 'b', text: 'Because surge pricing is illegal to compute in real time in most markets.', correct: false, explanation: 'This is a system design/scaling concern, not a legal one - the lesson is about read contention and cost, not regulation.' },
+        { id: 'c', text: 'Because caches are always faster than databases regardless of the workload.', correct: false, explanation: 'That is too generic a claim; the real reason here is specifically avoiding a hot, repeatedly-recomputed read on the request path, not a blanket cache-vs-database rule.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are good reasons to use a routing engine (road graph) rather than straight-line distance divided by an average speed for ETA? (Select all that apply.)',
+        options: [
+        { id: 'a', text: 'Straight-line distance ignores obstacles like rivers, one-way streets, and highway detours that change actual travel time.', correct: true, explanation: 'Correct - these are exactly the cases where haversine-distance-based estimates diverge most from reality.' },
+        { id: 'b', text: 'A routing engine can account for road class and traffic conditions that a flat average speed cannot.', correct: true, explanation: 'Correct - road class and time-of-day traffic materially change duration for the same distance, which a single average-speed constant cannot capture.' },
+        { id: 'c', text: 'Straight-line distance calculations are computationally more expensive than routing graph searches.', correct: false, explanation: 'The opposite is true - haversine distance is a trivial formula, while graph search over a road network is the more expensive operation. The reason to prefer routing is accuracy, not cost.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Pickup ETA should be recomputed on every single driver GPS ping to stay as accurate as possible.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Recomputing on every ping (every few seconds, purely to keep the map marker smooth) is wasted work - ETA changing by a couple of seconds is not meaningful, so it should run on its own coarser cadence.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct - pickup ETA should update on a coarser timer or on meaningful movement, decoupled from the higher-frequency location-streaming cadence used for map smoothing.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A rider confirms a quoted fare with a 2.2x surge multiplier. By the time a driver is matched 90 seconds later, the live surge multiplier for that cell has dropped to 1.8x. What should happen to this rider’s fare?',
+      options: [
+        { id: 'a', text: 'It stays based on the 2.2x multiplier that was snapshotted into the trip record at quote confirmation time.', correct: true, explanation: 'Correct - locking the multiplier at confirmation is what keeps the quoted price trustworthy; only distance/time reconcile against what actually happened.' },
+        { id: 'b', text: 'It should immediately update to use the new 1.8x multiplier, since that reflects current market conditions more accurately.', correct: false, explanation: 'Silently re-pricing after confirmation is the pitfall this lesson warns about - riders remember the number they confirmed, and changing it erodes trust even if the new number is technically more current.' },
+        { id: 'c', text: 'The trip should be cancelled and the rider asked to re-request at the new rate.', correct: false, explanation: 'Nothing about a supply/demand ratio shifting after confirmation is a reason to cancel a matched trip; the confirmed quote should simply be honored.' },
+      ],
+    },
+  ]}
+/>

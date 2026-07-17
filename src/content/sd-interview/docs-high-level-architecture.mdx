@@ -1,0 +1,222 @@
+---
+title: "High-Level Architecture"
+module: "Design Google Docs"
+moduleOrder: 13
+order: 3
+track: "interview"
+summary: "Lays out the services a collaborative document editor needs — client, edit sequencer, document store, and presence — and traces one keystroke through all of them."
+tags: ["google-docs", "system-design", "architecture", "collaborative-editing", "websocket"]
+estMinutes: 12
+cheatsheet:
+  - "Split the design into an edit plane (ordering and applying operations) and a snapshot plane (durable document state and history) — they have very different consistency and latency needs."
+  - "Every document needs exactly one sequencing point per document (not per cluster) so operations from different clients get a single, agreed-upon order — this is usually a per-document owner/leader, not a stateless fan of servers."
+  - "Clients hold a persistent connection (WebSocket) to receive other editors' operations in near real time; falling back to polling breaks the 'see changes as they type' experience the whole product is built on."
+  - "Never let the client apply its own edit optimistically and also wait for the server's echo without a reconciliation step — that double-applies the same keystroke."
+  - "Periodic snapshots (checkpoints) of the operation log exist to bound replay time and storage growth, not to replace the log as the source of truth."
+  - "A single very active document (a company-wide wiki page, a shared meeting notes doc) is a hot-shard problem, not a hot-user problem — plan for one document needing more than one machine's worth of throughput."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+The previous lesson picked a collaboration model — OT or CRDT — for resolving
+concurrent edits. That decision answers "what happens when two operations
+collide," but it says nothing about how an operation gets from one person's
+keyboard to a server, gets ordered against everyone else's operations, gets
+stored durably, and gets pushed back out to every other open tab on that
+document. That's an architecture problem, and it's a different one than most
+CRUD-backed apps solve: a typical web app treats each request as independent,
+but a document editor has to maintain a single, continuously converging
+piece of shared state across an unbounded number of concurrently connected
+clients. Get the architecture wrong and either edits get silently dropped,
+two people's cursors fight over the same word, or the whole document grinds
+to a halt under its own history.
+
+## Why this isn't just "CRUD with a database"
+
+A REST-style CRUD app can serve every request from any stateless instance,
+because each request is self-contained: read the row, maybe write the row,
+respond. A document editor can't do that, for two reasons.
+
+First, edits are **relative to a specific known base state** — an operation
+like "insert `x` at position 42" only makes sense against a specific version
+of the document. If two servers accept edits from different clients against
+what they each believe is the current state, and those beliefs have
+diverged, you get corruption. Something has to be the single point of truth
+for "what version is this document currently at."
+
+Second, other editors need to **see the change immediately**, not on their
+next poll. That means the server has to be able to push, not just respond —
+the same persistent-connection requirement you'd see in a chat system, but
+serving a very different payload (structured edit operations instead of
+chat messages).
+
+## Major components
+
+### Client editor
+
+Renders the document and turns keystrokes into edit operations (insert,
+delete, format-range) rather than shipping raw text diffs. It applies its
+own operations locally and optimistically — so typing feels instant — while
+also sending them to the server and reconciling against operations that
+come back from other clients. This local-apply-plus-reconcile loop is the
+piece most people get wrong; more on that below.
+
+### Connection gateway
+
+A tier of servers terminating a persistent connection (WebSocket, in almost
+every real implementation) per open document tab. Like a chat gateway, it's
+stateful and sticky — a given tab's socket lives on one instance — but here
+it's forwarding structured edit operations both directions instead of chat
+messages. It does no ordering logic itself; that's the next component's job.
+
+### Edit sequencer (per-document owner)
+
+The component that actually answers "what order did these operations happen
+in, relative to this document's history?" Every operation for a given
+document routes through a single logical owner for that document — often
+implemented as one active leader process (or an equivalent locking/
+sequencing scheme) per document, not a stateless pool. That owner assigns
+each incoming operation a sequence number, applies the collaboration
+model's transform/merge logic from the previous lesson, and broadcasts the
+result to every other connected client editing that document.
+
+This is the component that makes "one document, one owner" the load-bearing
+constraint of the whole design: shard by document ID, and a single document
+can never be sequenced by two different owners at once, or you're back to
+the divergent-base-state problem from the intro.
+
+### Document store
+
+Durable storage for two things: the append-only **operation log** (every
+accepted operation, in sequence order — this is what OT/CRDT replay is built
+on) and periodic **snapshots** of the fully-materialized document, so a
+client opening a document doesn't have to replay its entire history from
+operation one. A wide-column or log-oriented store fits the operation log
+well; the snapshot can live in blob storage or the same store, keyed by
+document ID and sequence number.
+
+### Presence service
+
+Tracks who has a document open and where their cursor/selection currently
+is, so collaborators see each other's live cursors. This rides on the same
+persistent connection as edits but is logically separate — presence data is
+ephemeral (never durably stored) where edit operations are not, so it's
+worth keeping the two paths distinct even though they share a transport.
+
+### Metadata and access-control service
+
+Owns document titles, folder structure, sharing permissions, and version
+history entries — the parts of "a document" that aren't the character
+content itself. A typical relational or document database is a fine fit
+here; it's a low-write-volume, read-heavy workload unrelated to the
+high-frequency edit path.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    ClientA[Editor A] -->|persistent conn| GW1[Connection gateway]
+    ClientB[Editor B] -->|persistent conn| GW2[Connection gateway]
+    GW1 --> Seq[Edit sequencer - owner for doc D]
+    GW2 --> Seq
+    Seq --> Log[(Operation log)]
+    Seq --> Snap[(Periodic snapshots)]
+    Seq -->|broadcast merged op| GW1
+    Seq -->|broadcast merged op| GW2
+    GW1 --> ClientA
+    GW2 --> ClientB
+    Meta[(Metadata / ACL store)] -.-> GW1
+    Meta -.-> GW2
+`} />
+
+## Worked example: two people editing the same line
+
+Say Alice and Bob both have document D open, both looking at the same line
+of text, both connected through different connection-gateway instances.
+Alice types a character at position 10. Her client applies it locally right
+away — the cursor and text update instantly, with no wait for a round trip
+— and simultaneously sends `insert(10, "x", baseVersion=57)` to her gateway,
+which forwards it to D's edit sequencer.
+
+At nearly the same moment, Bob deletes a character at position 8, also
+against `baseVersion=57`. His operation arrives at the sequencer a few
+milliseconds after Alice's.
+
+The sequencer processes them one at a time, in arrival order: Alice's insert
+lands first, moving the sequencer's authoritative version to 58 and
+appending the operation to the log. Bob's delete arrives next, still
+carrying `baseVersion=57`, so the sequencer runs it through the transform
+step from the collaboration model — adjusting Bob's position 8 against
+Alice's already-applied insert (which, at position 10, doesn't actually
+shift position 8, but the sequencer doesn't get to assume that; it always
+transforms). The adjusted operation gets appended as version 59 and
+broadcast to both clients.
+
+Alice's client receives Bob's transformed delete and applies it directly —
+it never touched her own local text, so there's nothing to reconcile. Bob's
+client receives Alice's insert back, echoed through the sequencer; his
+client's reconciliation logic recognizes this as an operation it needs to
+merge against the edit it already applied optimistically, not a duplicate
+of its own send. Both clients now agree on the exact same document state at
+version 59, without either user ever seeing a lock, a conflict dialog, or a
+noticeable delay.
+
+<Callout type="warning">
+  A common mistake is having the client apply its own operation locally and
+  then, when the server echoes that same operation back (now with an
+  assigned sequence number), apply it a second time. The fix is a
+  reconciliation step: the client tracks which operations it sent that
+  haven't been acknowledged yet, and when the server's echo matches one of
+  those, it updates bookkeeping (sequence number, pending-ack state) without
+  re-applying the edit to the document text. Skipping this shows up as
+  duplicated characters that only the *typing* user sees — a bug that's easy
+  to miss in testing with a single tab, but breaks immediately with two.
+</Callout>
+
+## Where this leaves you
+
+This lesson named the services — client, connection gateway, per-document
+edit sequencer, operation log plus snapshots, presence, and metadata — and
+walked one pair of concurrent edits through all of them. It intentionally
+didn't cover how the edit sequencer itself is made highly available when its
+one owner process fails, how the system behaves when a client disconnects
+mid-edit and reconnects later, or how a document with thousands of
+simultaneous editors avoids a single sequencer becoming a bottleneck. Those
+are exactly the deep-dive concerns of the next two lessons: designing the
+editing service in detail, then scaling it and handling offline clients.
+
+<Quiz
+  lessonId="docs-high-level-architecture"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does a single document need one logical "owner" (edit sequencer) rather than being served by any stateless server in a pool?',
+      options: [
+        { id: 'a', text: 'Because edit operations are relative to a specific base version of the document, so one authority is needed to assign a single agreed-upon order to concurrent operations.', correct: true, explanation: "Correct — without a single sequencing point per document, two servers could accept operations against diverging views of the document's state, corrupting it." },
+        { id: 'b', text: 'Because stateless servers cannot terminate WebSocket connections.', correct: false, explanation: 'Stateless servers can and do terminate persistent connections (as the connection gateway tier does) — the ownership requirement is specifically about ordering edits, not about holding sockets.' },
+        { id: 'c', text: 'Because the document store cannot be shared across multiple servers.', correct: false, explanation: 'The document store is a durable backend shared by the whole system; the ownership constraint is about the sequencing logic in front of it, not the storage layer itself.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are true about the client-side reconciliation step described in this lesson? (Select all that apply.)',
+      options: [
+        { id: 'a', text: "It prevents a client from re-applying its own operation a second time when the server echoes that operation back.", correct: true, explanation: 'Correct — the client tracks its own unacknowledged sends and updates bookkeeping rather than re-applying the text change when the echo matches.' },
+        { id: 'b', text: 'It is only necessary when the collaboration model is CRDT-based, not OT-based.', correct: false, explanation: 'The reconciliation problem exists for either model — any architecture that applies edits optimistically on the client and also receives its own echoed operation back needs this step.' },
+        { id: 'c', text: "It is why a client's own edits feel instant, since the local apply happens before any round trip to the server completes.", correct: true, explanation: "Correct — optimistic local application is what makes typing feel instant; reconciliation is the bookkeeping that keeps that optimistic state consistent with the server's authoritative order." },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Periodic snapshots of a document replace the operation log as the system\'s source of truth once they are taken.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The operation log remains the source of truth. Snapshots exist purely to bound how much history a client has to replay when opening a document — they are a performance optimization, not a replacement.' },
+        { id: 'false', text: 'False', correct: true, explanation: "Correct — the append-only operation log stays authoritative; snapshots are a derived, periodically-refreshed convenience so clients don't replay the full history from the beginning." },
+      ],
+    },
+  ]}
+/>

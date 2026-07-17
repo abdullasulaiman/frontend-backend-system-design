@@ -1,0 +1,290 @@
+---
+title: "Requirements and Estimation"
+module: "Design Google Docs"
+moduleOrder: 13
+order: 1
+track: "interview"
+summary: "Scopes a collaborative document editor into functional and non-functional requirements, then derives per-document concurrency, edit-operation throughput, and revision-history storage to justify a low-latency, per-document-sharded architecture."
+tags: ["requirements", "capacity-estimation", "real-time-collaboration", "interview-framework"]
+estMinutes: 12
+cheatsheet:
+  - "The hard part of a collaborative editor isn't total request volume — it's that every keystroke from one editor must reach the other 2-5 people looking at the same document within a couple hundred milliseconds, and every replica must converge on the same text."
+  - "State DAU, documents opened per DAU, and the fraction of opens that become truly multi-editor sessions before estimating anything — the number that matters is concurrent editors per document, not total documents in the system."
+  - "Total system-wide edit-operation throughput can look large in aggregate, but the workload shards almost perfectly by document ID — each individual document only ever sees a handful of ops/sec, which is the key insight that shapes the architecture."
+  - "Never store an edit only as a fine-grained op forever — the raw operation log grows far faster than the documents themselves; plan for periodic compaction into snapshots from the estimation phase, not as an afterthought."
+  - "Fan-out here is tiny (a handful of concurrent viewers per document) compared to something like a social feed's fan-out — don't reuse a celebrity-fan-out mental model where it doesn't apply."
+  - "Consistency requirement to state explicitly: all editors must converge to the identical document state regardless of the order edits arrive in — that single sentence is what the next lesson's OT vs. CRDT comparison exists to satisfy."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Picture three people editing the same paragraph of a shared document at
+the same time: one fixing a typo near the top, one adding a sentence in
+the middle, one deleting a clause near the bottom. Within a couple hundred
+milliseconds, each of them needs to see everyone else's changes, in the
+right place, without garbling the text or silently dropping anyone's edit.
+That's different from a typical CRUD app, and different from the
+read-heavy fan-out problems you'd design for a social feed — the audience
+for any single edit is tiny (a handful of people looking at that one
+document), but the latency and consistency bar is much higher.
+
+This lesson pins down what "collaborative document editor" means before
+designing anything, and derives the numbers that matter. We're
+deliberately not choosing a conflict-resolution algorithm or drawing the
+architecture here — those are the next two lessons. The job here is
+scoping requirements and sizing the problem so those decisions have
+something concrete to respond to.
+
+## Step 1: Scope the functional requirements
+
+A reasonable core for an interview-sized version of this system:
+
+- **Create, open, and edit a rich-text document**: headings, bold/italic,
+  lists, and basic formatting; treat embedded images/tables as extensions,
+  not the core problem.
+- **Real-time collaborative editing**: two or more users editing the same
+  document concurrently see each other's changes appear almost
+  immediately, with the document converging to the same content for
+  everyone.
+- **Presence**: see who else has the document open and roughly where their
+  cursor or selection is.
+- **Revision history**: view past versions of a document and restore an
+  earlier one.
+- **Access control and sharing**: an owner assigns viewer, commenter, or
+  editor permissions to specific people or via a shareable link.
+
+Explicitly defer and say so out loud: comments/suggestion mode, offline
+editing with later resync, and the exact conflict-resolution algorithm are
+real parts of the product, but each deserves its own lesson — offline
+support later in this module, OT vs. CRDT in the very next one. Naming
+them and moving on, rather than solving everything in one pass, is a
+strong signal in an interview.
+
+### Non-functional requirements
+
+- **Low edit-to-edit latency.** An edit made by one collaborator should
+  appear for other active editors within roughly 100-300ms under normal
+  network conditions — this is a live-interaction latency budget, not a
+  page-load one.
+- **Strong convergence, not strong consistency.** Every editor's local
+  copy must eventually reach the exact same document content regardless
+  of the order edits happen to arrive in — but a brief moment where two
+  editors see slightly different intermediate states is acceptable.
+- **Edits must never be silently lost once acknowledged.** A user who
+  sees "saved" and closes their laptop must never come back to find that
+  edit missing.
+- **Available over strictly consistent for the editing path**, but
+  durable and auditable for the revision history — losing a document's
+  history entirely is a much worse failure than a temporary sync hiccup.
+- **Scales by number of concurrently-active documents, not total users.**
+  The overwhelming majority of stored documents are closed and idle at
+  any moment; the system needs to handle spikes of concurrent editing on
+  a small fraction of documents, not uniform load across all of them.
+
+## Step 2: Establish the scale
+
+State assumptions plainly rather than silently guessing. A workable set of
+numbers for a large, widely used product:
+
+- 50 million daily active users (DAU).
+- Each DAU opens about 3 documents per day.
+- About 1 in 20 document-opens (5%) becomes a genuinely multi-editor
+  session at some point — meaning a second person joins while the first
+  is still there — rather than a solo read or solo edit.
+- During peak hours, roughly 500,000 documents are being edited by 2 or
+  more people simultaneously, averaging about 2.4 concurrent editors on
+  each of those documents.
+- A person actively composing text produces a small edit operation (an
+  insert or delete of a short run of characters, since the client
+  coalesces fast keystrokes into batches roughly every 100-150ms) on
+  average every 300-500ms while typing — but spends only about a quarter
+  of their connected time actually typing, with the rest spent reading,
+  scrolling, or thinking.
+- A typical document body is about 20 KB of rich text; assume roughly 2
+  billion documents exist in total across the product's lifetime.
+
+<Callout type="tip">
+  Say this out loud before computing anything: "Let's assume 50 million
+  DAU and that about 5% of document-opens become truly concurrent
+  multi-editor sessions — does that match the scale you had in mind, or
+  should we assume a more enterprise-heavy, more collaborative mix?"
+  Checking this with the interviewer matters more here than in a typical
+  read-heavy system, because the concurrent-editor ratio is the number
+  that drives the entire design.
+</Callout>
+
+## Step 3: Derive operation throughput and storage
+
+### Concurrent editing sessions
+
+- Concurrently-collaborative sessions at peak: 500,000 documents
+  multiplied by 2.4 average concurrent editors is about 1.2 million
+  live, connected editing sessions at any given peak moment.
+- This is the number that sizes your connection layer (persistent
+  WebSocket-style connections, presence tracking) — it has nothing to do
+  with the 2 billion total stored documents, almost all of which are
+  idle at any given instant.
+
+### Edit-operation throughput
+
+- Effective sustained op rate per connected session: roughly one op every
+  2 seconds once you factor in the 25% "actually typing" duty cycle
+  against a burst rate of one op every 300-500ms — call it about 0.5
+  ops/sec per session as a round number.
+- Peak system-wide incoming ops: 1.2 million sessions multiplied by 0.5
+  ops/sec is about 600,000 ops/sec in aggregate, across the whole fleet.
+- That aggregate number looks large, but it shards almost perfectly by
+  document ID: with 500,000 documents actively receiving edits, the
+  *per-document* rate is only around 1.2 ops/sec on average. No single
+  document is ever a throughput problem — the challenge is latency and
+  ordering for that document's small set of editors, not raw volume.
+
+### Storage: document bodies vs. the operation log
+
+- Total document body storage: 2 billion documents multiplied by 20 KB
+  is about 40 TB — trivial, and barely grows day to day since most
+  documents, once written, are edited rarely afterward.
+- Now estimate the *raw* operation log if every micro-edit were kept
+  forever: daily multi-editor sessions are roughly 50,000,000 DAU
+  multiplied by 3 opens multiplied by 5% is 7.5 million sessions/day.
+  Assume an average collaborative session lasts about 20 minutes (1,200
+  seconds) at 0.5 ops/sec: 7.5 million multiplied by 1,200 multiplied by
+  0.5 is about 4.5 billion ops/day.
+- At roughly 100 bytes per stored op (the edit itself, author, timestamp,
+  and a pointer into the document's revision chain), that's about 450 GB
+  per day of raw operation data — well over 150 TB a year, dwarfing the
+  40 TB of document content and growing without bound.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    U1["Editor A types"] -->|op, ~every 300-500ms while active| ES["Per-document edit shard\n(~1.2 ops/sec avg for this doc)"]
+    ES -->|broadcast, target under 300ms| U2["Editor B's client"]
+    ES -->|broadcast, target under 300ms| U3["Editor C's client"]
+    ES --> LOG["Append-only op log\n(~450GB/day raw, system-wide)"]
+    LOG -->|periodic compaction| SNAP["Snapshot + pruned history\n(~40TB total doc bodies)"]
+    style ES fill:#2b6cb0,color:#fff
+    style LOG fill:#4a5568,color:#fff
+    style SNAP fill:#4a5568,color:#fff
+`} />
+
+The contrast is the key takeaway: **per-document edit throughput is tiny,
+document bodies are cheap to store, but a naive "keep every operation
+forever" revision history grows far faster than the documents themselves
+and becomes the dominant storage and cost concern if left unaddressed.**
+
+## Step 4: State the resulting design constraints
+
+1. **Shard by document ID, not by user or by shard-of-everything.** Since
+   the workload is almost embarrassingly parallel across documents, a
+   per-document (or per-shard-of-documents) ownership model for routing
+   edits keeps each shard's load trivial.
+2. **The connection layer must support persistent, low-latency
+   delivery** (long-lived connections, not request/response polling) to
+   hit the 100-300ms edit-to-edit latency target for the roughly 1.2
+   million concurrent editing sessions at peak.
+3. **Convergence, not locking, is the concurrency model.** With multiple
+   people editing the same paragraph, blocking one editor until another
+   finishes is unacceptable at this latency budget — the next lesson's
+   choice between Operational Transformation and CRDTs exists specifically
+   to satisfy the "everyone converges to the same result" requirement
+   without locks.
+4. **Plan for op-log compaction from day one.** The 450 GB/day raw
+   operation volume is not sustainable to keep verbatim forever; revision
+   history needs periodic snapshotting with older fine-grained ops pruned
+   or rolled up, while still supporting "restore an earlier version."
+
+## Worked example: sizing one busy document
+
+Take a single document being actively co-edited by 4 people during a
+one-hour planning session. At the per-document average of about 1.2
+ops/sec (rounding up for a genuinely busy document, call it 3 ops/sec
+during the busiest stretches), that's roughly 10,800 operations over the
+hour. At 100 bytes/op, that's about 1 MB of raw operation-log data for
+that one document, for one meeting.
+
+Multiply that by even a modest 10,000 similarly busy documents on a given
+day (a small slice of the 500,000 peak-concurrent figure, sustained
+across a full day rather than one peak moment) and you get about 10 GB of
+op-log data just from the "busy" tier — before counting the long tail of
+documents with only occasional light edits. This is exactly why the
+design constraint above (compact into snapshots, prune old fine-grained
+ops once a document is quiescent) has to be part of the architecture, not
+a later optimization: the raw log outgrows the actual content it
+describes within days, not years.
+
+<Callout type="warning">
+  A common mistake is estimating this system the way you'd estimate a
+  social feed or a URL shortener — total documents, total users, average
+  QPS across the whole platform. Those numbers barely matter here. The
+  numbers that actually drive the design are per-document concurrent
+  editors, the resulting edit-to-edit latency budget, and the growth rate
+  of the operation/revision log relative to document size. Skip those and
+  you'll design a system that's fast for the wrong bottleneck (aggregate
+  throughput) while being slow or unbounded in storage for the real one
+  (per-document latency and history growth).
+</Callout>
+
+## Where this leads
+
+The numbers derived here — tiny per-document throughput, a strict
+sub-second latency budget for a small set of concurrent editors, a
+convergence requirement instead of locking, and an operation log that
+outgrows document content fast — are exactly what the next lesson
+responds to when it picks between Operational Transformation and CRDTs.
+The high-level architecture lesson after that builds the edit-routing and
+connection layer this lesson's per-document sharding constraint implies,
+and the final two lessons build the editing service and the
+scaling/offline story on top of it. Keep the concurrent-editors-per-document
+and op-log-growth numbers in mind — they're the justification you'll come
+back to at every later step.
+
+<Quiz
+  lessonId="docs-requirements-and-estimation"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Which figure should you compute first when sizing a collaborative document editor?',
+      options: [
+        { id: 'a', text: 'Total documents ever created across the platform', correct: false, explanation: 'Total stored documents mostly sit idle and barely affect the live-editing architecture; it is not the number that drives design decisions here.' },
+        { id: 'b', text: 'Concurrent editors per actively co-edited document, and how many documents are in that state at once', correct: true, explanation: 'This is the figure that determines connection-layer sizing, the latency budget, and the convergence requirement — the core design pressures of this system.' },
+        { id: 'c', text: 'Average characters per document', correct: false, explanation: 'Document body size is cheap to store and is not a meaningful constraint compared to concurrency and operation-log growth.' },
+        { id: 'd', text: 'Total registered accounts on the platform', correct: false, explanation: 'Registered accounts is a business metric, not an engineering load figure; DAU and concurrent-editor ratios matter far more for sizing.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasonable non-functional priorities to state upfront for a collaborative editor? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Edits from one collaborator should reach other active editors within roughly 100-300ms', correct: true, explanation: 'This live-interaction latency budget is central — collaborators need to see each other\'s changes almost immediately for the experience to feel "live."' },
+        { id: 'b', text: 'All editors\' copies must eventually converge to the identical document content regardless of the order edits arrive in', correct: true, explanation: 'This convergence guarantee is the specific requirement that the next lesson\'s OT vs. CRDT comparison exists to satisfy.' },
+        { id: 'c', text: 'The system should lock a paragraph for one editor at a time to avoid any concurrent edits', correct: false, explanation: 'Locking breaks the real-time, multi-person editing experience and does not scale to the sub-second latency bar; convergence-based approaches are used instead of locking.' },
+        { id: 'd', text: 'Total platform-wide QPS across all documents is the primary scaling constraint', correct: false, explanation: 'Because the workload shards near-perfectly by document ID, aggregate platform-wide QPS is far less important than per-document concurrency and latency.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Because peak system-wide edit-operation throughput can reach hundreds of thousands of ops/sec in aggregate, any single actively-edited document is itself a high-throughput bottleneck that needs special scaling.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Incorrect — the aggregate figure is large, but it shards almost perfectly by document ID; a single document typically only sees a handful of ops/sec even during a busy session.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — per-document throughput stays tiny even when aggregate system-wide throughput is large, because editing load is naturally partitioned by document.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'In the worked storage estimate, why does the raw operation log threaten to become a bigger storage problem than the documents themselves?',
+      options: [
+        { id: 'a', text: 'Because document bodies are stored using an inefficient text encoding', correct: false, explanation: 'The estimate assumes plain rich-text storage; encoding efficiency is not the driver of the discrepancy in this example.' },
+        { id: 'b', text: 'Because every keystroke-level edit is a small but separately-stored record, and their volume compounds daily far faster than document content changes', correct: true, explanation: 'Each fine-grained op adds a small fixed-size record, and thousands of them accumulate per busy document per day — outgrowing the (mostly static) document bodies within days if never compacted.' },
+        { id: 'c', text: 'Because revision history must be replicated across more data centers than the live document', correct: false, explanation: 'Replication factor was not part of this estimate; the driver is the sheer count of fine-grained operations accumulating over time, not replication topology.' },
+        { id: 'd', text: 'Because presence and cursor updates are stored permanently alongside edits', correct: false, explanation: 'Presence/cursor data is ephemeral and was not counted in the storage estimate; the growth driver is the durable edit-operation log itself.' },
+      ],
+    },
+  ]}
+/>
