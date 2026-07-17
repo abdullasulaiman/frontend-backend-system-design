@@ -211,8 +211,8 @@ defend a specific point on the push-vs-pull spectrum.
     },
     {
       id: 'q2',
-      kind: 'multi',
-      prompt: 'Which of these services would you expect to be read constantly but written rarely? (Select all that apply.)',
+      kind: 'mcq',
+      prompt: 'Which of these services would you expect to be read constantly but written rarely?',
       options: [
         { id: 'a', text: 'Follow graph service', correct: true, explanation: 'Following/unfollowing is a rare click compared to how often the follow graph gets read to build timelines and check relationships.' },
         { id: 'b', text: 'Engagement service (likes/retweets/replies)', correct: false, explanation: 'Engagement is written constantly on popular tweets — it is a high-write service, the opposite pattern.' },

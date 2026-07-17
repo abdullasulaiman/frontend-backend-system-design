@@ -215,8 +215,8 @@ business's location or a user's live position flow into the index.
     },
     {
       id: 'q3',
-      kind: 'multi',
-      prompt: 'Which of these are genuine advantages of a quadtree over a fixed-precision geohash grid? (Select all that apply.)',
+      kind: 'mcq',
+      prompt: 'Which of these is a genuine advantage of a quadtree over a fixed-precision geohash grid?',
       options: [
         { id: 'a', text: 'It adapts cell size to local point density, avoiding needlessly tiny cells in sparse areas and needlessly coarse cells in dense ones.', correct: true, explanation: 'Correct — a quadtree only splits regions that hold enough points, so cell size naturally shrinks in dense areas and stays large where data is sparse.' },
         { id: 'b', text: 'It requires no custom data structure to build or maintain, unlike geohash.', correct: false, explanation: 'This is backwards — geohash is the one that reduces to a plain indexed string column with no custom structure; a quadtree is the one you have to build, store, and rebalance yourself.' },

@@ -176,8 +176,9 @@ fan-out-on-write design would insert that one answer into 5 million
 separate feed structures immediately — a 5-million-write burst from one
 event. Re-running the estimation method with this case in mind: if even
 0.1% of daily answers land in a topic this large, that's 10 such events/day
-adding 500,000 fan-out writes each, or 5 million extra writes/day just from
-"hot" content — on top of the 240 million vote writes already budgeted.
+adding 5 million fan-out writes each, or 50 million extra writes/day just
+from "hot" content — a meaningful fraction on top of the 240 million vote
+writes already budgeted.
 That's the concrete number that justifies pulling (computing on read) for
 very large fan-out targets instead of pushing to every follower, which
 we'll design explicitly in the next lesson.

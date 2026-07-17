@@ -27,7 +27,7 @@ on your laptop with a few thousand terms loaded in memory. It will not
 survive contact with a real product: hundreds of millions of users, each
 firing a request on every keystroke, hitting a query distribution so skewed
 that a handful of prefixes account for a huge share of all traffic. Getting
-typeahead to scale isn't about a smarter trie — it's about get­ting almost
+typeahead to scale isn't about a smarter trie — it's about getting almost
 all of that traffic to never touch the trie at all, and handling the rest
 without ever blocking a live request on a rebuild.
 
