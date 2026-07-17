@@ -1,0 +1,161 @@
+---
+title: "Frontend Observability and Monitoring"
+module: "Bonus Lessons"
+moduleOrder: 10
+order: 3
+track: "concept"
+summary: "Measuring real-user performance, errors, and behavior in production with RUM, error tracking, and logging."
+cheatsheet:
+  - "RUM measures Core Web Vitals and custom timings from actual visitors' browsers — synthetic/lab tests measure a fixed environment, so both are needed and neither substitutes for the other."
+  - "Capture errors two ways: `window.onerror` for uncaught throws, `unhandledrejection` for promises nobody caught — an error boundary alone misses both."
+  - "Ship source maps to your error tracker (not to the public bundle) so minified stacks like `a.js:1:4021` resolve back to real file/line/function names."
+  - "Group errors by a normalized fingerprint (message shape plus top stack frames, not the raw message) so one root cause doesn't become a thousand separate tickets."
+  - "Sample RUM and logs (e.g. 100% of errors, 1-10% of successful traces) to control cost, but always sample 100% of the trace for a session already flagged as errored or slow."
+  - "Redact PII at the client before it leaves the browser (emails, tokens, free-text form fields) — a telemetry pipeline is a data-exfiltration surface if you don't."
+  - "Turn metrics into SLOs with an error budget (e.g. p75 LCP < 2.5s for 99% of sessions) and alert on budget burn rate, not on raw metric crossings, to avoid paging on noise."
+tags: ["observability", "monitoring", "rum", "bonus"]
+estMinutes: 11
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+You ship a frontend change, the CI pipeline is green, the staging demo looked fine, and then two weeks later a support ticket says "the app feels slow" with no repro steps and no error in your logs. Lab tests and manual QA only tell you how the app behaves on your machine, on your network, with your test data. Observability is how you find out what's actually happening for the other 100,000 sessions you never watched — which browsers are erroring, which pages are slow, and which users are stuck on a broken flow right now.
+
+This lesson covers the four pillars of frontend observability: Real User Monitoring (RUM) for performance, error tracking for crashes, structured event logging for behavior, and distributed tracing for tying a click to what happened on the backend. Then we'll cover the practical constraints that make all of this work at scale: sampling, privacy, and turning raw signals into actionable alerts.
+
+## Real User Monitoring (RUM)
+
+RUM means instrumenting the actual production app to report timing data from real visitors' browsers, as opposed to "synthetic" or "lab" monitoring, where a script runs your site in a controlled environment (a fixed device, network throttle, and location) on a schedule.
+
+Both matter, for different reasons:
+
+- **Synthetic monitoring** is consistent and great for catching regressions in CI or on a schedule — same machine, same network, every run, so a delta is a real delta.
+- **RUM** is what your users actually experience: a spread of devices, networks, and real-world conditions (a user on a 3-year-old Android phone over spotty LTE looks nothing like your MacBook on office Wi-Fi). Aggregate numbers like p75 LCP across real sessions are the metric that reflects reality.
+
+A typical RUM setup uses the browser's `PerformanceObserver` API to capture Core Web Vitals (LCP, INP, CLS) plus navigation timing, then beacons that data to a collection endpoint via `navigator.sendBeacon` so the request survives the page unloading. On top of the built-in web vitals, add **custom timings** for what matters to your product: "time to first meaningful chart render," or "checkout step 2 to step 3." These custom marks explain a business-relevant regression in ways "LCP got worse" alone can't, since that tells you something is slow but not which flow or component.
+
+## Client-side error tracking
+
+Unhandled JavaScript errors are silent by default — a component throws, React unmounts the tree, and the user sees a blank section, with nothing in your dashboards unless you're capturing it. Two sources need separate handling:
+
+- **Synchronous throws** surface via a global `window.onerror` handler (or a framework-level error boundary for render errors inside a component tree).
+- **Rejected promises with no `.catch`** don't trigger `onerror` at all — you need a dedicated `unhandledrejection` listener on `window`, or these failures vanish entirely.
+
+Both need to capture the message, stack trace, browser/OS, the app's release version, and enough app state (current route, relevant IDs) to reproduce the failure.
+
+### Making minified stacks readable
+
+Production JS is minified and bundled, so a raw stack trace looks like `TypeError: e is not a function at t.a (main.a1b2c3.js:1:48221)` — useless for debugging. **Source maps** solve this: generate a `.map` file at build time that maps minified positions back to original source, then upload it to your error tracker's servers (not your public CDN — a public source map hands your unminified source to anyone). The tracker resolves incoming stack traces against the matching release's source map and shows you the real file, function name, and line.
+
+### Grouping and alerting
+
+At any real scale, a single bug produces thousands of individual error events, not one. Group naively by exact error message, and "Cannot read properties of undefined (reading 'id')" thrown from ten call sites becomes one giant bucket, while the same logical bug thrown from three browsers with slightly different message text becomes three separate buckets. Good error trackers **fingerprint** by a normalized signature: error type plus the top few stack frames, with dynamic values (IDs, minified variable names) stripped out. That's what lets you alert on "a new fingerprint appeared" or "an existing fingerprint's rate spiked," instead of drowning in raw event counts.
+
+## Structured event logging and analytics
+
+RUM and error tracking answer "is it fast and does it work?" Structured event logging answers "what are people actually doing?" Every meaningful user action (viewed product page, added to cart, dismissed onboarding step 2) gets emitted as a structured event with a stable name and a small set of typed properties, batched and sent to an analytics pipeline.
+
+The discipline that matters here is a **shared event schema**: agree on event names and property shapes up front (one `checkout_step_completed` event with typed `step` and `cartValue` fields, not five teams each inventing their own name for the same action) so the data stays queryable instead of becoming an unstructured pile every team interprets differently. This layer typically produces conversion funnels and feature-adoption data, separate from the performance/error concerns above.
+
+## Distributed tracing: connecting frontend to backend
+
+RUM and error tracking are frontend-only views. When a page feels slow, the real question is often "slow because of what?" — the browser executing JS, or the API it called taking 2 extra seconds because of a locked database row three services downstream. Distributed tracing answers that by giving every user-initiated action a single **trace ID** the moment it starts (e.g. a "Place order" click), then propagating that ID through every hop: the fetch call carries it as a header, the API gateway reads it and passes it along, each backend service that touches the request adds its own **span** (a timed unit of work) tagged with that same trace ID.
+
+Pull up one slow trace and you get a single waterfall spanning the frontend render, the network request, and every backend service touched — instead of stitching frontend and backend logs together by hand and hoping timestamps line up.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[User clicks Place Order] --> B[Frontend span: click to fetch]
+  B --> C[Network span: fetch request]
+  C --> D[API gateway span]
+  D --> E[Inventory service span]
+  D --> F[Payment service span]
+  E --> G[Trace assembled: one waterfall]
+  F --> G
+`} />
+
+## Sampling: controlling volume and cost
+
+Capturing every metric from every session on a high-traffic app generates an enormous amount of redundant data — a thousand identical "page loaded fine in 800ms" events tell you nothing a hundred of them didn't already. Sampling trades completeness for cost:
+
+- Sample **RUM performance events** at some rate (say 10-20% of sessions) — enough for statistically meaningful p75/p95 numbers without storing every session.
+- Sample **structured analytics events** more aggressively for high-volume, low-value events (impressions, hovers) and less aggressively for high-value ones (purchases, signups).
+- **Never sample errors** the same way — a rare error affecting 0.1% of sessions is still worth knowing about, and sampling would make rare-but-real bugs invisible.
+- For tracing, a common pattern is "sample at the head" (trace 1% of all requests) combined with "always keep the trace if it turns out slow or errored" — so you don't pay to store every fast, boring trace, but never lose the interesting ones.
+
+## Privacy: telemetry is a data pipeline, not just numbers
+
+Every one of these systems ships data from a user's browser to your servers, which makes each one a place PII can leak if you're not careful. Concrete failure modes: a click-tracking library that records the full DOM text of a form field (capturing a typed password or SSN), an error message that includes a user's email in a validation string, or a session-replay tool recording keystrokes in an unmasked input.
+
+The fix is redaction **before data leaves the browser**, not after it lands in your warehouse: strip or mask known-sensitive fields (email, payment, free-text inputs) at the point of capture, avoid recording full request/response bodies by default, and treat any third-party analytics/monitoring vendor as a place your data now lives, subject to the same compliance obligations (GDPR, CCPA) as your own database.
+
+## From signals to SLOs and alerts
+
+Raw dashboards full of metrics don't page anyone at 3am — an SLO (Service Level Objective) does. The pattern: pick a metric that reflects user experience (p75 LCP, error rate, checkout success rate), set a target with an explicit error budget (e.g. "99% of sessions get LCP under 2.5s over a rolling 7 days"), and alert on **budget burn rate** — how fast you're consuming that 1% allowance — rather than firing the instant one session is slow. Burn-rate alerting distinguishes a real, sustained regression from a normal blip, which is what keeps on-call from getting paged into fatigue and ignoring everything.
+
+## Worked example: diagnosing a latency regression from RUM
+
+Say your RUM dashboard shows p75 LCP for the product page jumped from 1.8s to 3.4s starting yesterday afternoon. Here's a realistic diagnosis path:
+
+1. **Segment first.** Break the regression down by browser, device, and geography. Say it's isolated to mobile Safari, not desktop or Android — that rules out a generic backend slowdown (which would hit every client) and points at something client-specific: a recent deploy, a third-party script, or a Safari rendering quirk.
+2. **Check deploys against the timeline.** The regression start lines up almost exactly with yesterday's frontend release — a strong signal, but correlate, don't assume.
+3. **Look at the LCP element breakdown.** Your RUM tool reports which DOM element was the LCP candidate. If it changed from an `<img>` to a `<div>` heading after the deploy, that tells you what's now being measured changed — maybe a new above-the-fold banner now renders after a client-side fetch instead of being present in the initial HTML.
+4. **Confirm the mechanism with tracing.** Pull a handful of slow traces from mobile Safari sessions. The trace shows the banner's data request is a *third* API call, waterfalled after two others instead of running in parallel — that's the 1.6s.
+5. **Fix and verify.** Parallelize the requests (or move the banner's data into the initial payload), ship the fix, and watch the same RUM segment recover over the next few hours of real traffic — not just a synthetic re-test, since the fix needs to hold up across the actual device/network mix.
+
+RUM found *that* something regressed and roughly *where*; tracing found *why* — neither alone gets you to the fix as fast.
+
+<Callout type="warning">
+  A common mistake is treating an average (mean) as the headline metric instead of a percentile. A handful of very slow outlier sessions barely move an average across thousands of samples, so a real regression affecting the slowest 10-20% of your users can hide in a flat-looking mean while p95 tells a completely different story. Always monitor p75/p95 for performance metrics, not the mean — the mean is where regressions go to hide.
+</Callout>
+
+<Quiz
+  lessonId="frontend-observability-and-monitoring"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A promise rejects and nothing calls `.catch()` on it. Which mechanism is needed to capture this in your error tracker?',
+      options: [
+        { id: 'a', text: 'window.onerror', correct: false, explanation: 'window.onerror fires for uncaught synchronous throws, not for rejected promises — an unhandled rejection will not trigger it.' },
+        { id: 'b', text: 'An unhandledrejection event listener', correct: true, explanation: 'The unhandledrejection event on window is specifically for promises that reject with no handler attached — this is the only reliable way to capture them.' },
+        { id: 'c', text: 'A React error boundary', correct: false, explanation: 'Error boundaries catch errors thrown during rendering in the component tree; they do not catch rejected promises running outside the render cycle.' },
+        { id: 'd', text: 'The Performance Observer API', correct: false, explanation: 'PerformanceObserver reports timing/performance entries, not JavaScript errors.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are legitimate reasons to apply sampling in a frontend telemetry pipeline? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'High-traffic sites generate more RUM/analytics volume than is useful or affordable to store in full', correct: true, explanation: 'Storing every event from every session at scale gets expensive fast, and most of that volume is redundant for computing aggregate metrics like p75.' },
+        { id: 'b', text: 'It reduces the number of distinct errors you need to fix', correct: false, explanation: 'Sampling reduces event volume, not the underlying number of bugs — and sampling errors is generally a bad idea since you would risk missing rare-but-real failures.' },
+        { id: 'c', text: 'Statistically meaningful percentiles (p75, p95) do not require every single session, just a representative subset', correct: true, explanation: 'A well-chosen sample rate can produce accurate percentile estimates at a fraction of the storage cost of capturing every session.' },
+        { id: 'd', text: 'It automatically removes PII from the captured data', correct: false, explanation: 'Sampling only controls volume — it does not redact sensitive fields. PII protection requires explicit redaction logic, independent of sample rate.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Uploading a production source map to your public CDN alongside the minified bundle is a safe way to make source maps available to your error tracker.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A publicly accessible source map hands out your unminified source code to anyone who requests the .map file — it should be uploaded privately to the error tracker\'s servers, not published alongside the public bundle.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — source maps should be uploaded directly to the error tracking service (often as a build step) and kept off the public CDN to avoid exposing unminified source.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A RUM dashboard shows the mean LCP for a page is flat, but a distinct group of users is complaining about slowness. What is the most likely explanation?',
+      options: [
+        { id: 'a', text: 'RUM cannot measure LCP for real users, only synthetic tests can', correct: false, explanation: 'RUM is exactly the mechanism for capturing Core Web Vitals like LCP from real user sessions via PerformanceObserver.' },
+        { id: 'b', text: 'The mean is being skewed by fast sessions and hiding a regression concentrated in a slower segment (e.g. p95)', correct: true, explanation: 'A regression affecting a minority of sessions (a device class, region, or browser) can be diluted by the majority of fast sessions when you only look at the mean — percentiles like p75/p95 reveal that a subset is having a much worse experience.' },
+        { id: 'c', text: 'The complaints are unrelated to performance since the metric looks fine', correct: false, explanation: 'Dismissing user reports because an aggregate metric looks fine is exactly the mistake to avoid — segment and check percentiles before ruling anything out.' },
+        { id: 'd', text: 'LCP only reflects backend response time, not real user experience', correct: false, explanation: 'LCP measures when the largest visible content element finishes rendering in the browser, which reflects a mix of network, backend, and client-side rendering time — not backend time alone.' },
+      ],
+    },
+  ]}
+/>

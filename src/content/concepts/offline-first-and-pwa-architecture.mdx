@@ -1,0 +1,252 @@
+---
+title: "Offline-First and PWA Architecture"
+module: "Bonus Lessons"
+moduleOrder: 10
+order: 2
+track: "concept"
+summary: "Designing frontends that work offline using service workers, caching strategies, and background sync."
+cheatsheet:
+  - "The service worker lifecycle is install (cache the app shell) → activate (clean up old caches) → fetch (intercept requests) — a new worker waits until all old tabs close before activating, unless you call skipWaiting()."
+  - "Cache-first is for immutable, versioned assets (hashed JS/CSS, icons); network-first is for content that must be fresh when possible (HTML, prices); stale-while-revalidate is the middle ground for content that can be a version behind (avatars, feed lists)."
+  - "The app shell (layout, nav, core JS/CSS) is cache-first and loads instantly offline; the data inside it is fetched separately and can fail gracefully."
+  - "Use IndexedDB, not localStorage, for offline data reads — it's async, handles structured data and larger volumes without blocking the main thread."
+  - "Background Sync queues failed writes (e.g. 'post comment') in IndexedDB and replays them when connectivity returns, so a user's action isn't silently lost — but the UI must show it as pending, not as done."
+  - "Always version your cache names (e.g. app-shell-v3) and delete old versions in the activate handler, or you'll accumulate stale caches and never actually update assets."
+  - "Never cache-first your index.html or a service-worker-controlled entry point without a versioning story — that's the classic 'my deploy went out but users are stuck on the old app' bug."
+tags: ["pwa", "offline", "service-worker", "bonus"]
+estMinutes: 12
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Most frontend system design interviews implicitly assume a fast, stable
+connection. Real users don't have that: a commuter on a subway, a field
+technician in a warehouse with dead zones, or just someone on airplane wifi
+that half-works. If your app shows a blank white screen or an error toast the
+moment a request times out, you've built something that only works in the
+demo. Offline-first design flips the assumption — the app should keep working
+(reading cached data, queuing actions) when the network is unreliable or
+absent, and reconcile once it's back. That's the job of a service worker,
+a local data store, and a UI that's honest about what's fresh versus stale.
+
+## The service worker lifecycle
+
+A service worker is a script the browser runs in its own thread, separate
+from your page, that can intercept network requests and manage caches even
+when no tab is open. It goes through three phases:
+
+- **Install** — fires once, when the browser first sees a new or updated
+  service worker script. This is where you open a cache and pre-fetch the
+  app shell (the HTML skeleton, core CSS/JS bundles, offline fallback page).
+  If any of these fail to cache, install fails and the new worker is
+  discarded.
+- **Activate** — fires once install succeeds and the worker is ready to take
+  control. This is where you clean up caches from previous versions (delete
+  any cache key that doesn't match the current version string) so storage
+  doesn't grow unbounded and old assets don't linger.
+- **Fetch** — fires on every network request the page makes while this
+  worker is in control. You inspect the request and decide: serve from
+  cache, go to the network, or some combination — this is where caching
+  strategy lives.
+
+The tricky part is timing. A new service worker installs in the background
+while the old one is still controlling open tabs. By default it sits
+"waiting" until every tab running the old version closes, so users mid-session
+never get yanked onto new code under their feet. You can force it with
+`self.skipWaiting()` in install and `clients.claim()` in activate, but that
+means a page can suddenly start getting served by different logic mid-session
+— fine for a kill-switch fix, risky for anything that changes data shapes the
+running page doesn't expect.
+
+<Mermaid client:visible chart={`
+stateDiagram-v2
+    [*] --> Installing
+    Installing --> Waiting: install succeeds, old worker still active
+    Installing --> Redundant: install fails
+    Waiting --> Activating: old tabs close (or skipWaiting)
+    Activating --> Activated: old caches cleaned up
+    Activated --> [*]
+    Activated --> Fetch: intercepts page requests
+`} />
+
+## Caching strategies: pick per resource type
+
+Once a worker controls the page, its `fetch` handler decides how to answer
+each request. There's no single right strategy — you pick per resource type:
+
+### Cache-first
+
+Check the cache; if present, return it immediately and never touch the
+network. Fastest possible response, works fully offline, but the content can
+go stale forever if you never invalidate it.
+
+Use it for **immutable, content-hashed assets** — a JS bundle named
+`app.a3f9c1.js` never changes contents under that name, so if it's cached
+once, it's safe to serve from cache forever. Fonts and icons are similar.
+
+### Network-first
+
+Try the network; only fall back to cache if the request fails or times out.
+Guarantees freshness when online, degrades to "last known good" when offline.
+
+Use it for **content that must be current when reachable** — an HTML
+document, account balance, order status, search results. The cost is latency:
+every request waits on a real round trip (or a timeout) before falling back.
+
+### Stale-while-revalidate
+
+Return the cached response immediately, and in the background fire a network
+request that updates the cache for *next* time. The user always gets an
+instant response, and the cache slowly catches up to reality.
+
+Use it for content that's fine being **a version behind** — a user's avatar,
+a list of recent items, a settings blob. It's the best default for "mostly
+static, occasionally changes" data because it never blocks on the network,
+but it means the very first render after a change is still stale by
+definition — the update only shows up on the *next* load.
+
+| Strategy | Speed offline | Freshness | Good fit |
+|---|---|---|---|
+| Cache-first | Instant | Can be permanently stale | Hashed JS/CSS, fonts, icons |
+| Network-first | Slow (waits for timeout) | Best when online | HTML shell, prices, live status |
+| Stale-while-revalidate | Instant | One version behind | Avatars, feed lists, settings |
+
+## The app shell model
+
+The app shell is the minimal HTML/CSS/JS needed to render your layout — nav
+bar, sidebar, loading skeleton — without any of the actual data. You cache
+the shell cache-first at install time, so opening the app offline still
+shows a real UI instantly instead of a browser error page. The shell then
+makes its own data requests separately (network-first or SWR, per the table
+above), and each of those can fail independently without breaking the shell
+around it.
+
+This separation is what makes "works offline" tractable: you're not trying
+to cache an infinite, ever-changing set of API responses upfront — you cache
+a small, stable shell once, and treat data fetches as a separate concern that
+can gracefully degrade to "show cached data" or "show an offline banner."
+
+## Storing data for offline reads: IndexedDB
+
+`localStorage` is synchronous, string-only, and capped at a few megabytes —
+fine for a theme preference, wrong for offline data. **IndexedDB** is the
+browser's real embedded database: asynchronous (won't block the main thread),
+stores structured objects and blobs, indexed for querying, and scales to
+much larger volumes. The typical pattern: after a successful network fetch,
+write the normalized result into IndexedDB; on future loads (especially
+offline ones), read from IndexedDB first and render that while a background
+fetch tries to refresh it — which is exactly the same SWR idea, just applied
+to app data instead of static assets.
+
+## Queuing writes: background sync
+
+Reads degrade gracefully to "show cached/stale data." Writes are harder — a
+comment post, a form submission, a "mark as read" action — because dropping
+them silently loses user intent. The pattern: when a write fails due to no
+connectivity, don't just show an error and forget it. Save the pending
+action (the request payload plus enough metadata to retry it) into IndexedDB
+as a queue entry, and register a **background sync** task with the service
+worker. When the browser detects connectivity again, it wakes the service
+worker to replay queued writes against the real API, even if the user has
+since closed the tab.
+
+Two things you must get right: **idempotency** (the replay might fire twice
+if sync fires more than once, or the user might have also retried manually —
+give writes an idempotency key so the server can dedupe), and **UI honesty**
+(show the item as "sending" or "pending sync," not as fully saved, until the
+replay actually succeeds — see the next section).
+
+## Communicating offline/stale state to users
+
+Technical correctness isn't enough — the user needs to know what they're
+looking at:
+
+- A persistent **offline indicator** when `navigator.onLine` (plus an actual
+  failed-request signal, since `onLine` alone is unreliable) says you're
+  disconnected.
+- A **"showing cached data from ~2 hours ago"** style timestamp on views
+  served from stale-while-revalidate or cache-first fallback, so a stale
+  price or stock count doesn't get mistaken for live data.
+- **Pending/queued** visual state for writes waiting on background sync — a
+  greyed-out comment with a small clock icon beats a comment that looks
+  posted but silently vanishes if sync ultimately fails.
+- A clear **retry affordance** when a queued write does fail permanently
+  (e.g. server rejects it with a 4xx after reconnecting) — don't let it sit
+  in limbo forever.
+
+## Worked example: an offline-capable notes app
+
+Say you're building a notes app that should work on a flight. On first
+online load, the service worker installs and cache-firsts the app shell
+(HTML/CSS/JS). The notes list itself is fetched network-first and, on
+success, written into IndexedDB. The user goes offline mid-flight and opens
+the app: the shell loads instantly from cache, the notes list read falls
+back to IndexedDB since the network-first fetch times out, and a banner
+reads "Offline — showing notes from 09:14." They edit a note; the save
+request fails, so the client writes the edit into an IndexedDB outbox queue,
+marks that note "pending sync" in the UI, and registers a background sync
+task. When the plane lands and wifi connects, the browser fires the sync
+event, the service worker replays the queued edit against the API using an
+idempotency key, and on success the UI flips the note from "pending" to
+"synced" and clears the outbox entry.
+
+<Callout type="warning">
+  The most common offline-first bug is caching the wrong thing cache-first:
+  teams cache `index.html` or an unhashed bundle cache-first for speed, ship
+  a fix, and then watch users stay stuck on the broken version indefinitely
+  because the service worker keeps serving the old cached entry point and
+  never re-checks the network. Cache-first is only safe for content-hashed,
+  truly immutable assets. Your HTML entry point and any non-hashed critical
+  asset should be network-first (or at least SWR with a short max age), and
+  every cache you create should carry a version string in its name so
+  `activate` can delete stale ones — otherwise you're both serving stale
+  code *and* leaking storage on every deploy.
+</Callout>
+
+<Quiz
+  lessonId="offline-first-and-pwa-architecture"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A user profile avatar image rarely changes but it is fine if it is a version behind for a little while. Which caching strategy fits best?',
+      options: [
+        { id: 'a', text: 'Cache-first', correct: false, explanation: 'Cache-first would never pick up a changed avatar at all until the cache is manually invalidated — the avatar could go stale forever, not just briefly.' },
+        { id: 'b', text: 'Network-first', correct: false, explanation: 'Network-first works but forces every load to wait on a network round trip (or timeout) even though a slightly stale avatar is perfectly acceptable here — unnecessary latency for this use case.' },
+        { id: 'c', text: 'Stale-while-revalidate', correct: true, explanation: 'SWR returns the cached avatar instantly and refreshes it in the background, matching "fine to be a version behind" exactly.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are real risks specific to the "activate" phase of the service worker lifecycle if handled incorrectly? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Old, unused caches from previous versions never get deleted, wasting storage', correct: true, explanation: 'Cleaning up stale cache keys is exactly what the activate handler is responsible for; skipping it leaks storage across deploys.' },
+        { id: 'b', text: 'The app shell never gets pre-cached at all', correct: false, explanation: 'Pre-caching the app shell happens during install, not activate — this is not an activate-phase risk.' },
+        { id: 'c', text: 'A new worker can take control of already-open tabs that were built against an old data/JS version if clients.claim() is used carelessly', correct: true, explanation: 'clients.claim() in activate hands control to open tabs immediately, which can be risky if the new worker expects a different data shape than the currently running page.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Once a write is queued for background sync, it is safe to assume the server will only ever receive it exactly once, so no special handling is needed on the server side.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Background sync can retry, and a user might also manually resubmit — the same write can reach the server more than once, so it needs an idempotency key and server-side dedup.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — replays are not guaranteed exactly-once, so queued writes should carry an idempotency key and the server should dedupe on it.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'What is the main purpose of the "app shell" pattern in a PWA?',
+      options: [
+        { id: 'a', text: 'To cache all possible API responses ahead of time so the app never makes a network request', correct: false, explanation: 'The app shell is about the static UI skeleton, not about pre-caching every possible data response — data is fetched separately with its own strategy.' },
+        { id: 'b', text: 'To load a stable, cache-first UI skeleton instantly, so the layout renders even offline while data is fetched and can fail independently', correct: true, explanation: 'The app shell separates the stable, cacheable UI structure from the dynamic data layer, so a failed data fetch does not take down the whole page.' },
+        { id: 'c', text: 'To replace IndexedDB as the offline data store', correct: false, explanation: 'The app shell is about caching UI assets, not a data storage mechanism — IndexedDB (or the Cache API for assets) still handles storage.' },
+      ],
+    },
+  ]}
+/>

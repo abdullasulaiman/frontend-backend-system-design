@@ -1,0 +1,149 @@
+---
+title: "Design Systems and Component Libraries at Scale"
+module: "Bonus Lessons"
+moduleOrder: 10
+order: 5
+track: "concept"
+summary: "Building a shared design system and component library that keeps large frontends consistent and maintainable."
+cheatsheet:
+  - "Design tokens are the single source of truth for visual values (color, spacing, type) — apps consume tokens, they never hardcode hex codes or pixel values."
+  - "Layer the library: primitives (Button, Input) → composed components (FormField, Card) → patterns (SearchWithFilters) — most teams should build on composed components, not raw primitives, for consistency."
+  - "Bake theming and accessibility into the primitive layer once (focus states, ARIA roles, keyboard nav, dark mode via tokens) so every consumer inherits them for free."
+  - "Use semver strictly: patch for bug fixes, minor for additive props/components, major for breaking API or visual changes — and publish a codemod alongside every major bump."
+  - "Roll out breaking changes gradually: deprecate with a console warning and a migration doc, support the old and new API in parallel for a release or two, then remove."
+  - "Living docs (a Storybook-style catalog with usage guidance, do/don't examples, and accessibility notes) are the product — an undocumented component might as well not exist."
+  - "Governance is a trade-off: too much central gatekeeping and teams fork/route around the library; too little and you get inconsistent, unaccessible one-off components everywhere."
+tags: ["design-system", "components", "maintainability", "bonus"]
+estMinutes: 12
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Picture a company with 40 product teams, each shipping its own React app. Team A's buttons have 6px corners and a slightly different blue than team B's. One team's date picker doesn't work with a screen reader; another team's modal traps focus incorrectly. A rebrand rolls out over eight months because "update the primary color" means editing the same CSS rule in 40 different repos. None of this is anyone's fault individually — it's what happens when every team solves the same UI problems independently, at a different level of care.
+
+A design system is the fix: a shared, versioned source of truth for how things look and behave, packaged as tokens, components, and documentation every product team consumes instead of reinventing. Done well, "does this look right" and "is this accessible" stop being per-team judgment calls and become defaults. Done poorly, it's a bottleneck teams quietly bypass. This lesson covers the architecture that makes the difference.
+
+## Design tokens: the single source of truth
+
+A design token is a named, platform-agnostic value for a visual decision — `color.brand.primary`, `space.md`, `font.size.body`, `radius.card`. Tokens replace hardcoded values (`#3366FF`, `16px`) with a semantic name defined once and consumed everywhere — the layer where design decisions get made exactly once and then distributed.
+
+- **Design tools export tokens.** A tool like Figma can export color/spacing/type styles as structured data, which a build step turns into CSS custom properties, a JS/TS object, or platform-specific formats — one source feeding every platform.
+- **Rebranding becomes a token edit, not a find-and-replace.** Change `color.brand.primary` in one place, rebuild, and every consuming app updates on its next release.
+- **Themes are alternate token sets.** Light and dark mode are two value sets for the same token names; a component reading `color.surface.default` never needs to know which theme is active.
+- **Tokens have tiers.** Raw tokens (`blue.500 = #3366FF`) feed semantic tokens (`color.brand.primary = blue.500`), which feed component tokens (`button.background.primary = color.brand.primary`). This indirection lets you restyle one component without touching global values, and rebrand globally without touching components.
+
+## Layered component architecture
+
+Trying to ship one flat bucket of "components" breaks down fast — a `Button` and a full `CheckoutSummary` don't belong at the same level of abstraction, reuse, or stability guarantee. Most mature systems settle on three layers.
+
+**Primitives** are the smallest, most generic building blocks: `Button`, `Input`, `Checkbox`, `Icon`, `Text`. Unopinionated about business logic, styled purely from tokens, and where accessibility and theming get implemented once, correctly. Primitives change rarely — everything else depends on them.
+
+**Composed components** combine primitives into something with a specific, reusable shape: a `FormField` (label + input + error text), a `Card`, a `Modal`, a `DataTable`. These encode common layout and interaction patterns so teams don't re-derive "how do I lay out a labeled form field with an error state" every time.
+
+**Patterns** are larger, often product-specific assemblies built from composed components — a `SearchWithFilters` panel, an `OnboardingWizard`. Patterns may live in the shared library if several teams need the exact same one, or in a product's own codebase, built *from* the shared primitives and composed components. That's the right boundary: the design system owns primitives and composed components; products own patterns.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    T[Design Tokens<br/>color, space, type, radius] --> P[Primitives<br/>Button, Input, Icon, Text]
+    P --> C[Composed Components<br/>FormField, Card, Modal]
+    C --> PA[Patterns<br/>SearchWithFilters, Wizard]
+    PA --> App1[Product App A]
+    PA --> App2[Product App B]
+    C --> App1
+    C --> App2
+`} />
+
+This layering also tells you where a fix belongs. A focus-ring color bug is a token fix. A "screen reader doesn't announce this error" bug is a primitive fix. "Our checkout flow needs a different layout" is a pattern-level decision individual teams should be free to make on top of the shared layers — this is where central control should stop.
+
+### Theming and accessibility, built in once
+
+Accessibility retrofitted per-app never scales — 40 teams each remembering `aria-live` regions, focus trapping, and keyboard nav is a bet you'll lose. Baking these into the primitive layer means every `Button` has a correct focus state and `aria-*` attributes by construction, every `Modal` traps and restores focus and closes on `Escape` without the consumer writing any of that, and color tokens are pre-checked for contrast (e.g. WCAG AA) in every theme so `color.text.primary` on `color.surface.default` can't silently fail. Theming — light/dark, brand variants, high-contrast — becomes a token swap instead of a per-component reimplementation.
+
+## Versioning and distribution
+
+A design system is code that other teams' code depends on, which means it lives and dies by its versioning discipline.
+
+**Semver is the contract.** Patch releases are bug fixes with no API change. Minor releases add things — new components, new optional props — without breaking existing usage. Major releases contain breaking changes: a renamed prop, a removed component, a changed default. Teams should be able to trust that `^2.3.0` in their `package.json` is safe to auto-update; that trust evaporates the first time a "minor" release breaks a build.
+
+**Distribution is usually one of two shapes.** A monorepo (Nx, Turborepo) keeps the system and consuming apps in one repository, so a shared-component change and its usages land in the same review — common when teams share a release cadence. Alternatively, the system ships as a separately published package, versioned and released independently, decoupling cadence but requiring consumers to actively pull upgrades. Larger orgs with many independent teams usually prefer published packages so a slow-moving team isn't forced onto every release immediately.
+
+**Rolling out breaking changes** to dozens of consumers needs a process, not just a version bump: ship the new behavior alongside the old one in a minor release with the old path marked deprecated (dev console warning, doc callout); give teams a real migration window — months, not days — with a codemod for mechanical changes so nobody hand-edits hundreds of call sites; track which apps are still on the deprecated path; then remove it in the next major version once adoption data shows it's safe.
+
+<Callout type="warning">
+  A common and expensive mistake: shipping a visual or behavioral change as a "patch" because "it's just a style tweak." A default-padding or focus-ring tweak is invisible in a code diff but can break pixel-sensitive layouts or visual regression tests across every consuming app at once, with no warning. If a change alters anything a consumer could observe, treat it as at least a minor release, and reserve patches for fixes that restore previously-intended behavior.
+</Callout>
+
+## Documentation as the product
+
+A component that isn't documented gets used incorrectly, or gets reimplemented from scratch because nobody could figure out the "real" one. Living documentation — a browsable catalog, Storybook-style, showing every component in every variant/state with copy-pasteable usage code, do/don't guidance, and accessibility notes — is what makes a design system self-service instead of a support queue.
+
+Good docs answer three questions per component: what is this for (and what isn't — "use `Modal` for blocking dialogs, `Toast` for non-blocking ones"), how do I use it correctly (props, variants, a snippet), and what does it guarantee (accessibility, responsiveness, theming). That third answer is what tells teams what they get "for free" versus what they still have to build themselves.
+
+## Governance: avoiding both fragmentation and gridlock
+
+Someone has to decide what goes into the shared library, and how. Two failure modes sit on either side of a healthy governance model. **Too centralized**: every new component or token needs sign-off from a small design-system team that becomes a bottleneck, so product teams under deadline pressure build their own one-off `Button` instead of waiting — recreating the exact fragmentation the system was meant to prevent, just one layer deeper. **Too decentralized**: any team can add anything with no review, so quality erodes, accessibility regressions slip in, and the "shared" library becomes an uncurated grab-bag nobody trusts.
+
+The common working model is a small owning team plus an RFC-style contribution process: a team that needs a new pattern proposes it (often prototyping it in their own app first), the design-system team reviews for consistency/accessibility/API shape, and if it's broadly useful it graduates into the shared library with the owning team taking on its maintenance. That keeps the system growing from real product needs while keeping one team accountable for the quality bar.
+
+## Worked example: rebranding a checkout button
+
+Say the company decides the primary brand color changes from blue to teal, and product wants it live everywhere within two weeks. Without a design system, that means finding every hardcoded `#3366FF` (plus its shadow, hover, and disabled variants) across 40 repos, updating each one, and hoping nobody missed a spot or copy-pasted a subtly different shade eighteen months ago.
+
+With a design system: the teal token export updates `color.brand.primary` and its derived tokens (`button.background.primary`, `link.color`, `focus.ring`) in the tokens package, which gets a minor version bump (values changed, no API changed) and is published. Each app bumps its `@company/tokens` dependency — often automatically, since minor bumps fall within its existing `^1.x` range — and every button, link, and focus ring across all 40 apps is teal on the next deploy, with zero code changes anywhere. The two-week deadline is met because the actual work was one token change, not 40 app changes.
+
+## Tying it back to maintainability and the autonomy trade-off
+
+Every piece here — tokens, layering, versioning, documentation, governance — serves two goals: **consistency** (one coherent product experience instead of 40 slightly different ones) and **maintainability** (a fix or rebrand happens once, centrally, instead of N times independently, with N chances to get it wrong).
+
+The trade-off is real: every decision the system makes centrally is a decision an individual team no longer makes for itself. A team needing an unusual button variant either petitions the system team (slow), builds it locally as a pattern on shared primitives (usually fine), or forks the primitive (defeats the purpose). Getting the layering right — primitives and composed components centralized, patterns left to product teams — is how you keep most of the consistency benefit while leaving teams room to move fast on what's genuinely theirs to decide.
+
+<Quiz
+  lessonId="design-systems-and-component-libraries-at-scale"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A team wants to change the checkout button color across all 40 product apps within two weeks, using minimal per-app code changes. Which part of the design system architecture makes this feasible?',
+      options: [
+        { id: 'a', text: 'Design tokens as the single source of truth, consumed by every app', correct: true, explanation: 'Because color is defined once as a token and every component reads that token, changing the token value and publishing an update propagates the change everywhere without editing component code in each app.' },
+        { id: 'b', text: 'The Storybook documentation catalog', correct: false, explanation: 'Documentation helps teams use components correctly, but it does not itself propagate a visual change — that requires the underlying token/value to change and be redistributed.' },
+        { id: 'c', text: 'The pattern layer of the component library', correct: false, explanation: 'Patterns are larger, often product-specific assemblies; a global color change is a token-level concern, not something that lives at the pattern layer.' },
+        { id: 'd', text: 'Each product team maintaining its own copy of the button component', correct: false, explanation: 'That is precisely the fragmented setup a design system replaces — it would require 40 separate manual edits, not a single centralized change.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these belong in the "primitives" layer of a layered component architecture, as described in this lesson? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Button', correct: true, explanation: 'Button is a small, generic, unopinionated building block — a textbook primitive.' },
+        { id: 'b', text: 'Input', correct: true, explanation: 'Input is likewise a small, generic primitive that composed components and patterns are built on top of.' },
+        { id: 'c', text: 'A product-specific OnboardingWizard', correct: false, explanation: 'That is a pattern — a larger, often product-specific assembly built from composed components, not a small generic primitive.' },
+        { id: 'd', text: 'A FormField combining a label, input, and error text', correct: false, explanation: 'That is a composed component: it combines multiple primitives into a reusable shape, sitting one layer above primitives.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A visual-only change, like adjusting a component\'s default padding or focus-ring color, is safe to ship as a semver patch release since it does not change any prop or function signature.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False in practice: a visual change can break pixel-sensitive layouts or visual regression tests across every consuming app even without an API change, so it should be treated as at least a minor release, not a patch.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — patches should be reserved for fixes that restore previously intended behavior; anything a consumer can visually or behaviorally observe as different deserves at least a minor version bump.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A design-system team requires full sign-off on every new component before any team can use it, with no way to prototype locally first. What is the most likely long-term consequence described in this lesson?',
+      options: [
+        { id: 'a', text: 'Product teams start building their own one-off components to avoid the bottleneck, reintroducing fragmentation', correct: true, explanation: 'This is the "too centralized" failure mode: gatekeeping that is too strict pushes teams under deadline pressure to route around the shared library, recreating the inconsistency the system was meant to solve.' },
+        { id: 'b', text: 'The design system becomes more consistent and accessible over time', correct: false, explanation: 'Excess central gatekeeping tends to produce the opposite outcome — teams bypass the process rather than benefiting from stricter review.' },
+        { id: 'c', text: 'Semver versioning becomes unnecessary', correct: false, explanation: 'Versioning discipline is a separate concern from governance/contribution process; strict gatekeeping does not remove the need for semver.' },
+        { id: 'd', text: 'Design tokens stop being the source of truth', correct: false, explanation: 'Token architecture and contribution governance are independent; a gatekeeping problem does not change how tokens are defined or consumed.' },
+      ],
+    },
+  ]}
+/>

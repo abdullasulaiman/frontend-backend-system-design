@@ -1,0 +1,259 @@
+---
+title: "Real-Time Data and Synchronization"
+module: "Bonus Lessons"
+moduleOrder: 10
+order: 1
+track: "concept"
+summary: "How frontends keep data fresh and consistent in real time using polling, SSE, WebSockets, and reconciliation strategies."
+cheatsheet:
+  - "Pick delivery by shape: short polling for simple/low-frequency needs, long polling as a WebSocket fallback, SSE for one-way server-to-client streams, WebSockets for true bidirectional traffic."
+  - "Every real-time event needs a monotonically increasing sequence number (or server timestamp) — without one you cannot detect gaps, drops, or out-of-order delivery."
+  - "Reconcile optimistic UI by tagging local writes with a client-generated id; when the matching server event arrives, replace the optimistic entry instead of appending a duplicate."
+  - "On reconnect, don't just resume the stream — replay missed events from the last known sequence number (backfill), or you'll silently lose updates that happened during the gap."
+  - "Prefer merge-friendly conflict resolution (per-field last-write-wins with server timestamps, or CRDTs for collaborative editing) over blind 'last request wins' at the object level."
+  - "Ephemeral state like typing indicators and presence should never touch your durable data store — send it over the live channel only and let it expire if the connection drops."
+  - "An always-open WebSocket has a real battery and radio cost on mobile; degrade to polling or close the connection when the tab is backgrounded or the feature isn't visible."
+tags: ["real-time", "websocket", "sync", "bonus"]
+estMinutes: 12
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A dashboard that only updates on refresh feels broken the moment two people
+look at it at once. A comment thread where your own reply vanishes and
+reappears a second later feels buggy even though the data is technically
+correct. Users expect a frontend to reflect the state of the world *as it
+changes* — stock tickers, chat, collaborative docs, delivery trackers,
+dashboards other operators are watching too. Getting the transport right
+(how updates travel from server to client) is the easy half. The hard half,
+and the part that actually breaks in production, is reconciling those live
+updates with whatever the user's own screen already shows — including the
+optimistic changes they just made themselves.
+
+## Delivery mechanisms: how updates get to the client
+
+Before reconciliation is possible, you need a way to move new data to the
+client. Four options, in order of how "real-time" they actually are:
+
+- **Short polling** — the client asks "anything new?" every N seconds.
+  Simple and cacheable, but every poll costs a full round-trip even when
+  nothing changed, and latency is bounded by the poll interval.
+- **Long polling** — the client sends a request and the server holds it open
+  until there's data (or a timeout), then the client immediately re-opens
+  another. Lower latency than short polling, but still one connection per
+  update cycle, with timeout tuning needed on both ends.
+- **Server-Sent Events (SSE)** — a single long-lived HTTP connection over
+  which the server pushes a stream of events. Built on plain HTTP with auto
+  reconnect and `Last-Event-ID` resume baked into the browser's
+  `EventSource` API — but one-way, server to client only.
+- **WebSockets** — a persistent, full-duplex socket. The client sends as
+  freely as the server, with the lowest latency of the four, at the cost of
+  more infrastructure (sticky sessions or a pub/sub fan-out layer to scale
+  horizontally) and owning reconnect/backoff logic yourself.
+
+The choice usually comes down to directionality. A comment thread that also
+sends typing signals fits WebSockets well. A read-only activity feed or
+stock ticker is a textbook SSE case, since the client never pushes anything
+back over that channel. A "new version available" check is often fine with
+polling every 60 seconds — a WebSocket there is more infrastructure than the
+feature is worth.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Short polling] -->|simple, wasteful| E{Pick by need}
+  B[Long polling] -->|lower latency, no server push infra| E
+  C[SSE] -->|one-way stream, auto-reconnect| E
+  D[WebSocket] -->|bidirectional, lowest latency| E
+  E --> F[Comment thread + typing: WebSocket]
+  E --> G[Activity feed: SSE]
+  E --> H[Version check: polling]
+`} />
+
+## The hard part: reconciling live updates with local state
+
+Once events are arriving, the real work starts. The client already has a
+view of the world — some of it confirmed by the server, some optimistic (the
+user just clicked "post" and you rendered their comment before the server
+confirmed it). A live event stream has to merge into that view without
+duplicating, dropping, or reordering anything.
+
+### Matching optimistic writes to server confirmations
+
+When a user submits an action, generate a client-side id (a UUID) for it and
+render it immediately as "pending." Send that id to the server as part of
+the write. When the corresponding event comes back down the real-time
+channel — to the author's own client or broadcast to everyone — match it by
+that client id and swap the pending entry for the confirmed one instead of
+inserting a second copy. Skip this and the author sees their own comment
+twice: once from the optimistic render, once from the broadcast echoing
+their write back to them.
+
+### Ordering and sequence numbers
+
+Network delivery does not guarantee order, especially across reconnects,
+retried requests, or a load balancer routing to different server instances.
+Attach a monotonically increasing sequence number (or a precise server
+timestamp) to every event. The client buffers out-of-order events briefly
+and applies them in sequence, or — for simpler UIs — just discards any event
+whose number is lower than the highest one already applied. Without a
+sequence number, "event B, then event A" arriving in that order silently
+corrupts state that assumed A always precedes B.
+
+### Deduplication
+
+Any at-least-once delivery guarantee (what you want for correctness — better
+a duplicate than a silent drop) means the client must safely apply the same
+event twice with no visible effect. Keep a short-lived set of
+recently-applied event ids and no-op on a repeat. This matters most right
+after a reconnect, when the server may replay events the client already
+had, to be safe about the exact boundary.
+
+### Conflict resolution: last-write-wins vs. merge
+
+When two users edit overlapping data, you need a resolution rule, not
+just delivery. Two common approaches:
+
+- **Last-write-wins (LWW)** — each write carries a timestamp; the highest
+  timestamp wins per field (or per record). Simple and fine for most
+  CRUD-shaped features (a comment's edited text, an item's status). The
+  downside: a genuinely concurrent edit from another user is silently
+  discarded, with no merge and no warning.
+- **Merge / CRDT-based resolution** — structure the data so concurrent edits
+  combine instead of one overwriting the other (a counter that sums
+  increments regardless of order, or a CRDT-backed text field). More
+  implementation cost, but the only option when losing a concurrent edit is
+  unacceptable, as in simultaneous edits to a shared document.
+
+Most product features don't need full CRDTs — field-level LWW with a
+"someone else just edited this" toast is often the pragmatic middle ground.
+
+## Reconnection and backfill
+
+Connections drop — a phone goes into a tunnel, a laptop sleeps, a server
+restarts. The naive approach (open a new connection, wait for the next
+event) silently loses everything that happened during the gap. The correct
+approach: track the last applied sequence number client-side; on reconnect,
+send it as a resume point; have the server replay everything since that
+point (the backfill) before resuming the live stream; and if the gap is too
+large to replay, fall back to a full state refetch instead of patching
+forward from stale data.
+
+SSE gives you a chunk of this for free via `Last-Event-ID`, resent
+automatically by the browser on reconnect. WebSockets give you nothing for
+free — you own the resume-token protocol, the reconnect/backoff loop (with
+jitter, so a server restart isn't hammered by every client reconnecting at
+once), and the "give up and refetch" fallback yourself.
+
+## Presence and typing: ephemeral state is a different category
+
+Not everything that flows over a real-time channel belongs in your durable
+data model. "Alice is typing," "Bob is viewing this page," a cursor position
+in a shared document — this is presence/ephemeral state, and it plays by
+different rules than persisted data:
+
+- It doesn't need to survive a server restart or be replayed on reconnect —
+  if it's gone, the client shows nothing until the next signal arrives.
+- It should auto-expire. A typing indicator that never gets a follow-up
+  "stopped typing" event (the user's tab crashed) should time out
+  client-side after a couple of seconds, not persist forever.
+- It doesn't need sequence numbers or dedup at the same rigor as durable
+  events — "Alice is typing" arriving one tick late is a UX nit, not a
+  correctness bug the way losing a comment would be.
+
+Keep ephemeral state on its own channel or message type so a burst of
+typing events never competes with the delivery guarantees you built for
+durable data.
+
+## Worked example: a live comment thread
+
+Say you're building comments on an article, live-updating for every reader
+on the page:
+
+1. **User posts a comment.** Client generates `clientId: "c-8f2a"`, renders
+   it immediately as pending, and sends it to the server with that id.
+2. **Server persists it**, assigns `seq: 4821`, and broadcasts the event
+   (including `clientId`) to every connected client over WebSocket.
+3. **The author's own client** matches `clientId` against the pending entry
+   and flips it to "confirmed" — no duplicate rendered.
+4. **Every other reader's client** sees no matching pending entry and
+   simply appends the new comment in `seq` order.
+5. **Someone's phone drops connection** for eight seconds mid-scroll. On
+   reconnect, their client sends `lastSeq: 4818`; the server replays events
+   4819–4822 before resuming the live stream — nothing posted during the
+   gap is missed.
+6. **Typing indicators** ride a separate lightweight channel: `{ type:
+   "typing", userId, threadId }`, with no sequence number, expiring
+   client-side after 3 seconds of no follow-up.
+
+<Callout type="warning">
+  A common mistake: broadcasting every write straight from the database
+  change stream without a client id or sequence number attached, then
+  discovering that the author's own optimistic UI and the broadcast echo
+  produce a visible duplicate, that reconnects silently drop events, and that
+  two events applied out of order corrupt derived state (like an unread
+  count). Design the event envelope — client id, sequence number, timestamp —
+  before you build the transport; retrofitting it after clients are already
+  live is much more painful.
+</Callout>
+
+## The cost of always-on connections
+
+A persistent WebSocket or SSE stream isn't free. On mobile, keeping a radio
+connection active drains battery meaningfully faster than periodic polling,
+because the radio can't drop to a low-power state between updates. Many
+apps close or downgrade the live connection when the tab is backgrounded
+(the Page Visibility API) and reopen it when the user returns, falling back
+to a single "catch me up" fetch instead of maintaining the stream the whole
+time. Server-side, every open connection holds memory and, for WebSockets,
+often ties a client to a specific instance, which complicates scaling and
+deploys (a rolling restart has to migrate or reconnect every open socket).
+Before reaching for "just use WebSockets everywhere," weigh whether the
+feature actually needs sub-second updates or whether a 15-second poll would
+be indistinguishable to the user at a fraction of the infrastructure cost.
+
+<Quiz
+  lessonId="real-time-data-and-synchronization"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A user posts a comment optimistically, then the server broadcasts the confirmed comment back to all clients including the author. What prevents the author from seeing their comment appear twice?',
+      options: [
+        { id: 'a', text: 'Matching the broadcast event to the pending entry via a client-generated id sent with the original write', correct: true, explanation: 'The client id lets the author\'s own client recognize "this is my pending write being confirmed" and replace it in place, instead of treating the broadcast as a brand-new comment.' },
+        { id: 'b', text: 'Using a higher polling frequency so the confirmation arrives faster', correct: false, explanation: 'Speed does not solve deduplication — even an instant confirmation still needs to be matched to the pending entry, or it renders as a second comment.' },
+        { id: 'c', text: 'Only broadcasting to other users, never back to the author', correct: false, explanation: 'This would avoid the duplicate but breaks multi-device/multi-tab use: the author would not see their own comment sync to a second open tab or device.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are legitimate reasons to choose Server-Sent Events (SSE) over a WebSocket for a feature? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The client only ever needs to receive updates, never send data back over that same channel', correct: true, explanation: 'SSE is one-way (server to client); if the feature is purely a push stream, SSE avoids the extra complexity of a full-duplex socket.' },
+        { id: 'b', text: 'You want automatic reconnect and resume support without writing custom reconnect logic', correct: true, explanation: 'The browser\'s EventSource API auto-reconnects and resends Last-Event-ID, giving you a chunk of the reconnect/backfill protocol for free.' },
+        { id: 'c', text: 'The feature requires the lowest possible round-trip latency for messages sent from the client', correct: false, explanation: 'SSE cannot carry client-to-server messages on the same stream at all, let alone with low latency — that requirement points to WebSockets, not SSE.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'After a dropped connection reconnects, replaying only the newest snapshot of data (without replaying missed individual events) is always sufficient to keep the client in sync.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A snapshot can restore current state, but many UIs need the individual missed events too (e.g. to show "3 new comments" or animate them in) — that requires backfilling from a sequence number, not just fetching the latest snapshot.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — whether a snapshot alone suffices depends on the feature. Anything that depends on presenting the sequence of missed events, not just the end state, needs backfill from a last-known sequence number.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'boolean',
+      prompt: 'Typing indicators and other presence signals should generally be stored in the same durable database records as the underlying content, with the same sequence-number and dedup guarantees.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Ephemeral state like typing/presence is intentionally lighter weight: it does not need to survive a restart, be replayed on reconnect, or carry the same ordering guarantees as durable content.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — presence/typing signals are ephemeral by design. They should ride the live channel without persistence, and expire client-side if a follow-up signal never arrives.' },
+      ],
+    },
+  ]}
+/>

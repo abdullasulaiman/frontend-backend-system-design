@@ -1,0 +1,256 @@
+---
+title: "Feature Flags and Progressive Delivery"
+module: "Bonus Lessons"
+moduleOrder: 10
+order: 4
+track: "concept"
+summary: "Shipping safely with feature flags, canary releases, A/B experiments, and instant rollback."
+cheatsheet:
+  - "Deploy is 'code is on servers'; release is 'code is visible to users' — flags are the lever that separates the two."
+  - "Four flag flavors: release toggles (temporary, delete after 100%), ops kill-switches (permanent, for degrading gracefully), experiment flags (drive A/B analysis), and permission flags (long-lived, tied to plan/role)."
+  - "Server-evaluated flags avoid the flash-of-wrong-variant flicker that client-only evaluation causes on first paint."
+  - "Bucket users by a stable hash of a durable ID (user ID, not session ID) so the same person gets the same variant across visits and devices."
+  - "Ramp with rings or percentages (1% to 5% to 25% to 100%), not one big switch — each stage is a chance to catch a regression before it's everywhere."
+  - "A flag is the fastest rollback you have: flipping a boolean beats a revert-and-redeploy by minutes to hours during an incident."
+  - "Every flag is a debt: stale flags multiply test combinations exponentially and rot into dead branches nobody trusts — schedule their removal when you create them."
+tags: ["feature-flags", "experimentation", "delivery", "bonus"]
+estMinutes: 11
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Picture a Friday afternoon deploy that ships a redesigned checkout flow to
+100% of traffic. Twenty minutes later, conversion drops 8%, and the
+on-call engineer's only option is "revert the deploy" — a new build, a new
+pipeline run, ten-plus minutes if nothing goes wrong. Neither is a good
+Friday. The fix is to stop treating "code is on the server" and "code is
+visible to users" as the same event. A feature flag is a runtime switch
+that decides, per request or per user, which code path executes — so
+shipping (deploy) and exposing (release) become two decisions you can make
+independently, and reverse independently.
+
+This lesson covers what flags are used for, where they get evaluated and
+why that matters, how rollouts ramp up safely, how experiments turn a flag
+into a measurement tool, and what it costs to run a codebase full of them.
+
+## Why decouple deploy from release
+
+Once a flag wraps a code path, "ship the code" and "turn it on" become two
+separate levers:
+
+- **Deploy without releasing.** Merge and deploy a half-finished feature
+  behind a flag that's off in production — it sits inert, exercised only
+  in staging or by internal testers, with zero customer risk.
+- **Release without a new deploy.** Flip a flag from off to on (or 5% to
+  50%) and the change takes effect immediately for whoever the targeting
+  rule matches — no build, no pipeline, no new artifact.
+- **Un-release instantly.** Flip it back. This is the rollback story: an
+  incident caused by a bad feature is fixed by a config change, not a
+  redeploy.
+
+This also solves a workflow problem: without flags, a big feature forces a
+long-lived branch that drifts and produces painful merges. Flags let you
+merge small, continuous changes to trunk behind an off flag, and switch it
+on only once the feature is actually done.
+
+## Flag types
+
+Not all flags serve the same purpose, and conflating them is where flag
+debt starts. Four common categories:
+
+- **Release toggles** — gate a new feature during development and
+  rollout. Temporary by design: once the feature is at 100% and stable,
+  the flag and the old code path should be deleted.
+- **Ops / kill-switches** — wrap a risky or expensive dependency (a
+  third-party widget, a heavy recommendation call) so it can be disabled
+  instantly if it's slow, erroring, or overloading a downstream service.
+  These are often permanent — they're a circuit breaker, not a rollout
+  mechanism.
+- **Experiment flags** — split traffic between variants specifically to
+  measure a metric difference (an A/B test). Temporary, and tied to an
+  analysis pipeline, not just an on/off switch.
+- **Permission / entitlement flags** — gate a feature by plan, role, or
+  org (enterprise-only analytics, admin-only tooling). Long-lived by
+  design; they encode a business rule, not a rollout state.
+
+Naming these distinctly matters because it tells you how urgently each one
+needs cleanup. A release toggle sitting untouched for six months is a bug
+waiting to confuse the next engineer; a permission flag doing the same
+thing is just working as intended.
+
+## Where flags get evaluated
+
+A flag check needs an answer to "what's this user's config," and that
+answer can come from the client or the server — with different trade-offs.
+
+**Client-evaluated**: the browser fetches a config blob mapping flag keys
+to values and branches locally. Cheap, with no extra round-trip mid-render
+— but the config has to arrive before render (or you render a default
+first), and a savvy user can inspect or tamper with client-side flag
+state, so it's unsuitable for anything entitlement-sensitive.
+
+**Server-evaluated**: the server decides the variant — often baked
+straight into the HTML response — before the client renders anything.
+This keeps entitlement checks trustworthy and sidesteps the flash problem
+below, at the cost of extra server-side plumbing and, for SPA-style apps,
+a round-trip before the client can render.
+
+### The flash-of-wrong-variant problem
+
+If a client-rendered app boots with a default (say, the old checkout UI),
+fetches flag config after mount, and then swaps in the new variant, users
+see a visible flip mid-page-load — the frontend equivalent of layout
+shift, and it's jarring for anything above the fold. It's the same class
+of problem as flash-of-unstyled-content, just for feature variants instead
+of CSS.
+
+Fixes fall into a few buckets: resolve the flag server-side and inline the
+decision into the initial HTML/props (SSR apps get this close to free);
+block first paint briefly on a fast, cached flag fetch (only tolerable if
+that fetch is genuinely fast, sub-50ms-class, not a full API call); or
+persist the last-known variant in local storage so at least repeat visits
+render correctly immediately, with the network fetch only there to correct
+drift.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  U[User request] --> S[Server evaluates flag]
+  S -->|variant baked into HTML/props| B[Browser renders correct variant on first paint]
+  U -.->|client-only alt path| C[Browser renders default]
+  C -.-> F[Fetch flag config]
+  F -.-> W[Swap to real variant: visible flash]
+`} />
+
+## Progressive rollout patterns
+
+Turning a flag fully on the moment it's ready reintroduces the exact risk
+flags exist to avoid. Instead, ramp exposure gradually so a bad change
+affects the smallest possible group before you notice and roll back.
+
+- **Canary release**: expose the new path to a small, low-risk slice
+  first — internal employees, a single region, or a small percentage of
+  traffic — and watch error rates and core metrics before widening.
+- **Percentage ramps**: a scripted or manual staircase — 1% for an hour,
+  5% overnight, 25% the next day, 100% once metrics hold — with an
+  explicit hold-and-check step at each rung rather than one jump.
+- **Ring-based rollout**: concentric groups ordered by risk tolerance
+  (internal dogfooders to beta opt-ins to general availability), where
+  each ring must look healthy before the next one is opened. This is
+  useful when "who's affected" matters as much as "how many are affected"
+  — internal users can absorb a rough edge that a paying customer can't.
+
+Whichever pattern, the rollout needs real monitoring — error rate,
+latency, and the specific business metric the feature targets — checked
+at each stage before advancing. A ramp with no one watching dashboards is
+just a slower version of "ship to everyone and hope."
+
+## Running experiments without breaking the metrics
+
+An A/B test is a flag with a measurement plan attached: users are split
+into variants, each is exposed to a different code path, and you compare
+an outcome metric (conversion, time-on-task, error rate) between groups.
+Two things make the difference between a trustworthy result and a
+misleading one.
+
+**Consistent bucketing.** A user must land in the same variant every time
+they're evaluated — this session, next session, on their phone tomorrow —
+or the experiment measures noise instead of a treatment effect. The
+standard approach is a deterministic hash: combine a stable ID (user ID,
+not a session ID that resets) with the flag/experiment key, hash it, and
+mod into buckets. Same inputs always produce the same bucket, with no
+storage needed beyond the ID itself. If you bucket by session or IP
+instead, the same person can flip between variants across visits and
+dilute your effect size until it's undetectable.
+
+**Don't peek and stop early.** Checking results daily and stopping the
+moment one variant looks ahead inflates false positives — early
+fluctuations regress to the mean as sample size grows. Decide the sample
+size or run duration up front (accounting for weekly seasonality — a
+Tuesday-only sample doesn't represent weekend behavior) and read the
+result once that bar is met, not whenever the interim numbers look good.
+
+## Worked example: rolling out a new pricing page
+
+A team rebuilds the pricing page and wants to ship it safely. The plan:
+
+1. **Build behind a release toggle**, `pricing-v2`, default off, merged to
+   trunk continuously so the branch never goes stale.
+2. **Server-evaluated**: the page is server-rendered, so the flag decides
+   which template renders before any HTML reaches the browser — no flash,
+   no client tampering.
+3. **Canary at 2%**, bucketed by a hash of user ID, held for 24 hours while
+   watching page-load latency and add-to-cart rate. Nothing moves; proceed.
+4. **Ramp**: 2% to 10% to 50% to 100% over four days, each rung held a day
+   and checked against those same metrics plus checkout completion.
+5. It's also run as an **experiment**: within the exposed population, half
+   see v2 and half stay on v1 — a control group, not just "metrics didn't
+   get worse" for everyone exposed.
+6. Day three: checkout completion dips 3% at the 50% ramp. Someone flips
+   `pricing-v2` back to 0%. Users are back on the old page within seconds
+   — no redeploy, no incident bridge call, just a config change while the
+   team investigates.
+7. Once the bug is fixed, re-ramp from where it left off. Once stable at
+   100% for a couple of weeks, **delete the flag and the old v1 code
+   path** — the toggle's job is done.
+
+<Callout type="warning">
+  The most common failure mode isn't a bad rollout — it's flag debt.
+  Every flag left in the codebase after its rollout finishes doubles the
+  number of code paths QA and engineers have to reason about: two flags
+  means four combinations, five flags means thirty-two. Old, forgotten
+  flags accumulate as dead `if` branches nobody's confident is safe to
+  delete, config nobody remembers the purpose of, and bugs that only
+  reproduce in the untested "flag off" branch six months after everyone
+  assumed it was on for good. Treat "delete the flag" as an explicit,
+  ticketed step of the rollout, not an optional cleanup — and keep an
+  inventory of live flags with an owner and an expected removal date for
+  every release toggle.
+</Callout>
+
+<Quiz
+  lessonId="feature-flags-and-progressive-delivery"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A client-rendered app renders the old UI by default, then fetches flag config after mount and swaps to the new variant. What problem does this describe?',
+      options: [
+        { id: 'a', text: 'Flag debt', correct: false, explanation: 'Flag debt is about stale flags piling up over time, not a rendering sequence problem on a single page load.' },
+        { id: 'b', text: 'Flash of wrong variant', correct: true, explanation: 'Rendering a default before the real flag value arrives causes a visible flip once the correct variant loads — the flash-of-wrong-variant problem, best fixed by resolving the flag server-side.' },
+        { id: 'c', text: 'Inconsistent bucketing', correct: false, explanation: 'Bucketing consistency is about a user landing in the same variant across sessions, not about a mid-page-load visual swap.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine costs of running a codebase with many long-lived feature flags? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The number of code-path combinations QA has to consider grows fast as flags accumulate', correct: true, explanation: 'Each independent flag roughly doubles the combinations to reason about or test, so a handful of stale flags gets expensive quickly.' },
+        { id: 'b', text: 'Forgotten flags leave untested "off" branches that can silently rot', correct: true, explanation: 'If everyone assumes a flag is permanently on, the "off" branch stops getting exercised and can break without anyone noticing until it matters.' },
+        { id: 'c', text: 'Flags make it impossible to do a canary or percentage rollout', correct: false, explanation: 'The opposite is true — flags are exactly what enables canary and percentage rollouts; the cost is cleanup debt, not lost rollout capability.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'For a consistent A/B test, users should be bucketed using a hash of their session ID so that returning visitors are re-randomized into either variant, reducing bias.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'This is backwards. Bucketing on a session ID lets the same person land in different variants across visits, which dilutes the measured effect rather than reducing bias.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — bucketing should use a stable, durable identifier like user ID so a given user always lands in the same variant across sessions and devices.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A payment provider integration occasionally times out under load. The team wraps it in a flag that, when flipped off, falls back to a simpler synchronous flow. What kind of flag is this?',
+      options: [
+        { id: 'a', text: 'An ops kill-switch', correct: true, explanation: 'This flag exists to degrade gracefully under operational trouble, not to gate a rollout or run an experiment — it is a permanent circuit breaker, the definition of an ops kill-switch.' },
+        { id: 'b', text: 'An experiment flag', correct: false, explanation: 'There is no A/B measurement goal here — the flag exists purely to protect the system when a dependency misbehaves.' },
+        { id: 'c', text: 'A permission flag', correct: false, explanation: 'Permission flags gate features by plan or role; this flag is about operational safety, unrelated to who the user is.' },
+      ],
+    },
+  ]}
+/>

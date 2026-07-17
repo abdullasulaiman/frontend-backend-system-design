@@ -477,6 +477,88 @@ export const MANIFEST: LessonBrief[] = [
       "Introduce an original, structured six-step approach — this course's own framework, not a reproduction of any commercial course's named framework — for tackling any frontend system design interview question end to end: (1) clarify requirements and scope, (2) estimate scale and data, (3) break the problem into components, (4) design the API and data flow, (5) choose the rendering and state architecture, (6) evaluate performance and trade-offs. Explain what to say and cover in each step and roughly how much time to spend on it in a 35–45 minute interview, then walk through applying all six steps briefly to one small example (e.g. a 'like button with a live count') so readers see the framework in action before using it on the five case studies in the Interview Prep track.",
   },
 
+  // --- Module 9: Conclusion (moduleOrder 9) — 1 lesson ---
+  {
+    track: 'concept',
+    module: 'Conclusion',
+    moduleOrder: 9,
+    order: 1,
+    slug: 'wrapping-up-frontend-system-design',
+    title: 'Wrapping Up Frontend System Design',
+    summary: 'Consolidates the whole course into a mental model and a checklist for approaching any frontend system design problem.',
+    tags: ['conclusion', 'interview-prep', 'review'],
+    estMinutes: 8,
+    brief:
+      'Close out the concepts track by tying the whole course together. Recap the throughline: nonfunctional requirements drive architecture; the fundamentals (rendering, state, DOM) underpin every decision; performance, API design, patterns, and security are the levers you trade off; and the six-step framework is how you apply all of it under interview time pressure. Give the reader a compact, durable mental model and a final pre-interview checklist (clarify requirements, estimate scale, decompose components, design data flow and API, pick rendering/state architecture, address performance/accessibility/security, state trade-offs). Point forward to the Interview Prep case studies as where to practice. Keep it motivating and concise.',
+  },
+
+  // --- Module 10: Bonus Lessons (moduleOrder 10) — 5 lessons ---
+  {
+    track: 'concept',
+    module: 'Bonus Lessons',
+    moduleOrder: 10,
+    order: 1,
+    slug: 'real-time-data-and-synchronization',
+    title: 'Real-Time Data and Synchronization',
+    summary: 'How frontends keep data fresh and consistent in real time using polling, SSE, WebSockets, and reconciliation strategies.',
+    tags: ['real-time', 'websocket', 'sync', 'bonus'],
+    estMinutes: 12,
+    brief:
+      'Explain how a frontend keeps data fresh and consistent in real time. Compare the delivery mechanisms — short/long polling, Server-Sent Events, and WebSockets — and when each fits. Cover the hard part: reconciling live server updates with local optimistic state (conflict handling, last-write-wins vs. merge, ordering/sequence numbers, dedup), handling reconnection and backfill after a dropped connection, and presence/typing-style ephemeral state. Use a small collaborative example (e.g. a live comment thread) and note the performance/battery cost of always-on connections.',
+  },
+  {
+    track: 'concept',
+    module: 'Bonus Lessons',
+    moduleOrder: 10,
+    order: 2,
+    slug: 'offline-first-and-pwa-architecture',
+    title: 'Offline-First and PWA Architecture',
+    summary: 'Designing frontends that work offline using service workers, caching strategies, and background sync.',
+    tags: ['pwa', 'offline', 'service-worker', 'bonus'],
+    estMinutes: 12,
+    brief:
+      'Describe how to design a frontend that works offline or on flaky networks. Explain the service worker lifecycle (install/activate/fetch) and the main caching strategies (cache-first, network-first, stale-while-revalidate) and when to use each. Cover the app shell model, storing data locally (IndexedDB) for offline reads, queuing writes with background sync for later replay, and the UX of communicating offline/stale state to users. Note the pitfalls: cache invalidation, versioning the service worker, and avoiding serving stale critical assets.',
+  },
+  {
+    track: 'concept',
+    module: 'Bonus Lessons',
+    moduleOrder: 10,
+    order: 3,
+    slug: 'frontend-observability-and-monitoring',
+    title: 'Frontend Observability and Monitoring',
+    summary: 'Measuring real-user performance, errors, and behavior in production with RUM, error tracking, and logging.',
+    tags: ['observability', 'monitoring', 'rum', 'bonus'],
+    estMinutes: 11,
+    brief:
+      'Explain how to know what is actually happening in a shipped frontend. Cover Real User Monitoring (collecting Core Web Vitals and custom timings from real sessions), client-side error tracking (capturing unhandled errors/promise rejections, source maps for readable stack traces, grouping and alerting), structured event logging/analytics, and distributed tracing that stitches a user action to backend spans. Discuss sampling to control volume/cost, protecting user privacy/PII in telemetry, and turning these signals into SLOs and alerts. Use a concrete example of diagnosing a latency regression from RUM data.',
+  },
+  {
+    track: 'concept',
+    module: 'Bonus Lessons',
+    moduleOrder: 10,
+    order: 4,
+    slug: 'feature-flags-and-progressive-delivery',
+    title: 'Feature Flags and Progressive Delivery',
+    summary: 'Shipping safely with feature flags, canary releases, A/B experiments, and instant rollback.',
+    tags: ['feature-flags', 'experimentation', 'delivery', 'bonus'],
+    estMinutes: 11,
+    brief:
+      'Explain how modern frontends decouple deploy from release using feature flags. Cover flag types (release, ops kill-switches, experiment, permission), how flags are evaluated on the client vs. server and the flash-of-wrong-variant problem, progressive rollout patterns (canary, percentage ramps, ring-based rollout), running A/B experiments and reading results without breaking metrics, and the safety win of instant rollback via a flag. Address the cost side: flag debt/cleanup, testing multiple flag combinations, and consistent bucketing of a user across sessions.',
+  },
+  {
+    track: 'concept',
+    module: 'Bonus Lessons',
+    moduleOrder: 10,
+    order: 5,
+    slug: 'design-systems-and-component-libraries-at-scale',
+    title: 'Design Systems and Component Libraries at Scale',
+    summary: 'Building a shared design system and component library that keeps large frontends consistent and maintainable.',
+    tags: ['design-system', 'components', 'maintainability', 'bonus'],
+    estMinutes: 12,
+    brief:
+      'Explain why large organizations build a design system and how it is architected. Cover design tokens as the single source of truth for visual decisions, layered component architecture (primitives → composed components → patterns), theming and accessibility baked into the library, versioning and distribution (semver, a monorepo or published packages) and how breaking changes are rolled out to many consuming apps, documentation (living component docs/storybook-style catalogs), and governance (contribution model, avoiding fragmentation). Connect it back to maintainability and consistency, and note the trade-off between central control and team autonomy.',
+  },
+
   // ===========================================================================
   // INTERVIEW TRACK — 20 lessons across 5 case studies (4 lessons each)
   // ===========================================================================
