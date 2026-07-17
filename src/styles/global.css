@@ -326,3 +326,12 @@ hr {
   background: var(--brand);
   color: #fff;
 }
+
+/* Course switcher links at the top of the sidebar. Same aria-current
+   convention as .nav-lesson above, but a subtler active treatment since
+   these aren't the primary lesson navigation. */
+.course-switch-link[aria-current='page'] {
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 600;
+}

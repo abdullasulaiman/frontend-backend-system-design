@@ -1,34 +1,50 @@
 ---
 import { getCollection } from 'astro:content';
-import { buildNav } from '../lib/navigation';
+import { buildNav, flattenNav } from '../lib/navigation';
+import { COURSES, type Course } from '../lib/courses';
 import ProgressRing from './ProgressRing';
 
 export interface Props {
+  /** Key of the course currently being viewed (see src/lib/courses.ts). */
+  activeCourse: Course['key'];
   /** id (slug) of the lesson currently being viewed, if any, for highlighting. */
   activeId?: string;
 }
 
-const { activeId } = Astro.props;
+const { activeCourse, activeId } = Astro.props;
 
-const [conceptEntries, interviewEntries] = await Promise.all([
-  getCollection('concepts'),
-  getCollection('interview'),
-]);
+const course = COURSES.find(c => c.key === activeCourse) ?? COURSES[0];
+
+// Resolve each course's first lesson (from its first track) once, for the
+// course switcher at the top of the sidebar. Falls back to `/cheatsheets`
+// if a course has no lessons yet, so the switcher link is never dead.
+const courseFirstHrefs = new Map<Course['key'], string>();
+for (const c of COURSES) {
+  let href = '/cheatsheets';
+  for (const track of c.tracks) {
+    const entries = await getCollection(track.collection);
+    const first = flattenNav(buildNav(entries))[0];
+    if (first) {
+      href = `${track.basePath}/${first.id}`;
+      break;
+    }
+  }
+  courseFirstHrefs.set(c.key, href);
+}
 
 // `buildNav` groups by module, and modules are scoped per-track, so each
 // track's entries are grouped independently rather than merged together.
-const conceptNav = buildNav(conceptEntries);
-const interviewNav = buildNav(interviewEntries);
+const tracks = await Promise.all(
+  course.tracks.map(async track => {
+    const entries = await getCollection(track.collection);
+    return { ...track, nav: buildNav(entries) };
+  })
+);
 
 // Build each module's lesson-id list once here (stable reference) and pass
 // that same array down to <ProgressRing>. ProgressRing's effect depends on
 // `lessonIds`, so a freshly-allocated array literal on every render would
 // make it tear down + re-subscribe its `gfsd:progress` listener needlessly.
-const tracks = [
-  { key: 'concepts', label: 'Concepts', base: '/concepts', nav: conceptNav },
-  { key: 'interview', label: 'Interview Prep', base: '/interview', nav: interviewNav },
-] as const;
-
 const moduleLessonIds = new Map<string, string[]>();
 for (const track of tracks) {
   for (const mod of track.nav) {
@@ -40,8 +56,24 @@ for (const track of tracks) {
 <aside
   class="w-full shrink-0 border-[var(--border)] p-4 lg:sticky lg:top-16 lg:h-[calc(100vh-4rem)] lg:w-72 lg:overflow-y-auto lg:border-r"
   aria-label="Lesson navigation"
-  transition:persist="sidebar"
+  transition:persist={`sidebar-${course.key}`}
 >
+  <nav aria-label="Courses" class="mb-5 flex flex-col gap-1 border-b border-[var(--border)] pb-4">
+    <h2 class="mb-1 px-2 text-xs font-bold uppercase tracking-wide text-[var(--muted)]">Courses</h2>
+    {COURSES.map(c => {
+      const isActiveCourse = c.key === course.key;
+      return (
+        <a
+          href={courseFirstHrefs.get(c.key)}
+          aria-current={isActiveCourse ? 'page' : undefined}
+          class="course-switch-link rounded-sm px-2 py-1.5 text-sm font-medium text-[var(--muted)] no-underline transition-colors duration-[var(--transition-fast)] hover:bg-[var(--surface)] hover:text-[var(--text)]"
+        >
+          {c.label}
+        </a>
+      );
+    })}
+  </nav>
+
   {tracks.map(track => (
     <div class="mb-6 last:mb-0">
       <h2 class="mb-2 px-2 text-xs font-bold uppercase tracking-wide text-[var(--muted)]">
@@ -66,7 +98,7 @@ for (const track of tracks) {
                 return (
                   <li>
                     <a
-                      href={`${track.base}/${lesson.id}`}
+                      href={`${track.basePath}/${lesson.id}`}
                       aria-current={isActive ? 'page' : undefined}
                       class="nav-lesson block rounded-sm px-2 py-1.5 text-sm transition-colors duration-[var(--transition-fast)]"
                     >

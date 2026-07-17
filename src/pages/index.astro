@@ -2,56 +2,70 @@
 import BaseLayout from '../layouts/BaseLayout.astro';
 import ProgressRing from '../components/ProgressRing';
 import { getCollection } from 'astro:content';
-import { buildNav } from '../lib/navigation';
+import { buildNav, flattenNav } from '../lib/navigation';
+import { COURSES } from '../lib/courses';
 
-const [conceptEntries, interviewEntries] = await Promise.all([
-  getCollection('concepts'),
-  getCollection('interview'),
-]);
+// Short per-track descriptions for the roadmap cards. Only the frontend
+// course's tracks have bespoke copy today; anything not listed here falls
+// back to a generic line built from the course blurb.
+const trackDescriptions: Record<string, string> = {
+  concepts: 'Core frontend system design building blocks — rendering, state, performance, architecture.',
+  interview: 'Timed drills and mock walkthroughs that put the concepts to work under interview conditions.',
+  'sd-concepts': 'Core distributed-systems building blocks — scaling, storage, messaging, and reliability.',
+  'sd-interview': 'End-to-end walkthroughs of classic system design interview problems.',
+};
 
-const conceptNav = buildNav(conceptEntries);
-const interviewNav = buildNav(interviewEntries);
-
-const tracks = [
-  {
-    key: 'concepts',
-    label: 'Concepts',
-    description: 'Core frontend system design building blocks — rendering, state, performance, architecture.',
-    base: '/concepts',
-    nav: conceptNav,
-  },
-  {
-    key: 'interview',
-    label: 'Interview Prep',
-    description: 'Timed drills and mock walkthroughs that put the concepts to work under interview conditions.',
-    base: '/interview',
-    nav: interviewNav,
-  },
-] as const;
+// For each course, resolve its tracks' nav (module -> lessons) up front so
+// the roadmap section below can render synchronously.
+const courseData = await Promise.all(
+  COURSES.map(async course => {
+    const tracks = await Promise.all(
+      course.tracks.map(async track => {
+        const entries = await getCollection(track.collection);
+        const nav = buildNav(entries);
+        return {
+          ...track,
+          description: trackDescriptions[track.key] ?? course.blurb,
+          nav,
+        };
+      })
+    );
+    const lessonCount = tracks.reduce((n, t) => n + t.nav.reduce((m, mod) => m + mod.lessons.length, 0), 0);
+    return { ...course, tracks, lessonCount };
+  })
+);
 
 // Build each module's lesson-id list once (stable reference) so <ProgressRing>
 // doesn't tear down + re-subscribe its progress listener on every render.
-// Same approach as Sidebar.astro.
+// Keyed by `${courseKey}:${trackKey}:${module}` so modules with the same
+// name in different tracks/courses never collide.
 const moduleLessonIds = new Map<string, string[]>();
-for (const track of tracks) {
-  for (const mod of track.nav) {
-    moduleLessonIds.set(`${track.key}:${mod.module}`, mod.lessons.map(l => l.id));
+for (const course of courseData) {
+  for (const track of course.tracks) {
+    for (const mod of track.nav) {
+      moduleLessonIds.set(`${course.key}:${track.key}:${mod.module}`, mod.lessons.map(l => l.id));
+    }
   }
 }
 
-// Primary CTA: first lesson of the Concepts track, in nav order. Falls back
-// to the first Interview Prep lesson, and finally to the roadmap section
-// itself, so the hero never links to a 404 while content is still sparse.
-const firstConceptLesson = conceptNav[0]?.lessons[0];
-const firstInterviewLesson = interviewNav[0]?.lessons[0];
-const heroHref = firstConceptLesson
-  ? `/concepts/${firstConceptLesson.id}`
-  : firstInterviewLesson
-    ? `/interview/${firstInterviewLesson.id}`
-    : '#roadmap';
-const heroCtaLabel = firstConceptLesson || firstInterviewLesson ? 'Start learning' : 'View the roadmap';
+// Primary CTA: first lesson of the frontend course's first track (Concepts),
+// in nav order. Falls back down the list of every course/track so the hero
+// never links to a 404 while content is still sparse, and finally to the
+// roadmap section itself.
+let heroHref = '#roadmap';
+let heroCtaLabel = 'View the roadmap';
+outer: for (const course of courseData) {
+  for (const track of course.tracks) {
+    const first = flattenNav(track.nav)[0];
+    if (first) {
+      heroHref = `${track.basePath}/${first.id}`;
+      heroCtaLabel = 'Start learning';
+      break outer;
+    }
+  }
+}
 
-const totalLessons = conceptEntries.length + interviewEntries.length;
+const totalLessons = courseData.reduce((n, c) => n + c.lessonCount, 0);
 ---
 
 <BaseLayout title="The System Design Handbook">
@@ -77,8 +91,8 @@ const totalLessons = conceptEntries.length + interviewEntries.length;
         </h1>
         <p class="mx-auto mt-5 max-w-2xl text-lg text-white/85 sm:text-xl">
           Master the architecture, performance, and API-design tradeoffs that separate senior
-          engineers — through interactive lessons and interview-style drills covering frontend
-          system design today, with backend system design coming soon.
+          engineers — through interactive lessons and interview-style drills covering both
+          frontend and backend system design.
         </p>
 
         <div class="mt-9 flex flex-wrap items-center justify-center gap-4">
@@ -97,72 +111,73 @@ const totalLessons = conceptEntries.length + interviewEntries.length;
         </div>
 
         <p class="mt-7 text-sm text-white/70">
-          {totalLessons} lesson{totalLessons === 1 ? '' : 's'} across two tracks · No signup · No paywall
+          {totalLessons} lesson{totalLessons === 1 ? '' : 's'} across {courseData.length} course{courseData.length === 1 ? '' : 's'} · No signup · No paywall
         </p>
       </div>
     </section>
 
     <!-- Roadmap -->
     <section id="roadmap" class="mx-auto max-w-6xl px-4 py-16 sm:px-6 sm:py-20">
-      <div class="reveal mx-auto mb-12 max-w-2xl text-center">
-        <h2 class="text-3xl font-bold tracking-tight text-[var(--text)] sm:text-4xl">
-          Two tracks, one system
-        </h2>
-        <p class="mt-3 text-[var(--muted)]">
-          Work through Concepts to build a mental model, then drill Interview Prep to rehearse
-          explaining it under pressure. Progress is tracked locally in your browser.
-        </p>
-      </div>
+      {courseData.map((course, ci) => (
+        <div class={ci > 0 ? 'mt-16' : ''}>
+          <div class="reveal mx-auto mb-12 max-w-2xl text-center">
+            <h2 class="text-3xl font-bold tracking-tight text-[var(--text)] sm:text-4xl">
+              {course.label}
+            </h2>
+            <p class="mt-3 text-[var(--muted)]">{course.blurb}</p>
+          </div>
 
-      <div class="grid grid-cols-1 gap-8 lg:grid-cols-2">
-        {tracks.map((track, ti) => {
-          const lessonCount = track.nav.reduce((n, m) => n + m.lessons.length, 0);
-          return (
-            <div
-              class={`reveal reveal-delay-${ti + 1} flex h-full flex-col rounded-lg border border-[var(--border)] bg-[var(--surface)] p-6 shadow-[var(--shadow-card)] sm:p-8`}
-            >
-              <div class="mb-6 flex items-start justify-between gap-3">
-                <div>
-                  <h3 class="text-xl font-bold text-[var(--text)]">{track.label}</h3>
-                  <p class="mt-1 text-sm text-[var(--muted)]">{track.description}</p>
-                </div>
-                <span class="shrink-0 rounded-pill bg-[var(--surface-2)] px-3 py-1 text-xs font-semibold text-[var(--muted)]">
-                  {lessonCount} lesson{lessonCount === 1 ? '' : 's'}
-                </span>
-              </div>
+          <div class="grid grid-cols-1 gap-8 lg:grid-cols-2">
+            {course.tracks.map((track, ti) => {
+              const lessonCount = track.nav.reduce((n, m) => n + m.lessons.length, 0);
+              return (
+                <div
+                  class={`reveal reveal-delay-${ti + 1} flex h-full flex-col rounded-lg border border-[var(--border)] bg-[var(--surface)] p-6 shadow-[var(--shadow-card)] sm:p-8`}
+                >
+                  <div class="mb-6 flex items-start justify-between gap-3">
+                    <div>
+                      <h3 class="text-xl font-bold text-[var(--text)]">{track.label}</h3>
+                      <p class="mt-1 text-sm text-[var(--muted)]">{track.description}</p>
+                    </div>
+                    <span class="shrink-0 rounded-pill bg-[var(--surface-2)] px-3 py-1 text-xs font-semibold text-[var(--muted)]">
+                      {lessonCount} lesson{lessonCount === 1 ? '' : 's'}
+                    </span>
+                  </div>
 
-              {track.nav.length === 0 ? (
-                <div class="flex flex-1 items-center justify-center rounded-card border border-dashed border-[var(--border)] p-8 text-center text-sm text-[var(--muted)]">
-                  Modules for this track are coming soon.
+                  {track.nav.length === 0 ? (
+                    <div class="flex flex-1 items-center justify-center rounded-card border border-dashed border-[var(--border)] p-8 text-center text-sm text-[var(--muted)]">
+                      Modules for this track are coming soon.
+                    </div>
+                  ) : (
+                    <ul class="flex flex-col gap-3">
+                      {track.nav.map(mod => {
+                        const lessonIds = moduleLessonIds.get(`${course.key}:${track.key}:${mod.module}`) ?? [];
+                        const firstLesson = mod.lessons[0];
+                        return (
+                          <li>
+                            <a
+                              href={`${track.basePath}/${firstLesson.id}`}
+                              class="flex items-center justify-between gap-4 rounded-card border border-[var(--border)] bg-[var(--bg)] px-4 py-3 no-underline transition-colors duration-[var(--transition-fast)] hover:border-[var(--brand)] hover:bg-[var(--surface-2)]"
+                            >
+                              <span class="min-w-0">
+                                <span class="block truncate font-semibold text-[var(--text)]">{mod.module}</span>
+                                <span class="block text-sm text-[var(--muted)]">
+                                  {mod.lessons.length} lesson{mod.lessons.length === 1 ? '' : 's'}
+                                </span>
+                              </span>
+                              <ProgressRing client:visible lessonIds={lessonIds} size={44} label={`${mod.module} progress`} />
+                            </a>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
                 </div>
-              ) : (
-                <ul class="flex flex-col gap-3">
-                  {track.nav.map(mod => {
-                    const lessonIds = moduleLessonIds.get(`${track.key}:${mod.module}`) ?? [];
-                    const firstLesson = mod.lessons[0];
-                    return (
-                      <li>
-                        <a
-                          href={`${track.base}/${firstLesson.id}`}
-                          class="flex items-center justify-between gap-4 rounded-card border border-[var(--border)] bg-[var(--bg)] px-4 py-3 no-underline transition-colors duration-[var(--transition-fast)] hover:border-[var(--brand)] hover:bg-[var(--surface-2)]"
-                        >
-                          <span class="min-w-0">
-                            <span class="block truncate font-semibold text-[var(--text)]">{mod.module}</span>
-                            <span class="block text-sm text-[var(--muted)]">
-                              {mod.lessons.length} lesson{mod.lessons.length === 1 ? '' : 's'}
-                            </span>
-                          </span>
-                          <ProgressRing client:visible lessonIds={lessonIds} size={44} label={`${mod.module} progress`} />
-                        </a>
-                      </li>
-                    );
-                  })}
-                </ul>
-              )}
-            </div>
-          );
-        })}
-      </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
     </section>
 
     <!-- How to use -->
@@ -176,10 +191,11 @@ const totalLessons = conceptEntries.length + interviewEntries.length;
             <div class="mx-auto mb-3 flex h-9 w-9 items-center justify-center rounded-card bg-[var(--brand)] text-sm font-bold text-white sm:mx-0">
               1
             </div>
-            <h3 class="font-semibold text-[var(--text)]">Pick a track</h3>
+            <h3 class="font-semibold text-[var(--text)]">Pick a course, then a track</h3>
             <p class="mt-1 text-sm text-[var(--muted)]">
-              Start with Concepts for foundations, or jump into Interview Prep if you already know
-              the material and want timed practice.
+              Choose Frontend or Backend system design, then start with Concepts/Foundations for
+              the fundamentals, or jump into the interview-prep track if you already know the
+              material and want timed practice.
             </p>
           </div>
           <div class="text-center sm:text-left">

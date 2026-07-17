@@ -3,12 +3,12 @@ import { getCollection, render } from 'astro:content';
 import LessonLayout from '../../layouts/LessonLayout.astro';
 
 export async function getStaticPaths() {
-  const entries = await getCollection('interview');
+  const entries = await getCollection('sd-concepts');
   return entries.map(entry => ({ params: { slug: entry.id }, props: { entry } }));
 }
 const { entry } = Astro.props;
 const { Content, headings } = await render(entry);
 ---
-<LessonLayout entry={entry} headings={headings} collection="interview">
+<LessonLayout entry={entry} headings={headings} collection="sd-concepts">
   <Content />
 </LessonLayout>
