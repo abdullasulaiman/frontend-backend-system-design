@@ -23,7 +23,7 @@ import Mermaid from '../../components/Mermaid';
 
 Most interview candidates can say "use a NoSQL database" when a design needs to scale past a single relational instance. Far fewer can explain *how* a system like DynamoDB actually stays available when a rack loses power, a network link flakes, or a single key gets hammered by ten thousand requests a second. That gap is exactly what interviewers probe for once you've drawn the boxes — and DynamoDB is one of the best-documented, most battle-tested answers to "how do you build a key-value store that never says no."
 
-This lesson pulls apart the ideas that make DynamoDB work: consistent hashing for partitioning, leaderless replication for durability, and tunable consistency for the latency/correctness trade-off. These aren't DynamoDB-only tricks — they show up any time you're asked to design a distributed key-value store, a session store, or a cache tier that needs to survive node failures without downtime. (If you haven't yet, it's worth comparing this against the [Netflix case study](/system-design/design/case-study-case-study-netflix-global-video-streaming-at-scale) earlier in this module — that lesson is about serving large blobs to millions of viewers; this one is about serving tiny reads/writes with strict latency SLAs, a genuinely different problem shape.)
+This lesson pulls apart the ideas that make DynamoDB work: consistent hashing for partitioning, leaderless replication for durability, and tunable consistency for the latency/correctness trade-off. These aren't DynamoDB-only tricks — they show up any time you're asked to design a distributed key-value store, a session store, or a cache tier that needs to survive node failures without downtime. (If you haven't yet, it's worth comparing this against the [Netflix case study](/system-design/design/case-study-netflix-global-video-streaming-at-scale) earlier in this module — that lesson is about serving large blobs to millions of viewers; this one is about serving tiny reads/writes with strict latency SLAs, a genuinely different problem shape.)
 
 ## The core problem DynamoDB solves
 
@@ -87,7 +87,7 @@ If each session item is small (session ID, user ID, a few claims — call it 1 K
 The three ideas in this lesson — consistent hashing for placement, leaderless quorum replication for durability, and vector clocks (or a simpler last-writer-wins policy) for conflict resolution — are the standard toolkit for "highly available key-value store" questions generally, not DynamoDB trivia. Cassandra, Riak, and Voldemort all descend from the same 2007 Dynamo paper and make similar choices with different defaults. If an interviewer asks you to design a distributed cache or a rate-limiter's counter store, reaching for "partition by consistent hashing, replicate N ways, pick a quorum that matches the consistency the feature actually needs" is a stronger answer than naming a specific product.
 
 <Quiz
-  lessonId="case-study-case-study-amazon-dynamodb-highly-available-key-value-at-sca"
+  lessonId="case-study-amazon-dynamodb-highly-available-key-value-at-scale"
   client:visible
   questions={[
     {
