@@ -1,0 +1,264 @@
+---
+title: "Design a Stock Exchange / Trading System"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 9
+track: "interview"
+summary: "Design a matching engine for a stock exchange, covering the order book, price-time priority matching, deterministic sequencing, and how the rest of the system stays consistent with a single-threaded core."
+tags: ["trading-systems", "matching-engine", "low-latency", "order-book", "sequencing"]
+estMinutes: 13
+cheatsheet:
+  - "The matching engine is the one component that must be sequential and single-writer per symbol — parallelism there breaks price-time priority, so scale by sharding symbols across engines instead of threading one engine."
+  - "An order book is two sorted structures (bids descending, asks ascending) keyed by price, each price level holding a FIFO queue of orders — that queue is what gives price-time priority."
+  - "A trade happens when the best bid >= the best ask; the resting order's price is used, not the aggressor's, so the earlier order never gets a worse fill than it asked for."
+  - "Durability comes from a sequencer that assigns a monotonic ID and appends to a replicated log before the match runs — replay of that log is how a crashed engine (or a DR replica) rebuilds identical state."
+  - "Market data (the public order book feed) and execution reports (private fill confirmations) are separate output streams with different fan-out and latency needs — don't couple them to the same publish path."
+  - "Risk checks (buying power, position limits, fat-finger checks) run pre-trade, before an order reaches the book, because canceling a trade after it prints is a regulatory and reputational mess, not just an engineering rollback."
+  - "'Fair' in this domain means deterministic and auditable, not 'load balanced' — every participant must be able to reconstruct why order A matched before order B from the sequence log."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Most system design interviews reward you for finding the right place to trade
+consistency for throughput. A stock exchange flips that instinct: the core of
+the system — the matching engine — is one of the few places in this whole
+course where you deliberately give up parallelism and horizontal scaling to
+get strict, deterministic ordering, because the correctness of a trade
+literally means "which order arrived first at this price." Get the sequencing
+wrong and you haven't just introduced a bug, you've mismatched someone's
+trade. This lesson designs the pieces around that constraint: how orders get
+in, how they're matched, how the result is published, and how the one
+single-threaded component in the middle still handles millions of orders a
+day without becoming the bottleneck for everything else.
+
+## Requirements
+
+**Functional**
+
+- Traders submit orders: limit orders (buy/sell N shares at price P or
+  better) and market orders (buy/sell N shares at the best available price).
+- Orders can be canceled or amended before they fully execute.
+- The system matches compatible buy and sell orders and produces trades.
+- Participants receive execution reports (their own fills) and can subscribe
+  to a public market data feed (best bid/ask, recent trades, depth).
+- Every order and trade is fully auditable after the fact.
+
+**Non-functional**
+
+- **Correctness over throughput.** A trade must respect price-time priority
+  exactly; no exceptions for load.
+- **Low, predictable latency.** Order-to-acknowledgment in the microseconds-
+  to-low-single-digit-milliseconds range for the matching path; the wider
+  system (account services, reporting) can be much looser.
+- **Determinism.** Given the same input sequence, replaying it must produce
+  the identical output every time — this is how you recover from a crash and
+  how regulators/participants audit disputes.
+- **No silent data loss.** An acknowledged order or trade must survive a
+  crash of any single component.
+
+We're explicitly not designing a full brokerage (portfolios, tax lots,
+customer-facing app) or a blockchain-based settlement layer — this is the
+exchange's matching core plus the plumbing that feeds it and reports out of
+it.
+
+## High-level architecture
+
+Orders flow in from gateways, get risk-checked, then hit a sequencer that
+imposes one global (or per-symbol) order before handing them to the matching
+engine. The engine's output — trades and book updates — fans out to
+execution reports and market data.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  T[Trader / Broker] --> GW[Order Gateway]
+  GW --> RISK[Pre-Trade Risk Check]
+  RISK --> SEQ[Sequencer]
+  SEQ --> LOG[(Append-only Order Log)]
+  SEQ --> ME[Matching Engine - per symbol]
+  ME --> EXEC[Execution Report Service]
+  ME --> MD[Market Data Publisher]
+  EXEC --> T
+  MD --> SUB[Market Data Subscribers]
+  ME --> AUDIT[(Trade / Audit Store)]
+`} />
+
+- **Order gateway** — the client-facing entry point (FIX protocol or a REST/
+  WebSocket API for a retail-style exchange). Validates message shape, auths
+  the session.
+- **Pre-trade risk check** — rejects an order before it ever reaches the
+  book: buying power, position limits, price-collar ("fat finger") checks.
+  This has to be fast and stateless-ish per account, because it sits on the
+  hot path.
+- **Sequencer** — assigns each accepted order a monotonically increasing
+  sequence number and durably logs it before matching runs. This is what
+  makes the whole pipeline replayable.
+- **Matching engine** — one logical instance per symbol (or per shard of
+  symbols), holding that symbol's order book in memory and matching orders
+  against it.
+- **Execution report service** — turns each match event into a private
+  confirmation sent back to the two participants involved.
+- **Market data publisher** — turns book/trade events into a public feed
+  (best bid/offer, depth-of-book, last trade) broadcast to everyone.
+
+## The order book and price-time priority
+
+An order book for one symbol is two sorted collections:
+
+- **Bids**, sorted by price descending (highest buyer wants to trade first).
+- **Asks**, sorted by price ascending (lowest seller wants to trade first).
+
+Within a price level, orders sit in a FIFO queue — first order in at that
+price is first to be matched at that price. This is "price-time priority":
+better price always wins; ties broken by arrival time. That queue is the
+entire reason the matching engine has to process orders strictly in arrival
+order — reordering two orders at the same price changes who gets filled.
+
+A match occurs whenever the best bid price is greater than or equal to the
+best ask price. The trade executes at the **resting order's price** (the
+order that was already in the book), not the incoming order's price — this
+guarantees the resting side never gets a worse price than they originally
+asked for, and the aggressor (incoming order) effectively gets "price
+improvement" if the book had a better price than they were willing to pay.
+
+A market order skips the price check entirely and just walks the book,
+consuming price levels from the top until it's filled or the book runs dry
+(at which point, depending on the exchange's rules, it either rests as a
+limit order at the last traded price or is canceled — this is a real design
+choice you should state explicitly in an interview).
+
+### Why the matching engine is single-threaded per symbol
+
+It's tempting to reach for the usual scaling toolkit — partition by hash,
+add replicas, load balance. For one symbol's order book, you can't: two
+orders for the same symbol arriving concurrently on different threads and
+racing into the book is exactly the bug that breaks price-time priority
+(and produces a non-reproducible outcome — you can no longer replay the log
+and get the same trades back). So the standard design pins each symbol's
+book to a single core, processed by a single thread pulling sequenced orders
+off a queue, one at a time. Scaling isn't "more threads for one engine," it's
+"more engines, one per symbol or symbol-shard" — this is horizontal scaling
+at the symbol level, not inside a single book.
+
+<Callout type="tip">
+  This is a good moment in an interview to name the trade-off explicitly:
+  "I'm choosing to make the matching engine single-threaded per symbol
+  because correctness here means a specific, auditable ordering — not
+  because I don't know how to parallelize it." Interviewers are checking
+  whether you understand *why* you're avoiding concurrency here, not whether
+  you can avoid it by accident.
+</Callout>
+
+## Sequencing and durability
+
+Because the engine only holds state in memory for speed, you need a way to
+survive a crash without losing or reordering trades. The standard pattern is
+an **append-only log** (think Kafka-partition-per-symbol, or a dedicated
+sequencer service) that every accepted order is written to *before* the
+matching engine consumes it. The log entry's position is the order's
+sequence number.
+
+Recovery after a crash: spin up a fresh matching engine, replay the log from
+the last durable snapshot (or from the beginning), and it deterministically
+rebuilds the identical order book and trade history — same inputs, same
+order, same output, every time. This is also how a hot-standby replica stays
+ready to take over: it consumes the same log in parallel and mirrors the
+primary's state without doing any matching itself until it's promoted.
+
+The same log is the backbone of auditability: regulators and participants in
+a trade dispute can point at sequence numbers and reconstruct exactly what
+the book looked like at each step.
+
+## Market data vs. execution reports
+
+These look similar (both are "tell someone what happened") but have
+different shapes and should not share an infrastructure path:
+
+- **Execution reports** are private, 1:1, and must never be dropped — a
+  trader needs to know their order filled. Delivered over a reliable,
+  ordered channel per session (e.g., FIX drop-copy) with acknowledgment and
+  retransmit.
+- **Market data** is public, fan-out to potentially tens of thousands of
+  subscribers, and tolerates occasional gaps if a fast recovery/snapshot
+  mechanism exists — a UDP multicast feed with periodic full-book snapshots
+  is a common real-world pattern, because retransmitting to everyone over
+  TCP at that fan-out doesn't scale the same way.
+
+Coupling them (e.g., generating market data off the execution-report queue)
+tends to either slow down the private, latency-sensitive path with public
+fan-out concerns, or slow down public data with per-session reliability
+overhead it doesn't need.
+
+## Worked example: sizing one symbol's engine
+
+Take a moderately liquid stock trading 5 million shares a day, with an
+average order size of 200 shares — that's 25,000 orders/trades-worth of
+activity a day. Concentrated in a 6.5-hour trading session, that's roughly
+1,100 orders/minute average, but real markets are bursty: opening/closing
+auctions and news events can spike a single symbol to 5,000+ messages/second
+for short windows.
+
+A single-threaded matching engine handling in-memory comparisons against a
+red-black-tree-or-skip-list order book can process on the order of
+100,000-plus simple limit-order matches per second on modern hardware — so
+one symbol's steady-state and even burst load fits comfortably on one core.
+The real scaling question isn't "can one engine keep up with one symbol," it's
+"how do I run 8,000 listed symbols without 8,000 dedicated cores sitting
+mostly idle." The answer is grouping: shard symbols across a pool of engine
+processes (e.g., 50-100 processes each owning ~100 symbols), routing each
+order by symbol to its owning shard, so quiet symbols share a core and only
+the busiest names (think a hot earnings-day stock) get dedicated capacity.
+
+## Common pitfalls
+
+<Callout type="warning">
+  The most common mistake in this design is trying to scale the matching
+  engine like a normal stateless service — adding replicas behind a load
+  balancer for a single symbol's book "for availability." That doesn't add
+  availability, it adds a race condition: two engines each think they own
+  the authoritative book, and now two participants can each believe they
+  hold the same shares, or a marketable order matches twice. Availability
+  for one symbol's book comes from a hot-standby that replays the same
+  sequenced log and can take over on failure — never from concurrent
+  writers to the same book.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="free-design-a-stock-exchange-trading-system"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Two limit buy orders for the same stock arrive at the same price, a few milliseconds apart. Which one should be matched first when a matching sell order arrives?',
+      options: [
+        { id: 'a', text: 'Whichever buy order has the larger quantity', correct: false, explanation: 'Quantity does not determine priority within a price level. Price-time priority uses price first, then arrival time, not size.' },
+        { id: 'b', text: 'The buy order that arrived first', correct: true, explanation: 'At the same price, price-time priority breaks ties by arrival order — the earlier order sits ahead in that price level’s FIFO queue and is matched first.' },
+        { id: 'c', text: 'It is chosen at random to keep things fair across participants', correct: false, explanation: 'Randomizing at the same price would make outcomes non-deterministic and unauditable, which is the opposite of what an exchange needs.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'boolean',
+      prompt: 'Scaling the matching engine for a single, very high-volume symbol is best done by running multiple engine replicas behind a load balancer, similar to a stateless web service.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Multiple concurrent writers to one symbol’s order book create races that break price-time priority and can produce inconsistent fills. A single book must have one writer.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. A single symbol’s book stays single-writer; you scale across symbols by sharding, and get availability via a hot-standby replaying the same sequenced log, not via concurrent writers.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'multi',
+      prompt: 'Which statements correctly describe the role of the append-only sequenced log in this design? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It lets a crashed matching engine rebuild identical state by replaying orders in the same order', correct: true, explanation: 'Correct — deterministic replay from the log is exactly how the engine recovers to the same state it had before crashing.' },
+        { id: 'b', text: 'It assigns the sequence number that price-time priority ties are broken by', correct: true, explanation: 'Correct — the sequencer’s monotonic ordering is the "time" component that resolves same-price ordering deterministically.' },
+        { id: 'c', text: 'It replaces the need for pre-trade risk checks, since bad orders can just be removed from the log later', correct: false, explanation: 'Risk checks must happen before an order reaches the book — once a trade executes and prints, it cannot simply be erased from the log without real regulatory and counterparty consequences.' },
+        { id: 'd', text: 'It is the source of truth used to audit and reconstruct trade disputes', correct: true, explanation: 'Correct — sequence numbers give every participant a way to point at exactly what the book looked like at each step.' },
+      ],
+    },
+  ]}
+/>

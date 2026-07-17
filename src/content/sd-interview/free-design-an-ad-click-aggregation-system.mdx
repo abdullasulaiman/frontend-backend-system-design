@@ -1,0 +1,150 @@
+---
+title: "Design an Ad Click Aggregation System"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 6
+track: "interview"
+summary: "Design a pipeline that ingests billions of ad click events per day and produces near-real-time, fraud-resistant aggregate counts for billing and reporting."
+tags: ["ad-tech", "stream-processing", "data-pipelines", "exactly-once", "aggregation"]
+estMinutes: 13
+cheatsheet:
+  - "Log clicks as immutable append-only events (click_id, ad_id, timestamp, user/context) — never mutate counters in place at ingest time; aggregation is a downstream concern."
+  - "Use a stream processor (windowed aggregation) rather than direct database counters — DB row-level increments can't survive the write rate of a large ad platform."
+  - "Pick a dedup key (click_id, or a hash of user+ad+time-bucket) and dedup at the stream layer with an idempotency store (bloom filter or key-value cache with a TTL) before counts are ever incremented."
+  - "Choose windowing carefully: tumbling windows for simple per-minute rollups, sliding windows for 'trailing N minutes' dashboards, and watermarks to bound how long you wait for late events before finalizing a window."
+  - "Separate the 'fast, approximate' real-time path (seconds-to-minutes latency, OK to be slightly off) from the 'slow, exact' batch reconciliation path (hours latency, used as the source of truth for billing)."
+  - "Fraud/bot filtering happens before aggregation, not after — once a click is counted into an aggregate, un-counting it requires a correction event, not a silent decrement."
+  - "Design the query side for the actual access pattern: pre-aggregate into a time-bucketed store (ad_id, minute) -> count, don't force advertiser dashboards to scan raw click logs."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every ad platform lives or dies on one number: how many times was this ad clicked, and how much does the advertiser owe? Get that number wrong and you either overcharge advertisers (they leave) or undercharge them (you lose revenue at scale). The twist that makes this a hard system design problem rather than a `SELECT COUNT(*)` is volume and correctness under failure: a mid-size ad network sees tens of thousands of clicks per second, click events can arrive late or duplicated, and a subset of "clicks" are bots or click-farms trying to drain a competitor's budget. You need a pipeline that's fast enough for advertisers to watch spend in near-real-time, and exact enough that finance can bill off the same numbers.
+
+This lesson designs that pipeline: ingestion, deduplication, windowed aggregation, and the query layer advertisers actually look at.
+
+## Requirements
+
+**Functional**
+- Ingest ad click events (a user clicked an ad that was served to them) at very high write throughput.
+- Aggregate clicks per ad (and per campaign, per advertiser) over time windows — "clicks in the last minute," "clicks today," "clicks this month."
+- Support advertiser-facing dashboards querying recent aggregates with low latency.
+- Feed a billing pipeline that must be exact — no double-counting, no dropped clicks.
+
+**Non-functional**
+- High write throughput: design for 50,000-100,000 clicks/sec at peak for a large network.
+- Near-real-time dashboards: aggregates visible within seconds to a couple of minutes.
+- Exactly-once semantics for the numbers that touch billing — at-least-once ingestion is fine as long as duplicates are filtered before they're counted twice.
+- Tolerate late-arriving events (a mobile client that was offline for 30 seconds) without permanently corrupting a window's count.
+- Resilience to bot/fraud traffic inflating counts.
+
+<Callout type="note">
+  A related but distinct problem is *attribution* (which ad gets credit for a purchase that happened later). This lesson focuses on counting and aggregating clicks themselves — attribution deserves its own design.
+</Callout>
+
+## High-level architecture
+
+The core idea: never try to increment a shared counter directly from the request path. Instead, log every click as an immutable event, then let a stream-processing layer turn the event stream into aggregates asynchronously.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  C[Ad-serving client] -->|click event| G[Ingestion gateway]
+  G --> Q[Event log / Kafka]
+  Q --> D[Dedup + fraud filter]
+  D --> A[Stream aggregator windowed]
+  A --> S[(Aggregate store: ad_id, minute -> count)]
+  A --> R[(Raw event store, for reconciliation)]
+  S --> API[Query API]
+  API --> DB[Advertiser dashboard]
+  R --> B[Batch reconciliation job]
+  B --> S
+`} />
+
+**Ingestion gateway** — a thin, horizontally scaled service that accepts click pings (usually a redirect or beacon fired by the ad-serving client) and writes them straight into a durable log (Kafka or an equivalent). It does no aggregation itself; its only job is "accept the event, persist it, ack the client" as fast as possible. This is what absorbs the write spike — a stateless HTTP layer in front of a partitioned log scales close to linearly by adding more gateway instances and log partitions.
+
+**Event log** — the durable, ordered, replayable backbone. Partitioning by `ad_id` (or a hash of it) keeps all events for a given ad in the same partition, which matters later for aggregation locality.
+
+**Dedup + fraud filter** — runs as a stream-processing stage before anything gets counted. Two independent problems live here:
+- *Duplicates*: retries from the client, or the gateway itself acking then crashing before the write is confirmed, can produce the same logical click twice. Dedup on a `click_id` (client-generated UUID) or a derived key using an idempotency cache with a bounded TTL (a few minutes is enough to cover realistic retry windows).
+- *Fraud*: bot traffic, click farms, and self-clicks get filtered by rules or a lightweight scoring model (velocity per IP/device, known bot signatures, click-to-impression ratio anomalies). This is necessarily heuristic — perfect fraud detection isn't the goal here, catching the obvious abuse before it inflates a bill is.
+
+**Stream aggregator** — the heart of the system. It consumes the deduped, filtered stream and maintains running counts per `(ad_id, time_bucket)`, emitting updated aggregates as each window progresses or closes.
+
+**Aggregate store** — a store optimized for the read pattern: point lookups and small range scans keyed by `(ad_id, time_bucket)`. A wide-column store or a time-series database fits well; you're writing small increments constantly and reading small ranges for dashboards.
+
+**Batch reconciliation** — a periodic (e.g. hourly or daily) job that re-reads the raw event log and recomputes exact totals, correcting for anything the real-time path got approximately right but not exactly right (e.g. a fraud model whose rules changed, or edge cases in late-arriving data). Billing is computed off this exact path, not the real-time path.
+
+## Windowing and late events
+
+Clicks don't arrive in perfectly ordered, on-time streams. A user's device is briefly offline, a mobile network retries, or a client batches events before sending. The aggregator has to decide: how long do I wait for more events belonging to a window before I call that window "final"?
+
+Three windowing strategies matter here:
+
+- **Tumbling windows** — fixed, non-overlapping intervals (e.g. one-minute buckets). Simplest model: an event with timestamp `t` belongs to exactly one bucket. Good default for "clicks per minute" rollups.
+- **Sliding windows** — overlapping windows (e.g. "trailing 5 minutes," recomputed every 10 seconds). Useful for dashboards showing a moving rate, at the cost of more compute since each event can contribute to multiple windows.
+- **Watermarks** — a moving threshold saying "we don't expect events older than this anymore." When the watermark passes a tumbling window's end, that window is finalized and emitted downstream (e.g. into the billing-facing store). Late events that arrive after the watermark has passed are still recorded (so the raw log stays complete for reconciliation) but trigger a correction rather than silently reopening a closed aggregate.
+
+Getting the watermark delay right is a genuine trade-off: a short delay makes dashboards feel live but produces more corrections; a long delay makes numbers more stable but adds latency before an advertiser sees "final" spend for a given minute. A common approach is to publish a *provisional* aggregate immediately (fast, slightly approximate) and a *finalized* aggregate once the watermark passes (a few minutes later), clearly labeling which is which in the API.
+
+## Exactly-once counting on an at-least-once pipeline
+
+Most distributed messaging systems only guarantee at-least-once delivery — a consumer crash-and-restart can replay events. You don't need exactly-once delivery to get exactly-once *counting*; you need idempotent aggregation on top of at-least-once delivery. Two practical mechanisms:
+
+1. **Deduplication keys with a bounded lookback.** Every click carries (or is assigned) a unique ID. The aggregator keeps a short-lived idempotency table (recent IDs seen, per partition) and skips any ID it's already counted. This bounds memory because you only need to remember IDs within the maximum plausible retry/replay window, not forever.
+2. **Idempotent writes to the aggregate store.** Instead of "increment counter by 1" (which double-applies on replay), structure the aggregation as "recompute the count for this batch from source events and upsert the result" — replaying the same batch produces the same final value rather than compounding.
+
+<Callout type="warning">
+  A common mistake: implementing the aggregate counter as a simple distributed `INCR` triggered directly from the ingestion path. Under retries (client retry, gateway retry, consumer rebalance replaying a batch) this double- or triple-counts clicks, and because increments are commutative and irreversible, you can't tell after the fact which increments were legitimate. Always route counting through a dedup stage keyed on a stable click identifier, and prefer idempotent upserts (recompute-and-replace for a batch) over blind increments wherever the aggregation logic allows it.
+</Callout>
+
+## Worked example: sizing the pipeline
+
+Take a mid-size ad network serving 2 billion ad impressions/day with a 1.5% click-through rate: that's 30 million clicks/day, or roughly 350 clicks/sec on average. Peak traffic (evening browsing hours, a viral campaign) commonly runs 5-10x average, so design ingestion for ~2,500-3,500 clicks/sec sustained peak, with headroom to absorb short bursts well above that.
+
+Each click event is small — click_id, ad_id, campaign_id, timestamp, a few context fields — call it 300 bytes. At 3,500 events/sec that's about 1 MB/sec of raw ingest, trivially within a single well-provisioned log cluster's throughput, meaning the bottleneck in practice is almost never the log itself but the downstream dedup lookups and fraud scoring, which do far more work per event (a cache read, a rules evaluation) than the ingestion write does.
+
+For the aggregate store: with ~5 million distinct ads active on a given day and one-minute buckets, that's `5,000,000 x 1,440` minutes = 7.2 billion rows/day in the finest-grained aggregate table if you kept every minute forever — which you don't. Roll minute-level data up into hourly and daily aggregates after a retention window (say, 7 days of minute-level detail, 90 days of hourly, indefinite daily), and the storage footprint drops by roughly two orders of magnitude without losing the granularity advertisers actually query against.
+
+## Trade-offs and where this connects
+
+This design mirrors the general "high-write-volume counting" pattern that also shows up in view counters, like/reaction counts, and rate limiters — the common thread is always "don't hit a hot row directly, batch through a log and aggregate asynchronously." If you're also covering the companion lesson on leaderboards in this module, notice the same tension appears there: an approximate-but-fast read path versus an exact-but-slower reconciliation path.
+
+The main trade-off to be ready to discuss in an interview is **freshness versus correctness**. A pure streaming design gives you sub-minute dashboards but some risk of transient inaccuracy around window boundaries and fraud-model updates. A pure batch design (recompute everything nightly) is exact but useless for anyone trying to watch campaign spend in real time. The two-tier design above — fast provisional aggregates plus a slower authoritative reconciliation — is the standard answer, and it's worth explicitly naming which numbers feed the advertiser dashboard versus which numbers feed the invoice.
+
+<Quiz
+  lessonId="free-design-an-ad-click-aggregation-system"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does this design avoid incrementing a shared counter directly from the ad click ingestion path?',
+      options: [
+        { id: 'a', text: 'Direct increments cannot be double-applied under retries, but are too slow at high write volume', correct: false, explanation: 'The opposite is true: direct increments are fast but are exactly the operation that double-applies under retries, since an increment has no memory of whether it already happened.' },
+        { id: 'b', text: 'Retries and replays on an at-least-once pipeline can double-count a click if the aggregation step is a blind increment rather than a deduplicated, idempotent update', correct: true, explanation: 'Correct. Because delivery is at-least-once, the same click can be processed more than once; only deduplication plus idempotent aggregation (not raw increments) guarantees the final count is right.' },
+        { id: 'c', text: 'Databases cannot perform increment operations at all', correct: false, explanation: 'Databases can and do support increment operations; the issue is correctness under retries/replays, not whether the operation exists.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are legitimate reasons a click event might need to be counted into a window after that window\'s watermark has already passed? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A mobile client was briefly offline and sent the click event late', correct: true, explanation: 'Network gaps on client devices are a common source of late-arriving events relative to their true click timestamp.' },
+        { id: 'b', text: 'A batching client buffered several clicks before flushing them to the server', correct: true, explanation: 'Client-side batching intentionally delays event delivery, so events can arrive well after the window their timestamp belongs to.' },
+        { id: 'c', text: 'The stream aggregator restarted and needs to reprocess its input from the beginning of time', correct: false, explanation: 'A restart triggers replay of unacknowledged/recent events for fault tolerance, not a full from-the-beginning reprocessing, and is a duplicate-handling concern, not why an event is "late" relative to its own timestamp.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In this design, the real-time streaming aggregate and the batch reconciliation aggregate are expected to always be numerically identical the moment the streaming aggregate is published.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False as stated. The real-time path is explicitly a fast, provisional approximation; the batch path is the slower, authoritative source used for billing, and the two can briefly disagree, especially around window boundaries or after fraud-rule updates.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. The two-tier design deliberately trades short-term accuracy for speed in the real-time path, and relies on batch reconciliation to produce the exact numbers billing depends on.' },
+      ],
+    },
+  ]}
+/>

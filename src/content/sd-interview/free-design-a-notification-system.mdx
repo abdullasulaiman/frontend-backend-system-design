@@ -1,0 +1,276 @@
+---
+title: "Design a Notification System"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 1
+track: "interview"
+summary: "Designs a multi-channel notification system that fans out push, email, and SMS from many internal services through a durable queue, per-channel workers, and user-controlled preferences."
+tags: ["notifications", "system-design", "queues", "fan-out", "reliability"]
+estMinutes: 13
+cheatsheet:
+  - "Decouple 'decide to notify' from 'deliver the notification' with a durable queue — a slow or down email provider must never block the checkout service that triggered the notification."
+  - "One fan-out worker per channel (push, email, SMS, in-app) — each has a different provider API, rate limit, and retry/backoff policy, so a single shared worker becomes a bottleneck and a blast radius."
+  - "Store an idempotency key (event ID plus channel) with every send attempt so retries after a crash or timeout don't double-notify a user."
+  - "Check user preferences and quiet hours before rendering and sending, not after — this is also where you dedupe near-duplicate events (e.g. 5 'someone liked your post' events into one digest)."
+  - "Third-party push/SMS/email providers are the least reliable part of the system — isolate each behind its own worker pool, circuit breaker, and dead-letter queue so one provider's outage doesn't stall the others."
+  - "Track delivery state per notification (queued, sent, delivered, failed, read) — 'sent' from your system is not the same as 'delivered' to the device, and product/analytics teams will ask for this distinction."
+  - "At high volume, batch and rate-limit sends per user and per provider — providers throttle or ban senders that burst traffic, and users churn from apps that spam them."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Almost every backend system eventually needs to tell a human that something
+happened: an order shipped, a payment failed, someone commented on your
+post, a security alert needs attention. It looks like a small feature —
+"just send an email" — until it's plugged into fifty different services,
+each of which wants to reach users through push, email, SMS, and in-app
+alerts, with different urgency, different rate limits, and different
+provider APIs. Interviewers like this problem because a naive design (each
+service calls the email API directly) looks fine in a demo and falls over
+in production the first time an email provider has a bad day and takes
+half your product down with it.
+
+This lesson designs a general-purpose notification system: a service that
+sits between "something happened" and "the user was told," and does it
+reliably, at scale, without becoming a single point of failure for the rest
+of the company's backend.
+
+## Requirements
+
+**Functional**
+
+- Accept notification requests from many internal services (order service,
+  social feed, security team, marketing) with a common API.
+- Deliver through multiple channels: push (mobile), email, SMS, and in-app
+  (a bell icon with unread items).
+- Respect per-user preferences — which channels, which categories, quiet
+  hours.
+- Support both single, immediate notifications ("your payment failed") and
+  templated bulk sends ("flash sale starts in 1 hour," to 10 million
+  users).
+
+**Non-functional**
+
+- Reliability over raw speed for most notification types — a notification
+  is allowed to arrive a few seconds late, but it must not silently
+  disappear.
+- Scale to tens of millions of notifications a day, with bursty spikes
+  (a marketing campaign or an outage alert can 100x normal volume in
+  minutes).
+- No single slow or failing downstream provider should degrade unrelated
+  traffic (an SMS provider outage shouldn't delay push notifications).
+- At-least-once delivery per channel, with dedup so retries don't spam
+  users.
+
+What's explicitly out of scope for this lesson: rendering rich in-app
+notification feeds (that overlaps with a general feed/timeline design) and
+building your own SMS/push carrier infrastructure — we treat those as
+third-party providers behind an API, which is how virtually every real
+system does it.
+
+## High-level design
+
+The core idea is a **producer/consumer split with a durable queue in the
+middle**. Internal services are producers: they don't know or care how
+delivery happens, they just publish "notify user X that Y happened." A
+fan-out layer reads those events, expands them into per-channel jobs, and
+hands each job to a channel-specific worker pool that talks to the actual
+provider (APNs/FCM for push, an email API, an SMS gateway).
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Internal services\norder, feed, alerts] -->|publish event| B[Notification API]
+  B --> C[(Durable queue)]
+  C --> D[Fan-out worker]
+  D --> E[(User prefs + templates)]
+  D --> F[Push queue]
+  D --> G[Email queue]
+  D --> H[SMS queue]
+  F --> I[Push worker -> APNs/FCM]
+  G --> J[Email worker -> ESP]
+  H --> K[SMS worker -> SMS gateway]
+  I --> L[(Delivery status store)]
+  J --> L
+  K --> L
+`} />
+
+Walking the request path:
+
+1. A producing service calls the **notification API** with a structured
+   event: user ID (or a list/segment), event type, and the data needed to
+   render it (order ID, commenter name, etc.) — never a pre-rendered
+   message, so templates can be updated without touching every producer.
+2. The API writes the event to a **durable queue** and returns immediately.
+   This is the single most important decision in the whole design: the
+   caller's request finishes the instant the event is durably queued, not
+   when the notification is actually delivered.
+3. A **fan-out worker** picks up the event, looks up the user's channel
+   preferences and quiet-hours settings, decides which channels apply, and
+   renders the per-channel message from a template.
+4. It enqueues one job per channel onto per-channel queues.
+5. **Channel workers** each own their provider integration, retry policy,
+   and rate limiting, and write delivery status back to a status store.
+
+### Why split fan-out from delivery
+
+You could try to do steps 3-5 in one worker, but splitting them buys two
+things. First, isolation: if the SMS gateway is down, SMS jobs pile up in
+their own queue while push and email keep flowing — nothing shares a
+thread pool or a retry budget with anything else. Second, independent
+scaling: email volume and push volume don't grow at the same rate, and
+providers have wildly different rate limits (an SMS gateway might cap you
+at a few hundred messages per second; a push provider might handle tens of
+thousands). Separate queues and worker pools let you scale each
+independently instead of over-provisioning everything to match your
+noisiest channel.
+
+## Deep dive: the pieces that make this actually reliable
+
+### Idempotency and exactly-once-feeling delivery
+
+Queues in this kind of system are almost always **at-least-once**: a
+worker can crash after sending to the provider but before acknowledging
+the queue message, causing a redelivery. If you re-run the send blindly,
+the user gets the same push notification twice. The fix is a dedup key —
+typically `hash(event_id, channel, user_id)` — checked against a store
+(Redis with a TTL works well) before sending. If the key already exists,
+skip the send and just re-acknowledge the queue message. This turns
+"at-least-once delivery to the queue" into "effectively-once delivery to
+the user," which is what actually matters.
+
+### Preferences, quiet hours, and digesting
+
+Preferences aren't just an on/off toggle — treat them as a matrix of
+(category, channel): a user might want push for "someone messaged you" but
+only email (not SMS) for "your subscription renewed." Check this matrix in
+the fan-out worker, before rendering, so you never waste a render or a
+provider call on a suppressed notification.
+
+Quiet hours and digesting live in the same layer. Instead of firing five
+separate "X liked your post" pushes within a minute, hold low-priority
+events in a short window (say, 2-5 minutes) and collapse them into one
+"5 people liked your post" notification. High-priority events — a failed
+payment, a security alert — skip this window and go out immediately, so
+priority needs to be a first-class field on every event, not an
+afterthought.
+
+### Delivery status and read receipts
+
+"Sent" (you handed it to the provider), "delivered" (the provider confirms
+the device received it), and "read" (the user opened it) are three
+different states, and conflating them causes real problems — product
+teams will ask "how many people saw this alert" and the honest answer
+requires all three. Store a status row per (notification, channel) and
+update it as provider webhooks and read events come in. This table is
+also your operational dashboard: a spike in "failed" for one channel is
+your earliest signal that a provider is degraded.
+
+### Rate limiting and backpressure
+
+Bulk sends (a marketing blast to 10 million users) are a different traffic
+shape than transactional sends (one payment failure) and need different
+handling. Give bulk campaigns a lower-priority queue and a token-bucket
+rate limiter tuned to what each provider allows, so a campaign never
+starves a transactional "your password was reset" notification sitting
+right behind it in an unpartitioned queue. Priority queues — or simply
+separate queues per priority tier consumed with weighted preference — keep
+latency-sensitive notifications fast even while a campaign of millions is
+draining in the background.
+
+<Callout type="warning">
+  A common mistake is letting the producing service call the email/SMS/push
+  provider directly "just for this one urgent case," bypassing the queue
+  "to save time." This reintroduces exactly the coupling the whole design
+  exists to avoid: now the order service's checkout latency depends on a
+  third-party email API's response time, and an email provider outage can
+  take down checkout. Every notification, urgent or not, should go through
+  the same durable queue — use priority tiers within the system to make
+  urgent notifications fast, not a bypass around it.
+</Callout>
+
+## Worked example: estimating the queue and worker fleet
+
+Say the product sends an average of 50 million notifications a day across
+all channels, with a peak-to-average ratio of 5x during a flash sale or
+incident (common for bursty notification traffic).
+
+- Average rate: 50,000,000 / 86,400 seconds is about 580 events/sec.
+- Peak rate: 580 x 5 is about 2,900 events/sec.
+- If the channel mix is roughly 60% push, 30% email, 10% SMS, peak SMS
+  traffic alone is about 290/sec — comfortably under most SMS gateways'
+  per-account rate limits, confirming SMS needs its own queue and worker
+  pool rather than sharing capacity with push.
+- Each fan-out worker doing a preference lookup, template render, and
+  three queue writes might sustain roughly 200-300 events/sec per
+  instance, so peak load needs on the order of 10-15 fan-out worker
+  instances, auto-scaled off queue depth rather than a fixed count.
+
+The number that actually matters in an interview isn't the precise
+instance count — it's showing you can reason from daily volume to peak
+QPS to per-channel load, and that you'd size and isolate the SMS path
+differently from push because its provider limits are an order of
+magnitude tighter.
+
+## Trade-offs to call out
+
+- **Push vs. pull for in-app notifications**: pushing over a WebSocket
+  gives instant in-app updates but adds persistent-connection
+  infrastructure; polling is simpler but adds latency and load. Most
+  systems start with polling plus a lightweight WebSocket/SSE push once
+  in-app "live" feel is a real requirement.
+- **Single queue vs. per-channel queues**: a single queue is simpler to
+  operate but couples channel failure domains together — per-channel
+  queues cost more operational surface area but are worth it once you have
+  more than one provider with meaningfully different reliability.
+- **Synchronous preference checks vs. precomputed preference cache**: at
+  very high fan-out volume (a segment of millions), a per-event database
+  lookup for preferences doesn't scale — cache preferences in a fast store
+  keyed by user ID and invalidate on preference change.
+
+<Quiz
+  lessonId="free-design-a-notification-system"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does the notification API write to a durable queue and return immediately, rather than sending the notification synchronously before responding?',
+      options: [
+        { id: 'a', text: 'So the calling service is not blocked on a slow or unavailable third-party provider', correct: true, explanation: 'Decoupling the producer from delivery is the core reliability win — a slow email API should never add latency to the service that triggered the notification.' },
+        { id: 'b', text: 'Because queues are always faster than direct API calls', correct: false, explanation: 'Raw speed is not the reason; a queue write plus async processing can be slower end-to-end. The point is isolation and durability, not speed.' },
+        { id: 'c', text: 'Because providers require all requests to go through a queue', correct: false, explanation: 'Providers have no such requirement; the queue is an internal architectural choice, not an external constraint.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasons to use separate queues and worker pools per channel (push, email, SMS)? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Each provider has different rate limits, so channels need independent scaling', correct: true, explanation: 'SMS gateways, push providers, and email APIs allow very different throughput, so shared capacity either wastes resources or throttles the wrong channel.' },
+        { id: 'b', text: 'An outage in one provider should not stall delivery on the other channels', correct: true, explanation: 'Isolation is the main reliability benefit — a stuck SMS gateway should not back up push or email jobs sharing the same workers.' },
+        { id: 'c', text: 'It removes the need for a dedup/idempotency check', correct: false, explanation: 'Per-channel queues do not affect idempotency. At-least-once queue delivery can still redeliver a job to a channel worker, so a dedup key is still required per channel.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A notification marked "sent" by the notification system guarantees the user has seen it.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: '"Sent" only means the system handed the message to the provider. Delivery to the device and the user actually reading it are separate states that need their own tracking.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — sent, delivered, and read are distinct states, typically updated via provider webhooks and client read events respectively.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A user "likes" a post 5 times in quick succession from different friends, each triggering a notification event. What is the best way to avoid spamming the recipient with 5 separate push notifications?',
+      options: [
+        { id: 'a', text: 'Hold low-priority events in a short time window and collapse them into a single digest notification', correct: true, explanation: 'Digesting near-duplicate, low-priority events into one notification (e.g. "5 people liked your post") is the standard fix, while high-priority events bypass the window.' },
+        { id: 'b', text: 'Drop all but the first event permanently', correct: false, explanation: 'Silently dropping events loses information the user might want (e.g. who liked the post) rather than summarizing it.' },
+        { id: 'c', text: 'Rate-limit the producing service so it cannot emit more than one event per minute', correct: false, explanation: 'Throttling the producer conflates an unrelated concern (feed/like events) with notification delivery, and would also suppress legitimate distinct events from other features.' },
+      ],
+    },
+  ]}
+/>

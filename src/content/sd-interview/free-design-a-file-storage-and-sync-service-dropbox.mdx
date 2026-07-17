@@ -1,0 +1,254 @@
+---
+title: "Design a File Storage and Sync Service (Dropbox)"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 2
+track: "interview"
+summary: "Walks through designing a Dropbox-style file storage and sync service, covering chunked uploads, content-addressed dedup, metadata versioning, and the client-server sync protocol that keeps multiple devices consistent."
+tags: ["file-storage", "sync", "object-storage", "chunking", "consistency"]
+estMinutes: 13
+cheatsheet:
+  - "Split files into fixed-size or content-defined chunks (4 MB is a common default) so uploads resume mid-file and unchanged chunks are never re-sent or re-stored."
+  - "Store chunk bytes in a hash-addressed blob store (key = SHA-256 of the chunk) and keep a separate metadata service mapping file paths to ordered chunk-hash lists — this is what gives you free cross-user, cross-file dedup."
+  - "A file's identity for sync purposes is its ordered list of chunk hashes plus a monotonically increasing version number, not its raw bytes — version numbers are what let clients detect they're behind without diffing content."
+  - "Clients don't poll for changes at scale: they hold a long-lived connection to a notification service that pushes 'something changed, go sync' pings, then pull the actual metadata diff over a normal API call."
+  - "Conflicting concurrent edits are resolved by keeping both versions (a 'conflicted copy') rather than silently discarding one — silent data loss is the one mistake users never forgive in a sync product."
+  - "Local file-system watchers (inotify/FSEvents) plus a debounce window are what detect local changes cheaply; don't rescan the whole file tree on every save."
+  - "Chunking + content hashing solves storage efficiency and resumability; it does not solve conflict resolution — those are two separate problems that are easy to conflate in an interview."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Dropbox-style storage-and-sync is a favorite interview prompt because it forces
+you to reason about three hard problems at once: storing huge binary blobs
+cheaply, keeping several independent devices converged on the same file state,
+and doing both without re-uploading a whole file every time one paragraph
+changes. It also overlaps with real systems you've probably touched —
+Google Drive, OneDrive, iCloud Drive, even git's own object model — so the
+ideas here transfer directly. This lesson builds the design from requirements
+through the sync protocol that actually keeps devices consistent, and calls
+out the trade-offs an interviewer will push on.
+
+## Requirements and scale
+
+**Functional requirements:**
+
+- Upload, download, and store files of arbitrary size (up to a few GB).
+- Automatically sync a file across every device where a user is logged in.
+- Support offline edits that sync once connectivity returns.
+- Keep some version history and let a user restore a previous version.
+- Share a file or folder with another user, with read or read-write access.
+
+**Non-functional requirements:**
+
+- Durability of stored data is non-negotiable — losing a user's file is worse
+  than any amount of downtime.
+- Sync latency should be low (seconds, not minutes) so collaborators see
+  changes promptly, but perfect real-time collaboration (Google Docs-style,
+  character-by-character) is out of scope — that's covered in this course's
+  Google Docs case study.
+- The system must handle large files efficiently: re-uploading a 2 GB video
+  because one byte changed is unacceptable.
+
+**Rough scale, for a mid-size product:** 50 million users, average 10 GB
+stored per user (500 PB total), 500 million file-change events per day across
+all users. That event rate — roughly 6,000 changes/second average, bursting
+much higher — is the number that should drive your architecture, not the
+storage total. Storage is "buy more disks"; change-event throughput is a
+distributed-systems problem.
+
+## High-level architecture
+
+Split the system into four pieces with distinct responsibilities:
+
+1. **Client** — watches the local file system for changes, chunks modified
+   files, and talks to the backend over a sync API.
+2. **Block/blob storage** — durable, content-addressed storage for the raw
+   chunk bytes (an S3-like object store under the hood).
+3. **Metadata service** — the source of truth for "what does this file look
+   like right now": its chunk list, version number, owner, and permissions.
+4. **Notification service** — tells other online clients that something
+   changed, so they know to go pull the new metadata.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  C1[Client A] -->|chunk + upload| B[Blob Storage]
+  C1 -->|commit metadata| M[Metadata Service]
+  M -->|change event| N[Notification Service]
+  N -->|push: sync now| C2[Client B]
+  C2 -->|pull diff| M
+  C2 -->|download missing chunks| B
+`} />
+
+Notice the split between blob storage and metadata: chunk bytes and the
+"which chunks make up this file, in what order" information are stored
+separately. That separation is what makes dedup, resumable uploads, and
+version history all fall out of the same mechanism instead of needing three
+separate features.
+
+## Chunking and content-addressed storage
+
+When a client detects a modified file, it doesn't upload the whole thing. It
+splits the file into chunks (commonly 4 MB fixed-size, though content-defined
+chunking with a rolling hash handles insertions/deletions in the middle of a
+file more gracefully) and hashes each chunk with SHA-256.
+
+The client then asks the metadata service which of those hashes it already
+has stored. Only chunks that don't already exist anywhere in the system get
+uploaded. This buys you three things simultaneously:
+
+- **Resumable uploads** — if a 2 GB upload dies at 80%, only the remaining
+  chunks need to go up on retry, not the whole file.
+- **Deduplication** — if two users both save the same PDF attachment, or a
+  user renames a file without touching its contents, the chunk hashes match
+  and nothing new gets stored. In practice, dedup on real-world file
+  populations (installers, shared documents, common templates) can cut
+  storage by 20 to 40 percent.
+- **Cheap diff sync** — editing one paragraph in a large document changes
+  only the chunks around that edit; the rest of the chunk list is untouched,
+  so only the changed chunks re-upload.
+
+A file's metadata record, then, is essentially: `file_id`, `path`,
+`owner`, `version`, and an ordered list of chunk hashes. The blob store never
+needs to know which files reference a chunk — it just serves bytes by hash,
+and can garbage-collect a chunk once no metadata record references it anymore.
+
+## The sync protocol
+
+This is the part interviewers dig into, because "just sync the files" hides
+real design decisions.
+
+**Detecting local changes:** don't rescan the whole directory tree on a
+timer — that doesn't scale past a few thousand files and burns battery/CPU.
+Use OS-level file-system watch APIs (inotify on Linux, FSEvents on macOS,
+ReadDirectoryChangesW on Windows), debounced by a short window (a few hundred
+milliseconds) so a burst of writes from one save doesn't fire the sync
+pipeline a dozen times.
+
+**Detecting remote changes:** each client holds a long-lived connection
+(WebSocket or long-poll) to the notification service. When any device commits
+a new version of a file, the metadata service publishes a lightweight event —
+just `file_id` and `new_version`, not the content — and the notification
+service fans it out to every other online client with access to that file.
+The receiving client then makes a normal API call to pull the metadata diff
+and figure out exactly which chunks it's missing.
+
+This two-step "push a thin signal, then pull the real diff" pattern matters:
+the notification path stays cheap and can fan out to millions of idle
+connections, while the actual payload transfer happens over a regular,
+retryable, resumable API call rather than being squeezed through the
+real-time channel.
+
+**Detecting a stale client on reconnect:** every client stores the last
+version number it synced per file. On reconnect (after being offline), it
+asks the metadata service "give me everything with a version greater than
+mine" instead of re-fetching everything — the same resync-by-version-number
+idea you'd use in any change-feed design.
+
+## Handling conflicts
+
+Two devices edit the same file while both are offline, then both come back
+online. Whoever commits second has a version number that's now behind the
+server's latest. The correct behavior is **never silently discard one
+edit**. Instead:
+
+- The metadata service rejects the stale commit (version mismatch).
+- The client creates a **conflicted copy** — e.g. `report (conflicted copy,
+  Alice's laptop, 2026-07-14).docx` — preserving both edits as separate files.
+- The user resolves it manually later.
+
+This is deliberately less clever than automatic merging. Automatic text
+merging works for structured, mergeable formats (which is what OT/CRDT-based
+editors are built for) but is unsafe for arbitrary binary files — you cannot
+"merge" two conflicting versions of a `.zip` or a `.psd`. Keeping both copies
+is the one strategy that's always safe.
+
+## Worked example: a 4 MB edit to a 500 MB file
+
+A user has a 500 MB video project file synced to three devices. On device A,
+they trim a few seconds off the end, changing roughly 4 MB worth of
+underlying data spread across a handful of chunks near the end of the file.
+
+Without chunking, syncing this edit means re-uploading 500 MB and every other
+device re-downloading 500 MB — for a change smaller than 1% of the file.
+With 4 MB chunking: the file breaks into about 125 chunks; only the 1-2
+chunks touching the trimmed region have new hashes. Device A uploads roughly
+4-8 MB, the metadata service updates the chunk list and bumps the version,
+and devices B and C each download the same 4-8 MB of changed chunks plus a
+small metadata diff — not 500 MB. That's the entire value proposition of
+content-addressed chunking in one concrete number.
+
+<Callout type="warning">
+  A common design mistake: treating "detect that a file changed" and "sync
+  the new bytes efficiently" as the same problem, and reaching for a single
+  mechanism (like polling the whole file's checksum) to solve both. In a real
+  design they're separate concerns with separate mechanisms — file-system
+  watchers plus push notifications for *detecting* change quickly, and
+  chunk-level content hashing for *transferring* change cheaply. Conflating
+  them usually leads candidates to propose full-file re-hashing on every
+  poll interval, which doesn't scale to millions of files per user base.
+</Callout>
+
+## Trade-offs to raise proactively
+
+- **Fixed-size vs. content-defined chunking**: fixed-size chunking is
+  simpler but a single byte inserted at the start of a file shifts every
+  chunk boundary after it, defeating dedup for that edit. Content-defined
+  chunking (boundaries chosen by a rolling hash finding pattern matches)
+  costs more CPU but survives insertions/deletions gracefully — worth
+  mentioning even if you implement the simpler version first.
+- **Strong vs. eventual consistency for metadata**: a single-writer-per-file
+  version counter (similar to the per-document owner pattern used in
+  collaborative editors) gives you strong consistency on "what's the latest
+  version" without a global lock across the whole system.
+- **Storage tiering**: infrequently accessed files can move to cheaper,
+  higher-latency storage classes after some idle period, trading retrieval
+  latency for cost at petabyte scale.
+
+## Where this connects
+
+If the interview steers toward real-time collaborative editing on top of
+this (multiple people typing in the same document simultaneously), that's a
+different problem with a different solution — see this course's Design
+Google Docs case study for OT/CRDT-based collaboration. This lesson's sync
+model assumes "last writer per file at a point in time," not
+character-level concurrent editing.
+
+<Quiz
+  lessonId="free-design-a-file-storage-and-sync-service-dropbox"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does the design store file chunks in a content-addressed blob store keyed by hash, rather than storing whole files keyed by file ID?',
+      options: [
+        { id: 'a', text: 'It enables deduplication and lets only changed chunks be re-uploaded on an edit', correct: true, explanation: 'Content-addressing means identical bytes anywhere in the system map to the same stored chunk, and only chunks with new hashes need to be transferred after an edit.' },
+        { id: 'b', text: 'It makes the metadata service unnecessary', correct: false, explanation: 'The opposite — you still need a metadata service to track which ordered list of chunk hashes makes up each file version.' },
+        { id: 'c', text: 'It guarantees strong consistency across devices automatically', correct: false, explanation: 'Chunking is a storage-efficiency technique; consistency is handled separately via version numbers and the sync protocol.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which mechanisms does the design use to avoid re-scanning or re-uploading unchanged data? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'OS-level file-system watchers (inotify/FSEvents) to detect local changes', correct: true, explanation: 'Watchers detect changed files immediately without polling the whole directory tree.' },
+        { id: 'b', text: 'Content hashing of chunks to detect which parts of a file actually changed', correct: true, explanation: 'Only chunks with new hashes are uploaded; unchanged chunks are already present in the blob store.' },
+        { id: 'c', text: 'A push notification service that signals "something changed" so clients pull a diff instead of polling', correct: true, explanation: 'Push-then-pull avoids constant polling for remote changes while keeping the real payload transfer on a normal, resumable API call.' },
+        { id: 'd', text: 'Periodically re-uploading every file in full to guarantee consistency', correct: false, explanation: 'This is exactly what the design avoids — full re-uploads on a timer would defeat the purpose of chunking and dedup.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'When two devices make conflicting offline edits to the same file, the correct default behavior is to automatically merge the changes into a single file.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Automatic merging is unsafe for arbitrary binary files. The safe default is keeping both versions as a "conflicted copy" and letting the user resolve it.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the design rejects the stale commit and preserves both edits as separate files rather than silently discarding or auto-merging one.' },
+      ],
+    },
+  ]}
+/>

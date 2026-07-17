@@ -1,0 +1,161 @@
+---
+title: "Design a Distributed Lock Service"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 4
+track: "interview"
+summary: "Designs a distributed lock service that lets many processes across a cluster coordinate exclusive access to a shared resource, covering fencing tokens, lease expiry, and the split-brain failure modes that make this deceptively hard."
+tags: ["distributed-locks", "coordination", "consensus", "fault-tolerance", "consistency"]
+estMinutes: 12
+cheatsheet:
+  - "A distributed lock is a lease, not a mutex: it always has a TTL, because the only alternative to expiry is a hang forever when the lock holder crashes."
+  - "Fencing tokens (a monotonically increasing number handed out with every lock grant) are the fix for the fatal flaw of naive locks — a paused/slow client waking up after its lease expired and still writing to the resource. The resource itself must check and reject stale tokens."
+  - "Build the lock service on a consensus protocol (Raft/Paxos) or use one that already has it (ZooKeeper, etcd, Consul) — a single Redis node is not fault tolerant, and multi-node Redis locks (Redlock) are contested precisely because clock assumptions replace consensus."
+  - "Clock assumptions are the hidden risk: TTL-based expiry assumes bounded clock drift and bounded pause times (GC, VM stalls, page faults). If that assumption breaks, two clients can legitimately believe they hold the same lock at once."
+  - "Session-based locks (ZooKeeper ephemeral nodes) tie the lock to a heartbeat connection instead of a wall-clock TTL — the lock is released when the session dies, which is more forgiving of clock skew but adds session-management complexity."
+  - "Always pick a lock granularity that matches contention: one lock per shopping cart, not one lock for the entire orders table, or every unrelated request queues behind the same mutex."
+  - "State clearly in the interview whether you need mutual exclusion for correctness (e.g., preventing double-charging) versus just deduplicating retries (e.g., idempotency keys) — they are different problems with cheaper solutions for the second one."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Plenty of backend problems disappear once you can say "only one process touches this at a time." A batch job that must not run twice concurrently, a leader election among ten worker nodes, an inventory decrement that must not double-sell the last item in stock — all of these are one `acquire lock` away from being simple. The catch is that "acquire a lock" is trivial on one machine (a mutex, a semaphore) and surprisingly hard across a fleet of machines that can crash, pause, or lose network connectivity mid-operation.
+
+A distributed lock service is infrastructure that many other systems in this course quietly depend on: a leaderboard's rebalancing job, a ticket-booking system's seat reservation, a payment service's "don't double-charge this order" guard. This lesson designs that service directly, and spends most of its time on the failure mode that breaks naive implementations — a lock holder that looks dead but isn't.
+
+## Requirements
+
+**Functional:**
+
+- `acquire(resource_id, holder_id, ttl)` — grant exclusive ownership of `resource_id` if nobody else holds it, for at most `ttl`.
+- `release(resource_id, holder_id)` — voluntarily give up a held lock.
+- `renew(resource_id, holder_id, ttl)` — extend an active lease (a heartbeat, so long-running work doesn't lose the lock mid-task).
+- Locks must be reentrant-safe to reason about: only the current holder can release or renew.
+
+**Non-functional:**
+
+- **Safety above all**: at most one holder at any instant, even during network partitions or node failures. A lock service that occasionally grants two holders is worse than no lock service — it gives false confidence.
+- **Liveness**: if a holder crashes without releasing, the lock must eventually become acquirable again — no permanent deadlock.
+- **Low latency**: acquire/release round trips in the single-digit milliseconds, since locks often sit on a request's critical path.
+- **Availability**: the lock service itself must survive node failures — if it's a single point of failure, everything that depends on it inherits that fragility.
+
+Safety and liveness are in tension here: a strict "never release early" policy gives perfect safety but risks deadlock forever; a "release after 5 seconds no matter what" policy gives perfect liveness but risks releasing while the original holder is still working. The rest of this lesson is about managing that tension, not eliminating it — it can't be eliminated.
+
+## High-level design
+
+The lock service sits between clients and the resource they're protecting. It doesn't touch the resource itself — it only answers "who, if anyone, currently owns this lock." At its core it needs:
+
+- A **replicated, consistent store** for lock state (who holds each lock, and until when), so a node failure doesn't lose or duplicate that state.
+- A **consensus layer** (Raft or Paxos) so that a majority of replicas agree on every acquire/release/renew before it's considered committed — this is what prevents two nodes from each thinking they granted the same lock during a network partition.
+- A **lease/TTL mechanism** so abandoned locks self-expire instead of requiring an external process to detect dead holders.
+
+In practice you don't build the consensus layer yourself — you build on top of ZooKeeper, etcd, or Consul, all of which already implement Raft/Paxos-style replication and expose primitives well-suited to locking (ZooKeeper's ephemeral sequential znodes, etcd's lease API). The "design a lock service" interview question is really "show me you understand what a correct lock service needs from its underlying consensus store, and where the sharp edges are" — not "implement Raft from scratch."
+
+<Mermaid client:visible chart={`
+flowchart LR
+  C1[Client A] -->|acquire order-42| LS[Lock Service]
+  C2[Client B] -->|acquire order-42| LS
+  LS --> R1[(Replica 1)]
+  LS --> R2[(Replica 2)]
+  LS --> R3[(Replica 3)]
+  R1 <--> R2
+  R2 <--> R3
+  LS -->|granted, token=17| C1
+  LS -->|denied, already held| C2
+`} />
+
+### Acquire/release flow
+
+1. Client sends `acquire(resource_id, ttl)`.
+2. The lock service checks, via its replicated log, whether an unexpired lock entry exists for `resource_id`.
+3. If none exists, it writes a new entry `(resource_id, holder_id, expires_at, fencing_token)` through consensus (a majority of replicas must ack) and returns success plus the fencing token.
+4. If one exists and hasn't expired, it returns "denied" (or blocks/queues, depending on API design).
+5. The holder either finishes and calls `release`, or calls `renew` periodically to push `expires_at` forward while work continues.
+6. If the holder never renews or releases, the entry expires at `expires_at` and the lock becomes acquirable again — no manual intervention needed.
+
+## The core problem: fencing tokens
+
+Here's the failure that makes naive distributed locks dangerous. Client A acquires a lock with a 10-second TTL, then pauses — a long GC pause, a hypervisor stealing its CPU, a slow disk write, whatever. Ten seconds pass. The lock service, correctly, expires A's lock and grants it to client B. B starts doing work on the shared resource. Then A wakes up, still believing it holds the lock, and also writes to the resource. Now two writers are active — exactly what the lock existed to prevent, and the lock service did nothing wrong; A's clock and process scheduling did.
+
+The fix isn't a longer TTL (that just delays the same problem and hurts liveness) — it's giving the *resource itself* a way to detect and reject stale writers. That's a fencing token: a number that increases every time the lock is granted (1, 2, 3, ...). The resource being protected must check that any incoming write carries a fencing token greater than the last one it accepted, and reject anything older.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant A as Client A
+    participant LS as Lock Service
+    participant Res as Protected Resource
+    participant B as Client B
+    A->>LS: acquire(lock)
+    LS-->>A: granted, token=17
+    Note over A: long GC pause...
+    LS->>LS: lease expires
+    B->>LS: acquire(lock)
+    LS-->>B: granted, token=18
+    B->>Res: write(token=18)
+    Res-->>B: accepted (18 > 17)
+    Note over A: wakes up, unaware
+    A->>Res: write(token=17)
+    Res-->>A: rejected (17 < 18)
+`} />
+
+This shifts the safety guarantee from "the lock service says only one holder exists" (which it cannot actually guarantee once you admit clocks and schedulers are imperfect) to "the resource never accepts a stale write, even if two clients briefly both believe they hold the lock." That second guarantee is achievable; the first one, without fencing, isn't.
+
+<Callout type="warning">
+  A distributed lock built on TTL expiry with no fencing token is not actually safe against the pause/GC scenario above — it just makes the failure rare enough that it's easy to miss in testing and painful in production. If the resource being protected can enforce a monotonic token check (most datastores can — a conditional write against a version column, an `expected_token` field), always add it. If it truly cannot (e.g., an external API with no such concept), the lock alone cannot give you the safety guarantee you probably think it does — you need a different mitigation, like making the operation itself idempotent.
+</Callout>
+
+## Design choices and trade-offs
+
+**TTL-based lease vs. session-based lock.** A TTL lease (Redis-style `SET key value NX PX 10000`) is simple but ties correctness to clock assumptions — bounded drift, bounded pause times. A session-based lock (ZooKeeper ephemeral znode) ties the lock to a live heartbeated connection instead: the lock releases when the session dies, detected by missed heartbeats rather than wall-clock expiry. Session-based locks handle slow-but-not-dead clients more gracefully (the session just needs to keep heartbeating) but add the complexity of session management and still need a bounded session timeout somewhere.
+
+**Single Redis node vs. quorum-based store.** A single Redis instance hands out locks fast, but it's a single point of failure — a crash mid-operation either loses lock state (two clients can now both acquire) or fails every request until recovery. Redlock (multi-node Redis locking) tries to fix this without full consensus, and it's genuinely controversial precisely because it substitutes clock/timing assumptions for the safety proofs a Raft/Paxos-based store gives for free. Where correctness actually matters, prefer a consensus-backed store (ZooKeeper, etcd, Consul) over ad hoc multi-node Redis schemes.
+
+**Lock granularity.** Locking one row/resource (`order-42`) versus locking a whole table or partition is a contention-versus-complexity trade-off. Fine-grained locks (one per resource ID) scale better under high concurrency because unrelated requests never wait on each other, but you pay in the number of lock entries the service tracks. Coarse-grained locks are simpler to reason about but turn the lock into a throughput bottleneck the moment traffic grows — watch for this specifically when a candidate proposes "one global lock" for convenience.
+
+**Blocking acquire vs. fail-fast acquire.** Some callers want to queue and wait for the lock (a batch job that just needs to run eventually); others want an immediate "someone else has it, try again later" (a request on the user-facing critical path, where blocking would tie up a thread/connection). Exposing both modes, or at minimum a bounded wait, keeps the API useful for both cases.
+
+## Worked example: preventing a double-charge
+
+Say a payment service processes "capture payment for order 42" requests, and a retry (from a flaky client, a load balancer replay, or an over-eager timeout) can plausibly send that request twice within a few hundred milliseconds. Without coordination, both requests could pass a "has this order been charged?" check simultaneously (both read "no" before either writes "yes"), and the customer gets charged twice.
+
+With the lock service: request 1 calls `acquire("order-42-capture", ttl=5s)`, gets fencing token 9, does the charge, writes `payment_status = captured, token = 9` to the orders table (a conditional write requiring `token > current_token`), then releases. Request 2, arriving 50ms later, calls `acquire` on the same resource ID and is denied immediately (lock still held) — it returns a "capture already in progress, retry" response rather than proceeding. If request 1's process died mid-charge instead of finishing cleanly, the 5-second TTL expires, a retry (or a reconciliation job) acquires with token 10, and the conditional write on the orders table still protects against any stale write from request 1 showing up late.
+
+Note what the lock is and isn't doing here: it prevents *concurrent* captures, but it doesn't replace the idempotency key needed to safely retry a genuinely-failed capture. In production you want both — the lock for mutual exclusion during the operation, an idempotency key (keyed on a client-supplied request ID) so a retry can return the cached result instead of re-executing. Many "don't double-process" problems elsewhere in this course lean on idempotency keys alone; only the ones with a true read-then-write race, like the capture example here, actually need mutual exclusion too.
+
+<Quiz
+  lessonId="free-design-a-distributed-lock-service"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'A client acquires a lock, then experiences a long GC pause well past the lock’s TTL, then wakes up and writes to the protected resource as if it still held the lock. What is the standard fix for this specific failure?',
+      options: [
+        { id: 'a', text: 'Increase the TTL so pauses never exceed it', correct: false, explanation: 'A longer TTL only shifts the pause-length threshold at which the bug reappears, and it hurts liveness by making every crash recovery slower. It does not eliminate the failure.' },
+        { id: 'b', text: 'Have the protected resource check a monotonically increasing fencing token and reject stale writes', correct: true, explanation: 'This is the actual fix: it moves the safety guarantee from "the lock service believes only one holder exists" (unprovable given clock/scheduling assumptions) to "the resource never accepts an out-of-order write," which is enforceable with a simple version check.' },
+        { id: 'c', text: 'Use a single Redis node instead of a quorum-based store, since it responds faster', correct: false, explanation: 'Response speed is unrelated to this failure mode, and a single node is also a worse choice for fault tolerance since it is a single point of failure.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine trade-offs to weigh when designing a distributed lock service? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'TTL-based leases assume bounded clock drift and bounded pause times, which is a real assumption that can be violated', correct: true, explanation: 'Correct — this is exactly why fencing tokens (or session-based locks) matter; TTL alone is not a complete safety guarantee.' },
+        { id: 'b', text: 'Coarse-grained locking (one lock for an entire table) is simpler to reason about but can turn the lock into a throughput bottleneck', correct: true, explanation: 'Correct — granularity is a real contention-vs-complexity trade-off; unrelated requests queuing behind one lock is a common real-world mistake.' },
+        { id: 'c', text: 'Building the lock store on a Raft/Paxos-based system removes the need to ever set a TTL or expiry at all', correct: false, explanation: 'Consensus solves replica agreement, not the "holder crashed without releasing" problem — you still need a lease/expiry mechanism (TTL or session-based) for liveness, on top of consensus for safety of the replicated state.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A session-based lock (like a ZooKeeper ephemeral node tied to a heartbeated connection) removes the need for any bounded timeout assumption.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Session-based locks still rely on a bounded session timeout to decide when a connection is considered dead — they change what triggers expiry (missed heartbeats vs. wall-clock TTL) but do not remove the need for a timeout assumption entirely.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — session-based locks are more forgiving of a slow-but-alive client (it just needs to keep heartbeating) but still require a bounded session/heartbeat timeout under the hood.' },
+      ],
+    },
+  ]}
+/>

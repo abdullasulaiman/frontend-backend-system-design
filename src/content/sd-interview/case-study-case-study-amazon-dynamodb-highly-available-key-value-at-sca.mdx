@@ -1,0 +1,124 @@
+---
+title: "Case Study: Amazon DynamoDB — Highly Available Key-Value at Scale"
+module: "System Design Case Studies"
+moduleOrder: 23
+order: 2
+track: "interview"
+summary: "Explains how DynamoDB uses consistent hashing, replication, and tunable quorums to stay available and fast at massive scale, and what that means for how you'd design a similar store in an interview."
+tags: ["dynamodb", "distributed-systems", "consistent-hashing", "availability", "nosql"]
+estMinutes: 13
+cheatsheet:
+  - "DynamoDB partitions data by consistent hashing on the partition key, spreading a table across many storage nodes without a central router deciding placement per-request."
+  - "Every partition is replicated (commonly 3-way) across separate racks/AZs; writes go through a small leaderless replica set rather than a single primary."
+  - "Tunable consistency: `R + W > N` gives strong (quorum) reads; `R + W <= N` gives eventual consistency with lower latency and cost — pick per-request, not per-table."
+  - "Vector clocks (or similar causality metadata) let DynamoDB accept concurrent writes during a partition and detect conflicting versions later instead of blocking availability."
+  - "Sloppy quorums + hinted handoff mean a write can succeed even when a 'home' replica is unreachable, trading strict consistency for availability during failures."
+  - "Hot partition keys (a single celebrity user ID, a single popular product) don't get fixed by adding nodes — they need key design changes (sharding suffixes, write sharding) because one key always lives on one partition's replica set."
+  - "In an interview, DynamoDB is the canonical answer for 'I need a key-value store with predictable low latency and no single point of failure' — know its trade-offs (limited query flexibility, eventual consistency by default) so you can justify choosing or rejecting it."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Most interview candidates can say "use a NoSQL database" when a design needs to scale past a single relational instance. Far fewer can explain *how* a system like DynamoDB actually stays available when a rack loses power, a network link flakes, or a single key gets hammered by ten thousand requests a second. That gap is exactly what interviewers probe for once you've drawn the boxes — and DynamoDB is one of the best-documented, most battle-tested answers to "how do you build a key-value store that never says no."
+
+This lesson pulls apart the ideas that make DynamoDB work: consistent hashing for partitioning, leaderless replication for durability, and tunable consistency for the latency/correctness trade-off. These aren't DynamoDB-only tricks — they show up any time you're asked to design a distributed key-value store, a session store, or a cache tier that needs to survive node failures without downtime. (If you haven't yet, it's worth comparing this against the [Netflix case study](/system-design/design/case-study-case-study-netflix-global-video-streaming-at-scale) earlier in this module — that lesson is about serving large blobs to millions of viewers; this one is about serving tiny reads/writes with strict latency SLAs, a genuinely different problem shape.)
+
+## The core problem DynamoDB solves
+
+Amazon's retail business needed a data store where a shopping cart write during Black Friday traffic could never fail because "the database is busy" or "a node is down." A relational database with a single writable primary can't give you that guarantee — if the primary is unreachable, writes stop, full stop. DynamoDB's founding design goal was to prioritize **availability and partition tolerance over strict consistency** for the workloads that need it (in CAP terms, an AP system with tunable knobs toward C when you ask for it), while keeping read/write latency in the single-digit milliseconds regardless of table size.
+
+That means the design has to answer three questions cleanly:
+
+1. Given a key, which node(s) hold the data?
+2. How many copies exist, and what happens when some are unreachable?
+3. When copies disagree, which one wins — and who decides?
+
+## Partitioning: consistent hashing over a key ring
+
+DynamoDB (like the Amazon Dynamo research system it's descended from) partitions data using **consistent hashing**. Conceptually, hash the space of all possible partition-key values onto a ring of numbers `0` to `2^128 - 1`. Each storage node owns a contiguous arc of that ring. To find where a key lives, hash the key and walk clockwise to the first node boundary.
+
+The payoff over naive hashing (`hash(key) % number_of_nodes`) is what happens when the cluster resizes. With modulo hashing, adding one node reshuffles nearly every key's target node — a massive, cluster-wide data movement. With consistent hashing, adding a node only takes over the arc immediately preceding it; every other node's ownership is untouched. In production DynamoDB, each physical node actually owns many small "virtual nodes" scattered around the ring, which spreads a newly added node's share of the load evenly across many existing peers instead of one unlucky neighbor absorbing it all in one shot.
+
+This is the same idea a candidate should reach for whenever a design needs to shard by key and rebalance without a full rehash: caches (memcached client libraries do this), sharded queues, and CDN request routing all reuse it.
+
+## Replication and the leaderless write path
+
+Each partition on the ring is replicated to `N` nodes (DynamoDB's Dynamo heritage commonly uses `N = 3`), placed on distinct racks or availability zones specifically so a single rack/AZ failure doesn't take out every copy at once. Critically, there's no single elected leader per partition that all writes must go through. Any replica can coordinate a write, which removes the "if the leader is down, writes stall until a new one is elected" failure mode that plagues leader-based systems during network partitions.
+
+A write is considered successful once `W` of the `N` replicas acknowledge it; a read is considered authoritative once it has queried `R` replicas and reconciled their responses. The classic quorum rule ties these together:
+
+- `R + W > N` → every read set and every write set overlap by at least one replica, so a read is guaranteed to see the latest acknowledged write. This is **strong (quorum) consistency**.
+- `R + W <= N` → reads and writes might not overlap, so a read can return a stale value. This is **eventual consistency**, but it's cheaper: fewer replicas to contact means lower latency and better availability if some replicas are slow or unreachable.
+
+This is exposed to the caller as a per-request choice in real DynamoDB (`ConsistentRead=true` vs. the default eventually-consistent read) rather than a fixed table-wide setting — a strong signal in an interview that "consistency" isn't a single toggle, it's a spectrum you tune per access pattern.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    subgraph Ring["Consistent hash ring"]
+      direction LR
+      N1((Node A)) --> N2((Node B)) --> N3((Node C)) --> N4((Node D)) --> N1
+    end
+    Client[Client write: key=user123] -->|hash key, find replicas| N2
+    N2 -->|replicate| N3
+    N2 -->|replicate| N4
+    N2 -->|ack after W replicas confirm| Client
+`} />
+
+### Surviving partitions: sloppy quorums and hinted handoff
+
+Strict quorums (always contact the exact `N` "home" replicas) mean a write blocks if enough home replicas are unreachable — the opposite of the availability goal. DynamoDB instead uses a **sloppy quorum**: if a home replica is down, the coordinator temporarily writes to the next healthy node on the ring instead, marking it with a "hint" that it's holding data on another node's behalf. Once the original replica recovers, that data gets handed back (**hinted handoff**). The write succeeds either way — the system chooses availability over strictly guaranteeing which physical nodes hold the copy at any instant.
+
+The cost of that choice: two clients can end up writing "concurrently" to what's logically the same key during a partition, producing conflicting versions once things reconnect. DynamoDB's Dynamo lineage handles this with **vector clocks** — metadata tracking which node produced which version and in what causal order — so the system can later detect "these two versions are genuinely concurrent, not one superseding the other" and either auto-merge (last-writer-wins, common in the managed DynamoDB service today) or surface both versions to the application to resolve.
+
+<Callout type="warning">
+  A common interview mistake: treating "distributed key-value store" as automatically meaning "infinitely scalable, no hot spots." A single partition key still maps to one fixed replica set on the ring — if one key (a viral post ID, a celebrity's user ID) receives disproportionate traffic, adding more nodes to the cluster does nothing for that key, because it was never going to be spread across them. The fix is at the schema level: add a random or hashed suffix to the key to spread writes across multiple physical partitions (write-sharding), then fan-in reads across the shards. Say this explicitly when your interviewer pushes on "what if this key gets hot" — reaching for "add more nodes" is the wrong answer and a common tell that a candidate hasn't internalized how partitioning actually works.
+</Callout>
+
+## Worked example: sizing a session-store table
+
+Say you're asked to design a session store for a service with 50 million daily active users, each session read or refreshed on roughly every request, averaging 20 requests/user/day. That's `50M x 20 = 1B` operations/day, or about 11,600 ops/sec average — but interview-grade capacity planning uses peak, not average, so assume a 3x peak multiplier: ~35,000 ops/sec at peak.
+
+If each session item is small (session ID, user ID, a few claims — call it 1 KB) and you don't need strong consistency for a session read (a few-hundred-millisecond staleness window on "is this session still valid" is fine for almost every product), you'd choose eventually consistent reads: cheaper, and DynamoDB's read-capacity accounting charges half as much for eventually-consistent reads as for strongly-consistent ones. Partition key: session ID directly (uniformly random by construction, since session IDs are generated as random tokens) — no hot-key risk, no need for a sharding suffix. Set a table-level Time To Live attribute so expired sessions age out automatically instead of requiring a cleanup job. The interesting design decision isn't the raw throughput number — DynamoDB scales past 35K ops/sec routinely — it's recognizing that session IDs are already uniformly distributed, so the partitioning story here is a non-issue, unlike a table keyed by user ID where a small number of power users could concentrate traffic.
+
+## Where this generalizes beyond DynamoDB
+
+The three ideas in this lesson — consistent hashing for placement, leaderless quorum replication for durability, and vector clocks (or a simpler last-writer-wins policy) for conflict resolution — are the standard toolkit for "highly available key-value store" questions generally, not DynamoDB trivia. Cassandra, Riak, and Voldemort all descend from the same 2007 Dynamo paper and make similar choices with different defaults. If an interviewer asks you to design a distributed cache or a rate-limiter's counter store, reaching for "partition by consistent hashing, replicate N ways, pick a quorum that matches the consistency the feature actually needs" is a stronger answer than naming a specific product.
+
+<Quiz
+  lessonId="case-study-case-study-amazon-dynamodb-highly-available-key-value-at-sca"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does DynamoDB use consistent hashing instead of hashing keys modulo the number of nodes?',
+      options: [
+        { id: 'a', text: 'Consistent hashing is faster to compute per request', correct: false, explanation: 'The computational cost of the hash function itself is not the reason — both approaches hash a key in roughly constant time.' },
+        { id: 'b', text: 'It limits how much data must move when nodes are added or removed', correct: true, explanation: 'With modulo hashing, changing the node count reshuffles almost every key’s target node. Consistent hashing only reassigns the arc adjacent to the changed node, so a resize only moves a small, bounded fraction of keys.' },
+        { id: 'c', text: 'It guarantees strong consistency on every read', correct: false, explanation: 'Consistent hashing is purely about placement/routing of keys to nodes. Consistency (strong vs. eventual) is a separate, orthogonal knob controlled by the R/W quorum settings.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements correctly describe DynamoDB’s quorum model? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'R + W > N guarantees a read will see the most recent acknowledged write', correct: true, explanation: 'When the read set and write set are both drawn from N replicas and their sizes sum to more than N, they must overlap in at least one replica, which guarantees the read observes the latest write.' },
+        { id: 'b', text: 'A sloppy quorum means writes always go to the exact same N home replicas, no exceptions', correct: false, explanation: 'The opposite is true — a sloppy quorum explicitly allows writing to a temporary stand-in node when a home replica is unreachable, trading strict placement for availability.' },
+        { id: 'c', text: 'Lower R and W values generally reduce read/write latency at the cost of consistency guarantees', correct: true, explanation: 'Contacting fewer replicas per operation means waiting on fewer round trips, which lowers latency, but it also means reads and writes may no longer be guaranteed to overlap, allowing stale reads.' },
+        { id: 'd', text: 'Vector clocks are used to physically move data between racks', correct: false, explanation: 'Vector clocks track causal ordering between versions of a value so conflicting concurrent writes can be detected; they carry no data-placement responsibility. Hinted handoff is the mechanism that moves data.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Adding more nodes to a DynamoDB-style cluster automatically fixes a hot-partition problem caused by one extremely popular key.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A single key always hashes to the same position on the ring and lives on the same replica set regardless of total cluster size. Extra nodes help spread the overall key space, not the traffic to one specific key.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Fixing a hot key requires a schema-level change — such as adding a random or hashed suffix to spread its writes across multiple partitions — not just growing the cluster.' },
+      ],
+    },
+  ]}
+/>

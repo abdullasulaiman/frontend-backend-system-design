@@ -1,0 +1,137 @@
+---
+title: "Design a Web Analytics System"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 11
+track: "interview"
+summary: "Design a pipeline that turns billions of pageview and click events from millions of browsers into fast, queryable dashboards showing traffic, funnels, and unique visitors."
+tags: ["analytics", "stream-processing", "data-pipelines", "olap", "estimation"]
+estMinutes: 13
+cheatsheet:
+  - "Client SDKs must batch and use a fire-and-forget send (sendBeacon or a keepalive fetch) so tracking never blocks page navigation or unload."
+  - "Separate the write path (ingest, buffer, durable log) from the read path (pre-aggregated OLAP store) — dashboards must never scan raw event logs directly."
+  - "Sessionize with an inactivity-timeout window (commonly 30 minutes), not a fixed clock window — a session is 'this user's continuous activity,' not 'this hour.'"
+  - "Count unique visitors with an approximate structure like HyperLogLog, not an exact set — exact per-dimension unique counts don't scale past a modest cardinality."
+  - "Pre-aggregate along the dimensions dashboards actually filter by (time bucket, page, referrer, device, geo) — ad-hoc queries over raw events are for backfills and debugging, not the live UI."
+  - "Decide your consistency story explicitly: analytics dashboards can tolerate seconds-to-minutes of lag and approximate counts in exchange for scale — don't over-engineer exactness that the product doesn't need."
+  - "Bot and spider traffic must be filtered before aggregation (user-agent rules, behavioral heuristics), or your 'unique visitors' number silently drifts upward over time."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every product team wants the same three questions answered instantly: how many people visited today, where did they come from, and where did they drop off? A web analytics system (think a self-hosted Google Analytics or Plausible) answers those questions at a scale most people underestimate — a mid-size site alone can generate tens of millions of tracked events a day, from browsers you don't control, over networks that drop packets and clocks that don't agree with each other. The interesting engineering problem isn't "store an event," it's turning an enormous, messy stream of pageviews and clicks into dashboards that load in under a second.
+
+This lesson designs that system end to end: client-side tracking, ingestion, sessionization, aggregation, and the query layer a dashboard actually hits. If you've read the sibling lesson on ad click aggregation in this module, you'll recognize the same "log first, aggregate asynchronously" backbone — but web analytics adds its own hard problems: sessionization, unique-visitor counting at scale, and serving flexible, multi-dimensional queries instead of a single counter.
+
+## Requirements
+
+**Functional**
+- Track pageviews and custom events (clicks, form submits, custom app events) from web (and optionally mobile) clients.
+- Group events into sessions per visitor and compute session-level metrics (duration, pages per session, bounce rate).
+- Answer dashboard queries: traffic over time, top pages, referrers, device/browser/geo breakdowns, and funnels ("of users who viewed the product page, how many reached checkout?").
+- Report unique visitors and unique sessions, not just raw event counts.
+
+**Non-functional**
+- Scale to high write throughput: a large site can produce 5,000-20,000 events/sec at peak.
+- Dashboards must load in low hundreds of milliseconds to a couple of seconds, even over months of historical data.
+- Tolerate approximate answers where exactness doesn't matter (unique visitor counts) in exchange for speed and lower storage cost.
+- Tracking must never visibly slow down the page it's embedded in.
+- Respect privacy constraints (data retention limits, IP anonymization, opt-out/do-not-track) depending on jurisdiction.
+
+<Callout type="note">
+  This lesson focuses on first-party product/traffic analytics (your own site, your own dashboard). Real-time bidding and cross-site ad attribution are related but distinct problems with different trust and latency requirements.
+</Callout>
+
+## High-level architecture
+
+The client never writes to a database directly. It fires small, batched events at a collection endpoint, which is the only job that endpoint does — accept and durably queue. Everything downstream (sessionizing, aggregating, serving) happens asynchronously.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  B[Browser SDK] -->|batched beacon| G[Collector API]
+  G --> Q[Event log Kafka]
+  Q --> F[Bot/spam filter]
+  F --> S[Sessionizer]
+  S --> A[Stream aggregator]
+  A --> O[(OLAP aggregate store)]
+  Q --> R[(Raw event lake)]
+  O --> D[Dashboard query API]
+  R --> BJ[Batch reprocessing job]
+  BJ --> O
+`} />
+
+**Browser SDK** — a small script that listens for page loads/navigations and custom events, buffers them client-side, and flushes on a timer or page-hide using `navigator.sendBeacon` (or a `keepalive` fetch as a fallback) so a page unload doesn't drop the last batch.
+
+**Collector API** — a thin, stateless, horizontally scaled service. It validates the payload, stamps a server-side receive timestamp (client clocks aren't trustworthy), and writes straight into a partitioned event log. No aggregation happens here.
+
+**Event log** — durable, ordered, replayable. Partition by a visitor/session identifier so a given visitor's events land in the same partition, which sessionization needs.
+
+**Bot/spam filter** — a stream stage that drops or flags obvious non-human traffic (known bot user-agents, implausible click velocity, headless-browser fingerprints) before anything gets counted, the same principle as fraud filtering in ad click aggregation.
+
+**Sessionizer** — groups a visitor's events into sessions using an inactivity timeout (see below) and emits session-level records once a session closes.
+
+**Stream aggregator** — rolls sessionized events up into time-bucketed, multi-dimensional aggregates: pageviews and uniques by `(minute, page, referrer, device, country)`.
+
+**OLAP aggregate store** — a column-oriented store built for "filter by a few dimensions, aggregate over a time range" queries (this is the same shape of problem a columnar warehouse or time-series database is built for). Dashboards query this, never the raw log.
+
+**Raw event lake** — cheap, append-only storage of every raw event, used for backfills, new-metric reprocessing, and audits — not for live queries.
+
+## Sessionization
+
+A session isn't "all events in a fixed clock hour" — it's "this visitor's continuous run of activity." The standard approach is an inactivity-timeout window: if a visitor's next event arrives within, say, 30 minutes of their last one, it belongs to the same session; a gap longer than that starts a new session. This means a session's boundary can't be finalized until either the timeout elapses with no new event, or an explicit end signal (tab close, if the SDK can detect it) arrives — which is why sessionization runs as a stateful stream job keyed by visitor ID, holding partial sessions open until they time out.
+
+## Counting uniques without blowing up memory
+
+"Unique visitors this month, broken down by country and referrer" sounds simple until you realize you'd need an exact set of visitor IDs per dimension combination to compute it precisely — and that set can be huge and must be intersected/unioned across time buckets to answer range queries. The standard fix is a probabilistic structure like **HyperLogLog (HLL)**: it estimates the cardinality of a set using a small, fixed-size sketch (a few kilobytes) with a typical error rate around 1-2%, and — crucially — HLL sketches can be merged, so "uniques this month" is just merging 30 daily sketches instead of re-scanning raw events. This is the single biggest scaling trick that makes unique-visitor dashboards fast at high cardinality.
+
+<Callout type="warning">
+  A common mistake: storing an exact `SET` of visitor IDs per `(day, page)` bucket to answer "unique visitors" queries. This looks fine in a demo with a few thousand events and then falls over at real traffic — both the storage (huge sets, one per dimension combination) and the query cost (unioning sets across a date range) scale far worse than a HyperLogLog sketch, which stays a fixed small size regardless of how many visitors it's counted.
+</Callout>
+
+## Worked example: sizing a mid-size site
+
+Say the site gets 10 million pageviews/day, averaging 3 tracked events per pageview (a pageview plus two custom events like scroll-depth and a click) — that's 30 million events/day, or about 350 events/sec average. Traffic isn't flat: a launch or a viral post can push peak-to-average ratios of 8-10x, so provision the collector and log for roughly 3,000-3,500 events/sec sustained peak.
+
+Each event (visitor ID, session ID, page URL, referrer, timestamp, a handful of dimension fields) is small, call it 400 bytes. At peak that's under 1.5 MB/sec of raw writes — trivial for a log, meaning the real capacity planning question is downstream: how many aggregate rows does the OLAP store hold? With one-minute buckets across, say, 50,000 distinct pages, that's `50,000 x 1,440 minutes = 72 million rows/day` at minute granularity. Roll that up to hourly after a short retention window (a few days of minute-level detail is enough for live debugging) and daily beyond that, and the store's footprint drops by roughly two orders of magnitude while dashboards querying "last 90 days" still hit small, fast pre-aggregated rows instead of scanning raw events.
+
+## Trade-offs
+
+The central trade-off is the same "fast-and-approximate versus slow-and-exact" tension you'll see across most high-volume aggregation systems: real-time dashboards run on approximate structures (HLL uniques, provisional session states) because exactness at this scale is either impossible or prohibitively expensive to serve live. Where web analytics differs from something like ad click billing is that there's usually no hard requirement for the numbers to ever become bit-exact — nobody's invoice depends on "unique visitors" being precisely correct to the last count, so the batch-reconciliation tier here exists mainly to fix genuinely wrong data (a bot wave that slipped through, a schema bug) rather than to produce a legally exact final number. That relaxed correctness bar is exactly what lets this design lean harder into approximation than a billing-adjacent pipeline would.
+
+<Quiz
+  lessonId="free-design-a-web-analytics-system"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does this design use HyperLogLog sketches instead of exact sets to compute unique visitor counts?',
+      options: [
+        { id: 'a', text: 'Exact sets are impossible to build in a stream-processing system', correct: false, explanation: 'Exact sets are entirely possible to build; the problem is that they scale poorly (in storage and merge cost) at high cardinality and across many dimension combinations, not that they cannot be constructed.' },
+        { id: 'b', text: 'HyperLogLog gives a small, fixed-size, mergeable sketch that estimates cardinality with a small error rate, which scales far better than storing and unioning exact visitor-ID sets per dimension bucket', correct: true, explanation: 'Correct. The fixed sketch size and mergeability (e.g. combining daily sketches into a monthly estimate) is what makes unique-visitor dashboards fast and cheap at scale.' },
+        { id: 'c', text: 'Dashboards never need unique visitor counts, only raw pageview counts', correct: false, explanation: 'Unique visitors is one of the core metrics this system needs to answer, distinct from raw pageview/event counts.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which design choices help ensure client-side tracking never degrades the page it is embedded in? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Batching events client-side and flushing on a timer or page-hide rather than sending one request per event', correct: true, explanation: 'Batching reduces the number of network requests fired during page interaction, lowering overhead on the client.' },
+        { id: 'b', text: 'Using navigator.sendBeacon (or a keepalive fetch) so the final flush survives page unload without blocking navigation', correct: true, explanation: 'sendBeacon/keepalive fetch are specifically designed to let a request complete in the background during unload without delaying navigation.' },
+        { id: 'c', text: 'Having the client wait for the collector to acknowledge and aggregate the event before continuing', correct: false, explanation: 'Waiting on aggregation would tie page behavior to backend processing latency; the client should fire-and-forget and let aggregation happen asynchronously server-side.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A session should be defined as all events that occur within the same fixed clock hour (e.g. 2:00-3:00 PM), regardless of gaps in activity.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'False as stated. Sessions are defined by an inactivity timeout (commonly ~30 minutes of no activity ends a session), not by fixed clock boundaries, so a session can span across an hour mark or end well before one.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct. Sessionization groups a visitor’s continuous activity using an inactivity timeout, which is independent of fixed clock-hour boundaries.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,253 @@
+---
+title: "Case Study: Netflix — Global Video Streaming at Scale"
+module: "System Design Case Studies"
+moduleOrder: 23
+order: 1
+track: "interview"
+summary: "Breaks down how Netflix splits its architecture into a control plane of stateless AWS microservices and a data plane of a purpose-built CDN, and why that split — plus deliberate failure injection — is what lets it stream at global scale."
+tags: ["netflix", "cdn", "video-streaming", "microservices", "resilience-engineering"]
+estMinutes: 13
+cheatsheet:
+  - "Netflix splits into two planes: a control plane (browse, search, auth, recommendations — stateless microservices on AWS) and a data plane (the actual video bytes — served by Open Connect, Netflix's own CDN)."
+  - "Open Connect works because content isn't personalized per viewer: the same file serves everyone, so it can be pre-positioned at ISP-embedded caches ahead of demand instead of reacting to cache misses."
+  - "Appliances fill (download new titles from Netflix's own backbone) during regional off-peak hours, then serve nearly all requests locally during peak — origin traffic is a rounding error next to total viewing hours."
+  - "Regional AWS outages don't take down playback for existing subscribers already routed to an Open Connect appliance — the CDN plane is decoupled from the control plane's availability."
+  - "Chaos engineering (randomly killing instances, and later whole regions, in production) is not a stunt — it's how you validate that failover and circuit breakers actually work, because untested failure paths fail when you need them most."
+  - "Graceful degradation beats hard failure: if the personalization service is unhealthy, fall back to a generic or cached row of titles rather than erroring the whole home page."
+  - "The three-region active-active AWS layout means losing a full region is a capacity/redirect problem (survivors absorb the shifted traffic), not an outage — but only if you provision headroom for it ahead of time."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Netflix streams to hundreds of millions of subscribers across nearly every
+country with an internet connection, and at peak hours in many regions it
+accounts for a meaningful double-digit share of all downstream internet
+traffic. That number alone tells you this isn't a "scale the database"
+problem. Serving video at that volume, reliably, while also personalizing
+what every single subscriber sees the moment they open the app, forces a
+specific architectural choice that shows up constantly in system design
+interviews: **separate the part of the system that decides what to show
+you from the part that actually delivers the bytes**, and scale each one
+completely differently.
+
+This case study walks through how that split works in practice, why
+Netflix built its own CDN instead of only using a third-party one, and how
+deliberately breaking your own production system became a core scaling
+practice rather than a liability.
+
+## The two-plane architecture
+
+Think of a Netflix session as two almost entirely separate systems working
+together:
+
+- **The control plane** — everything that isn't video bytes: login,
+  billing, search, the home page grid, recommendations, "continue
+  watching," and the initial handshake that tells your device which server
+  to actually stream from. This runs as hundreds of independent
+  microservices, historically all on AWS.
+- **The data plane** — the video segments themselves, delivered through
+  **Open Connect**, a CDN Netflix built and operates itself rather than
+  renting from a generic third party.
+
+This split matters because the two halves have wildly different scaling
+characteristics. The control plane handles metadata-sized requests
+(kilobytes) but needs to be fast and highly personalized per user. The data
+plane handles enormous payloads (gigabytes per stream) but the *same*
+payload serves millions of different viewers — video isn't personalized
+content, so it's the textbook case for aggressive caching.
+
+<Mermaid client:visible chart={`
+flowchart LR
+    U[Subscriber device] -->|browse, search, "play" click| CP[Control plane<br/>microservices on AWS]
+    CP -->|"stream from this server"| OC[Open Connect<br/>appliance in ISP/IXP]
+    U -->|video segments| OC
+    CP --> C[(Cassandra /<br/>EVCache)]
+`} />
+
+## Open Connect: pre-positioning beats reacting
+
+A generic CDN caches reactively: a viewer requests a segment, the nearest
+edge node has a miss, it fetches from origin, and it's cached for the next
+viewer nearby. That works, but Netflix pushed further: because a catalog
+title is finite, predictable, and identical for everyone who watches it,
+Open Connect **pre-positions** content before anyone asks for it, rather
+than waiting for cache misses.
+
+Open Connect appliances — Netflix-built servers loaded with storage and
+network capacity — are physically placed in two kinds of locations:
+directly inside ISP networks (so traffic never has to leave the ISP at
+all) and at internet exchange points where many networks interconnect.
+Each night, during a region's low-traffic hours, appliances "fill":
+downloading new and popular titles from Netflix's own backbone. During
+peak viewing hours, that fill traffic stops entirely and the appliances
+serve purely from local storage — so peak-hour demand never competes with
+the ingestion traffic that's populating the caches.
+
+The predictability of viewing patterns is what makes this work: Netflix
+knows in advance roughly which titles will be popular in which region (new
+releases, regional trends, personalization data), so it can decide *what*
+to pre-position and *where*, instead of discovering demand after the fact
+the way a purely reactive CDN does.
+
+### Why not just use a third-party CDN entirely
+
+A generic CDN is a reasonable choice for many companies, and Netflix does
+use multiple methods depending on region and ISP relationship. But at
+Netflix's traffic volume, the economics and control matter enough to
+justify owning the data plane:
+
+- **Egress cost** at this volume is enormous; owning the appliances and
+  placing them inside ISPs (often at the ISP's request, since it also
+  saves the ISP's own transit costs) changes the cost structure entirely.
+- **Traffic predictability** lets Netflix pre-position instead of relying
+  purely on reactive cache-fill, which a generic CDN's shared,
+  multi-tenant infrastructure can't tailor to one catalog's release
+  calendar.
+- **Direct ISP placement** removes an entire network hop and a shared,
+  contended path for a huge fraction of requests.
+
+The general lesson for an interview: "we'll put a CDN in front of it" is
+the right instinct, but at large enough scale with predictable enough
+content, pre-positioning content ahead of demand beats caching reactively
+after a miss — and it's worth stating that trade-off explicitly rather than
+treating "CDN" as a single undifferentiated box.
+
+## The control plane: stateless services and shared caches
+
+The control plane is built as many independently deployable
+microservices — a request gateway routes and authenticates incoming
+requests, then fans out to whichever backend services a given page needs
+(one call to render the home page might touch a dozen services: profile,
+recommendations, continue-watching, artwork selection, and more). Each
+service is kept stateless so any instance can handle any request, which is
+what makes horizontal scaling and fast redeploys possible. Shared state
+lives in dedicated stores: a wide-column store (Cassandra) for durable,
+highly available data that must survive node and even region failures, and
+an in-memory caching layer in front of it to keep read latency low for the
+data every request needs (like your profile or watch history).
+
+Because a single page load fans out to many internal services, one slow
+or unhealthy dependency can't be allowed to cascade and take down the
+whole page. This is handled with the same techniques covered in this
+module's failure-modes lesson: per-dependency timeouts, circuit breakers
+that stop calling a failing service instead of piling up retries, and
+bulkheads that isolate one service's failure from consuming resources
+needed by others.
+
+## Resilience as an engineering practice, not an afterthought
+
+The idea Netflix is most associated with in interview prep circles is
+**chaos engineering**: deliberately injecting failure into production to
+verify the system actually survives it, instead of hoping the failure
+paths work when a real outage hits. The practice started small — randomly
+terminating individual service instances during business hours, on
+purpose, to force every service to prove it tolerates losing an instance
+without customer impact — and expanded to simulating the loss of an
+*entire AWS region*, since a real region-level cloud outage is exactly the
+kind of rare, high-blast-radius event you can't afford to discover you're
+unprepared for.
+
+This only works because of another structural decision: running **active
+in at least three AWS regions simultaneously**, each capable of absorbing
+the others' traffic. Losing one region becomes a traffic-redirection and
+capacity problem the surviving regions must have headroom for, not a
+subscriber-facing outage — but only if that failover path has actually
+been exercised, which is exactly what the regional chaos drills verify.
+
+## Worked example: what actually breaks in a regional AWS outage
+
+Say Netflix's control-plane services in one AWS region go dark for twenty
+minutes. Walk through the blast radius:
+
+- **Subscribers mid-stream, already connected to an Open Connect
+  appliance, keep watching.** The data plane doesn't depend on that
+  region's control-plane services being healthy — it already told the
+  device which appliance to use.
+- **New "press play" requests and browsing** from users routed to the
+  failed region need to fail over: DNS/traffic routing shifts them to a
+  healthy region, and that region needs pre-provisioned spare capacity to
+  absorb the extra load without falling over itself.
+- **A service the interviewer might poke at: recommendations.** If the
+  personalization service in the failing region is unreachable and
+  failover hasn't happened yet, the right behavior is a graceful fallback
+  (a generic or last-known-cached row of titles) rather than a broken home
+  page — degrade a feature, don't fail the request.
+
+The number worth internalizing: the failure of an entire region should
+cost you spare capacity and a brief redirect, not an outage — if it costs
+more than that, the chaos drills should have caught it before a real event
+did.
+
+<Callout type="warning">
+  A common interview mistake is describing Netflix's resilience purely as
+  "they have multiple servers" without naming the actual mechanism. The
+  useful things to say out loud are specific: stateless services so any
+  instance is disposable, circuit breakers so one slow dependency can't
+  cascade, active-active multi-region so a whole region can be lost without
+  an outage, and — critically — chaos testing that *proves* those failure
+  paths work in production rather than assuming they do. An interviewer
+  will push back on "it's resilient" the same way they'd push back on "it
+  scales" with no supporting mechanism.
+</Callout>
+
+## What this case study is not about
+
+Worth stating explicitly so you don't over-reach in an interview: this
+lesson covers Netflix's delivery and resilience architecture, not the
+recommendation algorithm itself (a machine-learning problem with its own
+deep-dive) and not encoding/transcoding pipeline internals (conceptually
+similar to the transcoding lesson elsewhere in this course, just at
+Netflix's specific scale). If asked to "design Netflix" in an interview,
+the two-plane split and the pre-positioned CDN are the structural ideas
+worth leading with before going deeper into any one sub-system.
+
+<Quiz
+  lessonId="case-study-case-study-netflix-global-video-streaming-at-scale"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the main reason Open Connect pre-positions content at ISP-embedded appliances instead of relying purely on reactive cache-fill like a typical CDN?',
+      options: [
+        { id: 'a', text: 'Video segments compress better when pre-positioned', correct: false, explanation: 'Compression is unrelated to where or when content is placed on an appliance; this is not the reason for pre-positioning.' },
+        { id: 'b', text: 'Content isn\'t personalized per viewer and demand is predictable, so Netflix can fill caches ahead of a title becoming popular rather than discovering demand from misses', correct: true, explanation: 'Because the same file serves every viewer and viewing patterns are reasonably predictable, Netflix can push titles to appliances during off-peak hours ahead of time instead of reacting to a flood of cache misses at peak.' },
+        { id: 'c', text: 'ISPs require all cached content to be pre-approved before serving it', correct: false, explanation: 'This describes a regulatory/legal concern, not the engineering reason Open Connect pre-positions content.' },
+        { id: 'd', text: 'Reactive caching is technically impossible for video files', correct: false, explanation: 'Reactive caching works fine for video in general — plenty of CDNs do it. Pre-positioning is a deliberate optimization Netflix layers on top given its scale and predictable catalog demand, not a technical necessity.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'A subscriber is mid-stream, already connected to an Open Connect appliance, when the AWS region hosting Netflix\'s control-plane microservices for their account goes down. Which statements are accurate? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Their current playback continues uninterrupted, since the data plane doesn\'t depend on that control-plane region staying healthy', correct: true, explanation: 'The appliance already has the streaming assignment; ongoing playback is decoupled from the control plane\'s live availability.' },
+        { id: 'b', text: 'Any new "press play" or browse request from users routed to that region needs to fail over to a healthy region', correct: true, explanation: 'New requests still need the control plane, so they must be redirected (via DNS/routing) to a surviving region with enough spare capacity.' },
+        { id: 'c', text: 'The entire global service goes down until that one region recovers', correct: false, explanation: 'Netflix runs active-active across multiple regions specifically so that losing one region is a capacity/redirect problem for the survivors, not a global outage.' },
+        { id: 'd', text: 'Recommendations should gracefully degrade to a generic or cached list rather than breaking the whole home page if personalization is unreachable', correct: true, explanation: 'This is the graceful-degradation principle: a non-critical, personalized feature failing should degrade, not take down the whole page.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Chaos engineering at Netflix (e.g. killing instances or simulating a regional outage in production) is primarily a way to demonstrate resilience to customers, rather than to actually validate that failover mechanisms work.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'The point is functional validation, not demonstration: an untested failover path is unproven, and chaos engineering exists to catch the gap between "we believe this fails over" and "this actually fails over" before a real outage does.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — chaos engineering deliberately injects failure in production specifically to verify failover, circuit breakers, and redundant capacity actually work under real conditions, catching gaps before a genuine outage exposes them.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why does Netflix separate its architecture into a control plane (AWS microservices) and a data plane (Open Connect CDN) rather than treating the whole system as one uniformly scaled service?',
+      options: [
+        { id: 'a', text: 'Because the two halves have fundamentally different scaling characteristics: small, highly personalized requests versus enormous, largely identical payloads', correct: true, explanation: 'The control plane serves per-user, kilobyte-scale, personalized responses; the data plane serves gigabyte-scale payloads that are identical across viewers of the same title — those call for different infrastructure and different scaling strategies.' },
+        { id: 'b', text: 'Because AWS does not support serving large video files at all', correct: false, explanation: 'AWS can serve large files; the separation is a deliberate architectural and cost decision, not a technical limitation of the cloud provider.' },
+        { id: 'c', text: 'Because regulations require video bytes and account data to be legally separated', correct: false, explanation: 'This is not a regulatory requirement; the split is driven by scaling and cost characteristics, not legal mandate.' },
+        { id: 'd', text: 'Because microservices cannot be deployed in the same region as a CDN', correct: false, explanation: 'There is no such deployment restriction; microservices and CDN infrastructure can and do coexist in the same regions.' },
+      ],
+    },
+  ]}
+/>

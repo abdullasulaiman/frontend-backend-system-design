@@ -1,0 +1,267 @@
+---
+title: "Design a Ticket Booking System (Ticketmaster)"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 3
+track: "interview"
+summary: "Walks through designing a large-scale ticket booking platform, focusing on the hard problem at its core: preventing the same seat from being sold twice when thousands of people try to buy it in the same second."
+tags: ["concurrency", "distributed-locking", "inventory", "queueing", "system-design"]
+estMinutes: 13
+cheatsheet:
+  - "The core problem isn't storage or search — it's contention. A popular on-sale event turns one row (one seat) into a hot key that thousands of requests want to write at once."
+  - "Never let two requests both think they hold the same seat: use a single source of truth per seat (row-level lock, conditional write, or a per-seat state machine) and treat 'reserve' as an atomic compare-and-swap, not read-then-write."
+  - "Model seat status as a state machine: available -> held -> booked, with a hold TTL (typically 5-10 minutes) that reverts to available automatically if checkout doesn't complete."
+  - "A virtual waiting room in front of checkout is a load-shedding tool, not a booking mechanism — it caps concurrent access to the hot inventory path so the seat-locking logic doesn't fall over."
+  - "Overselling is worse than under-selling: prefer pessimistic locking or short-lived holds over purely optimistic concurrency for the final booking step, even though optimistic approaches scale better for browsing."
+  - "Search/browse (which events, which sections have availability) and book (lock this exact seat) are different problems with different consistency needs — don't force one datastore or one consistency model to serve both."
+  - "Idempotency keys on the payment/booking API are mandatory: client retries and double-clicks during a stressful checkout flow must not double-charge or double-book."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Most system design lessons are about scaling reads or making writes durable.
+Ticket booking is different: it's a scaling problem wrapped around a
+correctness problem. When tickets for a stadium tour go on sale, tens of
+thousands of people can hit "buy" for the same 200 seats within the same
+second. Get the architecture wrong and you either oversell seats (a real
+customer shows up to a seat someone else is also holding — an outage of
+trust, not just of servers) or you throttle so aggressively that the site
+looks broken during the one moment it matters most. This lesson designs a
+Ticketmaster-style system around that tension, then goes deep on the part
+every interviewer actually cares about: how you guarantee a seat is sold
+exactly once.
+
+## Requirements
+
+**Functional**
+
+- Browse events, venues, and seat maps; see real-time seat availability.
+- Select one or more seats and hold them temporarily during checkout.
+- Complete payment and receive a confirmed booking; the hold either
+  converts to a booking or expires back to available.
+- Support cancellations/refunds that release seats back into inventory.
+
+**Non-functional**
+
+- **Correctness over availability for the booking step**: never sell the
+  same seat twice, even under extreme concurrent load.
+- **High read throughput** for browsing (millions of users looking at a
+  handful of popular events simultaneously).
+- **Fairness and load shedding** during on-sale spikes — a flash-sale style
+  traffic pattern, not steady-state load.
+- Reasonable latency: seat map loads in under a second; a seat hold
+  confirms in low hundreds of milliseconds.
+
+Scale anchor: a major tour on-sale can see 1-2 million concurrent users
+hitting a site that's selling, say, 50,000 seats across 20 shows. That's a
+2,000:1 ratio of demand to supply concentrated into the first few minutes —
+the defining constraint for this design.
+
+## High-level architecture
+
+Split the system into a **browse path** (read-heavy, tolerant of slight
+staleness) and a **booking path** (write-heavy on a tiny hot key set,
+correctness-critical). Forcing both through the same components is the
+most common design mistake here.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  U[User] --> WR[Waiting Room / Queue]
+  WR --> GW[API Gateway]
+  GW --> SEARCH[Search & Catalog Service]
+  GW --> SEATSVC[Seat Reservation Service]
+  SEARCH --> CACHE[(Read Cache: seat map snapshots)]
+  SEATSVC --> LOCK[(Seat Lock Store: per-seat state)]
+  SEATSVC --> QUEUE[Hold-Expiry Queue]
+  SEATSVC --> PAY[Payment Service]
+  PAY --> BOOKDB[(Bookings DB)]
+  QUEUE --> SEATSVC
+`} />
+
+- **Search & catalog service** serves event/venue/seat-map browsing off a
+  cache that's refreshed frequently (every few seconds) rather than read
+  from the source of truth on every request. Slightly stale "this section
+  looks available" is fine — the booking step re-checks truth.
+- **Seat reservation service** owns the seat state machine and is the only
+  writer to seat state. This is the correctness-critical component.
+- **Waiting room / admission queue** sits in front of the booking path
+  during on-sale events, admitting a controlled number of users per second
+  so the reservation service never sees more concurrent writers than it
+  can safely handle.
+- **Payment service** is a separate, idempotent step that only runs after a
+  seat is successfully held — you never charge a card before you know the
+  seat is yours to sell.
+
+## The core problem: exactly-once seat allocation
+
+Model each seat with three states: `available`, `held`, `booked`. A hold
+carries a TTL (5-10 minutes is typical) and an owner (the user's session or
+booking-attempt ID).
+
+The critical operation is: "flip this seat from `available` to `held` for
+me, and fail if anyone else got there first." That must be atomic. Two
+practical ways to build it:
+
+1. **Conditional write / compare-and-swap** on a per-seat row: `UPDATE
+   seats SET status = 'held', held_by = :user, expires_at = :ttl WHERE
+   seat_id = :id AND status = 'available'`. If the affected-row count is
+   zero, someone else already grabbed it — return "seat unavailable"
+   immediately. This works well on a relational database with row-level
+   locking, or on any store that supports conditional writes.
+2. **Distributed lock per seat** (e.g. a Redis `SET seat:123 user_id NX PX
+   300000`) for an even faster hot path, with the lock's owner later
+   confirmed against a durable booking record before payment completes.
+   This trades a small window of "lock says held, DB not yet updated" for
+   much higher throughput on the hottest seats; you reconcile by writing
+   the durable state as soon as the lock succeeds, in the same request.
+
+Either way, the seat is a single logical resource with a single writer
+path — there is no read-then-decide-then-write gap where two requests can
+both believe they succeeded.
+
+<Callout type="warning">
+  The classic bug: reading seat status, checking it's "available" in
+  application code, and then issuing a separate write to mark it "held."
+  Under load, two requests both read "available" before either writes,
+  and both proceed to book the same seat. Any check-then-act pattern that
+  isn't a single atomic operation (a conditional write, a compare-and-swap,
+  a database-enforced unique constraint) will oversell under enough
+  concurrency, even if it looks correct in every manual test you ran with
+  one browser tab.
+</Callout>
+
+### Hold expiry
+
+Holds must expire automatically, or a user who abandons checkout locks a
+seat forever. Two common approaches: a TTL directly on the lock/row
+(Redis `PX`, or a database expiry column checked on every read), backed by
+a periodic sweep job that reverts stale `held` rows to `available` for
+stores without native TTLs. Always re-validate the hold's expiry at the
+moment of payment confirmation too — don't trust that the client's
+countdown timer matches server state.
+
+## Handling the on-sale spike: queueing and fairness
+
+Even with correct per-seat locking, you don't want a million requests all
+hammering the reservation service in the same second — that's a thundering
+herd regardless of how atomic your writes are. A **virtual waiting room**
+in front of the booking path admits users at a controlled rate (say, 5,000
+per minute) using a token or a randomly assigned queue position, so the
+reservation service only ever sees a manageable number of concurrent
+booking attempts. This is purely about load shedding and perceived
+fairness — it does not replace per-seat locking, it protects the system
+that does the locking.
+
+Design the queue to be honest: show an estimated wait, don't let users
+refresh to cut the line (bind position to a session token, not to
+"first request wins on retry"), and make sure the queue itself is cheap to
+serve (a lightweight token-dispensing service, not the same database doing
+seat writes).
+
+## Data model sketch
+
+- **Events / Venues / Seats**: mostly static, cacheable, read-heavy —
+  fine in a standard relational store or even a search index for browsing.
+- **Seat state**: the hot, small, contention-heavy table — one row per
+  seat per event, with `status`, `held_by`, `expires_at`, `version`. Keep
+  this table narrow; every extra column is more lock contention.
+- **Bookings**: append-only, one row per confirmed purchase, written once
+  payment succeeds — this is your durable record and audit trail,
+  decoupled from the mutable seat-state table.
+
+Sharding seat state by `event_id` keeps the hot key concentrated to one
+partition per event rather than spread thin — which is fine, because
+contention is inherently per-event anyway; a popular Tuesday-night on-sale
+for one arena doesn't need to coordinate with seat state for an unrelated
+event across the country.
+
+## Worked example: a 20,000-seat stadium on-sale
+
+Say a stadium show has 20,000 seats and the on-sale opens at 10:00:00 AM,
+with 800,000 users already waiting. The waiting room admits 4,000 users
+per minute into the booking flow. Each admitted user's first action is a
+seat-map read (served from cache, sub-100ms) followed by a hold attempt on
+a specific seat via conditional write.
+
+At peak, maybe 4,000 concurrent hold attempts land within the same
+minute — but because each is a `WHERE status = 'available'` conditional
+update on a specific seat row, only one succeeds per seat and the rest get
+an immediate, correct "unavailable, pick another seat" response. No two
+users ever both believe they hold seat `12A-14`. Within roughly 5 minutes,
+all 20,000 seats are held or booked, and the remaining ~780,000 queued
+users see "sold out" instead of piling further load onto a saturated
+system — the queue did its job by capping concurrency, and the per-seat
+lock did its job by making the actual allocation race-free.
+
+## Trade-offs and what to say in an interview
+
+- **Pessimistic locking (hold-then-book) vs. optimistic (try to book,
+  retry on conflict)**: pessimistic holds give users a clear "you have 8
+  minutes to check out" UX and simplify correctness; pure optimistic
+  retries scale slightly better but produce a worse user experience under
+  contention (repeated "someone beat you to it" failures). Most real
+  ticketing systems use pessimistic holds for this reason.
+- **Strong consistency for seat state vs. eventual consistency for
+  browsing**: don't be afraid to say these need different guarantees out
+  loud — it shows you're not defaulting to "one big consistent database
+  for everything."
+- **Waiting room adds latency and complexity for the 99% of days there's
+  no spike.** A reasonable answer is to make it a feature flag that
+  activates for high-demand on-sales, not a permanent gate on every
+  purchase.
+
+## Related lessons
+
+If the interviewer pushes on "how do you actually implement the per-seat
+lock at scale," the ideas in **Design a Distributed Lock Service** apply
+directly. If they push on "how do you avoid double-charging on retries,"
+that's the same idempotency concern covered from the payments angle in the
+Design a Hotel / Airbnb Reservation System lesson later in this module.
+
+<Quiz
+  lessonId="free-design-a-ticket-booking-system-ticketmaster"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What is the primary correctness risk this design has to guard against?',
+      options: [
+        { id: 'a', text: 'The seat catalog returning stale results', correct: false, explanation: 'Slightly stale browsing data is an accepted trade-off in this design, not the primary risk — booking correctness is.' },
+        { id: 'b', text: 'Two concurrent requests both successfully reserving the same seat', correct: true, explanation: 'This is overselling, the failure mode the entire seat-locking design exists to prevent, since two customers cannot both hold the same physical seat.' },
+        { id: 'c', text: 'The waiting room showing an inaccurate wait-time estimate', correct: false, explanation: 'An inaccurate estimate is a UX annoyance, not a correctness failure of the booking system itself.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'boolean',
+      prompt: 'Reading a seat\'s status in application code, checking it equals "available," and then issuing a separate write to mark it "held" is a safe way to implement seat reservation under high concurrency.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'This check-then-act pattern has a race window: two requests can both read "available" before either writes, resulting in both being told they succeeded.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — reservation must be a single atomic operation, such as a conditional write or compare-and-swap, not separate read and write steps.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'multi',
+      prompt: 'Which of these are legitimate reasons to put a virtual waiting room in front of the booking path for a high-demand on-sale? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It caps the number of concurrent writers hitting the seat reservation service', correct: true, explanation: 'This is its main purpose: protecting the correctness-critical booking path from a thundering herd of simultaneous requests.' },
+        { id: 'b', text: 'It replaces the need for atomic per-seat locking', correct: false, explanation: 'The waiting room controls load; it does not make seat allocation atomic. Two admitted users could still race for the same seat without proper locking.' },
+        { id: 'c', text: 'It gives users a predictable, fair-feeling experience instead of a flood of immediate failures', correct: true, explanation: 'A queue with a position/estimate is a better user experience than everyone racing and most getting instant errors.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A user holds seat 14A for checkout but closes the browser tab and never completes payment. What should happen?',
+      options: [
+        { id: 'a', text: 'The seat stays held indefinitely until an operator manually releases it', correct: false, explanation: 'Manual intervention does not scale to thousands of abandoned checkouts per on-sale and would slowly starve inventory.' },
+        { id: 'b', text: 'The hold expires automatically via its TTL and the seat reverts to available', correct: true, explanation: 'This is why holds carry a TTL (typically 5-10 minutes) — abandoned holds must self-expire so inventory isn\'t silently locked away forever.' },
+        { id: 'c', text: 'The seat is booked anyway since the hold was created successfully', correct: false, explanation: 'A hold is not a booking; payment must complete before the seat converts to booked. Otherwise abandoned sessions would consume inventory permanently.' },
+      ],
+    },
+  ]}
+/>

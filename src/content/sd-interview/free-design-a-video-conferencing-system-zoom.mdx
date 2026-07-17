@@ -1,0 +1,167 @@
+---
+title: "Design a Video Conferencing System (Zoom)"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 8
+track: "interview"
+summary: "Walks through designing a real-time video conferencing system, covering media routing topologies, signaling, adaptive bitrate, and the trade-offs behind SFU-based architectures like Zoom's."
+tags: ["video-conferencing", "webrtc", "real-time-systems", "media-streaming", "system-design"]
+estMinutes: 14
+cheatsheet:
+  - "Mesh topology doesn't scale past ~4 participants (each client uploads N-1 streams); an SFU (Selective Forwarding Unit) lets clients upload once and the server fans out, trading server bandwidth cost for client simplicity."
+  - "An MCU mixes all streams server-side into one composite stream — lowest client bandwidth/CPU, but expensive to run and adds a re-encode delay; mostly used for large webinars or recording, not live low-latency calls."
+  - "Signaling (who's in the call, session negotiation) and media (the actual audio/video packets) are two separate concerns — signaling can go over WebSocket/HTTPS, media goes over UDP-based RTP for latency, never TCP."
+  - "Simulcast: each sender encodes 2-3 quality layers (e.g. 180p/360p/720p) and the SFU forwards the layer that fits each receiver's bandwidth and screen size, instead of re-encoding server-side."
+  - "Target under 150ms one-way latency for natural conversation; UDP is chosen over TCP because a retransmitted late video frame is worse than a dropped one — real-time media prefers loss over delay."
+  - "NAT traversal needs STUN (discover public IP) and, when that fails behind symmetric NATs/firewalls, TURN (relay all traffic through a server) as a fallback — budget TURN capacity for roughly 15-20% of sessions."
+  - "Active speaker detection and bandwidth estimation (e.g. via RTCP receiver reports) drive server-side decisions about which layers to forward — the design problem is as much about congestion control as it is about routing."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+A video call has a much harder latency budget than almost anything else you'll design. A news feed can be a few hundred milliseconds stale and nobody notices. A video call with 400ms of round-trip delay feels broken — people talk over each other, and the conversation falls apart. That single constraint (get audio and video from one face to another face in well under 200ms, at a bandwidth the receiver's network can actually sustain, for possibly hundreds of participants at once) is what makes this problem genuinely different from the CRUD-and-cache systems that dominate most interviews. Zoom, Google Meet, and Microsoft Teams all converge on similar answers because the physics of real-time media leaves little room for creativity — which is exactly why interviewers like this question: it tests whether you understand *why* the standard architecture looks the way it does, not whether you can recite it.
+
+## Requirements
+
+**Functional:**
+- Users can create/join a meeting via a room ID or link.
+- Support multi-party audio and video, screen sharing, and text chat within a call.
+- Participants see and hear each other with acceptably low latency.
+- Support recording a meeting for later playback.
+- Handle participants joining from wildly different network conditions (fiber to a spotty 4G connection) without breaking the call for everyone else.
+
+**Non-functional:**
+- Low latency: sub-150ms one-way media delay is the target for natural conversation.
+- Scale from 1:1 calls to large meetings (hundreds of participants) and webinars (thousands of viewers, few speakers).
+- Adaptive quality — degrade gracefully under packet loss or bandwidth constraints instead of freezing or dropping the call.
+- Reasonable server cost — media is expensive to move and process; the architecture should minimize redundant server-side work.
+
+We're explicitly *not* solving for perfect quality on a bad network — we're solving for the call staying usable and continuing to communicate the important information (a person's audio, mostly) even as video degrades.
+
+## How should media actually flow between participants?
+
+This is the first fork in the design, and it determines almost everything downstream: cost, scalability, latency, and server complexity. There are three topologies.
+
+### Mesh (peer-to-peer)
+
+Every participant opens a direct connection to every other participant and sends their audio/video straight to them. No media server involved at all.
+
+This is dead simple and has the lowest possible latency (one hop, no server in the path). It's also the reason it only works for very small calls: with `N` participants, each client must **upload** its stream `N-1` times simultaneously. A 4-person mesh call means each client uploads 3 copies of its video — on a typical home upload connection (5-10 Mbps), that's already tight. At 8 participants it's unworkable for most home connections. Mesh is fine for 1:1 calls or maybe 3-4 people; it's not a general solution.
+
+### MCU (Multipoint Control Unit)
+
+The opposite extreme: every client sends one upload to a central server, which decodes every incoming stream, composites them into a single mixed audio/video stream (e.g. one frame with everyone in a grid), and sends that one combined stream back down to each participant.
+
+This minimizes client bandwidth and CPU — you always send and receive exactly one stream, no matter how many people are on the call. The cost moves entirely to the server: decoding, compositing, and re-encoding N streams per participant is CPU-intensive and adds real latency (a full decode-composite-encode cycle, typically 100-300ms) before anyone even sees the mixed frame. MCUs are still used for scenarios like recording a "gallery view" composite or bridging into legacy hardware conferencing systems, but they're rarely the answer for live low-latency calls anymore.
+
+### SFU (Selective Forwarding Unit) — the answer almost every modern system uses
+
+Each client uploads its stream once to the server, and the server simply **forwards** (routes) each incoming stream to whichever other participants need it — no decoding or re-encoding in the hot path. A participant in a 10-person call still uploads once, but downloads up to 9 incoming streams (which the client-side UI can choose to not render/decode if a tile is off-screen or minimized).
+
+This is the sweet spot: it caps upload bandwidth per client at 1x (good for the common case of asymmetric home connections — upload is usually the scarce resource), keeps server-side CPU cost to routing rather than transcoding, and keeps latency low since packets pass through with no re-encode. The cost that remains is **server egress bandwidth**, which now scales roughly with `N` participants times `N-1` downloads — a real, budgeted cost, but a bandwidth cost rather than a compute cost, which is cheaper to scale horizontally. This is the architecture Zoom, Meet, and Teams are built on for live meetings.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  A[Participant A] -- upload 1x --> SFU[SFU Media Server]
+  B[Participant B] -- upload 1x --> SFU
+  C[Participant C] -- upload 1x --> SFU
+  SFU -- forward B, C --> A
+  SFU -- forward A, C --> B
+  SFU -- forward A, B --> C
+`} />
+
+## High-level architecture
+
+Beyond the media path, a full system needs a control plane to manage rooms, users, and signaling, plus supporting services for chat and recording.
+
+<Mermaid client:visible chart={`
+flowchart TB
+  Client[Client apps] -->|HTTPS| API[Signaling / Room API]
+  Client -->|WebSocket| Signal[Signaling Service]
+  Client -->|RTP over UDP| SFU[SFU Cluster]
+  API --> RoomDB[(Room / Session Store)]
+  Signal --> RoomDB
+  SFU --> TURN[TURN Relay]
+  SFU --> Recorder[Recording Service]
+  Recorder --> Blob[(Object Storage)]
+  Signal --> Chat[Chat Service]
+`} />
+
+**Signaling service** handles everything *about* the call that isn't media itself: who's joining, session negotiation (exchanging each client's supported codecs and network candidates — the WebRTC "offer/answer" exchange), and mid-call events (someone muted, someone's screen-sharing started). This runs over a persistent connection like WebSocket, separate from the media path, and can tolerate normal web-service latency (tens of milliseconds) because it's not carrying audio/video itself.
+
+**SFU cluster** is the media plane. Rooms get assigned to a specific SFU instance (or a small cluster of instances geographically close to the participants, to keep the extra server hop cheap), and clients connect to it directly over UDP for RTP media once signaling has completed the handshake. This is intentionally decoupled from the signaling service so the two can scale independently — media routing is CPU/bandwidth-bound, signaling is connection-count-bound.
+
+**NAT traversal**: most clients sit behind NAT/firewalls and don't have a routable public IP. **STUN** servers let a client discover its own public-facing IP:port so it can tell the SFU where to send packets directly. When a client is behind a symmetric NAT or restrictive corporate firewall that STUN can't punch through (in practice this affects a meaningful minority of sessions), the client falls back to **TURN**, which relays all media through a server rather than routing it directly — more expensive and slightly higher latency, but the only thing that works in that situation. A production design has to budget real server capacity for TURN relay, not just treat it as an edge case.
+
+## Adapting to bad networks: simulcast and congestion control
+
+Participants join from wildly different networks — a laptop on fiber and a phone on 4G in the same meeting. Two techniques handle this without falling back to a lowest-common-denominator quality for everyone:
+
+- **Simulcast**: instead of encoding one quality stream, each sending client encodes 2-3 layers simultaneously (say, 180p, 360p, and 720p) and uploads all of them. The SFU picks which layer to forward to each individual receiver based on that receiver's available bandwidth and how large their video tile is on screen — a receiver on 4G gets the 180p layer, a receiver on fiber with a full-screen view gets 720p, and this decision can change dynamically as conditions change, without the sender re-encoding anything.
+- **Bandwidth estimation and congestion control**: receivers periodically report packet loss and jitter back to the sender/SFU (via RTCP receiver reports). The sender uses this to estimate available bandwidth and adjust its encoding bitrate, and the SFU uses it to decide which simulcast layer each receiver can currently sustain. This is a continuous feedback loop, not a one-time negotiation at call start.
+
+The reason UDP (via RTP) is used instead of TCP for media matters here too: TCP guarantees delivery by retransmitting lost packets, but a retransmitted video frame that's 300ms late is useless for a live call — you'd rather drop that frame and keep playing forward. Real-time media consistently prefers bounded loss over unbounded delay, which is the opposite trade-off web APIs usually make.
+
+## Worked example: sizing a 500-person all-hands meeting
+
+Say one host presents to 500 attendees who mostly have cameras off, plus a handful of panelists with video on. This is really a webinar shape, not a mesh-of-equals shape, and the SFU design handles it naturally: only the host's and panelists' video streams (say, 5 active video sources at 720p, roughly 1.5 Mbps encoded each) need to be forwarded widely.
+
+Server egress for that meeting is roughly `500 attendees x 1 video stream (the active speaker or host, ~1.5 Mbps) x` — call it 750 Mbps of egress from that one SFU instance for that one meeting, if everyone receives the same single stream. That's why large webinars often cap how many *simultaneous* video streams a receiver actually gets (e.g. only the current active speaker plus pinned panelists, not all 500 attendees' cameras), and why "large meeting" mode in real products intentionally looks different from small-group mode — it's not a UI preference, it's a bandwidth-driven design decision. A single beefy SFU instance can typically sustain several Gbps of egress, so this one meeting is a small fraction of one instance's capacity, but at platform scale you're provisioning SFU capacity in aggregate Gbps across thousands of concurrent meetings, and that number, not CPU, is usually the dominant infrastructure cost.
+
+## Common pitfalls
+
+<Callout type="warning">
+  The most common mistake in this interview is treating video conferencing like a generic streaming or messaging problem and reaching for a message queue or CDN as the centerpiece of the design. Neither fits: a queue adds buffering latency that breaks live conversation, and a CDN is built for one-to-many delivery of content that already exists, not two-way, sub-150ms, symmetric media exchange between live participants. Anchor the design on the SFU/mesh/MCU topology choice first — that's the load-bearing decision everything else hangs off.
+</Callout>
+
+## Where this fits with other lessons
+
+If you haven't already, the notification system and web analytics lessons in this module cover the "high fan-out, latency-tolerant" end of real-time systems — useful contrast, since video conferencing sits at the opposite, latency-intolerant end of that spectrum despite superficially similar "many clients, one event" shapes.
+
+<Quiz
+  lessonId="free-design-a-video-conferencing-system-zoom"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why do modern video conferencing systems generally use an SFU instead of a full mesh once a call has more than a handful of participants?',
+      options: [
+        { id: 'a', text: 'Mesh has higher latency than an SFU because packets take an extra server hop', correct: false, explanation: 'The opposite is true — mesh has the lowest possible latency since media goes directly peer-to-peer with no server hop. The SFU is chosen despite adding a hop.' },
+        { id: 'b', text: 'In a mesh, each client must upload its stream N-1 times, which overwhelms typical upload bandwidth as participant count grows', correct: true, explanation: 'Correct. Mesh requires each client to send a separate upload to every other participant, so upload bandwidth demand grows linearly with participant count and quickly exceeds what typical connections can sustain.' },
+        { id: 'c', text: 'SFUs support more codecs than a mesh topology can', correct: false, explanation: 'Codec support is unrelated to topology — it depends on what the client and server implementations negotiate, not on whether media is routed peer-to-peer or through a server.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements about MCUs (Multipoint Control Units) are accurate?',
+      options: [
+        { id: 'a', text: 'An MCU decodes and re-encodes streams server-side into one composite stream', correct: true, explanation: 'Correct — this is the defining property of an MCU: it mixes all incoming streams into a single outgoing composite, unlike an SFU which just forwards packets.' },
+        { id: 'b', text: 'An MCU minimizes client-side bandwidth and CPU compared to an SFU', correct: true, explanation: 'Correct — clients receive one already-mixed stream instead of N separate streams, at the cost of pushing decode/composite/encode work onto the server.' },
+        { id: 'c', text: 'An MCU is generally the best choice for minimizing end-to-end latency in a live call', correct: false, explanation: 'MCUs add a decode-composite-encode cycle that introduces real latency (often 100-300ms), which is worse for live conversation than an SFU\'s pass-through forwarding.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Real-time video media is typically sent over UDP (via RTP) rather than TCP because losing a packet is usually preferable to the delay caused by retransmitting it.',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct. TCP\'s retransmission guarantees delivery but at the cost of delay; a live call would rather skip a late frame than wait for a retransmit, so UDP-based RTP is standard for real-time media.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This is backwards — TCP\'s reliability guarantee is exactly what real-time media avoids, because retransmitted-but-late packets are worse than dropped ones for live conversation.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A participant is on a 4G connection with fluctuating bandwidth, in a call with several other participants on fast fiber connections. What technique lets the SFU give this participant a lower-quality stream without forcing everyone else down to that quality too?',
+      options: [
+        { id: 'a', text: 'TURN relay', correct: false, explanation: 'TURN is about relaying media when direct connectivity (NAT traversal) fails — it does not address adapting stream quality to bandwidth.' },
+        { id: 'b', text: 'Simulcast, where senders encode multiple quality layers and the SFU forwards the layer that fits each receiver', correct: true, explanation: 'Correct. Simulcast lets a sender push several quality layers at once; the SFU independently chooses which layer to forward to each receiver based on that receiver\'s bandwidth, so one struggling receiver does not degrade quality for everyone else.' },
+        { id: 'c', text: 'Increasing the signaling service\'s WebSocket heartbeat interval', correct: false, explanation: 'The signaling heartbeat is unrelated to media quality — it just tracks whether a client connection is still alive.' },
+      ],
+    },
+  ]}
+/>

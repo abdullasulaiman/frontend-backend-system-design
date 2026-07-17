@@ -1,0 +1,222 @@
+---
+title: "Case Study: Discord — Scaling Real-Time Chat to Millions"
+module: "System Design Case Studies"
+moduleOrder: 23
+order: 4
+track: "interview"
+summary: "Walks through how Discord fans out text messages and presence to huge communities while keeping voice on a completely separate, latency-optimized path."
+tags: ["discord", "real-time", "websocket", "chat", "case-study"]
+estMinutes: 13
+cheatsheet:
+  - "Split the problem in two: a durable, ordered text/event path (store then fan out) versus a lossy, latency-critical voice/video path (never store, never wait) — they need opposite trade-offs and should never share the same pipeline."
+  - "Model each chat room (guild/channel) as a single owning process or shard that serializes membership, permission, and ordering decisions for that room — this avoids split-brain on 'who is currently in this room' without needing a distributed lock per message."
+  - "Fan-out-on-write (push to every connected member's socket) works until a room has hundreds of thousands of members; past that, batch/rate-limit the push and let clients pull the backlog instead of trying to deliver every event to everyone instantly."
+  - "Presence (who's online) is the highest-churn, most disposable piece of state in the system — treat it as ephemeral and heavily coalesced/throttled, never as durably-logged truth."
+  - "Voice/video should route media peer-to-peer or through a regional relay (SFU), never through the same server that's doing chat-message bookkeeping — mixing the two couples an availability-critical path to a latency-critical one."
+  - "Persistent WebSocket connections need first-class support for resuming a session after a brief network blip (replay missed events by sequence number) — without it, every Wi-Fi hiccup looks like a full reconnect storm to your infra."
+  - "A gateway/edge tier that only routes bytes should be able to scale independently from the stateful room/session tier that holds membership and ordering logic — conflating the two forces you to over-provision both together."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Most chat-system designs in an interview assume small groups: a 1:1 DM, or a
+group chat with a few dozen members. Discord's actual production problem is
+different in kind, not just degree — a single community ("guild," in
+Discord's internal vocabulary) can have hundreds of thousands to over a
+million members, with tens of thousands of them online and typing in the
+same channel during a live event. Layer on top of that a completely
+different real-time workload — voice and video calls, which cannot tolerate
+the latency of "store the message, then fan it out" — and you get a system
+that has to solve two very different real-time problems under one product,
+at a scale where a naive fan-out design falls over immediately. That
+combination — huge rooms, mixed durability requirements, and a
+persistent-connection tier serving millions of simultaneous sockets — is
+what makes this a distinct case study from a generic "design a chat app"
+exercise.
+
+## The two workloads: text and voice are not the same problem
+
+It's tempting to design one real-time pipe and push both chat messages and
+voice audio through it. Discord's architecture treats them as separate
+systems on purpose, because their correctness requirements are opposite:
+
+- **Text messages** must be durable and ordered. A message you send has to
+  survive a server restart, show up in history for someone who joins the
+  channel a week later, and appear in a consistent order for everyone
+  reading it. Latency matters, but a few hundred milliseconds of delivery
+  lag is invisible to users.
+- **Voice/video** must be low-latency and can tolerate loss. A dropped audio
+  frame from half a second ago is worthless — retransmitting it just adds
+  more delay. There's no "history" to replay. What matters is getting the
+  *next* frame there in tens of milliseconds, not guaranteeing every frame
+  arrives.
+
+Designing both as "send it through the same durable message queue" either
+makes voice unusably laggy (waiting on a write-ahead log per audio frame) or
+makes text unreliable (dropping chat messages the way you'd tolerate
+dropping audio). The fix is architectural separation: a gateway/session tier
+plus a durable message store for text, and an entirely separate real-time
+media relay for voice that never touches the message-storage path.
+
+## Text path: gateway, guild owner, and message store
+
+### The persistent-connection gateway
+
+Every connected client holds one long-lived WebSocket to a gateway server.
+The gateway's job is narrow: authenticate the connection, multiplex many
+users' traffic over few TCP connections to backend services, and push
+events (new messages, member joins, presence changes) down to the client as
+they happen. Gateways are stateless enough to scale horizontally and are
+sharded by user, not by guild — a single client only ever needs one socket,
+regardless of how many guilds it belongs to.
+
+### One logical owner per guild
+
+Membership, roles/permissions, and channel state for a given guild need a
+single consistent view — two servers independently deciding "who's currently
+allowed to see this channel" is how you get a permission change that only
+half the system respects. Discord's approach is to make each guild owned by
+one process (running on the Erlang/Elixir BEAM runtime, which is built for
+exactly this: millions of cheap, isolated, message-passing processes). That
+owner process holds the guild's live state in memory, applies changes
+serially, and pushes deltas out to every gateway connection currently
+subscribed to that guild. Sharding by guild ID means a single very large
+guild always lands on one physical node's worth of that guild's ownership
+logic, which is precisely the scaling limit the next section deals with.
+
+### Durable storage for messages
+
+The guild owner doesn't hold message history — that goes to a separate,
+horizontally-scalable store (a wide-column, log-friendly database is a
+natural fit, since the access pattern is almost entirely "append a message"
+and "read the last N messages in a channel," rarely arbitrary updates).
+Writing a message is a two-step: persist it durably first, then hand it to
+the guild owner to fan out to connected members. If the fan-out step fails
+or is slow, the message still exists and a client can always fetch history
+on reconnect — durability doesn't depend on delivery succeeding.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    C1[Client A] -->|WebSocket| GW1[Gateway shard]
+    C2[Client B] -->|WebSocket| GW2[Gateway shard]
+    GW1 --> Owner[Guild owner process]
+    GW2 --> Owner
+    Owner --> Store[(Message store)]
+    Store --> Owner
+    Owner -->|fan out event| GW1
+    Owner -->|fan out event| GW2
+    GW1 --> C1
+    GW2 --> C2
+    VC1[Voice client] -.->|media, UDP| SFU[Regional voice relay]
+    VC2[Voice client] -.->|media, UDP| SFU
+`} />
+
+## The million-member guild problem
+
+Fan-out-on-write — push every message to every connected member instantly —
+is fine for a 50-person guild. It breaks down when a guild has 500,000
+members and 60,000 of them are online during a launch event, all watching
+one announcements channel. A few specific techniques handle this:
+
+- **Lazy member/presence loading.** Clients only get the full member list
+  and live presence for the small slice of the guild they're actually
+  looking at (the visible member sidebar), not all 500,000 members'
+  statuses at once. The rest loads in small chunks on demand.
+- **Coalescing presence updates.** Online/offline/status-change events are
+  extremely high-churn and low-value individually. Rather than pushing each
+  one immediately, they get batched over a short window (tens to low
+  hundreds of milliseconds) and sent as one update, cutting event volume by
+  orders of magnitude with no perceptible UX cost.
+- **Read-heavy, not write-heavy scaling for the guild owner.** Since one
+  guild's ownership logic lives on one node, an enormous guild's peak load
+  is bounded by that node's throughput. The mitigation is keeping the
+  per-event work on that node as cheap as possible (routing and small
+  deltas only, never re-serializing large member lists per message) so the
+  ceiling is as high as it can be before a guild needs further splitting of
+  responsibilities.
+
+## Worked example: estimating fan-out for one hot channel
+
+Say a 200,000-member guild has 40,000 members concurrently connected during
+a live event, and the announcements channel gets one message per second
+during the peak. Naive fan-out-on-write means each message triggers 40,000
+individual pushes — 40,000 events/second sustained just from this one
+channel, before counting any other guild activity on the same gateway
+fleet.
+
+At that rate, a gateway shard handling, say, 5,000 of those connections
+still has to emit 5,000 pushes per incoming message — trivial for a single
+event, but it compounds fast if ten channels across different large guilds
+are all this active simultaneously, or if the message rate spikes to ten
+per second during a hype moment. The mitigations that keep this tractable
+are the same ones described above: presence and typing-indicator traffic
+(much higher churn than actual messages) get coalesced hard, and the guild
+owner batches outgoing deltas per gateway shard rather than making one
+round trip per member. The message-send path itself stays simple — write
+once, fan out once per connected shard, not once per member — because the
+gateway shard is the one that expands one event into N socket writes, not
+the guild owner.
+
+<Callout type="warning">
+  A common design mistake is routing voice/video media through the same
+  stateful room-owner process that handles chat message ordering. It seems
+  convenient — one component "owns" the room, why not have it relay audio
+  too — but it means a spike in chat activity (or a slow message-store
+  write) can add latency to live voice audio, and it means the owner
+  process, sized for message-ordering throughput, now also has to handle
+  raw media bandwidth. Keep media on its own regional relay tier that only
+  the participants in that specific call touch, with the room owner
+  involved solely in call signaling (who's joining/leaving), not the media
+  itself.
+</Callout>
+
+## What this case study is really testing
+
+An interviewer using Discord as a prompt is rarely testing whether you know
+Erlang. They're testing whether you instinctively separate durability
+requirements (chat must persist and order correctly) from latency
+requirements (voice must be fast and can lose data), whether you reach for
+"shard by room, one owner per room" instead of a single global lock for
+membership/ordering, and whether you notice that presence — the thing every
+naive design treats like a normal event — is actually the highest-volume,
+lowest-value traffic in the whole system and needs to be treated
+differently from messages. If you find yourself proposing one pipeline for
+everything real-time, that's the signal to stop and split the problem.
+
+<Quiz
+  lessonId="case-study-case-study-discord-scaling-real-time-chat-to-millions"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why does this design keep voice/video media on a separate path from text messages, rather than routing both through the same pipeline?',
+      options: [
+        { id: 'a', text: 'Because voice requires low latency and tolerates dropped data, while text requires durability and ordering — mixing them forces one workload to accept the wrong trade-off.', correct: true, explanation: 'Correct — a durable, ordered write-then-fan-out pipeline adds latency voice cannot afford, while a lossy low-latency path is unacceptable for messages that must persist and stay in order.' },
+        { id: 'b', text: 'Because voice traffic uses more bandwidth than text, and bandwidth is the only reason to separate them.', correct: false, explanation: 'Bandwidth differs, but the core reason for separation is the conflicting latency/durability requirements, not raw data volume alone.' },
+        { id: 'c', text: 'Because WebSockets cannot carry binary audio data.', correct: false, explanation: 'WebSockets can carry binary frames; the separation is a design choice driven by latency and reliability trade-offs, not a technical limitation of the transport.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which techniques does this lesson describe for handling a guild (chat room) with hundreds of thousands of members? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Lazily loading member lists and presence only for the slice of members a client is actively viewing.', correct: true, explanation: 'Correct — clients get full member/presence detail on demand for what they can see, not the entire membership at once.' },
+        { id: 'b', text: 'Coalescing high-churn presence updates into batched windows instead of pushing each change immediately.', correct: true, explanation: 'Correct — presence is extremely high-volume and low-value per event, so batching cuts traffic drastically with no perceptible cost.' },
+        { id: 'c', text: 'Storing every member\'s full presence history durably so it can be replayed later.', correct: false, explanation: 'Presence is treated as ephemeral, disposable state — it is explicitly not durably logged, since only the current status matters, not its history.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In this design, a chat message is considered durably saved only after it has been successfully delivered to every currently connected member of the channel.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Durability is decoupled from delivery: the message is persisted to the message store first, independent of whether fan-out to connected clients succeeds or is delayed.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the message is written to durable storage first; fan-out to connected sockets is a separate, best-effort step, and any client can fetch history on reconnect regardless of whether it received the live push.' },
+      ],
+    },
+  ]}
+/>

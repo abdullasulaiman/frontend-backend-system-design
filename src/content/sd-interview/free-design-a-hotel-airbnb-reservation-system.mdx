@@ -1,0 +1,282 @@
+---
+title: "Design a Hotel / Airbnb Reservation System"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 14
+track: "interview"
+summary: "Design a reservation platform for hotels or short-term rentals, focused on the one problem that defines this class of system: guaranteeing no two guests can ever book the same room for overlapping dates."
+tags: ["reservation-system", "booking", "concurrency-control", "distributed-transactions", "sql"]
+estMinutes: 13
+cheatsheet:
+  - "The core invariant is a no-overlap constraint per room per date range, not raw throughput — booking write volume is low (thousands/sec globally at Airbnb's scale, not millions), so correctness under concurrency dominates the design."
+  - "Prefer a relational database with a date-range exclusion constraint (or SELECT ... FOR UPDATE plus an application check) over optimistic 'check then write' logic — the check-then-act pattern always has a race window under concurrent requests."
+  - "Model availability as an inventory row per room per night, not just a bookings table — decrementing a per-night counter makes the overlap check a single row lock instead of a range scan."
+  - "Split search (read-heavy, eventually-consistent, cacheable) from booking (write-heavy, strongly consistent, transactional) — they have opposite scaling needs and should not share the same query path."
+  - "Use a hold/reserve step (short-lived soft lock, 10-15 minutes) between 'user picks dates' and 'payment confirms' so payment latency never causes a double-book, but expire it aggressively so abandoned carts release inventory."
+  - "Idempotency keys on the booking-confirmation endpoint are mandatory — clients retry on timeout, and a retried booking request must not create a second reservation."
+  - "Overbooking is a product decision, not just a bug to eliminate — many hotel chains deliberately overbook by a small percentage and handle the rare collision with compensation (upgrade, refund, relocation), because 100% safety margins waste inventory."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Picture two people opening the same Airbnb listing at 9:00pm on a Friday,
+both looking at the same weekend, both hitting "Reserve" within a second of
+each other. Only one of them can get the room. Get this wrong and you've
+either sold the same bed twice — an angry guest showing up to a locked
+door — or you've falsely told a guest a room is unavailable when it isn't,
+losing a booking for no reason. Every other feature of a reservation system
+(search, pricing, reviews, messaging) is standard product engineering. This
+one guarantee — **no two overlapping bookings for the same unit** — is the
+part that makes this a genuinely interesting systems design problem, and
+it's usually where interviews spend most of their time.
+
+This lesson designs a booking platform in the shape of Airbnb or a hotel
+chain's reservation system: search for available inventory, hold it briefly,
+confirm it with payment, and never let two holds turn into two confirmed
+bookings for the same dates. (If you've read the
+[Ticket Booking System](/system-design/design/free-design-a-ticket-booking-system-ticketmaster)
+lesson in this module, the "hold then confirm" shape will feel familiar —
+the difference here is the resource being reserved is a *date range* on a
+specific room, not a single seat at a single showtime, which changes how
+the availability check works.)
+
+## Requirements
+
+**Functional**
+
+- Search for available listings/rooms by location, date range, and guest
+  count.
+- View a specific listing's calendar (which dates are open).
+- Reserve a room for a date range: hold it temporarily, then confirm with
+  payment.
+- Cancel a reservation, releasing the inventory back to availability.
+- Host/hotel-side: create and update listings, block out dates, adjust
+  pricing.
+
+**Non-functional**
+
+- Correctness above all: never confirm two overlapping bookings for the
+  same room. This is a hard invariant, not a best-effort target.
+- Search is read-heavy and can tolerate a few minutes of staleness (a room
+  that was just booked can briefly still show up in search results, so long
+  as the actual booking attempt correctly rejects it).
+- Booking confirmation must be strongly consistent and low-latency (under
+  ~500ms end to end, excluding payment processor round-trip).
+- Scale: a large platform handles on the order of a few million listings
+  and tens of thousands of bookings per minute at peak (holiday booking
+  rushes) — write-heavy compared to most content systems, but nowhere near
+  the throughput of an ad-click or telemetry pipeline.
+
+## High-level architecture
+
+Three responsibilities need to be pulled apart because they scale
+differently: **search** (find candidate rooms), **availability/booking**
+(the transactional core), and **pricing/payment** (mostly external, with a
+thin coordination layer).
+
+<Mermaid client:visible chart={`
+flowchart LR
+  U[Guest] --> GW[API Gateway]
+  GW --> SS[Search Service]
+  GW --> BS[Booking Service]
+  SS --> IDX[(Search Index<br/>listings + rough availability)]
+  BS --> INV[(Inventory DB<br/>per-room, per-night rows)]
+  BS --> HOLD[(Hold Store<br/>TTL cache)]
+  BS --> PAY[Payment Service]
+  BS --> NOTIF[Notification Service]
+  H[Host] --> LS[Listing Service]
+  LS --> IDX
+  LS --> INV
+`} />
+
+- **Search service** queries a denormalized index (Elasticsearch or similar)
+  built from listing metadata plus a coarse availability signal. It answers
+  "which of these 500 listings in this city have *no known conflict* for
+  these dates" quickly, but it is allowed to be a little stale.
+- **Booking service** owns the actual transactional guarantee. Every
+  confirmed booking goes through it, and it is the only thing allowed to
+  write to the authoritative inventory store.
+- **Inventory store** is a relational database (Postgres/MySQL) — not a
+  NoSQL store — because the overlap check is fundamentally a constrained
+  write, and relational engines give you row locks, transactions, and
+  constraints for free instead of requiring you to hand-roll them.
+- **Hold store** is a short-TTL cache (Redis) holding "soft locks": a
+  reservation the user has started but not yet paid for.
+
+## The core problem: preventing double-booking
+
+There are two common ways to model availability, and the choice matters a
+lot for how the overlap check works.
+
+### Option A: a bookings table with date ranges
+
+Store one row per booking: `room_id, start_date, end_date`. To check
+availability you query for any existing booking on that room whose range
+overlaps the requested range. This is intuitive, but "does this range
+overlap any existing range" is a range query, and preventing a race between
+two concurrent range checks needs either a database-level exclusion
+constraint (Postgres's `EXCLUDE USING gist` with a range type) or an
+explicit table/row lock around the check-then-insert. Without one of those,
+two transactions can both read "no conflict" before either commits its
+insert — a classic time-of-check-to-time-of-use (TOCTOU) race.
+
+### Option B: a per-night inventory row
+
+Store one row per `room_id, date` (or `room_id, date, unit_index` if a
+listing has multiple identical units, like a hotel room type). Booking N
+nights means locking and decrementing N rows. This turns the overlap check
+into N simple row-level operations instead of one range query, and it
+composes naturally with `SELECT ... FOR UPDATE` — the database's normal row
+locking handles the concurrency for you. It costs more storage (a row per
+night per room, not per booking) but that's cheap relative to correctness.
+
+Most production systems lean toward B, or a hybrid: per-night inventory
+counts for the fast path, with a bookings table for the human-readable
+record (who booked what, for receipts and cancellation).
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant G as Guest
+    participant BS as Booking Service
+    participant DB as Inventory DB (txn)
+    participant P as Payment
+    G->>BS: Reserve room X, Jul 20-22
+    BS->>DB: BEGIN; SELECT nights FOR UPDATE
+    DB-->>BS: rows locked, all available
+    BS->>DB: mark nights as HELD, set hold_expiry
+    DB-->>BS: COMMIT
+    BS-->>G: hold confirmed, 15 min to pay
+    G->>BS: submit payment
+    BS->>P: charge card
+    P-->>BS: success
+    BS->>DB: BEGIN; mark nights CONFIRMED; COMMIT
+    BS-->>G: booking confirmed
+`} />
+
+The key move: the transaction that locks the rows and the transaction that
+flips them from available to held happen atomically, inside one database
+transaction, before payment is even attempted. Payment can take seconds
+(3D Secure, bank round-trips); you never want to hold a row lock open for
+that long, so the hold state — not an open transaction — is what protects
+the inventory while payment runs.
+
+<Callout type="warning">
+  A common mistake is implementing availability as "SELECT to check if
+  free, then, in application code, INSERT the booking" without wrapping both
+  in a single transaction with row locking. Under low concurrency this works
+  every time in testing, which is exactly why it's dangerous — it passes QA
+  and then double-books during a real traffic spike, because two requests
+  can both pass the SELECT check before either INSERT lands. Always make the
+  check-and-reserve step one atomic operation (a transaction with `FOR
+  UPDATE`, or a database constraint that rejects the second insert
+  outright), never two separate round-trips.
+</Callout>
+
+## Holds, expiry, and idempotency
+
+A hold is a soft reservation: inventory rows marked `HELD` with an
+expiration timestamp (commonly 10-15 minutes). Two things have to be true
+for holds to work correctly:
+
+- **Expiry must be enforced by a background sweep or lazily on read** — a
+  scheduled job (or a check every time the row is touched) that flips
+  expired `HELD` rows back to `AVAILABLE`. Relying on the client to "release"
+  the hold is not safe; browsers close, apps crash, users abandon carts.
+- **Confirmation must be idempotent.** The client may retry the "confirm
+  booking" call after a timeout, not knowing whether the first attempt
+  succeeded. Require an idempotency key (e.g. a client-generated UUID) on
+  the confirm endpoint, and store it with a uniqueness constraint — a
+  retried request with the same key returns the already-created booking
+  instead of creating a second one.
+
+## Search and read scaling
+
+Search doesn't need the same consistency guarantee as booking — showing a
+listing that got booked 30 seconds ago is a minor annoyance (the booking
+attempt will correctly reject it), not a correctness bug. That lets you
+serve search from a denormalized index updated asynchronously (via
+change-data-capture from the inventory DB, or an event the booking service
+emits on state changes), cache aggressively at that layer since popular
+destinations and dates are read far more often than any one room is booked,
+and push the final, authoritative check to booking time, where it's cheap
+because search already narrowed the field to a handful of candidates.
+
+This search/booking split is the same pattern you'll see in the
+[Ticket Booking System](/system-design/design/free-design-a-ticket-booking-system-ticketmaster)
+lesson: decouple the expensive, latency-tolerant "browse" path from the
+narrow, strongly-consistent "commit" path.
+
+## Worked example: estimating the hot path
+
+Say a platform has 5 million active listings and averages 20,000 confirmed
+bookings per minute at peak (roughly 333/second) — modest compared to a
+flash-sale ticket drop, because demand for a specific room on specific
+dates is naturally spread out rather than everyone racing for the same
+resource at once. Each booking touches, say, 3 nights: that's about 1,000
+row locks per second at peak, easily handled by a properly indexed
+relational database, as long as the index is on `(room_id, date)` so a lock
+only ever touches the handful of rows for that room's requested nights
+instead of scanning the whole table.
+
+Contrast that with search: the same platform might see 200,000 queries per
+minute (over 3,000/second), each browsing dozens of candidate listings —
+roughly 10x booking's volume, at much lower staleness sensitivity per
+query. That gap is exactly why search gets its own cached, asynchronous
+index instead of sharing the inventory database, where it would contend
+for the same locks the booking path depends on for correctness.
+
+## Trade-offs and further considerations
+
+- **Strong consistency vs. overbooking on purpose.** Airlines and hotel
+  chains sometimes intentionally overbook by a small margin (e.g. 2-3%)
+  based on historical no-show rates, accepting a rare compensation cost
+  (upgrade, refund, relocation) in exchange for higher utilization. That's
+  a business decision layered on top of a correctness-preserving system,
+  not a reason to relax the underlying no-double-book guarantee.
+- **Multi-region.** A global platform can't put every region's writes
+  through one database without adding latency for distant guests.
+  Partitioning inventory by geography (a listing's bookings are handled by
+  its home region) keeps the transactional path local, at the cost of more
+  complex cross-region search aggregation.
+- **Cancellations and refund windows** add their own state machine (pending
+  cancellation, refunded, dispute) but don't change the core availability
+  model — a cancellation is just a transaction that flips nights back to
+  `AVAILABLE`.
+
+<Quiz
+  lessonId="free-design-a-hotel-airbnb-reservation-system"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why is a per-night inventory row (one row per room per date) generally preferred over a pure bookings table with date-range columns for the availability check?',
+      options: [
+        { id: 'a', text: 'It uses less storage overall', correct: false, explanation: 'It actually uses more storage, since it stores one row per night per room instead of one row per booking. Storage is not the reason to prefer it.' },
+        { id: 'b', text: 'It turns the overlap check into simple row-level locks instead of a range-overlap query, composing naturally with SELECT ... FOR UPDATE', correct: true, explanation: 'Locking a fixed set of per-night rows is simpler to make atomic and race-free than checking whether a new date range overlaps existing ranges, which needs a range/exclusion constraint or explicit locking to be safe.' },
+        { id: 'c', text: 'It removes the need for a payment step before confirming a booking', correct: false, explanation: 'The inventory model is unrelated to whether payment happens before confirmation — that is a separate design decision (the hold step).' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are legitimate reasons to serve search from a separate, eventually-consistent index rather than querying the transactional inventory database directly? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Search traffic volume is typically much higher than booking traffic, and contending for the same locks would slow down the correctness-critical booking path', correct: true, explanation: 'Mixing a high-volume, read-heavy workload with the low-volume, lock-sensitive booking path risks contention that degrades the path that must stay correct and fast.' },
+        { id: 'b', text: 'A room briefly showing as available in search after it was actually booked is an acceptable, low-cost staleness window', correct: true, explanation: 'The booking service still performs the authoritative check at reservation time, so stale search results only cause an occasional rejected booking attempt, not a double-booked room.' },
+        { id: 'c', text: 'The overlap-prevention guarantee can be relaxed for search results since it only applies to confirmed bookings', correct: false, explanation: 'The no-double-book guarantee is not "relaxed" for search — search just does not need to enforce it, because booking still enforces it authoritatively at confirmation time. The guarantee itself never weakens.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Wrapping a check-then-insert booking flow in a single database transaction with row-level locking is sufficient to prevent double-booking, even without a hold/expiry mechanism, as long as payment completes inside that same transaction.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Payment can take seconds (3D Secure, bank round trips); holding a row lock open for the full payment duration would block other requests on those rows and doesn’t scale. The standard pattern separates locking (fast, inside a short transaction) from payment (slow, outside the lock) via a hold state.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — payment should happen outside the locking transaction. The short transaction locks rows and marks them HELD; payment then runs against that hold, and a second short transaction confirms or releases it based on the payment result.' },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,149 @@
+---
+title: "Design an Online Code Judge"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 13
+track: "interview"
+summary: "Designs an online code judge (LeetCode/Codeforces-style) that compiles and runs untrusted user code against test cases, with sandboxing and resource limits as the central design problem rather than an afterthought."
+tags: ["code-execution", "sandboxing", "container-security", "queueing", "resource-limits"]
+estMinutes: 12
+cheatsheet:
+  - "The hard problem in this system isn't judging correctness — it's running arbitrary, untrusted code safely. Treat sandboxing as the centerpiece of the design, not a bullet point at the end."
+  - "Every submission needs three independent limits enforced by the sandbox itself, not the language runtime: CPU time, memory, and wall-clock time. A language-level timeout (e.g. a `signal.alarm` in the submitted code) is useless because the untrusted code controls it."
+  - "Isolate at the kernel/VM boundary, not just the process boundary — namespaces + cgroups + seccomp (or a microVM like Firecracker/gVisor) is the realistic bar; a chroot alone stops nothing."
+  - "Separate compile from run: compile once, execute against N test cases from the same compiled artifact. Re-compiling per test case wastes CPU and gives no benefit — compilation isn't part of what's under test."
+  - "Never reuse a warm sandbox across submissions from different users. State (files written, processes left running, cached memory) leaking between tenants is both a correctness bug and a security hole."
+  - "Judging must be deterministic and idempotent: the same submission run twice should get the same verdict, and a worker crash mid-judge should be safely retryable rather than silently reporting a wrong result."
+  - "Contests create extreme burst load (thousands of submissions in the first few minutes) on top of a steady practice-mode trickle — size the worker pool and queue for the burst, and give contest submissions priority over background practice submissions."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every coding-interview platform, competitive-programming site, and "run this code" feature in an IDE is built on the same core problem: take code a stranger wrote, in a language you don't control, and execute it — safely, quickly, and at scale — without letting it read another user's data, exhaust the host machine, or escape onto the network. That's fundamentally different from most systems in this course, where the hard part is data modeling or consistency. Here, the hard part is that the input is actively adversarial. A user submitting a solution isn't necessarily malicious, but some fraction of the traffic always is — someone probing for a sandbox escape, someone trying to mine cryptocurrency on your compute fleet, someone writing `while(true){}` just to see what happens.
+
+This lesson designs an online code judge like the ones behind LeetCode, Codeforces, or HackerRank: submit code, get back a verdict (accepted, wrong answer, time limit exceeded, and so on). The interesting design decisions are almost entirely about the execution sandbox and the queueing/scaling around it — get that right and the rest of the system is a fairly ordinary CRUD-plus-queue application.
+
+## Requirements
+
+**Functional:**
+
+- A user submits source code, a language, and a problem ID.
+- The system compiles (if needed) and runs the code against a set of hidden test cases for that problem.
+- Each run is checked against expected output and produces a verdict: **Accepted (AC)**, **Wrong Answer (WA)**, **Time Limit Exceeded (TLE)**, **Memory Limit Exceeded (MLE)**, **Runtime Error (RE)**, or **Compile Error (CE)**.
+- The user can poll or subscribe for the result, since judging isn't instant.
+- Supports multiple languages (Python, Java, C++, Go, at minimum) with per-problem time/memory limits.
+
+**Non-functional:**
+
+- **Isolation**: one submission must never affect another submission's execution or read another submission's data.
+- **Resource-bounded**: a submission that hangs, allocates unbounded memory, or forks endlessly must be killed and reported as a normal verdict (TLE/MLE), not allowed to degrade the host.
+- **Throughput under burst**: contests can produce thousands of submissions in a few minutes; practice mode is a steady background trickle.
+- **Fairness**: a burst from one user (or one contest) shouldn't starve everyone else's queue.
+- **Determinism**: judging the same code against the same test cases must reliably produce the same verdict — flaky judging destroys trust in the platform fast.
+
+This lesson leaves ranking and scoreboards out of scope; see the [leaderboard lesson](/system-design/design/free-design-a-leaderboard-system) in this module for how a contest scoreboard is typically built on top of a stream of judge verdicts.
+
+## High-level design
+
+<Mermaid client:visible chart={`
+flowchart LR
+  U[User] -->|submit code| API[Submission API]
+  API --> Q[(Submission Queue)]
+  API --> DB[(Submissions DB)]
+  Q --> W1[Judge Worker]
+  Q --> W2[Judge Worker]
+  W1 --> SB[Sandbox: compile + run]
+  SB --> TC[(Test Cases Store)]
+  SB --> W1
+  W1 --> DB
+  U -->|poll / subscribe| API
+`} />
+
+1. **Submission API** accepts the code, writes a `submission` row with status `queued`, and pushes a job onto a queue. It returns immediately with a submission ID — judging is asynchronous, never synchronous in the request path, because a single run can legitimately take seconds and you don't want to hold an HTTP connection open for that.
+2. **Submission queue** decouples arrival rate from judging capacity. This is what absorbs contest bursts: submissions pile up in the queue rather than overwhelming workers or getting dropped.
+3. **Judge workers** pull jobs, spin up a sandbox, compile (if applicable), run against each test case, and write verdicts back.
+4. **Test case store** holds the hidden input/expected-output pairs per problem — kept separate from user-visible data and never sent to the client.
+5. The **client polls or subscribes** (a WebSocket or long-poll works fine) for a status transition from `queued` → `running` → a final verdict.
+
+### Compile once, run many
+
+For compiled languages, compile the submission exactly once inside the sandbox, then run the resulting binary against every test case for that problem, each as a separate bounded execution. Test cases don't need separate compiles — compilation isn't part of what's being measured, and re-compiling per test case just multiplies cost for no benefit. A compile failure short-circuits the whole submission as **Compile Error** before any test case runs.
+
+## Deep dive: the sandbox
+
+This is the part of the design an interviewer will push on hardest, because it's where most naive designs fail.
+
+**Process isolation isn't enough.** Running the submitted binary as a plain OS process with a `timeout` wrapper stops nothing determined — it can still read other files on the host, open sockets, or fork until the machine falls over. The realistic bar is a combination of:
+
+- **Linux namespaces** (PID, mount, network, user) so the process sees its own isolated view of the filesystem, process table, and network — it literally cannot see or signal other submissions' processes.
+- **cgroups** to hard-cap CPU shares, memory, and process/thread count for the sandbox as a whole, enforced by the kernel, not by the submitted code's own cooperation.
+- **seccomp-bpf** to filter which syscalls are even allowed — block `socket`, restrict `fork`/`clone` counts, deny raw disk access.
+- Or, for a stronger boundary, a **microVM** (Firecracker) or a user-space kernel (gVisor) instead of raw containers — heavier per-submission cost, but a much smaller attack surface, since a container-escape bug in the shared host kernel is a catastrophic single point of failure across every tenant.
+
+**Three limits, enforced independently:**
+
+- **CPU time** — actual CPU-seconds consumed, not wall-clock, so an I/O-bound submission doesn't get penalized for time it spent blocked.
+- **Wall-clock time** — a hard ceiling regardless of CPU usage, as a backstop against anything that hangs on I/O or sleeps forever.
+- **Memory** — a hard cgroup memory limit; exceeding it should trigger an OOM kill, reported to the user as MLE, not a host-wide memory pressure event.
+
+Critically, none of these limits can be enforced by code running *inside* the submission's own language runtime — the submitted code is exactly what you don't trust to self-regulate. The limits have to be imposed from outside the sandboxed process, by the kernel/hypervisor layer.
+
+<Callout type="warning">
+  A common and dangerous shortcut is reusing a "warm" container across submissions to save the cost of container startup — spin one up per language, keep it running, and just swap in the next user's code. This leaks state: files left on disk, background processes from a prior submission, even timing side-channels between users sharing the same warm environment. Always tear down and recreate the sandbox per submission (or per test case, for the strictest designs), and treat any measured startup-latency savings from container reuse as not worth the isolation you give up.
+</Callout>
+
+## Worked example: sizing for a contest
+
+Say a contest has 5,000 participants, each submitting an average of 6 times over a 2-hour window, with a sharp burst in the first 15 minutes as everyone reads the first problem and submits a quick attempt. That's 30,000 submissions total, but the burst window might see 40% of them — roughly 12,000 submissions in 15 minutes, or about 13 submissions/second sustained, with short spikes well above that.
+
+If each submission takes 2 seconds average sandbox time (spin-up, compile, run across ~15 test cases, teardown), one worker handles about 0.5 submissions/second. Covering a 13/sec sustained rate with headroom for spikes calls for roughly 40-50 judge workers during the contest window — versus maybe 5-10 workers sized for steady-state practice-mode traffic the rest of the day. This is exactly the shape of workload that favors autoscaling the worker pool against queue depth (scale out when the backlog grows, scale back in afterward) rather than provisioning for peak load year-round.
+
+Two more practical constraints worth stating out loud in an interview: give contest-tagged submissions a higher-priority queue than practice submissions, so a contest doesn't get stuck behind unrelated background traffic; and rate-limit resubmissions per user (e.g. one in-flight submission per user per problem) so a single impatient participant hammering "submit" doesn't consume a disproportionate share of worker capacity.
+
+## Trade-offs
+
+**Exact-match output vs. special judge.** Most problems compare output byte-for-byte (trimmed of trailing whitespace). Problems with multiple valid answers (e.g. "output any valid topological order") need a **special judge** — a separate verifier program the platform runs to check the submission's output against the problem's constraints, rather than a fixed expected string. Special judges are more work to write per problem but are unavoidable once "any correct answer" is a valid category of problem.
+
+**Container-per-submission vs. microVM-per-submission.** Containers (namespaces + cgroups + seccomp) start in tens of milliseconds and are cheap, but share the host kernel — a kernel-level container escape compromises every tenant on that host. MicroVMs (Firecracker) start in the low hundreds of milliseconds and cost more per submission, but each submission gets its own kernel, shrinking the blast radius of any single exploit to one submission. Platforms judging genuinely adversarial/competitive traffic (CTF-style judges, public code-execution APIs) lean toward microVMs; internal or lower-stakes practice judges often accept containers for the latency and cost win.
+
+**Synchronous "run now" vs. queued judging.** A "run this snippet" scratchpad feature (instant feedback while typing) often wants low-latency synchronous execution against a small, pre-warmed pool, accepting looser isolation guarantees for speed. A submission that counts toward a contest score should always go through the full queued, audited judging pipeline — correctness and fairness matter more than shaving off a second there.
+
+## Quiz
+
+<Quiz
+  lessonId="free-design-an-online-code-judge"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why is enforcing CPU time, memory, and wall-clock limits from inside the submitted code\'s own language runtime (e.g. a timer the submission sets itself) not a valid design?',
+      options: [
+        { id: 'a', text: 'Language runtimes are too slow to check limits frequently enough', correct: false, explanation: 'Performance isn\'t the issue — the issue is trust. A runtime-level timer runs inside the same untrusted process it is supposed to constrain.' },
+        { id: 'b', text: 'The submitted code is untrusted, so it cannot be relied on to self-regulate; limits must be enforced by the kernel/hypervisor from outside the process', correct: true, explanation: 'Exactly — a self-imposed limit is exactly the thing an adversarial or buggy submission can ignore, override, or never reach in the first place. cgroups and namespaces enforce limits externally, which the sandboxed process cannot bypass.' },
+        { id: 'c', text: 'It works fine for compiled languages but not interpreted ones', correct: false, explanation: 'The trust problem applies equally regardless of language — an interpreted or compiled submission is equally capable of ignoring a self-imposed limit.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are genuine reasons to avoid reusing a "warm" sandbox/container across submissions from different users? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Files or processes left behind by a prior submission can leak into the next user\'s execution environment', correct: true, explanation: 'Correct — this is a real cross-tenant state leak and a security concern, not just a tidiness issue.' },
+        { id: 'b', text: 'A shared warm environment can create timing side-channels between unrelated users\' code', correct: true, explanation: 'Correct — shared caches, CPU state, and timing artifacts from a previous run can subtly influence or leak information into the next run.' },
+        { id: 'c', text: 'Reusing containers always makes compilation fail for statically typed languages', correct: false, explanation: 'There is no such general failure mode — compilation correctness is unrelated to container reuse. The real problems with reuse are isolation/state-leak issues, not compiler behavior.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'In this design, the submission API should synchronously run the code and return the final verdict in the same HTTP request/response.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Judging can take seconds across multiple test cases, and holding an HTTP connection open for that is fragile at scale. The standard approach is to accept the submission, queue it, and let the client poll or subscribe for the verdict asynchronously.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the submission API should return immediately with a submission ID and queue the actual judging work, decoupling arrival rate (especially contest bursts) from judging capacity.' },
+      ],
+    },
+  ]}
+/>

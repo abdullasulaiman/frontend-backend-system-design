@@ -1,0 +1,137 @@
+---
+title: "Case Study: Cloudflare — Operating a Global Edge Network"
+module: "System Design Case Studies"
+moduleOrder: 23
+order: 5
+track: "interview"
+summary: "Examines how Cloudflare uses anycast routing and an everywhere-is-the-same-server architecture to run CDN, DDoS mitigation, and DNS services from hundreds of edge locations without regional failover logic."
+tags: ["cloudflare", "cdn", "edge-computing", "anycast", "ddos-mitigation"]
+estMinutes: 13
+cheatsheet:
+  - "Anycast lets many physical servers around the world advertise the same IP address; BGP routes each client to the topologically nearest one, so 'failover' is just the internet's routing tables converging around an outage — no DNS-based geo-routing needed."
+  - "Cloudflare's edge is deliberately homogeneous: every data center runs the same full stack (cache, WAF, DDoS scrubbing, DNS, Workers), so any request can be served correctly from any location — there's no 'edge does X, origin does Y' split to keep in sync."
+  - "Volumetric DDoS defense works by absorbing and dispersing, not blocking centrally: anycast spreads a flood across every edge location simultaneously, so a 1 Tbps attack becomes a few Gbps per site — an amount each site's local scrubbing can drop without ever troubling the origin."
+  - "A CDN cache miss should still be fast: Cloudflare terminates the client's TLS/TCP connection at the near edge and reuses long-lived, already-warm connections to origin over its private backbone, instead of a fresh internet path per request — this is 'connection coalescing,' not caching."
+  - "Compute-at-the-edge (Workers) trades a longer cold start and a stripped-down runtime (V8 isolates, not containers) for near-zero startup latency and being able to run at every one of hundreds of locations cheaply — good for auth checks, redirects, A/B routing; wrong tool for a stateful database transaction."
+  - "Anycast has one sharp edge: it isn't connection-aware. If BGP routes change mid-flow, a long-lived TCP or QUIC connection can silently get rerouted to a different physical server that has no session state, which is why in-flight requests, not just new ones, need to be designed to tolerate a mid-stream re-route."
+  - "In an interview, frame Cloudflare as 'push both routing and computation to the edge, keep the edge nodes fungible' — contrast with Netflix's model of 'push content to edge, keep control/personalization logic centralized,' which is a different point on the same spectrum."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Most system design case studies you'll study — Netflix, DynamoDB, Discord — are about scaling **one company's own product**. Cloudflare is a different shape of problem: it operates infrastructure that sits in front of millions of *other people's* websites and APIs, in over 300 cities, and has to be simultaneously a CDN, a DDoS scrubber, a DNS resolver, and (increasingly) a place to run arbitrary application code — all while adding as little latency as possible to a request that was already going to happen anyway.
+
+That combination forces a specific architectural stance: every edge location must be a complete, self-sufficient replica of the whole system, reachable by the nearest possible route, with no single choke point that an attacker or an outage can target. This lesson looks at how anycast routing, a homogeneous edge fleet, and edge compute combine to deliver that. It pairs well with the Netflix lesson earlier in this module — both push work to the edge, but for different reasons and with different trade-offs.
+
+## The core idea: anycast instead of DNS-based geo-routing
+
+Most multi-region services route users to the nearest data center using DNS: a client resolves `api.example.com`, the DNS server looks at the client's approximate location (via GeoIP), and returns the IP of the nearest regional cluster. This works, but it has two structural weaknesses: DNS answers get cached (by resolvers, by OS stacks, by browsers) for minutes to hours, so failover is slow, and "nearest" is only ever a GeoIP guess, not an actual network-topology measurement.
+
+Cloudflare instead uses **anycast**: the *same* IP address is announced, via BGP, from every one of its edge locations simultaneously. Routers across the internet don't know or care that dozens of physical servers claim to own that address — BGP's path-selection algorithm just routes each packet toward whichever announcement is topologically closest, hop-count and route-cost wise, to the sender. Two users on opposite sides of the planet, both connecting to `1.1.1.1`, transparently land on two different physical servers without either of them (or Cloudflare's DNS) doing anything geo-aware.
+
+This gets you two things DNS-based routing can't cheaply give you:
+
+- **Sub-second failover.** If a data center goes dark, it simply stops announcing its BGP routes. The internet's routers converge on the next-nearest announcement within seconds — no TTL to wait out, no client-side retry logic required.
+- **Free DDoS dispersion.** A volumetric attack aimed at one IP doesn't concentrate on one data center — the flood is split across every location currently announcing that route, roughly in proportion to the attacker's own network topology. A 2 Tbps flood arriving at 300 locations is a very different (survivable) problem per-location than 2 Tbps arriving at one.
+
+<Mermaid client:visible chart={`
+flowchart TB
+    U1[User - Singapore] -->|BGP: shortest path| E1[Edge PoP - Singapore]
+    U2[User - Frankfurt] -->|BGP: shortest path| E2[Edge PoP - Frankfurt]
+    A[Attacker flood] -->|same anycast IP| E1
+    A -->|same anycast IP| E2
+    A -->|same anycast IP| E3[Edge PoP - Sao Paulo]
+    E1 --> S1[Local scrubbing + cache]
+    E2 --> S2[Local scrubbing + cache]
+    E3 --> S3[Local scrubbing + cache]
+    S1 -.miss.-> O[Origin, over private backbone]
+    S2 -.miss.-> O
+`} />
+
+## A homogeneous edge: every PoP does everything
+
+The second key decision is that Cloudflare doesn't split its stack into "edge does caching, core does everything else." Every point of presence (PoP) runs the full software stack: TLS termination, the WAF (web application firewall), rate limiting, DDoS scrubbing, DNS resolution, cache, and the Workers runtime for edge compute. A request landing in any of the 300-plus cities gets a functionally identical experience.
+
+This matters for two reasons a candidate should be able to articulate:
+
+1. **No coordination tax.** If edge and origin logic had to agree on WAF rules or cache-invalidation state, every rule change would need a rollout protocol across regions with consistency guarantees. Because each PoP independently runs the same code against (mostly) the same configuration, a rule push is "replicate this config object to every PoP," not a distributed transaction.
+2. **Uniform failure domain.** Any PoP can absorb any other PoP's traffic during an outage or an anycast re-route, because there's no PoP that's "the DNS one" or "the WAF one." Losing a location is a capacity problem, not a missing-capability problem.
+
+The trade-off is config propagation lag: a WAF rule or cache-purge pushed centrally still takes time (typically seconds, not milliseconds) to reach every PoP, so there's a brief window where different users see different behavior. Cloudflare accepts that window in exchange for never needing synchronous cross-region coordination on the request path.
+
+### Keeping cache misses fast
+
+A CDN only helps on a cache hit. On a miss, Cloudflare still has to fetch from the customer's origin server — but it doesn't do that over the open internet per-request. The edge terminates the client's TLS/TCP (or QUIC) connection locally, then reuses an already-open, kept-warm connection to the origin over Cloudflare's own private backbone. This "connection coalescing" avoids paying TCP and TLS handshake round-trips on every miss, and it lets Cloudflare route the origin-bound leg over links it controls and has already provisioned capacity on, rather than at the mercy of public internet congestion between the PoP and the customer's data center.
+
+## Edge compute: pushing logic, not just bytes, to the edge
+
+Workers extends the same "every PoP does everything" philosophy to application logic. Instead of virtual machines or containers per request, Workers run customer JavaScript/WASM inside **V8 isolates** — the same lightweight sandboxing primitive V8 uses to isolate browser tabs from each other. An isolate starts in low single-digit milliseconds (no OS boot, no container image pull) and only needs a few KB of memory overhead, which is what makes it economical to have every one of hundreds of PoPs ready to run arbitrary customer code with no pre-warming.
+
+The trade-off is capability, not just performance: isolates share a process and don't get their own OS-level sandbox, so the isolation model relies on V8's JS/WASM sandbox rather than OS-level virtualization, and long-running or heavily stateful workloads (a multi-second batch job, a large in-memory dataset) don't fit the model — Workers are built for short, stateless-ish request/response logic (auth checks, header rewriting, A/B routing, small key-value lookups), not for replacing your origin's application server.
+
+## Worked example: sizing DDoS absorption capacity
+
+Say you're asked, in an interview, "estimate how anycast dispersion helps absorb a large DDoS attack." Walk through it like this:
+
+- Assume a 3 Tbps volumetric attack — large but realistic for a major incident.
+- Assume the attacking botnet's traffic is roughly proportional to global internet population density, and the anycast fleet has ~300 PoPs.
+- If dispersion were perfectly even, each PoP would see roughly 3 Tbps / 300 = 10 Gbps of attack traffic.
+- A single edge server's NIC and local scrubbing pipeline handling 10 Gbps of junk traffic while continuing to serve legitimate 1-10ms cache-hit responses is a tractable, already-provisioned-for problem — versus one data center trying to absorb the full 3 Tbps alone, which would saturate almost any single site's uplink.
+
+The real distribution isn't perfectly even — attackers and legitimate users don't share the same geography, and some PoPs are bigger than others — but the estimate captures the mechanism: anycast turns "defend against the whole attack" into "defend against attack-size divided by PoP-count," which is why volumetric DDoS mitigation at this scale is a *routing* strategy as much as a filtering one.
+
+<Callout type="warning">
+  A common mistake in interviews is describing anycast as if it were a smarter, IP-layer version of DNS geo-routing — "so it picks the closest server, like a load balancer." It isn't a load balancer and it isn't connection-aware: BGP makes a route decision per-packet-path, not per-session, so if the internet's routing tables change mid-connection (a link flaps, a peer reconverges), a long-lived TCP or QUIC connection can get silently rerouted to a *different* physical server with no memory of that session. Any state a request depends on (a TLS session, an in-progress upload) has to either be re-derivable at any PoP or accept the rare reconnection. Say this explicitly if you bring up anycast — it signals you understand the mechanism, not just the marketing term.
+</Callout>
+
+## How this compares to other lessons in this module
+
+Where Netflix (earlier in this module) pushes *content* to the edge but keeps personalization and control logic centralized, and DynamoDB replicates *data* across nodes within a service's own control, Cloudflare pushes both *routing* (via anycast) and *computation* (via Workers) to the edge, and treats every edge node as interchangeable. It's a useful third point on the "how much do you push to the edge, and what do you push" spectrum that shows up repeatedly in system design interviews — worth having a one-sentence contrast ready for any of the three.
+
+<Quiz
+  lessonId="case-study-case-study-cloudflare-operating-a-global-edge-network"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'What problem does anycast solve better than DNS-based geo-routing for directing users to the nearest edge location?',
+      options: [
+        { id: 'a', text: 'It guarantees strong consistency of cached content across all edge locations', correct: false, explanation: 'Anycast is a routing mechanism, not a consistency mechanism — it says nothing about whether cached content is identical across PoPs.' },
+        { id: 'b', text: 'It provides fast, cache-independent failover because routing is recomputed by BGP within seconds, without waiting on DNS TTLs', correct: true, explanation: 'Correct. DNS answers are cached by resolvers and clients for minutes to hours; anycast failover is a BGP routing change that propagates in seconds and requires no client-side cache expiry.' },
+        { id: 'c', text: 'It reduces the number of physical data centers Cloudflare needs to operate', correct: false, explanation: 'Anycast is orthogonal to fleet size — it changes how traffic is routed to existing locations, not how many locations exist.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which statements correctly describe why Cloudflare runs a homogeneous stack (every PoP does everything) rather than splitting responsibilities across specialized locations? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'It avoids needing synchronous cross-region coordination on the request path, since any PoP can independently handle any request type', correct: true, explanation: 'Correct — because no PoP is "the only one" that can do WAF, cache, or DNS, config can replicate asynchronously instead of requiring a distributed transaction per request.' },
+        { id: 'b', text: 'It means a lost PoP is purely a capacity problem, since remaining PoPs already have the full capability set to absorb its traffic', correct: true, explanation: 'Correct — this is the direct benefit of uniform capability: no PoP failure removes a capability from the system, only some capacity.' },
+        { id: 'c', text: 'It eliminates any propagation delay when pushing new WAF rules or cache-purge commands globally', correct: false, explanation: 'Homogeneity does not eliminate propagation lag — pushing config to hundreds of PoPs still takes measurable time (seconds), during which behavior can briefly differ by location.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Anycast routing is connection-aware: once a client establishes a TCP or QUIC connection to an anycast IP, that connection is guaranteed to keep routing to the same physical server for its duration.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Anycast makes a per-route decision at the BGP layer, not a per-session guarantee. A mid-flight BGP route change can redirect an in-progress connection to a different physical server.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — anycast has no built-in session affinity; systems built on it need to tolerate a rare mid-connection re-route rather than assume one is impossible.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'Why does Cloudflare Workers use V8 isolates instead of one container or VM per request?',
+      options: [
+        { id: 'a', text: 'Isolates provide stronger OS-level security guarantees than containers', correct: false, explanation: 'The opposite trade-off is true: isolates rely on V8\'s JS/WASM sandbox rather than OS-level virtualization, trading some isolation strength for far lower overhead.' },
+        { id: 'b', text: 'Isolates start in low single-digit milliseconds with minimal memory overhead, making it economical to keep every edge location ready to run arbitrary code with no pre-warming', correct: true, explanation: 'Correct — this is exactly the property that lets hundreds of PoPs each host the Workers runtime cheaply and respond to cold requests without a container-boot latency hit.' },
+        { id: 'c', text: 'Isolates support long-running, stateful workloads better than containers do', correct: false, explanation: 'It is the reverse: isolates are built for short, largely stateless request/response logic — long-running or heavily stateful workloads are a poor fit and belong on the origin.' },
+      ],
+    },
+  ]}
+/>

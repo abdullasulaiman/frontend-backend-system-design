@@ -1,0 +1,275 @@
+---
+title: "Design a Leaderboard System"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 7
+track: "interview"
+summary: "Design a real-time ranked leaderboard for a game or app, covering sorted-set data structures, write/read scaling, tie-breaking, and percentile queries at high write volume."
+tags: ["leaderboard", "ranking", "redis", "sorted-sets", "real-time"]
+estMinutes: 12
+cheatsheet:
+  - "A sorted set (score -> member, ordered by score) is the right primitive — Redis ZADD/ZRANK/ZREVRANGE give O(log N) updates and O(log N + K) range reads out of the box."
+  - "Rank queries are the hard part, not score updates — updating one player's score is cheap; 'what's my rank among 50M players' is the expensive query, so the data structure must make rank a first-class operation, not a COUNT(*) scan."
+  - "Shard leaderboards by contest/season/region, never as one giant global sorted set — a single Redis key is single-threaded and becomes a hot spot under concurrent writes."
+  - "Tie-break deterministically (e.g. earliest timestamp to reach that score wins) so rank is stable and reproducible, not dependent on iteration order."
+  - "Don't recompute the full leaderboard on every score change — update incrementally (ZINCRBY-style) and only re-page the surrounding window the user is viewing."
+  - "Separate the durable source of truth (a database write-ahead of every score event) from the serving structure (in-memory sorted set) — the sorted set is a fast, rebuildable cache, not your only copy of the data."
+  - "For 'nearby rank' UX (show me the 5 players above and below me), a sorted set answers this in one query via ZRANK + ZRANGE; a plain SQL table needs a self-join or window function that gets slow at scale."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Every competitive game, fitness app, and gamified product eventually needs
+a leaderboard: "show me the top 100 players" or "show me my rank among 40
+million users." It sounds like a `SELECT ... ORDER BY score DESC LIMIT 100`
+until you notice two things — scores update constantly (every match, every
+workout), and users don't just want the top 100, they want *their own* rank,
+which means finding a number's position inside tens of millions of rows,
+fast, on every page load. That combination — high write throughput plus
+constant-time rank lookups — is what makes leaderboards a genuinely
+interesting distributed systems problem, not a trivial CRUD feature.
+
+This lesson designs a leaderboard system that supports millions of
+concurrent players, real-time score updates, and cheap rank/percentile
+queries, including the classic "players near me" view.
+
+## Requirements
+
+**Functional**
+
+- Submit a score update for a player in a given context (a match, a season,
+  a daily contest).
+- Fetch the top N players for a leaderboard.
+- Fetch a specific player's current rank and score.
+- Fetch the players immediately above and below a given player (a "nearby
+  ranks" window).
+- Support multiple concurrent leaderboards (daily, weekly, all-time, per
+  region, per game mode).
+
+**Non-functional**
+
+- Rank and top-N reads must be low-latency (tens of milliseconds) even with
+  hundreds of millions of entries.
+- Score writes happen far more often than full-leaderboard reads in most
+  games — design for write-heavy, read-optimized-for-rank workloads.
+- Leaderboards reset on a schedule (daily/weekly) without downtime.
+- Consistency: a player's own rank can be a few seconds stale after a score
+  update; it does not need to be linearizable across the whole system.
+
+That last point matters. Interviewers often expect you to explicitly trade
+strict consistency for throughput here — this is not a ledger system like
+the one in the [ad click aggregation lesson](/system-design/design/free-design-an-ad-click-aggregation-system),
+where undercounting money is unacceptable. A leaderboard rank being one
+second stale is a non-event.
+
+## Why a plain database table falls short
+
+A naive `players(id, score)` table with `ORDER BY score DESC` works fine
+for a demo. The problem is the rank query: "what position is player X in?"
+requires counting how many rows have a higher score, which is a full or
+near-full table scan unless you maintain a running rank column — and that
+column has to be recomputed on every write that changes relative order,
+which is `O(N)` in the worst case. At 50 million players and thousands of
+score updates per second, neither the scan nor the recompute is viable.
+
+What you actually need is a data structure that keeps entries **ordered by
+score at all times** and supports:
+
+1. Insert/update a (member, score) pair in `O(log N)`.
+2. "What rank is member X?" in `O(log N)`.
+3. "Give me the top K" or "give me the K entries around rank R" in
+   `O(log N + K)`.
+
+A **sorted set** (a skip list or balanced tree keyed by score, with a
+member -> score index for O(1) score lookup) gives you all three. Redis's
+`ZSET` is the most common off-the-shelf implementation, but the same idea
+works as a custom skip list, a B-tree, or an order-statistics tree if you're
+building it yourself.
+
+## High-level architecture
+
+<Mermaid client:visible chart={`
+flowchart LR
+  C[Game / App Client] -->|submit score| API[Score API]
+  API --> Q[Write Queue]
+  Q --> W[Score Worker]
+  W --> DB[(Durable Score Log)]
+  W --> ZS[(Sorted Set Shard\nper leaderboard)]
+  C -->|get rank / top-N| RD[Read API]
+  RD --> ZS
+  RD --> Cache[(Top-N Cache)]
+`} />
+
+- **Score API** accepts a score event (`player_id`, `leaderboard_id`, delta
+  or absolute score, timestamp) and pushes it onto a write queue rather
+  than writing synchronously — this decouples ingestion spikes (end of a
+  match, a viral event) from the serving layer.
+- **Score workers** consume the queue, append the event to a durable log
+  (the source of truth — useful for audits, replays, and rebuilding a
+  corrupted sorted set), and apply the update to the in-memory sorted set
+  for that leaderboard.
+- **Read API** serves top-N, single-player-rank, and nearby-rank queries
+  directly from the sorted set. A short-lived cache (a few seconds TTL) in
+  front of the "global top 100" query absorbs the fact that everyone
+  requests the exact same page.
+
+### Sharding leaderboards, not just data
+
+The single most important scaling decision: **never put every player in
+the world into one sorted set.** A sorted set is a single logical
+structure — in Redis terms, a single key, served by one node. If millions
+of players hit "submit score" against one global leaderboard, that one
+shard becomes a write bottleneck no matter how fast the underlying
+structure is.
+
+Instead, shard along natural boundaries that already exist in the product:
+
+- **Per contest/season/day** — a "daily leaderboard" is naturally a
+  separate sorted set per day; yesterday's is frozen and can be archived.
+- **Per region or per game mode** — "top players in EU, ranked mode" is
+  its own key.
+- **Global all-time** leaderboards, if you truly need one, are the hard
+  case — consider whether the product actually needs an exact global rank
+  above, say, the top 10,000, or whether an approximate/periodically
+  recomputed rank is acceptable beyond that cutoff.
+
+Most real leaderboard products (competitive games, fitness apps) already
+have this shape — daily/weekly/seasonal, per-mode, per-region — which is
+convenient, because it means sharding falls out of the product design
+instead of being bolted on.
+
+## Handling ties and stable ordering
+
+Two players with the same score need a deterministic tie-break, or their
+relative rank flips depending on iteration order or which node answers the
+query — visibly broken to a user who refreshes and sees their rank swap
+with a tied opponent for no reason.
+
+The standard trick: encode a secondary key into the score itself. Instead
+of storing `score` alone, store a composite value such as
+`score * 10^13 + (MAX_TIMESTAMP - submitted_at)`, sorted the same
+direction. This makes "reached the score earlier" the tie-break (rewards
+players who got there first) while keeping a single sortable number, so
+the sorted set's native ordering handles ties for free without special-case
+comparison logic in the read path.
+
+## Nearby-rank queries
+
+"Show me the 5 players above and below me" is the query that most exposes
+why a sorted set beats a plain table. With `ZRANK` (or equivalent) you get
+the player's position in `O(log N)`, then a single range read
+(`ZREVRANGE rank-5 rank+5`) returns the window. A SQL equivalent needs a
+window function (`ROW_NUMBER() OVER (ORDER BY score DESC)`) computed over
+the full table, which most engines can't do efficiently at hundreds of
+millions of rows without materializing a lot of intermediate state.
+
+## Worked example: sizing a mobile game's daily leaderboard
+
+Say a mobile game has 20 million daily active players, each submitting an
+average of 8 score events per session (end of each level). That's 160
+million writes per day, or roughly 1,850 writes/sec average — with peaks
+several times higher around evening play hours in any given region, say
+10,000 writes/sec at peak.
+
+A single Redis sorted set comfortably handles that write rate (Redis
+routinely does 100K+ ops/sec per core for `ZADD`), so for one shard the
+bottleneck isn't the data structure — it's making sure you've actually
+sharded by day/region so no single key sees the full 10,000 writes/sec
+from every region simultaneously. Splitting into, say, 6 regional shards
+per day brings each shard to under 2,000 writes/sec at peak, comfortably
+inside a single node's headroom with room to grow.
+
+Memory: 20 million (player_id, score) pairs at roughly 100 bytes of
+overhead per sorted-set entry is about 2GB per full-population
+leaderboard — trivial for a modern cache node, and a good argument for
+keeping the sorted set as an in-memory serving layer backed by the durable
+log, rather than trying to force this shape into a disk-oriented database.
+
+## Rebuilding and consistency
+
+Because the sorted set is a cache-like serving structure, treat it as
+disposable and rebuildable from the durable score log at any time — that's
+what makes it safe to lose a node, deploy a new sharding scheme, or fix a
+bug in score computation. Rebuilding by replaying the log is slower than
+serving live traffic, so keep periodic snapshots of the sorted set state
+(or use Redis's own persistence) so a full replay from time zero is a
+disaster-recovery path, not the normal restart path.
+
+<Callout type="warning">
+  A common mistake is computing the entire leaderboard from scratch on
+  every score update — sorting all N players again because "the top 10
+  might have changed." This throws away the whole point of using an
+  ordered data structure. A correct sorted-set update only touches the
+  single member being changed (`O(log N)`); nothing else in the structure
+  needs to move. If you find yourself re-sorting or re-scanning on every
+  write, you've effectively rebuilt a slow database table on top of a fast
+  data structure.
+</Callout>
+
+## Trade-offs to state out loud in an interview
+
+- **Exact vs. approximate rank at extreme scale**: for the top page, exact
+  rank is cheap. For "your rank among 500 million players" on a truly
+  global leaderboard, some systems switch to an approximate rank (bucketed
+  percentile, refreshed periodically) rather than paying for exact
+  ordering across a sharded structure — call this out as a scaling lever,
+  not a compromise you'd take by default.
+- **In-memory sorted set vs. a specialized ranking database**: Redis
+  ZSETs are simple and battle-tested; some systems instead use a
+  purpose-built ranking service or an order-statistics tree in an
+  application server for tighter control over memory and eviction. Redis
+  is the pragmatic default; justify anything else with a concrete
+  requirement it doesn't meet.
+- **Durable log replay cost**: the durable log gives you correctness and
+  recoverability, but replaying it fully after a failure is slow at scale
+  — snapshotting the sorted-set state periodically bounds recovery time.
+
+## Quiz
+
+<Quiz
+  lessonId="free-design-a-leaderboard-system"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why is a plain SQL table with an ORDER BY score DESC query a poor fit for a large leaderboard?',
+      options: [
+        { id: 'a', text: 'SQL cannot sort numeric columns efficiently', correct: false, explanation: 'Sorting a single column is not the bottleneck — SQL engines sort fine. The problem is computing a specific row\'s rank among hundreds of millions of rows on every request.' },
+        { id: 'b', text: 'Finding one player\'s rank requires effectively counting rows with a higher score, which is expensive at high row counts and high write rates', correct: true, explanation: 'Rank is the expensive query, not the sort itself — without a structure that maintains order incrementally, computing rank means a scan or a window function over the whole table on every request.' },
+        { id: 'c', text: 'SQL databases cannot store more than a few million rows', correct: false, explanation: 'Row count is not the limitation; modern databases handle billions of rows. The issue is the cost of the specific rank query pattern, not storage capacity.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are valid reasons to shard a leaderboard rather than keep one global sorted set? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'A single sorted set / key is typically served by one node and becomes a write bottleneck under concurrent updates', correct: true, explanation: 'Correct — this is the core scaling reason. Concentrating all writes on one key caps throughput at whatever a single node can do.' },
+        { id: 'b', text: 'The product already has natural boundaries like daily contests, regions, or game modes that map cleanly to separate leaderboards', correct: true, explanation: 'Correct — sharding along boundaries the product already exposes (per-day, per-region) is simpler than inventing an artificial shard key.' },
+        { id: 'c', text: 'Sorted sets cannot hold more than a few thousand entries', correct: false, explanation: 'Sorted sets (e.g. Redis ZSETs) comfortably hold tens of millions of entries; capacity is not the reason to shard. Write concurrency and locality are.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A leaderboard system generally needs strict, linearizable consistency so a player\'s rank is always exactly up to date across every read replica.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Most leaderboard products tolerate a few seconds of staleness on rank/score visibility in exchange for much higher write throughput — this is a deliberate trade-off, not an oversight.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — eventual consistency (rank reflecting a score update within a second or two) is standard and acceptable; the non-functional requirements should say so explicitly rather than defaulting to strict consistency.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A "nearby ranks" feature (show 5 players above and below the current user) is efficient with a sorted set because:',
+      options: [
+        { id: 'a', text: 'The sorted set stores every player\'s full profile data inline, avoiding extra lookups', correct: false, explanation: 'Sorted sets typically store just member and score, not full profile data — profile info is usually fetched separately by ID. That is not why the query is efficient.' },
+        { id: 'b', text: 'You can get the player\'s rank in O(log N), then read a small contiguous range around that rank in O(log N + K)', correct: true, explanation: 'Correct — this two-step "find rank, then range-read around it" pattern is exactly what sorted sets are optimized for, unlike a plain table needing a window function over the whole dataset.' },
+        { id: 'c', text: 'The sorted set automatically caches every possible nearby-rank window in advance', correct: false, explanation: 'Sorted sets do not precompute windows; the efficiency comes from the O(log N + K) range-read operation being cheap to run on demand, not from precomputed caching.' },
+      ],
+    },
+  ]}
+/>

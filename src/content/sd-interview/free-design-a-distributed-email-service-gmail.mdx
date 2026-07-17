@@ -1,0 +1,157 @@
+---
+title: "Design a Distributed Email Service (Gmail)"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 12
+track: "interview"
+summary: "Designs a Gmail-scale email service, covering the receive/send pipeline, per-user mailbox storage, full-text search indexing, spam filtering, and multi-device sync."
+tags: ["email-systems", "storage", "search-indexing", "message-queues", "spam-filtering"]
+estMinutes: 13
+cheatsheet:
+  - "Split the write path in two: a durable, append-only receive pipeline (SMTP intake -> queue -> spam/virus scan -> storage) decoupled from delivery to the recipient's mailbox view, so a slow spam scan never blocks accepting mail from the sender's server."
+  - "Store message metadata (labels, thread ID, read/unread, folder) separately from the immutable raw MIME blob (headers + body + attachments) — metadata is small, mutable, and needs fast indexed queries; the blob is large, write-once, and belongs in object storage."
+  - "A mailbox is really a per-user log of label/flag mutations, not a single row you update in place — this is what makes IMAP-style multi-device sync (each device asks 'what changed since my last cursor?') cheap and correct even with concurrent devices."
+  - "Full-text search needs an inverted index per user (or per shard of users), built asynchronously off the write path — never make 'accept this email' block on 'index this email for search.'"
+  - "Deduplicate attachments by content hash: a 20MB PDF forwarded to 500 recipients on the same mail server should be stored once, not 500 times, with each mailbox holding a reference."
+  - "Threading (grouping a conversation) is a derived view built from `References`/`In-Reply-To` headers and subject normalization, not a separate storage system — get this wrong and replies silently break out of their thread."
+  - "Spam filtering runs at three levels — sender reputation/IP at connection time, content/ML scoring after acceptance, and user feedback loops (mark as spam) that retrain the model — reject-at-connection-time is cheapest but misses content-based spam entirely."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Email looks like a solved problem — it's a 1980s protocol, the interview question can't be that interesting. It's actually one of the better system design questions precisely because the constraints pull in different directions at once: mail must never be lost (durability trumps everything), it must accept from any server on the internet without prior trust (the opposite of most APIs you design), it must be searchable across years of history in milliseconds, and the same mailbox must stay consistent across a phone, a browser tab, and a desktop client all polling or pushing at once. Gmail-scale makes the numbers brutal too — billions of mailboxes, tens of billions of messages received daily, many of them spam you still have to receive, scan, and store before you can safely discard them.
+
+This lesson designs that service: how mail gets received and delivered, how a mailbox is actually stored so search and sync are both fast, and where spam filtering and attachment handling fit in.
+
+## Requirements
+
+**Functional:**
+
+- Receive mail via SMTP from any external mail server, and accept mail submitted by our own users for outbound delivery.
+- Store received mail durably, organized per recipient mailbox with labels/folders, read/unread state, and threading.
+- Full-text search across a user's entire mailbox history.
+- Multiple clients (web, mobile, IMAP) stay in sync with a single mailbox's state.
+- Attachments up to tens of MB, associated with messages.
+
+**Non-functional:**
+
+- **Durability above all**: once we've accepted a message (given the sending server a `250 OK`), losing it is unacceptable — that acknowledgment is a promise.
+- **High write throughput**: billions of inbound messages a day, arriving in bursts (a marketing blast, a compromised botnet spraying spam) that must not take the whole intake pipeline down.
+- **Low read latency**: opening an inbox or a search result should feel instant, even against a mailbox with hundreds of thousands of messages.
+- **Storage efficiency at scale**: exabytes of mail, much of it duplicated (forwards, mailing lists, newsletters sent to millions).
+- **Spam/abuse resistance**: the majority of inbound SMTP traffic industry-wide is spam; filtering it is a first-class requirement, not an afterthought bolted onto search relevance.
+
+Durability and throughput are in tension the same way they are in any log-structured system: fsync-per-message is safest and slowest, batched writes are faster and require getting acknowledgment semantics right so a batch failure doesn't silently drop a message we already told the sender we accepted.
+
+## High-level design
+
+Split the system into a **receive/intake path** and a **mailbox/serving path** — this separation is the single most important design decision, because it lets each side scale and fail independently.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  Ext[External mail server] -->|SMTP| MTA[Inbound MTA cluster]
+  MTA --> Q[(Durable intake queue)]
+  Q --> Spam[Spam / virus scan]
+  Spam --> Store[Message store: blob + metadata]
+  Store --> Idx[Search indexer]
+  Store --> Notif[Push notifier]
+  Client[Web / mobile / IMAP client] -->|read, search, sync| API[Mailbox API]
+  API --> Store
+  API --> Idx
+  Notif --> Client
+`} />
+
+**Inbound MTA cluster** — the servers that speak SMTP to the outside world. Their only job is to accept a connection, run cheap sender-reputation checks (known-bad IP, missing reverse DNS, failed SPF/DKIM), and, if not rejected outright, durably enqueue the raw message and return `250 OK`. Nothing expensive happens synchronously here — that's what keeps intake throughput high under a spam burst.
+
+**Intake queue** — a durable, ordered (per-partition) queue. This is the actual durability boundary: once a message is in the queue with a write acknowledgment, the `250 OK` we already sent is honored even if every downstream stage crashes and restarts.
+
+**Spam/virus scan** — a worker pool that pulls from the queue, runs content-based spam scoring and attachment virus scanning, and tags the message (inbox, spam folder, or reject/quarantine). This runs *after* acceptance, asynchronously — rejecting at the SMTP connection is cheap but only catches the crudest spam (bad IP reputation); most spam looks fine at the connection level and only reveals itself in content.
+
+**Message store** — durable storage split into the raw MIME blob (object storage, immutable, write-once) and mutable per-recipient metadata (labels, read state, thread ID) in a fast key-value or wide-column store keyed by `(user_id, message_id)`.
+
+**Search indexer** — consumes newly stored messages and updates a per-user (or per-shard) inverted index asynchronously, off the critical path of accepting mail.
+
+**Mailbox API** — what clients actually talk to: list messages, fetch a message, search, mark read/unread, move labels, and — critically — "what's changed since sync-cursor X," which is what makes multi-device sync work without every client re-fetching the whole mailbox.
+
+## Deep dive: storage, search, and sync
+
+### Mailbox storage: log of mutations, not a table you overwrite
+
+Model a mailbox as an append-only log of events — `message arrived`, `label added`, `marked read`, `moved to trash` — rather than a single mutable row per message that every client reads and writes in place. Each event carries a monotonically increasing per-mailbox sequence number (a "sync cursor"). A client syncs by asking "give me every event after cursor N," applies them locally, and stores the new highest cursor it saw. This is exactly the model IMAP's `UIDVALIDITY`/`MODSEQ` mechanism is built around, and it's what makes three devices independently polling the same mailbox converge on the same state without a central "who's editing this mailbox right now" lock.
+
+### Full-text search
+
+Search needs an inverted index (term -> list of message IDs containing it), built per user or per shard of users so one user's query never has to scan another user's mail. Building it synchronously on the write path would make accepting mail as slow as the slowest indexing operation — instead, the indexer consumes from the same durable pipeline asynchronously, typically landing new mail in search within seconds, which is an acceptable trade-off users never notice (nobody searches for an email the instant it arrives).
+
+### Attachment dedup
+
+The same attachment (a company-wide PDF, a viral forward, a newsletter image) can appear in millions of messages. Store attachments in object storage keyed by content hash (e.g., SHA-256 of the bytes); a message's metadata references the hash rather than embedding the bytes. Two messages with byte-identical attachments share one stored copy — this alone can cut attachment storage by an order of magnitude at mailing-list scale, at the cost of needing reference counting before you ever delete a blob.
+
+### Threading
+
+A "conversation view" groups messages that are logically one thread. Build it from the `References` and `In-Reply-To` headers (which chain a reply back to its parent) with a subject-normalization fallback (stripping `Re:`/`Fwd:` prefixes) for clients that don't set those headers correctly. This is a derived index, computed once per message on arrival and stored as a `thread_id`, not something recomputed on every inbox load — recomputing thread grouping on every read at Gmail scale would be prohibitively expensive.
+
+<Mermaid client:visible chart={`
+sequenceDiagram
+    participant Sender as Sending mail server
+    participant MTA as Inbound MTA
+    participant Q as Intake queue
+    participant Scan as Spam/virus scan
+    participant Store as Message store
+    Sender->>MTA: SMTP DATA (message bytes)
+    MTA->>Q: enqueue (durable write)
+    MTA-->>Sender: 250 OK
+    Q->>Scan: dequeue for scoring
+    Scan->>Store: write with label (inbox/spam)
+    Store->>Store: update per-user sync cursor
+`} />
+
+## Worked example: sizing the intake pipeline
+
+Say the service handles 20 billion inbound SMTP messages a day. That's roughly 230,000 messages/second on average, but SMTP traffic is bursty — spam campaigns and mailing-list blasts can spike well above average, so provision the MTA and queue tier for 3-5x average, around 1 million messages/second at peak.
+
+Average message size (headers + body, excluding large attachments which are a smaller fraction of message count) is maybe 50KB. At 20 billion/day that's roughly 1PB/day of raw intake before spam filtering discards or quarantines a large fraction of it — industry-wide, a majority of inbound SMTP traffic is spam, so if 60% gets tagged spam and stored with a much shorter retention window, the *actively retained* volume is meaningfully smaller than raw intake, though attachment storage (not counted in the 50KB estimate) dominates total bytes at rest over time. This is exactly why the two-tier storage split matters: the blob store needs to absorb PB/day cheaply (object storage, erasure-coded, optimized for cost per GB), while the metadata store needs to serve millisecond point-lookups and range scans for "show me my inbox" — very different storage engines optimized for very different access patterns, which is why you don't put both in the same database.
+
+<Callout type="warning">
+  A common mistake in this design: treating "accept the message" and "make the message visible/searchable in the mailbox" as one atomic step. If your MTA blocks on spam scanning, indexing, and mailbox-write all before returning `250 OK`, a slow scan or an indexer backlog directly throttles how fast you can accept mail from the entire internet — and SMTP senders that time out will retry, compounding the backlog. Accept and durably enqueue first; do everything else asynchronously off that queue. The one place this bites hardest is virus/spam scanning during a sudden traffic spike — design the queue and worker pool to absorb bursts without ever slowing down the accept step itself.
+</Callout>
+
+## Quiz
+
+<Quiz
+  lessonId="free-design-a-distributed-email-service-gmail"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should the inbound MTA durably enqueue a message and return `250 OK` before spam scanning and indexing happen, rather than doing all of it synchronously?',
+      options: [
+        { id: 'a', text: 'Because spam scanning is optional and can be skipped entirely for speed', correct: false, explanation: 'Spam scanning is a first-class requirement, not something to skip — the point is to run it asynchronously, not to remove it.' },
+        { id: 'b', text: 'Because a `250 OK` is a durability promise to the sending server, and blocking accept on slower downstream work throttles how fast the whole system can accept mail, especially during traffic bursts', correct: true, explanation: 'Correct — decoupling accept-and-enqueue from scanning/indexing keeps intake throughput high and independent of downstream processing speed, while the queue preserves the durability the 250 OK already promised.' },
+        { id: 'c', text: 'Because SMTP requires all processing to finish before a 250 response can legally be sent', correct: false, explanation: 'SMTP itself has no such requirement; the 250 response just confirms the message was accepted for delivery, which durable enqueueing satisfies.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are good reasons to store the mutable per-message metadata (labels, read state, thread ID) separately from the raw MIME blob? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'Metadata needs fast indexed point-lookups and range scans (e.g., "list my inbox"), which favors a different storage engine than bulk blob storage', correct: true, explanation: 'Correct — metadata access patterns (small, mutable, queried constantly) are a poor fit for the same storage engine used for large immutable blobs.' },
+        { id: 'b', text: 'The raw blob is large and write-once, so it belongs in cheaper object storage rather than a database optimized for frequent small updates', correct: true, explanation: 'Correct — this split lets each store be optimized for its actual access pattern (cost-per-GB for blobs, low-latency queries for metadata) instead of compromising on both in one system.' },
+        { id: 'c', text: 'It removes the need for a search index, since metadata alone is sufficient for full-text search', correct: false, explanation: 'Metadata (labels, read state) does not contain the message body text, so full-text search still needs a separate inverted index built from message content.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Modeling a mailbox as an append-only log of mutation events (with a per-mailbox sync cursor) rather than a single mutable row per message makes multi-device sync easier because each client just asks "what changed since my last cursor?"',
+      options: [
+        { id: 'true', text: 'True', correct: true, explanation: 'Correct — this is the basis of IMAP-style sync: clients track a cursor and fetch only new events since it, which converges correctly across multiple devices polling or pushing independently without a central edit lock.' },
+        { id: 'false', text: 'False', correct: false, explanation: 'This is in fact the standard approach for keeping multiple devices in sync with one mailbox cheaply and correctly — the statement is true, not false.' },
+      ],
+    },
+  ]}
+/>

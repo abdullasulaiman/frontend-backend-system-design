@@ -1,0 +1,147 @@
+---
+title: "Design an API Gateway"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 10
+track: "interview"
+summary: "Walks through designing an API gateway that fronts a set of microservices — routing, authentication, rate limiting, and resilience — and the trade-offs of building versus buying one."
+tags: ["api-gateway", "microservices", "rate-limiting", "load-balancing", "resilience"]
+estMinutes: 13
+cheatsheet:
+  - "An API gateway is a reverse proxy plus policy layer: routing, auth, rate limiting, and observability live at the edge so every backend service doesn't reimplement them."
+  - "Prefer a static, versioned route table (config or a routes database pushed to gateway nodes) over dynamic per-request service discovery lookups — it keeps the request path fast and predictable."
+  - "Rate limit by API key or client ID as a token bucket, and keep bucket state in a fast shared store (Redis) so limits hold across gateway instances, not per-node."
+  - "Terminate TLS and do authentication (JWT verification or session lookup) once at the gateway so backend services trust a signed internal header instead of re-parsing credentials."
+  - "A gateway is a single point of failure and a shared bottleneck by construction — run it as a stateless, horizontally scaled fleet behind a load balancer, never a single box."
+  - "Circuit-break per downstream service, not globally — one slow service (say, recommendations) failing shouldn't drag down requests to unrelated services (say, checkout)."
+  - "Don't let the gateway become a place where business logic accumulates — it should transform, route, and enforce policy, not implement domain rules that belong in a service."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Once a system grows past a handful of services, every client — mobile app, web app, third-party integrator — ends up needing to talk to dozens of backends: users, orders, payments, search, notifications. Each of those services would otherwise need to independently implement TLS termination, authentication, rate limiting, and request logging, and every client would need to know the network address of every service and handle its failures individually. That's a lot of duplicated, security-sensitive code spread across teams.
+
+An API gateway collapses that into a single, well-understood front door. Clients talk to one endpoint; the gateway routes, authenticates, throttles, and observes on their behalf, then forwards clean requests to the right backend. It's one of the most commonly asked "infrastructure" system design questions because it forces you to reason about request-path latency, statelessness, and failure isolation all at once — this lesson works through a design you can defend in an interview.
+
+## Requirements
+
+**Functional**
+
+- Route incoming HTTP(S) requests to the correct backend service based on path, host, or version (e.g. `/v2/orders/*` to the orders service).
+- Authenticate and authorize requests (API keys for third parties, JWTs/sessions for end users) before they reach backends.
+- Enforce per-client rate limits and quotas.
+- Aggregate/transform requests where useful (e.g. combine two backend calls into one client-facing response) — optional but common.
+- Provide centralized logging, metrics, and tracing for every request that crosses the edge.
+
+**Non-functional**
+
+- Low added latency — the gateway sits on the critical path of every request, so it must add single-digit milliseconds, not tens.
+- High availability — if the gateway is down, the entire system is down from a client's perspective.
+- Horizontally scalable to handle traffic spikes independent of any one backend's capacity.
+- Resilient to a misbehaving backend — one slow or failing service must not take down traffic to the rest.
+
+Out of scope for this lesson: a full service mesh (sidecar-per-service east-west traffic) — a gateway specifically handles north-south (client-to-system) traffic, which is a narrower and more tractable problem.
+
+## High-level design
+
+A request's journey through the gateway is a short, ordered pipeline: terminate the connection, authenticate, check limits, route, call the backend, then shape and return the response. Each stage is a filter the request either passes or gets rejected at, and stages run in an order chosen deliberately — cheap checks (is this a valid API key format?) before expensive ones (a rate-limit store lookup), and everything before the network hop to a backend, so a rejected request never wastes backend capacity.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  C[Client] --> LB[Load Balancer]
+  LB --> GW1[Gateway Node]
+  LB --> GW2[Gateway Node]
+  GW1 --> AUTH[Auth Check]
+  AUTH --> RL[Rate Limiter]
+  RL --> ROUTE[Router]
+  ROUTE --> S1[Orders Service]
+  ROUTE --> S2[Users Service]
+  ROUTE --> S3[Payments Service]
+  RL -.reads/writes.-> CACHE[(Shared Rate-Limit Store)]
+`} />
+
+### Routing
+
+The router maps an incoming request to a backend using a route table keyed on path prefix, hostname, or an explicit API version in the URL (`/v1/...` vs `/v2/...`). Keep this table as versioned, deployable configuration — not a live call to a service registry per request. A config reload or a slow-rollout push to gateway nodes is fast and auditable; a network hop to a discovery service on every request adds latency and a new failure mode to the hottest part of the system.
+
+Once a route is matched, the gateway needs the backend's actual network location. For a small number of services, static config (`orders-service.internal:8080`) is enough. At scale, pair the gateway with a service registry (backends register their healthy instances) so the gateway's local cache of endpoints refreshes periodically — say every few seconds — trading a small staleness window for keeping the request path free of a discovery round-trip.
+
+### Authentication and authorization
+
+The gateway is the natural place to answer "who is this caller, and are they allowed to do this?" once, rather than have every backend re-derive it. Two common shapes:
+
+- **API keys** for server-to-server or third-party integrator traffic — a lookup (cached) against a keys table returns the caller's identity and plan/quota tier.
+- **JWTs or session tokens** for end-user traffic — the gateway verifies a signature (JWT) or looks up a session (opaque token) and extracts a user ID and roles.
+
+Either way, the gateway forwards a **trusted, signed internal header** (e.g. `X-Auth-User-Id`, `X-Auth-Scopes`) to the backend instead of the raw credential. Backends trust that header because it only ever arrives from the gateway on an internal network they don't expose publicly — this means backends don't reimplement credential parsing, and a credential format change (e.g. switching auth providers) is a gateway-only change.
+
+### Rate limiting
+
+Rate limiting protects backends from both abusive clients and legitimate traffic spikes. The standard mechanism is a **token bucket** per client: each client has a bucket that refills at a fixed rate (say, 100 tokens/second) up to a cap, and each request costs one token; an empty bucket means a `429 Too Many Requests`.
+
+The tricky part is state. If each gateway node keeps its own in-memory bucket, a client's effective limit multiplies by however many gateway nodes handle their traffic — a 100 req/s limit becomes 100 req/s *per node*. Fix this by backing buckets with a shared, low-latency store like Redis, using an atomic increment-and-check (a Lua script or `INCR` + `EXPIRE`) so concurrent gateway nodes don't race. This adds one fast round-trip per request, which is an acceptable cost for correctness — and it's a cost you can shrink further by batching or by using a local cache with a short TTL for well-behaved, high-volume clients where being briefly over-limit is tolerable.
+
+### Resilience: circuit breakers and timeouts
+
+Because the gateway fans out to many independent backends, one backend having a bad day (a slow database, a deploy gone wrong) must never be allowed to consume all the gateway's threads/connections waiting on it, which would then stall traffic to *every* backend. The two standard defenses:
+
+- **Per-backend timeouts** — a call to the orders service that hasn't returned in, say, 500ms is aborted and returns an error to the client, freeing the connection.
+- **Per-backend circuit breakers** — after a threshold of consecutive failures/timeouts to a specific backend, the gateway "opens" the circuit and fails fast for that backend (skipping the network call entirely) for a cooldown window, then allows a trial request through to check recovery.
+
+Both are scoped **per downstream service**, not globally — a global breaker would take down healthy services just because one struggling service tripped it.
+
+## Worked example: sizing the gateway fleet
+
+Say the system serves 50,000 requests/second at peak, and each gateway node can sustain 5,000 req/s before CPU (mostly TLS handshakes and JSON parsing) becomes the bottleneck. That's 10 nodes at peak just to keep up — but running exactly at capacity means a single node failing pushes the rest into overload. Add headroom for that: run at roughly 60% average utilization, which means sizing for `50,000 / (5,000 * 0.6)` is about 17 nodes, and set up auto-scaling so the fleet can grow toward 20+ nodes during traffic spikes (flash sales, marketing pushes) without manual intervention.
+
+For the rate-limit store: if each request needs one Redis round-trip at roughly 1ms, and Redis comfortably handles 100,000+ ops/second on a modestly sized instance, one Redis primary (with a replica for failover) covers this load with room to spare — but it's worth watching, since it's now a shared dependency that every gateway node's hot path touches. A Redis outage shouldn't take the whole gateway down; a reasonable fallback is to fail open (allow the request) rather than fail closed (reject everything) when the rate-limit store is unreachable, since over-permissive is usually safer than a full outage.
+
+<Callout type="warning">
+  The most common mistake is letting the gateway accumulate business logic — stitching together three backend calls with conditional logic specific to one product feature, or hand-coding a special case for one client's integration. That logic now lives in a shared, high-traffic component that every team's request path runs through, so a bug or slow code path in one feature's logic degrades latency for everyone. Keep the gateway to cross-cutting concerns — routing, auth, rate limiting, observability, basic request/response shaping — and push anything domain-specific back into an owning service, even if it means one more network hop.
+</Callout>
+
+## Build vs. buy
+
+In a real interview, it's worth naming that most companies don't build a gateway from scratch — they configure an existing one (Kong, Envoy-based gateways, NGINX, or a cloud-managed offering like AWS API Gateway) and add custom plugins for anything company-specific (a bespoke auth scheme, a custom rate-limit policy). The system design skills above — where routing, auth, rate limiting, and circuit breaking sit in the pipeline, and why they're ordered that way — are exactly what's being tested even if the "real" answer is "we'd use an existing product here, configured this way," because interviewers want to see you reason about the pipeline stages and their trade-offs, not necessarily hand-write a gateway.
+
+## Summary
+
+An API gateway is fundamentally a reverse proxy with an opinionated request pipeline: authenticate, rate-limit, route, and call the backend, then shape the response — with resilience (timeouts, circuit breakers) scoped per downstream service so one bad backend never becomes a system-wide outage. The design challenges are less about the routing itself and more about keeping every stage of that pipeline fast, stateless where possible, and honest about what state (rate-limit buckets, route tables) must be shared across a horizontally scaled fleet.
+
+<Quiz
+  lessonId="free-design-an-api-gateway"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why should per-client rate-limit buckets be stored in a shared store like Redis instead of in each gateway node\'s local memory?',
+      options: [
+        { id: 'a', text: 'Local memory is slower to read than a network call to Redis', correct: false, explanation: 'The opposite is true — a local in-memory read is faster than a network round-trip. The reason to use a shared store is correctness, not speed.' },
+        { id: 'b', text: 'With per-node buckets, a client\'s effective limit multiplies by however many gateway nodes see its traffic', correct: true, explanation: 'If each of 10 gateway nodes independently enforces "100 req/s," a client routed across all 10 can send up to 1,000 req/s in aggregate — a shared store is needed to enforce one true limit across the fleet.' },
+        { id: 'c', text: 'Redis is required for the gateway to be stateless', correct: false, explanation: 'The gateway nodes themselves stay stateless either way; the issue is specifically that rate-limit counters need one consistent, shared value, which local memory per node cannot provide.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are reasons to scope circuit breakers per downstream service rather than having one global breaker for the whole gateway?',
+      options: [
+        { id: 'a', text: 'A single struggling backend (e.g. recommendations) would otherwise trip a global breaker and block traffic to healthy, unrelated backends', correct: true, explanation: 'That is the core failure-isolation reason: a global breaker conflates one service\'s health with the whole system\'s.' },
+        { id: 'b', text: 'Different backends have different normal failure rates and latency profiles, so a shared threshold is rarely correct for all of them', correct: true, explanation: 'A threshold tuned for a fast, reliable service would trip too eagerly (or too late) for a naturally slower or flakier one — per-service thresholds fit each backend\'s actual behavior.' },
+        { id: 'c', text: 'It removes the need for per-backend timeouts', correct: false, explanation: 'Circuit breakers and timeouts solve related but distinct problems — timeouts bound a single call\'s duration, breakers stop making calls to a service that is already failing. You need both.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'Business logic that stitches together responses from multiple backend services for one specific product feature belongs in the API gateway.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'Feature-specific logic in the gateway means every request through that shared, high-traffic component pays for one feature\'s code path, and a bug there can degrade unrelated traffic.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the gateway should stay limited to cross-cutting concerns (routing, auth, rate limiting, observability); feature-specific aggregation belongs in an owning service, such as a backend-for-frontend, even at the cost of an extra hop.' },
+      ],
+    },
+  ]}
+/>

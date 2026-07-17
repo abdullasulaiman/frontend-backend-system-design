@@ -1,0 +1,134 @@
+---
+title: "Case Study: Google — Serving Web Search"
+module: "System Design Case Studies"
+moduleOrder: 23
+order: 3
+track: "interview"
+summary: "Walks through how a search engine serves a query in under 200ms against an index of hundreds of billions of pages, using sharding, parallel fan-out, and tiered ranking."
+tags: ["search-engines", "inverted-index", "sharding", "fan-out", "ranking"]
+estMinutes: 13
+cheatsheet:
+  - "The serving path is fan-out/fan-in: a broker sends the query to every shard of the inverted index in parallel, then merges partial results — total latency is bounded by the slowest shard, not the average."
+  - "Documents are partitioned across shards (document-sharded index), and each shard is replicated multiple times so the broker can route around a slow or dead replica instead of waiting on it."
+  - "Ranking happens in at least two passes: a cheap, coarse score narrows billions of postings down to a few thousand candidates, and only those candidates get the expensive, feature-rich ranking model."
+  - "An inverted index maps each term to the sorted list of document IDs (postings) containing it — queries intersect/union these postings lists instead of scanning documents."
+  - "Freshness and latency trade off directly: a small 'fresh' index tier serves breaking content quickly while the large base index is rebuilt on a slower cycle, and query time merges both."
+  - "Tail latency, not average latency, sets the user-visible SLA — with thousands of parallel shard calls per query, even a 99.9th-percentile-slow shard shows up on nearly every request unless you design for stragglers (replication, hedged requests, timeouts with partial results)."
+  - "Caching works at multiple layers — result cache for repeated queries, posting-list cache for hot terms — but the long tail of unique queries means cache hit rate alone won't get you to your latency budget."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+Type a query into a search box and you expect an answer in a couple hundred milliseconds — not much longer than a single database round trip. Behind that response, the system is searching a corpus of hundreds of billions of documents, scoring and ranking the matches, and picking the best few before the page even finishes loading. No single machine can hold that corpus, let alone rank it in time, so the entire problem becomes: how do you make a query that logically touches "the whole web" behave, latency-wise, like it touched one small index?
+
+This case study is about the **serving path** — what happens between "user hits enter" and "ranked results appear" — not about crawling or how the index gets built in the first place. The interesting system design ideas here are less about any one clever data structure and more about how you compose sharding, replication, and staged computation to hit a tight latency budget at massive scale.
+
+## Sizing the problem
+
+Rough estimation, the way you'd do it out loud in an interview:
+
+- Corpus size: on the order of 100+ billion indexed pages.
+- Query volume: tens of thousands of queries per second sustained globally, with spikes far higher.
+- Latency budget: end-to-end response typically well under 300ms, with the search backend itself needing to return in well under half of that so there's room for network, rendering, and ads/other widgets.
+
+If you tried to keep an inverted index for 100 billion documents on one machine, you'd need it fully in memory to hit that latency budget (disk seeks are far too slow at this scale), and no single machine has that much RAM. That single fact — the index has to live in memory, and the index is far bigger than any one machine — is what forces sharding. This is the same fundamental pressure you saw with DynamoDB's key space being too large and too hot for one node (see the DynamoDB case study), except here it's an index instead of a key-value table, and the "hot spot" problem is replaced by a "fan-out" problem.
+
+## Splitting the index: document sharding
+
+The standard approach is a **document-partitioned index**: split the total document set into `N` shards (say, a few thousand), and each shard builds its own complete inverted index over only its slice of documents. A query is sent to *every* shard, each shard independently finds and scores its best local matches, and a merging layer combines the per-shard results into one final ranked list.
+
+This is different from splitting by *term* (an alternative called term-partitioning, where each shard owns a subset of the vocabulary). Document sharding is preferred in practice because it parallelizes query load evenly regardless of which terms appear in the query, and because adding capacity is as simple as adding more document shards — no term ever needs to move between machines just because it got popular.
+
+Each shard is replicated several times (both for durability and, more importantly here, for serving capacity and fault tolerance). A broker/mixer tier picks a live, lightly loaded replica per shard for each query.
+
+<Mermaid client:visible chart={`
+flowchart LR
+  U[User query] --> FE[Frontend / query understanding]
+  FE --> MX[Mixer / broker]
+  MX --> S1[Shard 1 replica]
+  MX --> S2[Shard 2 replica]
+  MX --> S3[Shard 3 replica]
+  MX --> SN[Shard N replica]
+  S1 --> MG[Merge + rank]
+  S2 --> MG
+  S3 --> MG
+  SN --> MG
+  MG --> SN2[Snippet + result generation]
+  SN2 --> U
+`} />
+
+## The query path, end to end
+
+1. **Query understanding**: the frontend spell-corrects, tokenizes, and figures out intent (a navigational query like "delta airlines" behaves differently than an informational one like "how does an inverted index work").
+2. **Fan-out**: the broker sends the (rewritten) query to one replica of every shard, in parallel, with a strict timeout.
+3. **Local scoring**: each shard intersects the postings lists for the query terms and computes a cheap relevance score per candidate document, returning only its top few results — not its whole matching set.
+4. **Fan-in / merge**: the broker collects shard responses and merges them into a single globally ranked candidate list. This step must tolerate a shard replying late or not at all within the timeout — a missing shard means a small chance of missing some relevant results, which is judged an acceptable trade-off against blowing the latency budget waiting on it.
+5. **Rich ranking**: the merged, much smaller candidate set (thousands, not billions) goes through a second, more expensive ranking pass that can afford heavier features — click history signals, page quality, personalization.
+6. **Presentation**: snippet generation, deduplication, and layout happen last, close to the response.
+
+The two-phase ranking split in steps 3 and 5 is the key trick that makes rich ranking affordable at all: you never run your most expensive model against billions of documents, only against the few thousand that survived a cheap first cut.
+
+## Freshness vs. a mostly-static base index
+
+Rebuilding a multi-hundred-billion-document index is a large batch job — it doesn't run continuously in real time. To handle time-sensitive content (breaking news, a just-published page), serving architectures typically keep a small, frequently-refreshed **fresh index** alongside the much larger, more slowly-updated **base index**, and merge results from both at query time. This mirrors a pattern you'll see again in the Cloudflare case study: a small, fast-changing layer sitting in front of a much larger, more slowly propagated one, so you get freshness where it matters without paying the cost of fast-updating everything.
+
+## Caching and the long tail
+
+Result caching (cache the final ranked page for an exact query string) and posting-list caching (keep hot terms' postings in a fast cache in front of disk/cold storage) both help, especially for navigational and trending queries that many users issue identically. But web search queries have an extremely long tail — a huge fraction of daily query volume is queries seen rarely or never before — so caching reduces average load without being a substitute for making the uncached path itself fast.
+
+<Callout type="warning">
+  The most common mistake when reasoning about this system out loud in an interview: designing around *average* shard latency instead of tail latency. With a fan-out to a few thousand shards per query, if each shard has even a 99.9th-percentile latency spike 1% of the time, the probability that *at least one* of thousands of shards is slow on any given query approaches certainty. The system has to be designed assuming some shard replica will always be slow right now — via replication, hedged/backup requests to a second replica when the first is late, and strict per-shard timeouts that return partial results rather than blocking the whole query.
+</Callout>
+
+## Worked example: how many shards, and why fan-out is unavoidable
+
+Say a shard's in-memory index needs to fit in 64GB of RAM per machine, and the total inverted index (postings, doc metadata, compressed text) for the corpus comes to roughly 640TB. That's `640TB / 64GB ≈ 10,000` shards, before any replication factor. With a replication factor of 3 for availability and load-spreading, that's around 30,000 machines just for index serving — before frontends, mixers, rankers, or crawling/indexing infrastructure.
+
+Now trace one query: it fans out to (at least) one replica of all ~10,000 shards, each of which must respond within, say, a 50ms slice of the overall budget. You cannot instead route the query to only "the shards that might have a match," because relevant documents are scattered essentially uniformly across all shards — there's no cheap way to know in advance which shards to skip. The fan-out to every shard, on every query, is structural, not an implementation shortcut — which is exactly why tail-latency handling (the callout above) isn't optional polish; it's load-bearing for the whole design.
+
+## Quiz
+
+<Quiz lessonId="case-study-case-study-google-serving-web-search" client:visible questions={[
+  {
+    id: 'q1',
+    kind: 'mcq',
+    prompt: 'Why is the inverted index for web search split by document (document-partitioned) rather than by term (term-partitioned) across shards?',
+    options: [
+      { id: 'a', text: 'Document partitioning spreads query load evenly regardless of which terms a query uses, and lets you add capacity by adding shards without ever moving a popular term.', correct: true, explanation: 'Correct — with term partitioning, a shard owning a hot term becomes a hotspot; document partitioning avoids that because every query touches every shard roughly equally.' },
+      { id: 'b', text: 'Term partitioning is impossible to implement for an inverted index.', correct: false, explanation: 'It is possible and used in some systems — it is just less favorable here because it creates load imbalance around popular terms.' },
+      { id: 'c', text: 'Document partitioning uses less total storage than term partitioning.', correct: false, explanation: 'Total storage is roughly the same either way; the deciding factor is load distribution and operational simplicity, not raw storage.' },
+    ],
+  },
+  {
+    id: 'q2',
+    kind: 'multi',
+    prompt: 'Which techniques help control tail latency in the fan-out/fan-in query path? (Select all that apply.)',
+    options: [
+      { id: 'a', text: 'Replicating each shard multiple times so a slow replica can be avoided or a hedged request sent to another', correct: true, explanation: 'Replication gives the broker somewhere else to route a request when one replica is slow or unresponsive.' },
+      { id: 'b', text: 'Enforcing a strict per-shard timeout and returning results from whichever shards replied in time', correct: true, explanation: 'This bounds total query latency by a fixed budget instead of waiting on the single slowest shard indefinitely.' },
+      { id: 'c', text: 'Increasing the number of shards a query fans out to', correct: false, explanation: 'More shards to fan out to increases, not decreases, the chance that some shard in the batch is slow on any given query.' },
+      { id: 'd', text: 'Sending a backup request to a second replica if the first has not responded after a short delay', correct: true, explanation: 'This is a classic hedged-request pattern: it trades a little extra load for a large reduction in tail latency.' },
+    ],
+  },
+  {
+    id: 'q3',
+    kind: 'boolean',
+    prompt: 'A two-phase ranking design runs the expensive, feature-rich ranking model against every document in the full corpus to maximize accuracy.',
+    options: [
+      { id: 'true', text: 'True', correct: false, explanation: 'That would be far too slow at this scale. The expensive model only runs on the small candidate set (thousands of documents) that survived a cheap first-pass score.' },
+      { id: 'false', text: 'False', correct: true, explanation: 'Correct — the whole point of the two-phase split is that the expensive ranking model only ever sees a small, pre-filtered candidate set, not the full corpus.' },
+    ],
+  },
+  {
+    id: 'q4',
+    kind: 'mcq',
+    prompt: 'Why do search-serving systems typically keep a separate small "fresh" index alongside a much larger, less frequently rebuilt "base" index?',
+    options: [
+      { id: 'a', text: 'Rebuilding the full multi-hundred-billion-document index is a large batch process, so a small frequently-refreshed layer is the practical way to surface very recent content quickly.', correct: true, explanation: 'Correct — full-index rebuilds are expensive and slow, so freshness is handled by a small layer that updates quickly and gets merged with the base index at query time.' },
+      { id: 'b', text: 'The base index cannot store recent content at all.', correct: false, explanation: 'The base index can and does eventually include recent content once rebuilt — the fresh index just covers the gap until then.' },
+      { id: 'c', text: 'It reduces the total number of shards needed for serving.', correct: false, explanation: 'The fresh/base split is about update cadence and content recency, not about reducing shard count.' },
+    ],
+  },
+]} />

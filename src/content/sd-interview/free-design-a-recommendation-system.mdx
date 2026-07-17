@@ -1,0 +1,291 @@
+---
+title: "Design a Recommendation System"
+module: "Free System Design Lessons"
+moduleOrder: 22
+order: 5
+track: "interview"
+summary: "Walks through designing a large-scale recommendation system — candidate generation, ranking, and feedback loops — as a multi-stage funnel rather than a single model call."
+tags: ["recommendation-system", "machine-learning", "system-design", "ranking", "personalization"]
+estMinutes: 13
+cheatsheet:
+  - "Split the pipeline into candidate generation (thousands to millions of items, cheap and approximate) and ranking (dozens of items, expensive and precise) — never run a heavy ranking model over the whole catalog."
+  - "Two-tower embedding models let you precompute item embeddings offline and do nearest-neighbor lookup online — this is what makes real-time retrieval over millions of items feasible."
+  - "The feature store is the seam between offline training and online serving — training and serving must read the exact same feature definitions or you get train/serve skew, a top real cause of production model bugs."
+  - "Batch precompute recommendations for most users; only compute online for high-value or highly active users where freshness matters enough to justify the latency cost."
+  - "Log impressions and skips, not just clicks — without negative signal the model only ever learns from a biased slice of what it already chose to show."
+  - "A cold-start item or user needs a non-personalized fallback (popularity, trending, content-based similarity) — personalization has nothing to rank against zero history."
+  - "Diversity and exploration have to be engineered in deliberately (bandits, randomized slots) — a pure exploit-the-model ranking collapses into a feedback loop that only shows more of what it already showed."
+---
+
+import Quiz from '../../components/Quiz';
+import Callout from '../../components/Callout.astro';
+import Mermaid from '../../components/Mermaid';
+
+"Design a recommendation system" shows up in interviews for feed-based
+products (video, music, e-commerce, social) because almost every large
+consumer product eventually needs one, and it's a genuinely different kind
+of design problem from a CRUD service. The hard part isn't storing data or
+scaling reads — it's that the "correct" output isn't well-defined ahead of
+time. You're not looking up a record; you're predicting which of millions
+of items a specific user is most likely to engage with, in under 200ms,
+using signals that go stale the moment you compute them. That combination
+of scale, latency, and a fuzzy correctness bar is what makes this lesson
+worth its own design, distinct from a straightforward ranked-feed problem.
+
+## Requirements
+
+**Functional**
+
+- Given a user (and optionally a context — home feed, "similar items,"
+  post-purchase), return a ranked list of items they're likely to engage
+  with.
+- Incorporate multiple signal types: past interactions (clicks, watches,
+  purchases), item metadata (category, content), and social/collaborative
+  signals (what similar users liked).
+- Handle cold start: new users with no history, new items with no
+  interactions.
+- Support feedback: today's recommendations should get worse or better
+  based on how users respond to them.
+
+**Non-functional**
+
+- Latency: p99 under roughly 100-200ms for the online request, since
+  recommendations usually sit on a page's critical path.
+- Scale: tens to hundreds of millions of users, a catalog from thousands
+  (e-commerce categories) to hundreds of millions of items (video,
+  social posts).
+- Freshness: a user's last five minutes of activity should be able to
+  influence the next thing they're shown, even if the underlying model
+  was trained yesterday.
+- Explore/exploit balance: the system must occasionally surface things
+  outside a user's established pattern, or it ossifies.
+
+<Callout type="note">
+  This lesson assumes the model itself (what to train, which loss function)
+  is out of scope for a systems interview — the interviewer wants the
+  *pipeline* that gets features to a model and predictions to a user within
+  budget, not a machine-learning research discussion. Say that framing out
+  loud early; it keeps the conversation on architecture.
+</Callout>
+
+## Why you can't rank the whole catalog
+
+The naive design is: take every item in the catalog, score it against the
+user with your best model, sort, return the top N. That's correct in
+theory and impossible in practice. A model expressive enough to capture
+real signal (deep cross-features between user and item) costs single-digit
+milliseconds *per item* to score. Scoring 50 million items per request
+would take minutes, not milliseconds — off by four to five orders of
+magnitude from the latency budget.
+
+The fix every production recommender uses is a **funnel**: cheap, coarse
+filtering first to cut the candidate set down by orders of magnitude, then
+progressively more expensive and more accurate scoring on the survivors.
+
+## High-level architecture: a two-stage funnel
+
+<Mermaid client:visible chart={`
+flowchart LR
+  U[User request] --> CG[Candidate Generation]
+  CG -->|1000s of items| RANK[Ranking]
+  RANK -->|10s of items| RERANK[Business Rules / Re-rank]
+  RERANK --> RESP[Response: top N]
+  FS[(Feature Store)] --> CG
+  FS --> RANK
+  LOGS[(Interaction Logs)] --> TRAIN[Offline Training]
+  TRAIN --> FS
+  TRAIN --> RANK
+`} />
+
+**Candidate generation** narrows millions of items to a few hundred or
+thousand plausible ones, cheaply. Common approaches:
+
+- **Collaborative filtering / embeddings**: represent users and items as
+  vectors in the same space (a "two-tower" model trains a user tower and
+  an item tower so that a user's vector sits near the vectors of items
+  they'd engage with). Item embeddings are precomputed offline and loaded
+  into an approximate-nearest-neighbor index (HNSW, IVF); at request time
+  you compute the user's vector and do a sub-millisecond ANN lookup.
+- **Rule-based / heuristic sources**: "trending in your region," "same
+  category as your last purchase," "followed by people you follow." These
+  run in parallel with the embedding retrieval and their outputs get
+  merged — multiple candidate sources feeding one pool is normal and
+  healthy, because each source covers a blind spot of the others.
+
+**Ranking** takes that merged pool (thousands of items) and scores each
+one with a heavier model that can afford to look at richer features —
+user-item cross-features, recency, session context — because it's now
+only scoring hundreds to low-thousands of items instead of millions.
+
+**Re-ranking / business rules** is a final cheap pass: remove items the
+user already bought/watched, enforce diversity ("no more than two items
+from the same seller in a row"), inject a small exploration slot, apply
+policy filters (age-restricted content, region blocks).
+
+## The feature store: the seam that breaks in practice
+
+Both candidate generation and ranking need features about the user and
+the item — recent click count, average session length, item popularity
+decayed over the last hour. These features are computed two places:
+**offline**, in bulk, when training the model on historical logs; and
+**online**, per-request, when serving a live prediction. If the offline
+and online code paths compute "average session length" even slightly
+differently, the model sees different-shaped inputs in training versus
+production and its accuracy silently degrades — this is **train/serve
+skew**, and it's one of the most common causes of "the model works in
+notebooks but underperforms in production."
+
+The standard fix is a **feature store**: a system that defines each
+feature once and serves it two ways — a batch view for building training
+datasets, and a low-latency online view (usually a key-value store like
+Redis or a wide-column store) for serving requests. Both paths read the
+same feature definition, so training and serving see identical
+transformations.
+
+## Freshness: batch vs. online recompute
+
+Recomputing full personalized recommendations for every user on every
+request is expensive. Most systems split by how much freshness actually
+matters:
+
+- **Batch precompute**: for the majority of users, run candidate
+  generation and ranking as an offline job (hourly or few-times-a-day),
+  store the resulting list in a cache keyed by user ID, and serve it
+  directly — a cache read, no model inference on the request path at all.
+- **Online recompute**: for users where the last few minutes matter (an
+  active shopping session, a user who just finished a video and is picking
+  the next one), recompute at request time using the freshest features,
+  accepting the extra latency.
+
+A common middle ground: serve the batch-precomputed list as a base, then
+apply a lightweight online re-rank using only session-level signals from
+the last few minutes, without rerunning the full candidate generation
+step.
+
+## Feedback loops and exploration
+
+Every impression and its outcome — click, watch-through, purchase, or
+explicit skip — gets logged and feeds back into training. Two mistakes
+are worth calling out explicitly:
+
+1. **Logging only positive signals.** If you only log clicks, the model
+   never learns what users saw and *ignored*, so it can't distinguish
+   "genuinely irrelevant" from "never shown." Log impressions and skips
+   alongside clicks so negative examples exist.
+2. **Pure exploitation.** A model trained only on past engagement, then
+   used to pick what to show next, then retrained on the outcomes of what
+   it showed — reinforces its own biases. Items it never surfaces never
+   get engagement data, so they never get recommended, forever. This is
+   why production systems reserve a small slot (often single-digit
+   percent of impressions) for exploration: recommending an item outside
+   the model's confident set, sometimes via a multi-armed bandit, purely
+   to gather signal on it.
+
+## Worked example: estimating the funnel
+
+Say a video platform has 80 million daily active users and a catalog of 5
+million videos, with a 150ms latency budget for the home-feed request.
+
+- **Candidate generation**: an ANN lookup over 5 million item embeddings
+  (each maybe 128 dimensions) using an HNSW index returns the top 2,000
+  candidates in single-digit milliseconds, merged with roughly 500 more
+  from a "trending" heuristic source and 500 from "same creator you
+  follow" — call it a pool of around 3,000 candidates after de-duplication.
+- **Ranking**: a model with richer user-item features scores those 3,000
+  candidates. At roughly 0.05ms per item on a batched GPU/CPU scoring
+  pass, that's about 150ms worth of naive per-item scoring — too slow — so
+  production systems batch the scoring call (score all 3,000 in one
+  vectorized pass) rather than looping item by item, bringing it down to
+  low tens of milliseconds.
+- **Re-rank**: filtering already-watched items and injecting 2-3
+  exploration slots into the top 20 is negligible cost, sub-millisecond.
+- **Total**: roughly 10-15ms candidate generation + 20-40ms ranking +
+  under 5ms re-rank, leaving comfortable headroom under 150ms for network
+  and serialization overhead.
+
+The number that matters isn't any single stage's latency — it's that each
+stage's *output size* determines the next stage's affordable *cost per
+item*. Get that ratio backwards (an expensive model scoring millions of
+items) and no amount of hardware fixes the budget.
+
+<Callout type="warning">
+  A frequent interview mistake is presenting the ranking model as if it
+  were the whole system — "we train a model, it ranks items, done." That
+  skips candidate generation entirely, which is the piece that actually
+  makes the latency budget achievable, and it skips the feature store,
+  which is where real production systems spend a surprising amount of
+  their engineering effort. If you only describe the model, you've
+  described 20% of the design; walk through the funnel, the feature
+  serving path, and the feedback loop explicitly.
+</Callout>
+
+## Trade-offs to raise proactively
+
+- **Precision vs. latency**: a bigger ranking model is more accurate but
+  slower — this is exactly why candidate generation exists, to buy the
+  ranking stage room to be expensive on a small set.
+- **Freshness vs. cost**: batch precompute is cheap but can be hours
+  stale; online recompute is fresh but costs a model call on every
+  request. Segment users by activity level rather than picking one
+  approach for everyone.
+- **Personalization vs. cold start**: a pure collaborative-filtering
+  approach has nothing to work with for a brand-new user or item;
+  content-based similarity and simple popularity fallbacks cover that gap
+  until enough interaction data accumulates.
+- **Relevance vs. diversity**: ranking purely by predicted engagement
+  produces a narrow, repetitive feed over time; diversity constraints and
+  exploration slots trade a little short-term click-through for long-term
+  retention and catalog coverage.
+
+This lesson focused on the retrieval-and-ranking pipeline; if your
+interview also touches on the kind of high-write-volume event logging
+that feeds the feedback loop, the patterns in this module's [Ad Click
+Aggregation System](/system-design/design/free-design-an-ad-click-aggregation-system)
+and [Web Analytics System](/system-design/design/free-design-a-web-analytics-system)
+lessons cover that ingestion path in more depth.
+
+<Quiz
+  lessonId="free-design-a-recommendation-system"
+  client:visible
+  questions={[
+    {
+      id: 'q1',
+      kind: 'mcq',
+      prompt: 'Why do production recommendation systems split work into candidate generation and ranking instead of scoring the entire catalog with one model?',
+      options: [
+        { id: 'a', text: 'A single-stage model cannot be trained on large catalogs', correct: false, explanation: 'Training is a separate concern from serving cost; a model can be trained on a large catalog fine. The issue is the per-request latency of scoring every item at serve time.' },
+        { id: 'b', text: 'Scoring millions of items with an expensive model per request would blow the latency budget, so cheap retrieval narrows the set first', correct: true, explanation: 'This is exactly the funnel argument: candidate generation cuts millions down to thousands cheaply, so the expensive ranking model only has to score a small, affordable set.' },
+        { id: 'c', text: 'Ranking models cannot process more than a few thousand items in their lifetime', correct: false, explanation: 'There is no such lifetime limit on a model; the constraint is per-request latency, not a cumulative cap on items scored.' },
+      ],
+    },
+    {
+      id: 'q2',
+      kind: 'multi',
+      prompt: 'Which of these are real risks of a recommendation system that only logs clicks and never negative or impression data? (Select all that apply.)',
+      options: [
+        { id: 'a', text: 'The model cannot distinguish "shown and ignored" from "never shown"', correct: true, explanation: 'Without impression/skip logs, there is no negative example distinguishing an item a user saw and passed on from one they never saw at all.' },
+        { id: 'b', text: 'The feedback loop reinforces whatever the model already tends to show, since unshown items never get any signal', correct: true, explanation: 'Items outside the model’s confident set never surface, so they never accumulate engagement data, so they never get recommended — a self-reinforcing loop.' },
+        { id: 'c', text: 'The online serving latency increases significantly', correct: false, explanation: 'What gets logged for offline training has no direct effect on the online request’s serving latency.' },
+      ],
+    },
+    {
+      id: 'q3',
+      kind: 'boolean',
+      prompt: 'A feature store’s main purpose is to make offline training faster, not to affect online serving correctness.',
+      options: [
+        { id: 'true', text: 'True', correct: false, explanation: 'A feature store’s central purpose is consistency: ensuring training and serving compute the same feature the same way, preventing train/serve skew, which is a correctness concern, not just a training speed concern.' },
+        { id: 'false', text: 'False', correct: true, explanation: 'Correct — the feature store exists primarily to keep offline (training) and online (serving) feature computation consistent, avoiding train/serve skew that silently degrades production accuracy.' },
+      ],
+    },
+    {
+      id: 'q4',
+      kind: 'mcq',
+      prompt: 'A ranking model that is trained only to maximize predicted click-through, with no diversity or exploration mechanism, will most likely lead to what over time?',
+      options: [
+        { id: 'a', text: 'A feed that narrows toward a repetitive set of similar items and stops surfacing anything outside the user’s established pattern', correct: true, explanation: 'Pure exploitation of a click-maximizing model collapses onto whatever already scores well, starving less-explored items of any chance to gather signal — exactly why exploration slots and diversity rules are engineered in deliberately.' },
+        { id: 'b', text: 'Higher and higher latency on every request', correct: false, explanation: 'Lack of diversity/exploration is a relevance and feedback-loop problem, not a latency problem — the model still scores the same number of candidates.' },
+        { id: 'c', text: 'The candidate generation stage will run out of items to retrieve', correct: false, explanation: 'Candidate generation still retrieves from the full catalog; the issue is that ranking/re-ranking without diversity constraints keeps favoring the same narrow slice of what it retrieves.' },
+      ],
+    },
+  ]}
+/>
