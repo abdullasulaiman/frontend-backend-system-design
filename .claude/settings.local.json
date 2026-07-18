@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(system_profiler SPFontsDataType)",
-      "WebFetch(domain:www.educative.io)",
-      "WebFetch(domain:www.greatfrontend.com)"
-    ]
-  }
-}
