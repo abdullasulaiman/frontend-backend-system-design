@@ -13,6 +13,10 @@
 //     the placeholder out.
 //   - Any failure (404 in dev, network error, etc.) is swallowed silently —
 //     never thrown, never left as an unhandled console error.
+//
+// Under a GitHub Pages project subpath the assets live at `<base>/pagefind/...`,
+// so the base (injected via define:vars) is prepended to every Pagefind URL.
+const pagefindBase = import.meta.env.BASE_URL; // e.g. '/frontend-backend-system-design/'
 ---
 
 <div class="hidden sm:block" data-search-root>
@@ -46,7 +50,7 @@
   }
 </style>
 
-<script is:inline>
+<script is:inline define:vars={{ pagefindBase }}>
   (function () {
     var root = document.querySelector('[data-search-root]');
     if (!root) return;
@@ -55,20 +59,26 @@
     var fallback = root.querySelector('[data-search-fallback]');
     if (!mount || !fallback) return;
 
+    // Pagefind assets live under the site's base path (e.g. a GitHub Pages
+    // project subpath). `pagefindBase` is injected via define:vars and ends
+    // with a trailing slash.
+    var jsUrl = pagefindBase + 'pagefind/pagefind-ui.js';
+    var cssUrl = pagefindBase + 'pagefind/pagefind-ui.css';
+
     // Guarded probe: only wire up the real UI if the built index exists.
-    // A missing /pagefind/pagefind-ui.js (e.g. during `astro dev`, where
-    // Pagefind hasn't run yet) must never throw or log a fetch/script error.
-    fetch('/pagefind/pagefind-ui.js', { method: 'HEAD' })
+    // A missing pagefind-ui.js (e.g. during `astro dev`, where Pagefind hasn't
+    // run yet) must never throw or log a fetch/script error.
+    fetch(jsUrl, { method: 'HEAD' })
       .then(function (res) {
         if (!res || !res.ok) return;
 
         var link = document.createElement('link');
         link.rel = 'stylesheet';
-        link.href = '/pagefind/pagefind-ui.css';
+        link.href = cssUrl;
         document.head.appendChild(link);
 
         var script = document.createElement('script');
-        script.src = '/pagefind/pagefind-ui.js';
+        script.src = jsUrl;
         script.onload = function () {
           try {
             if (window.PagefindUI) {

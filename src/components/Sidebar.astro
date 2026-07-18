@@ -2,6 +2,7 @@
 import { getCollection } from 'astro:content';
 import { buildNav, flattenNav } from '../lib/navigation';
 import { COURSES, type Course } from '../lib/courses';
+import { withBase } from '../lib/url';
 import ProgressRing from './ProgressRing';
 
 export interface Props {
@@ -20,12 +21,12 @@ const course = COURSES.find(c => c.key === activeCourse) ?? COURSES[0];
 // if a course has no lessons yet, so the switcher link is never dead.
 const courseFirstHrefs = new Map<Course['key'], string>();
 for (const c of COURSES) {
-  let href = '/cheatsheets';
+  let href = withBase('/cheatsheets');
   for (const track of c.tracks) {
     const entries = await getCollection(track.collection);
     const first = flattenNav(buildNav(entries))[0];
     if (first) {
-      href = `${track.basePath}/${first.id}`;
+      href = withBase(`${track.basePath}/${first.id}`);
       break;
     }
   }
@@ -98,7 +99,7 @@ for (const track of tracks) {
                 return (
                   <li>
                     <a
-                      href={`${track.basePath}/${lesson.id}`}
+                      href={withBase(`${track.basePath}/${lesson.id}`)}
                       aria-current={isActive ? 'page' : undefined}
                       class="nav-lesson block rounded-sm px-2 py-1.5 text-sm transition-colors duration-[var(--transition-fast)]"
                     >

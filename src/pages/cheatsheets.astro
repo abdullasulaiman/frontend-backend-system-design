@@ -3,6 +3,7 @@ import { getCollection } from 'astro:content';
 import BaseLayout from '../layouts/BaseLayout.astro';
 import { buildNav } from '../lib/navigation';
 import { COURSES } from '../lib/courses';
+import { withBase } from '../lib/url';
 
 // Aggregate all four collections, grouped course -> track -> module (nav
 // order), so cheatsheets cover every course even though the backend course
@@ -94,7 +95,7 @@ const allTracks = courseData.flatMap(c => c.tracks.map(t => ({ ...t, courseLabel
                             <article class="rounded-card border border-[var(--border)] bg-[var(--surface)] p-5 shadow-card print:border-black print:bg-transparent print:shadow-none">
                               <h5 class="m-0 mb-3 text-base font-semibold">
                                 <a
-                                  href={`${track.basePath}/${lesson.id}`}
+                                  href={withBase(`${track.basePath}/${lesson.id}`)}
                                   class="text-[var(--text)] no-underline hover:text-[var(--brand)] hover:underline"
                                 >
                                   {lesson.title}

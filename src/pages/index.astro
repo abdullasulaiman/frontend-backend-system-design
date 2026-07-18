@@ -4,6 +4,7 @@ import ProgressRing from '../components/ProgressRing';
 import { getCollection } from 'astro:content';
 import { buildNav, flattenNav } from '../lib/navigation';
 import { COURSES } from '../lib/courses';
+import { withBase } from '../lib/url';
 
 // Short per-track descriptions for the roadmap cards. Only the frontend
 // course's tracks have bespoke copy today; anything not listed here falls
@@ -58,7 +59,7 @@ outer: for (const course of courseData) {
   for (const track of course.tracks) {
     const first = flattenNav(track.nav)[0];
     if (first) {
-      heroHref = `${track.basePath}/${first.id}`;
+      heroHref = withBase(`${track.basePath}/${first.id}`);
       heroCtaLabel = 'Start learning';
       break outer;
     }
@@ -156,7 +157,7 @@ const totalLessons = courseData.reduce((n, c) => n + c.lessonCount, 0);
                         return (
                           <li>
                             <a
-                              href={`${track.basePath}/${firstLesson.id}`}
+                              href={withBase(`${track.basePath}/${firstLesson.id}`)}
                               class="flex items-center justify-between gap-4 rounded-card border border-[var(--border)] bg-[var(--bg)] px-4 py-3 no-underline transition-colors duration-[var(--transition-fast)] hover:border-[var(--brand)] hover:bg-[var(--surface-2)]"
                             >
                               <span class="min-w-0">
@@ -229,7 +230,7 @@ const totalLessons = courseData.reduce((n, c) => n + c.lessonCount, 0);
         endorsed by, or sourced from any commercial course.
       </p>
       <p class="mt-2">
-        <a href="/about" class="font-medium text-[var(--brand)] underline underline-offset-2 hover:text-[var(--brand-strong)]">
+        <a href={withBase('/about')} class="font-medium text-[var(--brand)] underline underline-offset-2 hover:text-[var(--brand-strong)]">
           About this project
         </a>
       </p>

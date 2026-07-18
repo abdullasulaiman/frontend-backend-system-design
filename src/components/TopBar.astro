@@ -3,6 +3,7 @@ import Search from './Search.astro';
 import ThemeToggle from './ThemeToggle';
 import { getCollection } from 'astro:content';
 import { buildNav, flattenNav } from '../lib/navigation';
+import { withBase } from '../lib/url';
 import { COURSES } from '../lib/courses';
 
 // Resolve the first lesson of each COURSE (from its first track) so the nav
@@ -14,9 +15,9 @@ async function firstLessonHref(course: (typeof COURSES)[number]): Promise<string
   for (const track of course.tracks) {
     const entries = await getCollection(track.collection);
     const first = flattenNav(buildNav(entries))[0];
-    if (first) return `${track.basePath}/${first.id}`;
+    if (first) return withBase(`${track.basePath}/${first.id}`);
   }
-  return '/cheatsheets';
+  return withBase('/cheatsheets');
 }
 
 // Short labels for the top-level nav — the full course.label ("Frontend
@@ -41,7 +42,7 @@ const courseLinks = COURSES.map((course, i) => ({
 >
   <div class="mx-auto flex max-w-[1600px] items-center gap-4 px-4 py-3 sm:px-6">
     <a
-      href="/"
+      href={withBase('/')}
       class="flex shrink-0 items-center gap-2 text-base font-bold text-[var(--text)] no-underline"
     >
       <span

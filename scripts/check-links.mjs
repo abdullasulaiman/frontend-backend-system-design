@@ -12,6 +12,12 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distRoot = path.resolve(__dirname, '..', 'dist');
 
+// The site is served from a subpath (GitHub Pages project site), so links in
+// the built HTML are prefixed with this base while the emitted files live at
+// the `dist/` root. Strip the base before resolving. Must match `base` in
+// astro.config.mjs.
+const BASE = '/frontend-backend-system-design';
+
 /** Recursively collect every `.html` file under `dir`. */
 async function findHtmlFiles(dir) {
   const entries = await readdir(dir, { withFileTypes: true });
@@ -66,6 +72,10 @@ async function resolves(href, sourceFile) {
   // and is already known to exist (the source file itself was found by the
   // scan). Nothing left to resolve.
   if (pathname === '') return true;
+
+  // Strip the base-path prefix so base-prefixed links resolve against dist root.
+  if (pathname === BASE) pathname = '/';
+  else if (pathname.startsWith(`${BASE}/`)) pathname = pathname.slice(BASE.length);
 
   let target;
   if (pathname.startsWith('/')) {
