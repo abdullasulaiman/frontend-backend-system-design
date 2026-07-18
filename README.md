@@ -1,69 +1,90 @@
 # The System Design Handbook
 
-> Two complete, original system-design courses — **Frontend** and **Backend** — in one fast, searchable, interactive web app. 250 lessons, quizzes, mock interviews, progress tracking, and revision cheatsheets.
+A free, interactive study platform for **system design interviews** — covering both **Frontend** and **Backend** system design in depth. 250 original lessons, hands-on quizzes, guided mock interviews, progress tracking, and one-page revision cheatsheets.
 
-**🔗 Live site:** https://your-username.github.io/frontend-backend-system-design/
-_(replace `your-username` with your GitHub username after deploying)_
+### 🚀 [**Open the live site →**](https://abdullasulaiman.github.io/frontend-backend-system-design/)
 
-Built with Astro + React islands. All content is original, self-hosted, and free.
-
----
-
-## What's inside
-
-Two independent courses, switchable from the top bar, each faithful to a full interview curriculum:
-
-### 🎨 Frontend System Design — 58 lessons (15 modules)
-Introduction · Nonfunctional Requirements · Fundamentals (rendering, state, DOM) · Performance & Optimization · API Architecture · Design Patterns & Architectures · Security · a step-by-step interview Framework · Conclusion · Bonus topics — plus **5 case studies** (Newsfeed, Video Streaming, Chat, Ride-Hailing, Calendar), each with a **mock interview**.
-
-### 🏗️ System Design Interview (Backend) — 192 lessons (48 modules)
-- **Foundations & Building Blocks:** interview prep, non-functional characteristics, estimation, DNS, load balancers, databases, key-value stores, CDN, ID generators, monitoring, distributed cache, message queues, pub-sub, rate limiter, blob store, search, logging, task scheduler, sharded counters…
-- **Design Problems:** YouTube, Quora, Google Maps, Yelp, Uber, Twitter, Instagram, TinyURL, Web Crawler, WhatsApp, Typeahead, Google Docs, Payments, ChatGPT-style systems, and more.
-- **Bonus:** 14 extra "Design X" lessons (Notification System, Dropbox, Ticketmaster, Zoom, Stock Exchange, API Gateway, Gmail, Airbnb…) and 5 company **case studies** (Netflix, DynamoDB, Google Search, Discord, Cloudflare).
-
-## Features
-- **Interactive quizzes** on every lesson — instant feedback with explanations.
-- **Mock-interview mode** — a prompt, your notes, a reveal-the-rubric flow, and a self-score.
-- **Progress tracking** — per-module completion rings (saved in your browser).
-- **Consolidated cheatsheets** — every lesson's key takeaways on one page for fast revision.
-- **Full-text search** across all lessons (Pagefind).
-- **Light / dark themes**, smooth client-side navigation, accessible (WCAG-AA), responsive.
-
-## Tech stack
-[Astro](https://astro.build) (content collections + view transitions) · React 19 islands · Tailwind CSS v4 · TypeScript (strict) · [Pagefind](https://pagefind.app) static search · Mermaid diagrams · Vitest.
+<https://abdullasulaiman.github.io/frontend-backend-system-design/>
 
 ---
 
-## Run it locally
+## Why this exists
 
-Requires **Node ≥ 22.12** (pinned via `.nvmrc`).
+Most system design prep is scattered across blog posts, videos, and paywalled courses — and almost all of it ignores the **frontend** interview entirely. This handbook brings both tracks together in one fast, searchable place, teaches each topic from first principles, and then makes you *practice* with quizzes and realistic mock-interview prompts. It's built to take you from "I know the concepts" to "I can confidently drive a 45-minute design interview."
+
+## What you'll get out of it
+
+- **A repeatable way to answer any design question** — a step-by-step framework (clarify → estimate → decompose → data & API → architecture → trade-offs) applied across every case study, so you stop freezing on open-ended prompts.
+- **Real depth on the frontend interview** — rendering strategies, state architecture, performance budgets, accessibility, security, and design systems, not just "make a to-do app."
+- **The full distributed-systems toolkit** — the building blocks (load balancers, databases, caches, queues, consistency models) *and* how to compose them into complete designs for real products.
+- **Practice, not just reading** — a quiz on every lesson (instant feedback + explanations) and 13 guided mock interviews with rubrics you score yourself against.
+- **Fast revision** — every lesson's key takeaways aggregated into printable cheatsheets, plus full-text search across all 250 lessons for the night before an interview.
+
+---
+
+## 📚 What's covered
+
+Two independent courses, switchable from the top bar. Each mirrors a complete, in-order interview curriculum.
+
+### 🎨 Frontend System Design — 58 lessons
+
+**Concepts**
+| Module | You'll learn |
+| --- | --- |
+| **Introduction** | What frontend system design is and how interviewers assess it |
+| **Nonfunctional Requirements** | Performance, accessibility & compatibility, localization/i18n, maintainability |
+| **Fundamentals** | Browser rendering pipeline, CSS layout & positioning, the DOM, state management |
+| **Performance & Optimization** | Critical rendering path, asset loading, code splitting, lazy loading, caching, image/media optimization, rendering strategies (CSR/SSR/SSG/ISR), Core Web Vitals, network optimization |
+| **API Architecture** | Client–server models, REST/GraphQL/gRPC/WebSocket/SSE, data formats & transport |
+| **Design Patterns & Architectures** | Component patterns, micro-frontends, module federation, monorepo vs. polyrepo, rendering & state architectures |
+| **Security** | Auth on the frontend (authN/authZ), XSS, CSRF, CSP, safe client-side storage |
+| **The Framework** | A six-step method for structuring any frontend design answer under time pressure |
+| **Bonus** | Real-time data & sync, offline-first/PWAs, frontend observability, feature flags & progressive delivery, design systems at scale |
+
+**Interview Prep — 5 case studies, each ending in a mock interview**
+News Feed · Video Streaming Platform · Chat Application · Ride-Hailing App · Calendar Application
+
+### 🏗️ Backend / Distributed System Design — 192 lessons
+
+**Foundations & Building Blocks**
+Interview strategy · non-functional characteristics (availability, reliability, scalability, consistency — CAP/PACELC) · back-of-the-envelope estimation · **DNS** · **load balancers** · **databases** (SQL vs. NoSQL, replication, sharding, indexing, transactions) · **key-value stores** (consistent hashing, quorums) · **CDNs** · **unique ID generation** · **distributed monitoring** & error tracking · **distributed cache** · **message queues** · **pub-sub** · **rate limiter** · **blob store** · **distributed search** · **distributed logging** · **task scheduler** · **sharded counters**.
+
+**Design Problems — the classic "Design X" interviews**
+YouTube · Quora · Google Maps · Yelp (proximity) · Uber · Twitter · News Feed · Instagram · TinyURL · Web Crawler · WhatsApp · Typeahead · Google Docs · Deployment System · Payment System · ChatGPT-style LLM serving · Data Infrastructure · LLM Support Bot · AI Code Assistant · Lessons from System Failures.
+
+**Bonus** — 14 extra designs (Notification System, Dropbox, Ticketmaster, Distributed Lock, Recommendations, Ad Click Aggregation, Leaderboard, Zoom, Stock Exchange, API Gateway, Web Analytics, Gmail, Online Code Judge, Airbnb) and 5 company case studies (**Netflix, Amazon DynamoDB, Google Search, Discord, Cloudflare**).
+
+> 8 of the design modules include a dedicated **mock interview** with a prompt and a scoring rubric.
+
+---
+
+## ✨ Features
+
+- **Quizzes on every lesson** — multiple-choice / multi-select / true-false with instant feedback and per-option explanations.
+- **Mock-interview mode** — a realistic prompt, space for your own notes, a reveal-the-rubric step, and a self-score.
+- **Progress tracking** — per-module completion rings, saved locally in your browser.
+- **Cheatsheets** — every lesson's key points collected on one filterable page for last-minute revision.
+- **Full-text search** across all 250 lessons.
+- **Light / dark themes**, smooth client-side navigation, diagrams, fully responsive, and accessible (WCAG-AA).
+
+## 🛠️ Built with
+
+[Astro](https://astro.build) · React 19 islands · TypeScript (strict) · Tailwind CSS v4 · [Pagefind](https://pagefind.app) static search · Mermaid diagrams · Vitest. Statically generated and deployed to GitHub Pages via GitHub Actions.
+
+## 💻 Run locally
+
+Requires **Node ≥ 22.12** (pinned in `.nvmrc`).
 
 ```bash
-nvm use            # or: nvm install
+nvm use          # or: nvm install
 npm install
-npm run dev        # http://localhost:4321/frontend-backend-system-design/
+npm run dev      # http://localhost:4321/frontend-backend-system-design/
 ```
 
-Other scripts: `npm run build` (static build + search index) · `npm run preview` · `npm run check` (type + content validation) · `npm test` · `npm run linkcheck`.
-
-## Deploy to GitHub Pages
-
-This repo ships a GitHub Actions workflow (`.github/workflows/deploy.yml`) that builds and publishes on every push to `main`.
-
-1. In `astro.config.mjs`, replace `your-username` in the `site:` line with your GitHub username.
-2. Create a **public** repo named exactly **`frontend-backend-system-design`** and push:
-   ```bash
-   git remote add origin git@github.com:<your-username>/frontend-backend-system-design.git
-   git push -u origin main
-   ```
-3. On GitHub: **Settings → Pages → Build and deployment → Source = "GitHub Actions"**.
-4. The site goes live at `https://<your-username>.github.io/frontend-backend-system-design/`.
-
-> The app is served from the `/frontend-backend-system-design/` subpath, which is why `base` is set in `astro.config.mjs`. If you rename the repo, update `base` (and the `BASE` constant in `scripts/check-links.mjs`) to match.
-
-**Suggested repo topics** (Settings → About) for discoverability: `system-design`, `system-design-interview`, `frontend-system-design`, `distributed-systems`, `interview-preparation`, `astro`, `learning-resource`.
+Useful scripts: `npm run build` (static build + search index) · `npm run preview` · `npm run check` (type + content validation) · `npm test` · `npm run linkcheck`.
 
 ---
 
 ## A note on originality
+
 This is an **independent, original** learning project written from scratch. It is **not affiliated with, endorsed by, or copied from** any commercial course (including Educative's "Grokking" courses) or any other provider. Well-known system names (e.g. "Design Uber") refer to the systems being designed — standard interview practice — and all explanations, diagrams, and quizzes are original.
