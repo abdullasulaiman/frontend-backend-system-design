@@ -57,6 +57,8 @@ for (const track of tracks) {
 <aside
   class="w-full shrink-0 border-[var(--border)] p-4 lg:sticky lg:top-16 lg:h-[calc(100vh-4rem)] lg:w-72 lg:overflow-y-auto lg:border-r"
   aria-label="Lesson navigation"
+  data-sidebar
+  data-course={course.key}
   transition:persist={`sidebar-${course.key}`}
 >
   <nav aria-label="Courses" class="mb-5 flex flex-col gap-1 border-b border-[var(--border)] pb-4">
@@ -117,12 +119,38 @@ for (const track of tracks) {
 </aside>
 
 <script is:inline>
-  // The sidebar is `transition:persist`ed across view-transition navigations,
-  // so its server-rendered active highlight would go stale. Reconcile the
-  // `aria-current="page"` marker against the current URL on every page load
-  // (fires on first load AND after each view transition). CSS keys the active
-  // styling off `[aria-current="page"]`, so toggling the attribute is enough.
+  // Sidebar behavior across view-transition navigations:
+  //  1. Reconcile the active-lesson highlight (`aria-current="page"`) against
+  //     the current URL — the sidebar is `transition:persist`ed, so its
+  //     server-rendered highlight would otherwise go stale. CSS keys the active
+  //     styling off `[aria-current="page"]`, so toggling the attribute suffices.
+  //  2. Preserve the sidebar's SCROLL POSITION. `transition:persist` keeps the
+  //     DOM node but the browser resets a scroll container's `scrollTop` when
+  //     it's moved during the swap, so we save it before the swap and restore
+  //     it after (keyed per course so switching courses doesn't cross over).
+  //
+  // Listeners are registered once (guarded), since inline scripts re-execute on
+  // every view-transition navigation.
   (function () {
+    function sidebar() {
+      return document.querySelector('aside[data-sidebar]');
+    }
+    function scrollKey(el) {
+      return 'gfsd:sb-scroll:' + ((el && el.getAttribute('data-course')) || '');
+    }
+    function saveScroll() {
+      var el = sidebar();
+      if (!el) return;
+      try { sessionStorage.setItem(scrollKey(el), String(el.scrollTop)); } catch (e) {}
+    }
+    function restoreScroll() {
+      var el = sidebar();
+      if (!el) return;
+      try {
+        var v = sessionStorage.getItem(scrollKey(el));
+        if (v !== null) el.scrollTop = parseInt(v, 10) || 0;
+      } catch (e) {}
+    }
     function syncActiveLesson() {
       var here = location.pathname.replace(/\/+$/, '');
       document.querySelectorAll('a.nav-lesson').forEach(function (a) {
@@ -134,7 +162,32 @@ for (const track of tracks) {
         }
       });
     }
+
+    if (!window.__gfsdSidebarInit) {
+      window.__gfsdSidebarInit = true;
+      // Save the current scroll right before navigating away.
+      document.addEventListener('astro:before-swap', saveScroll);
+      // After the new page is swapped in, restore scroll + fix the highlight
+      // (before paint, so there's no visible jump or stale highlight).
+      document.addEventListener('astro:after-swap', function () {
+        restoreScroll();
+        syncActiveLesson();
+      });
+      document.addEventListener('astro:page-load', syncActiveLesson);
+      // Keep the saved position fresh as the user scrolls the sidebar. Scroll
+      // events don't bubble, so listen in the capture phase and filter.
+      document.addEventListener(
+        'scroll',
+        function (e) {
+          var t = e.target;
+          if (t && t.getAttribute && t.getAttribute('data-sidebar') !== null) saveScroll();
+        },
+        true
+      );
+    }
+
+    // Initial full page load.
     syncActiveLesson();
-    document.addEventListener('astro:page-load', syncActiveLesson);
+    restoreScroll();
   })();
 </script>
